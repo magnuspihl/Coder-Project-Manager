@@ -202,7 +202,7 @@ This is simpler but less user-friendly. Support both flows.
 ### Listing Workspaces
 
 ```
-GET {CODER_URL}/api/v2/workspaces?q=owner:me
+GET {CODER_URL}/api/v2/workspaces
 Headers:
   Coder-Session-Token: {access_token}
 
