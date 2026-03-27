@@ -76,6 +76,7 @@ export default function WorkspacesPage() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [taskCounts, setTaskCounts] = useState<Record<string, TaskCounts>>({});
   const [tokenTotals, setTokenTotals] = useState<Record<string, TokenTotals>>({});
+  const [githubRepoUrls, setGithubRepoUrls] = useState<Record<string, string>>({});
   const [tasksByWorkspace, setTasksByWorkspace] = useState<Record<string, Task[]>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -91,10 +92,11 @@ export default function WorkspacesPage() {
 
   const loadData = async () => {
     try {
-      const { workspaces: ws, taskCounts: tc, tokenTotals: tt } = await getWorkspaces();
+      const { workspaces: ws, taskCounts: tc, tokenTotals: tt, githubRepoUrls: gh } = await getWorkspaces();
       setWorkspaces(ws);
       setTaskCounts(tc);
       setTokenTotals(tt || {});
+      setGithubRepoUrls(gh || {});
       setError('');
 
       // Fetch tasks for running workspaces in parallel
@@ -456,7 +458,7 @@ export default function WorkspacesPage() {
     const tasks = tasksByWorkspace[ws.id] || [];
     const openPorts = getOpenPorts(ws);
     const apps = getApps(ws);
-    const githubRepoUrl = tasks.find(t => t.github_repo_url)?.github_repo_url || null;
+    const githubRepoUrl = githubRepoUrls[ws.id] || tasks.find(t => t.github_repo_url)?.github_repo_url || null;
 
     return (
       <div
