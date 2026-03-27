@@ -435,9 +435,7 @@ export default function WorkspacesPage() {
           )}
         </div>
         <div className="flex items-center gap-2">
-          {typeof task.total_cost_usd === 'number' && task.total_cost_usd > 0 && (
-            <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono">${task.total_cost_usd.toFixed(2)}</span>
-          )}
+          <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono">${typeof task.total_cost_usd === 'number' && task.total_cost_usd > 0 ? task.total_cost_usd.toFixed(2) : '0.00'}</span>
           {task.id === spaceTargetTaskId && !selectedTaskId && !newTaskWorkspaceId && (
             <span className="text-[10px] text-gray-400 dark:text-gray-600">
               <kbd className="px-1 py-0.5 rounded border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 text-gray-400 dark:text-gray-500 font-mono text-[10px]">Space</kbd> to open
@@ -592,19 +590,17 @@ export default function WorkspacesPage() {
                   )}
                 </div>
               )}
-              {tokens && (tokens.total_input_tokens > 0 || tokens.total_output_tokens > 0 || tokens.total_cost_usd > 0) && (
-                <div
-                  className="text-xs text-gray-400 dark:text-gray-500 mt-0.5 font-mono"
-                  title={`Input: ${tokens.total_input_tokens.toLocaleString()} | Output: ${tokens.total_output_tokens.toLocaleString()}`}
-                >
-                  {(tokens.total_input_tokens > 0 || tokens.total_output_tokens > 0) && (
-                    <span>{formatTokens(tokens.total_input_tokens + tokens.total_output_tokens)} tokens</span>
-                  )}
-                  {tokens.total_cost_usd > 0 && (
-                    <span className={tokens.total_input_tokens > 0 || tokens.total_output_tokens > 0 ? 'ml-1.5' : ''}>${tokens.total_cost_usd.toFixed(2)}</span>
-                  )}
-                </div>
-              )}
+              <div
+                className="text-xs text-gray-400 dark:text-gray-500 mt-0.5 font-mono"
+                title={tokens ? `Input: ${tokens.total_input_tokens.toLocaleString()} | Output: ${tokens.total_output_tokens.toLocaleString()}` : 'No usage yet'}
+              >
+                {tokens && (tokens.total_input_tokens > 0 || tokens.total_output_tokens > 0) && (
+                  <span>{formatTokens(tokens.total_input_tokens + tokens.total_output_tokens)} tokens</span>
+                )}
+                <span className={tokens && (tokens.total_input_tokens > 0 || tokens.total_output_tokens > 0) ? 'ml-1.5' : ''}>
+                  ${tokens && tokens.total_cost_usd > 0 ? tokens.total_cost_usd.toFixed(2) : '0.00'}
+                </span>
+              </div>
             </div>
             {isRunning && (
               <button
