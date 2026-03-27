@@ -644,7 +644,7 @@ export default function WorkspacesPage() {
         </div>
 
         {/* Task list */}
-        <div className="flex-1 overflow-y-auto p-3 space-y-2" style={{ maxHeight: 'calc(100vh - 220px)' }}>
+        <div className="flex-1 overflow-y-auto p-3 space-y-2 min-h-0">
           {!isRunning ? (
             <p className="text-xs text-amber-600 dark:text-amber-400 px-1">Workspace must be running to execute tasks</p>
           ) : tasks.length === 0 ? (
@@ -659,7 +659,7 @@ export default function WorkspacesPage() {
   };
 
   return (
-    <div>
+    <div className="flex flex-col flex-1 min-h-0">
       {error && workspaces.length > 0 && (
         <div className="mb-3 flex items-center justify-between gap-2 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-400 text-sm px-3 py-2 rounded-lg">
           <span>Connection error: {error}</span>
@@ -670,7 +670,7 @@ export default function WorkspacesPage() {
           </button>
         </div>
       )}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex-shrink-0 flex items-center justify-between mb-4">
         <h2 className="text-xl font-semibold">Workspaces</h2>
         {stoppedWorkspaces.length > 0 && (
           <button
@@ -685,7 +685,7 @@ export default function WorkspacesPage() {
       {workspaces.length === 0 ? (
         <p className="text-gray-500 dark:text-gray-400">No workspaces found.</p>
       ) : (
-        <div className="flex gap-4 overflow-x-auto pb-4" style={{ minHeight: '300px' }}>
+        <div className="flex gap-4 overflow-x-auto pb-4 flex-1 min-h-0">
           {runningWorkspaces.map(renderWorkspaceColumn)}
           {showStopped && stoppedWorkspaces.map(renderWorkspaceColumn)}
         </div>
