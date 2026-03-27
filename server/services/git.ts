@@ -68,6 +68,37 @@ function storeTaskBranch(taskId: string, branch: string): void {
 }
 
 /**
+ * Detect the GitHub repository URL from a workspace's git remote.
+ * Converts SSH URLs (git@github.com:user/repo.git) to HTTPS URLs.
+ * Returns null if not a GitHub repo or detection fails.
+ */
+async function detectGitHubRepoUrl(workspaceName: string, projectDir: string): Promise<string | null> {
+  try {
+    const remoteUrl = await sshExec(workspaceName, `cd ${projectDir} && git config --get remote.origin.url`);
+    if (!remoteUrl) return null;
+
+    // SSH format: git@github.com:user/repo.git
+    const sshMatch = remoteUrl.match(/git@github\.com:(.+?)(?:\.git)?$/);
+    if (sshMatch) return `https://github.com/${sshMatch[1]}`;
+
+    // HTTPS format: https://github.com/user/repo.git
+    const httpsMatch = remoteUrl.match(/https:\/\/github\.com\/(.+?)(?:\.git)?$/);
+    if (httpsMatch) return `https://github.com/${httpsMatch[1]}`;
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Store the GitHub repo URL on a task in the database.
+ */
+function storeTaskRepoUrl(taskId: string, url: string): void {
+  getDb().prepare('UPDATE tasks SET github_repo_url = ? WHERE id = ?').run(url, taskId);
+}
+
+/**
  * Check if a workspace has a git repository at the given path.
  */
 async function hasGitRepo(workspaceName: string, projectDir: string): Promise<boolean> {
@@ -109,6 +140,13 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
 
     storeTaskBranch(task.id, branchName);
     task.git_branch = branchName;
+
+    // Detect and store the GitHub repo URL for UI linking
+    const repoUrl = await detectGitHubRepoUrl(ws, dir);
+    if (repoUrl) {
+      storeTaskRepoUrl(task.id, repoUrl);
+      task.github_repo_url = repoUrl;
+    }
 
     console.log(`[git] Created branch ${branchName} for task ${task.id}`);
   } catch (err: any) {
@@ -271,6 +309,13 @@ export async function handleTaskReopenGit(task: Task): Promise<void> {
     await sshExec(ws, `cd ${dir} && git checkout -b ${branchName}`, 15000);
 
     storeTaskBranch(task.id, branchName);
+
+    // Detect and store the GitHub repo URL for UI linking
+    const repoUrl = await detectGitHubRepoUrl(ws, dir);
+    if (repoUrl) {
+      storeTaskRepoUrl(task.id, repoUrl);
+    }
+
     addMessage(task.id, 'system', `Created new branch \`${branchName}\` for continued work.`);
   } catch (err: any) {
     addMessage(task.id, 'system', `Failed to create feature branch: ${err.message || err}`);

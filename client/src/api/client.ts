@@ -80,6 +80,8 @@ export interface Task {
   claude_session_id: string | null;
   failed_reason: string | null;
   verification_url: string | null;
+  git_branch: string | null;
+  github_repo_url: string | null;
   total_input_tokens: number;
   total_output_tokens: number;
   total_cost_usd?: number;
