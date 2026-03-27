@@ -1,6 +1,7 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, deleteCurrentSessionAssistantMessages, updateMessageCost, type Task } from './tasks.js';
 import { getDb } from '../db/index.js';
+import { handleTaskLaunchGit, handleTaskResumeGit } from './git.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || '50';
@@ -147,6 +148,19 @@ export async function processQueue(workspaceId: string): Promise<void> {
       return;
     }
 
+    // Check if this is a resume-pending task (was awaiting_feedback, user replied,
+    // but another task was working so it was re-queued). Detect by checking if the
+    // task already has a session and the last message is from the user.
+    if (next.claude_session_id) {
+      const msgs = getMessages(next.id);
+      const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+      if (lastMsg && lastMsg.role === 'user' && msgs.some(m => m.role === 'assistant')) {
+        // This task has a prior session and a pending user reply — resume it
+        await launchTask(next, true, lastMsg.content);
+        return;
+      }
+    }
+
     await launchTask(next);
   };
 
@@ -200,6 +214,13 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
       task.project_dir = detected;
       getDb().prepare('UPDATE tasks SET project_dir = ? WHERE id = ?').run(detected, task.id);
     }
+  }
+
+  // Git branch management: create branch for new tasks, switch for resumes
+  if (isResume) {
+    await handleTaskResumeGit(task);
+  } else {
+    await handleTaskLaunchGit(task);
   }
 
   // Build the claude command
