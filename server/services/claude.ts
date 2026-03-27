@@ -148,6 +148,19 @@ export async function processQueue(workspaceId: string): Promise<void> {
       return;
     }
 
+    // Check if this is a resume-pending task (was awaiting_feedback, user replied,
+    // but another task was working so it was re-queued). Detect by checking if the
+    // task already has a session and the last message is from the user.
+    if (next.claude_session_id) {
+      const msgs = getMessages(next.id);
+      const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+      if (lastMsg && lastMsg.role === 'user' && msgs.some(m => m.role === 'assistant')) {
+        // This task has a prior session and a pending user reply — resume it
+        await launchTask(next, true, lastMsg.content);
+        return;
+      }
+    }
+
     await launchTask(next);
   };
 
