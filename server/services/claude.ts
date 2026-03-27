@@ -1,6 +1,7 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, deleteCurrentSessionAssistantMessages, updateMessageCost, type Task } from './tasks.js';
 import { getDb } from '../db/index.js';
+import { handleTaskLaunchGit, handleTaskResumeGit } from './git.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || '50';
@@ -200,6 +201,13 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
       task.project_dir = detected;
       getDb().prepare('UPDATE tasks SET project_dir = ? WHERE id = ?').run(detected, task.id);
     }
+  }
+
+  // Git branch management: create branch for new tasks, switch for resumes
+  if (isResume) {
+    await handleTaskResumeGit(task);
+  } else {
+    await handleTaskLaunchGit(task);
   }
 
   // Build the claude command

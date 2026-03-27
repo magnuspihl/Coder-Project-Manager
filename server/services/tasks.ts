@@ -16,6 +16,7 @@ export interface Task {
   failed_reason: string | null;
   verification_url: string | null;
   ssh_pid: number | null;
+  git_branch: string | null;
   total_input_tokens: number;
   total_output_tokens: number;
   created_at: string;
