@@ -572,13 +572,6 @@ export default function WorkspacesPage() {
             <div className="min-w-0">
               <div className="text-xs text-gray-500 dark:text-gray-400 space-y-0.5">
                 <div>{ws.template_name}</div>
-                {agent.name && (
-                  <div>
-                    <span className={agent.connected ? 'text-green-600 dark:text-green-400' : 'text-gray-400 dark:text-gray-500'}>
-                      {agent.name} ({agent.connected ? 'connected' : 'disconnected'})
-                    </span>
-                  </div>
-                )}
               </div>
               {counts && (
                 <div className="flex gap-2 mt-1 text-xs flex-wrap">
