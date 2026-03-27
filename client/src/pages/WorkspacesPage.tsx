@@ -331,6 +331,27 @@ export default function WorkspacesPage() {
       <div className="text-xs text-gray-400 dark:text-gray-500 mt-1">
         {new Date(task.created_at).toLocaleString()}
       </div>
+      {task.git_branch && (
+        <div className="mt-1">
+          {task.github_repo_url ? (
+            <a
+              href={`${task.github_repo_url}/tree/${task.git_branch}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => e.stopPropagation()}
+              className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors font-mono"
+            >
+              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path d="M11.75 2.5a.75.75 0 0 1 0 1.5h-.75v4h.75a.75.75 0 0 1 0 1.5h-.75v.75a4.25 4.25 0 0 1-8.5 0V9.5H2a.75.75 0 0 1 0-1.5h.75V4H2a.75.75 0 0 1 0-1.5h3.5a.75.75 0 0 1 0 1.5H4.25v4h1.5V4H4.5a.75.75 0 0 1 0-1.5h3.5a.75.75 0 0 1 0 1.5H7.25v4h1.5v-4H8a.75.75 0 0 1 0-1.5ZM9.5 9.5h-4v.75a2.75 2.75 0 1 0 5.5 0V9.5h-.75Z" /></svg>
+              {task.git_branch}
+            </a>
+          ) : (
+            <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 font-mono">
+              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path d="M11.75 2.5a.75.75 0 0 1 0 1.5h-.75v4h.75a.75.75 0 0 1 0 1.5h-.75v.75a4.25 4.25 0 0 1-8.5 0V9.5H2a.75.75 0 0 1 0-1.5h.75V4H2a.75.75 0 0 1 0-1.5h3.5a.75.75 0 0 1 0 1.5H4.25v4h1.5V4H4.5a.75.75 0 0 1 0-1.5h3.5a.75.75 0 0 1 0 1.5H7.25v4h1.5v-4H8a.75.75 0 0 1 0-1.5ZM9.5 9.5h-4v.75a2.75 2.75 0 1 0 5.5 0V9.5h-.75Z" /></svg>
+              {task.git_branch}
+            </span>
+          )}
+        </div>
+      )}
       {task.status === 'working' && task.activity && (
         <div className="mt-2 flex items-center gap-2 text-xs text-blue-600 dark:text-blue-400">
           <div className="animate-spin h-3 w-3 border-[1.5px] border-blue-600 dark:border-blue-400 border-t-transparent rounded-full" />
@@ -551,13 +572,6 @@ export default function WorkspacesPage() {
             <div className="min-w-0">
               <div className="text-xs text-gray-500 dark:text-gray-400 space-y-0.5">
                 <div>{ws.template_name}</div>
-                {agent.name && (
-                  <div>
-                    <span className={agent.connected ? 'text-green-600 dark:text-green-400' : 'text-gray-400 dark:text-gray-500'}>
-                      {agent.name} ({agent.connected ? 'connected' : 'disconnected'})
-                    </span>
-                  </div>
-                )}
               </div>
               {counts && (
                 <div className="flex gap-2 mt-1 text-xs flex-wrap">

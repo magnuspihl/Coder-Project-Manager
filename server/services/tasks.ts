@@ -17,6 +17,7 @@ export interface Task {
   verification_url: string | null;
   ssh_pid: number | null;
   git_branch: string | null;
+  github_repo_url: string | null;
   total_input_tokens: number;
   total_output_tokens: number;
   created_at: string;
