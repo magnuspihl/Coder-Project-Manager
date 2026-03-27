@@ -1,5 +1,38 @@
-import { sshExec } from './claude.js';
+import { sshExec, detectProjectDir } from './claude.js';
 import { addMessage, type Task } from './tasks.js';
+import { execFile } from 'child_process';
+
+/**
+ * Fetch a GitHub token from Coder's external auth provider.
+ * Returns the token string or null if unavailable.
+ */
+function fetchGitHubToken(): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile('coder', ['external-auth', 'access-token', 'magnuspihl'], {
+      timeout: 10000,
+    }, (err, stdout) => {
+      if (err || !stdout?.trim()) resolve(null);
+      else resolve(stdout.trim());
+    });
+  });
+}
+
+/**
+ * Run a gh CLI command in a remote workspace with GH_TOKEN set.
+ */
+async function sshGh(workspaceName: string, command: string, timeout = 30000): Promise<string> {
+  const token = await fetchGitHubToken();
+  const tokenPrefix = token ? `GH_TOKEN=${token} ` : '';
+  return sshExec(workspaceName, `${tokenPrefix}${command}`, timeout);
+}
+
+/**
+ * Resolve project_dir for a task — use stored value or auto-detect.
+ */
+async function resolveProjectDir(task: Task): Promise<string | null> {
+  if (task.project_dir) return task.project_dir;
+  return detectProjectDir(task.workspace_name);
+}
 
 /**
  * Check if the workspace is on a non-main feature branch with commits ahead of main.
@@ -57,9 +90,10 @@ async function getDefaultBranch(workspaceName: string, projectDir: string): Prom
  * but do not block task completion.
  */
 export async function handleTaskCompletionGit(task: Task): Promise<void> {
-  if (!task.project_dir) return;
+  const dir = await resolveProjectDir(task);
+  if (!dir) return;
 
-  const { workspace_name: ws, project_dir: dir } = task;
+  const ws = task.workspace_name;
 
   try {
     const branch = await getFeatureBranch(ws, dir);
@@ -90,19 +124,18 @@ export async function handleTaskCompletionGit(task: Task): Promise<void> {
 
     const defaultBranch = await getDefaultBranch(ws, dir);
 
-    // Create PR using gh CLI
+    // Create PR using gh CLI (with GH_TOKEN from Coder external auth)
     const prTitle = task.title || `Task: ${task.prompt.slice(0, 60)}`;
     const prBody = `Automated PR for completed task.\n\n**Task:** ${task.title}\n**Task ID:** ${task.id}`;
-    const prUrl = await sshExec(ws,
-      `cd ${dir} && gh pr create --base ${defaultBranch} --head ${branch} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`,
-      30000
+    const prUrl = await sshGh(ws,
+      `cd ${dir} && gh pr create --base ${defaultBranch} --head ${branch} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`
     );
 
     addMessage(task.id, 'system', `Pull request created: ${prUrl}`);
 
     // Merge the PR
     try {
-      await sshExec(ws, `cd ${dir} && gh pr merge ${branch} --merge --delete-branch`, 30000);
+      await sshGh(ws, `cd ${dir} && gh pr merge ${branch} --merge --delete-branch`);
       addMessage(task.id, 'system', `PR merged and branch \`${branch}\` deleted.`);
 
       // Switch back to default branch
@@ -119,9 +152,10 @@ export async function handleTaskCompletionGit(task: Task): Promise<void> {
  * When a completed task is reopened, create a new feature branch for continued work.
  */
 export async function handleTaskReopenGit(task: Task): Promise<void> {
-  if (!task.project_dir) return;
+  const dir = await resolveProjectDir(task);
+  if (!dir) return;
 
-  const { workspace_name: ws, project_dir: dir } = task;
+  const ws = task.workspace_name;
 
   try {
     // Make sure we're on the default branch first
