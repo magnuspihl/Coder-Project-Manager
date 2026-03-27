@@ -117,7 +117,7 @@ export function getGithubRepoUrlsByWorkspace(): Record<string, string> {
   const rows = db.prepare(
     `SELECT workspace_id, github_repo_url
      FROM tasks
-     WHERE github_repo_url IS NOT NULL AND deleted = 0
+     WHERE github_repo_url IS NOT NULL AND deleted_at IS NULL
      GROUP BY workspace_id`
   ).all() as Array<{ workspace_id: string; github_repo_url: string }>;
   const result: Record<string, string> = {};
