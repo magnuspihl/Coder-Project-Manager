@@ -112,6 +112,21 @@ export interface WorkspaceTokenTotals {
 let tokenTotalsCache: { data: Record<string, WorkspaceTokenTotals>; timestamp: number } | null = null;
 const TOKEN_TOTALS_CACHE_MS = 30_000;
 
+export function getGithubRepoUrlsByWorkspace(): Record<string, string> {
+  const db = getDb();
+  const rows = db.prepare(
+    `SELECT workspace_id, github_repo_url
+     FROM tasks
+     WHERE github_repo_url IS NOT NULL AND deleted_at IS NULL
+     GROUP BY workspace_id`
+  ).all() as Array<{ workspace_id: string; github_repo_url: string }>;
+  const result: Record<string, string> = {};
+  for (const row of rows) {
+    result[row.workspace_id] = row.github_repo_url;
+  }
+  return result;
+}
+
 export function getTokenTotalsByWorkspace(): Record<string, WorkspaceTokenTotals> {
   const now = Date.now();
   if (tokenTotalsCache && (now - tokenTotalsCache.timestamp) < TOKEN_TOTALS_CACHE_MS) {

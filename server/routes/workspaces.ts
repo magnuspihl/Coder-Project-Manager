@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { execFile } from 'child_process';
 import { requireAuth } from '../middleware/auth.js';
 import { listWorkspaces, getWorkspace, stopWorkspace, startWorkspace, CoderAuthError } from '../services/coder.js';
-import { getTaskCountsByWorkspace, getTokenTotalsByWorkspace } from '../services/tasks.js';
+import { getTaskCountsByWorkspace, getTokenTotalsByWorkspace, getGithubRepoUrlsByWorkspace } from '../services/tasks.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 
 const router = Router();
@@ -57,7 +57,8 @@ router.get('/', requireAuth, async (req: Request, res: Response) => {
   if (workspaces === undefined) return;
   const taskCounts = getTaskCountsByWorkspace();
   const tokenTotals = getTokenTotalsByWorkspace();
-  res.json({ workspaces, taskCounts, tokenTotals });
+  const githubRepoUrls = getGithubRepoUrlsByWorkspace();
+  res.json({ workspaces, taskCounts, tokenTotals, githubRepoUrls });
 });
 
 // Proxy favicon/icon images from workspace ports (they require Coder auth)
