@@ -84,6 +84,9 @@ export function getDb(): Database.Database {
       db.exec("PRAGMA foreign_keys=ON");
     }
 
+    if (!cols.some(c => c.name === 'branch')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN branch TEXT");
+    }
     if (!cols.some(c => c.name === 'git_branch')) {
       db.exec("ALTER TABLE tasks ADD COLUMN git_branch TEXT");
     }

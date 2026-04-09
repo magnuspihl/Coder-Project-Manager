@@ -80,6 +80,7 @@ export interface Task {
   claude_session_id: string | null;
   failed_reason: string | null;
   verification_url: string | null;
+  branch: string | null;
   git_branch: string | null;
   github_repo_url: string | null;
   total_input_tokens: number;
@@ -159,10 +160,10 @@ export const getProjects = (workspaceId: string) =>
 export const getTasks = (workspaceId: string) =>
   request<{ tasks: Task[] }>(`/api/workspaces/${workspaceId}/tasks`);
 
-export const createTask = (workspaceId: string, prompt: string) =>
+export const createTask = (workspaceId: string, prompt: string, branch?: string) =>
   request<{ task: Task }>(`/api/workspaces/${workspaceId}/tasks`, {
     method: 'POST',
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify({ prompt, ...(branch ? { branch } : {}) }),
   });
 
 export const getTaskDetail = (taskId: string) =>
@@ -194,3 +195,65 @@ export const deleteTask = (taskId: string) =>
 
 export const restoreTask = (taskId: string) =>
   request<{ ok: boolean; task: Task }>(`/api/tasks/${taskId}/restore`, { method: 'POST' });
+
+// Discussions
+export interface Discussion {
+  id: string;
+  workspace_id: string;
+  workspace_name: string;
+  user_id: string;
+  claude_session_id: string | null;
+  status: string;
+  project_dir: string | null;
+  ssh_pid: number | null;
+  activity: TaskActivity | null;
+  running: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DiscussionMessage {
+  id: string;
+  discussion_id: string;
+  role: string;
+  content: string;
+  cost: number | null;
+  username: string | null;
+  created_at: string;
+}
+
+export interface TaskRequestItem {
+  id: string;
+  discussion_id: string;
+  prompt: string;
+  branch: string | null;
+  status: string;
+  created_task_id: string | null;
+  created_at: string;
+}
+
+export const getOrCreateDiscussion = (workspaceId: string) =>
+  request<{ discussion: Discussion; messages: DiscussionMessage[]; taskRequests: TaskRequestItem[] }>(
+    `/api/workspaces/${workspaceId}/discussion`,
+    { method: 'POST' }
+  );
+
+export const getDiscussionDetail = (discussionId: string) =>
+  request<{ discussion: Discussion; messages: DiscussionMessage[]; taskRequests: TaskRequestItem[] }>(
+    `/api/discussions/${discussionId}`
+  );
+
+export const sendDiscussionMessage = (discussionId: string, message: string) =>
+  request<{ ok: boolean }>(`/api/discussions/${discussionId}/message`, {
+    method: 'POST',
+    body: JSON.stringify({ message }),
+  });
+
+export const closeDiscussion = (discussionId: string) =>
+  request<{ ok: boolean }>(`/api/discussions/${discussionId}/close`, { method: 'POST' });
+
+export const approveTaskRequest = (discussionId: string, requestId: string) =>
+  request<{ task: Task }>(`/api/discussions/${discussionId}/task-requests/${requestId}/approve`, { method: 'POST' });
+
+export const dismissTaskRequest = (discussionId: string, requestId: string) =>
+  request<{ ok: boolean }>(`/api/discussions/${discussionId}/task-requests/${requestId}/dismiss`, { method: 'POST' });
