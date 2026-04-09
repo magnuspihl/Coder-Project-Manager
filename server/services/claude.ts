@@ -831,18 +831,30 @@ export async function launchDiscussion(
   }
 
   // Check if the session already exists on the remote workspace
-  // (e.g. user pasted an existing session ID via the edit field)
+  // (e.g. user pasted an existing session ID via the edit field, or resuming a CCW session).
+  // Claude scopes sessions to the cwd's project path, so we also resolve the correct working
+  // directory by checking whether the session lives under the project dir or the home dir.
   let remoteSessionExists = isResume;
-  if (!isResume && discussion.claude_session_id) {
+  let sessionWorkDir = discussion.project_dir;
+  if (discussion.claude_session_id) {
     try {
       const checkResult = await sshExec(discussion.workspace_name,
         `find ~/.claude/projects/ -name '${discussion.claude_session_id}.jsonl' 2>/dev/null | head -1`
       );
-      if (checkResult.trim()) {
+      const sessionPath = checkResult.trim();
+      if (sessionPath) {
         remoteSessionExists = true;
+        // If the session isn't in the project dir's scope, fall back to home dir.
+        // Claude encodes /home/coder/my-project as -home-coder-my-project
+        const projectDirEncoded = discussion.project_dir
+          ? '-' + discussion.project_dir.replace(/^\//, '').replace(/\//g, '-')
+          : null;
+        if (projectDirEncoded && !sessionPath.includes(`/projects/${projectDirEncoded}/`)) {
+          sessionWorkDir = '/home/coder';
+        }
       }
     } catch {
-      // Non-fatal — assume new session
+      // Non-fatal — assume new session, use default project_dir
     }
   }
 
@@ -867,8 +879,8 @@ export async function launchDiscussion(
   const exitFile = remoteDiscussionExitCodePath(discussion.id);
 
   let remoteCmd = '';
-  if (discussion.project_dir) {
-    remoteCmd += `cd ${shellEscape(discussion.project_dir)} && `;
+  if (sessionWorkDir) {
+    remoteCmd += `cd ${shellEscape(sessionWorkDir)} && `;
   }
   remoteCmd += `rm -f ${shellEscape(exitFile)} && `;
   remoteCmd += `${claudeCmd} > ${shellEscape(outputFile)} 2>&1; `;
