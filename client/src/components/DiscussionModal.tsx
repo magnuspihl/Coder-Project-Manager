@@ -3,6 +3,7 @@ import {
   getDiscussionDetail,
   sendDiscussionMessage,
   closeDiscussion,
+  updateDiscussionSession,
   approveTaskRequest,
   dismissTaskRequest,
   type Discussion,
@@ -36,6 +37,9 @@ export default function DiscussionModal({ discussionId, workspaceName, onClose, 
   const [loading, setLoading] = useState(true);
   const [message, setMessage, clearMessage] = useDraft(`discussion:${discussionId}`);
   const [sending, setSending] = useState(false);
+  const [editingSession, setEditingSession] = useState(false);
+  const [sessionIdDraft, setSessionIdDraft] = useState('');
+  const [sessionError, setSessionError] = useState('');
   const overlayRef = useRef<HTMLDivElement>(null);
   const scrollBodyRef = useRef<HTMLDivElement>(null);
   const initialScrollDone = useRef(false);
@@ -143,6 +147,29 @@ export default function DiscussionModal({ discussionId, workspaceName, onClose, 
     await loadData();
   };
 
+  const handleEditSession = () => {
+    setSessionIdDraft(discussion?.claude_session_id || '');
+    setSessionError('');
+    setEditingSession(true);
+  };
+
+  const handleSaveSession = async () => {
+    const trimmed = sessionIdDraft.trim();
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(trimmed)) {
+      setSessionError('Invalid UUID format');
+      return;
+    }
+    try {
+      await updateDiscussionSession(discussionId, trimmed);
+      setEditingSession(false);
+      setSessionError('');
+      await loadData();
+    } catch (err) {
+      setSessionError(err instanceof Error ? err.message : 'Failed to update');
+    }
+  };
+
   const handleOverlayClick = (e: React.MouseEvent) => {
     if (e.target === overlayRef.current) closeModal();
   };
@@ -175,6 +202,41 @@ export default function DiscussionModal({ discussionId, workspaceName, onClose, 
                     </span>
                   )}
                 </div>
+                {/* Session UUID */}
+                <div className="flex items-center gap-1.5 mt-1.5">
+                  <span className="text-[10px] text-gray-400 dark:text-gray-500 uppercase tracking-wide shrink-0">Session</span>
+                  {editingSession ? (
+                    <div className="flex items-center gap-1 flex-1 min-w-0">
+                      <input
+                        type="text"
+                        value={sessionIdDraft}
+                        onChange={(e) => { setSessionIdDraft(e.target.value); setSessionError(''); }}
+                        className="flex-1 min-w-0 text-[11px] font-mono px-1.5 py-0.5 border border-purple-300 dark:border-purple-700 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-purple-500"
+                        spellCheck={false}
+                        autoFocus
+                        onKeyDown={(e) => { if (e.key === 'Enter') handleSaveSession(); if (e.key === 'Escape') setEditingSession(false); }}
+                      />
+                      <button onClick={handleSaveSession} className="text-[10px] px-1.5 py-0.5 bg-purple-600 text-white rounded hover:bg-purple-700" title="Save">Save</button>
+                      <button onClick={() => setEditingSession(false)} className="text-[10px] px-1.5 py-0.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300" title="Cancel">Cancel</button>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-1 min-w-0">
+                      <code className="text-[11px] font-mono text-gray-500 dark:text-gray-400 truncate" title={discussion.claude_session_id || 'none'}>
+                        {discussion.claude_session_id || 'none'}
+                      </code>
+                      <button
+                        onClick={handleEditSession}
+                        className="text-[10px] text-purple-500 dark:text-purple-400 hover:text-purple-700 dark:hover:text-purple-300 shrink-0"
+                        title="Edit session ID"
+                      >
+                        edit
+                      </button>
+                    </div>
+                  )}
+                </div>
+                {sessionError && (
+                  <p className="text-[10px] text-red-500 mt-0.5">{sessionError}</p>
+                )}
               </div>
               <button
                 onClick={closeModal}
