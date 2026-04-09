@@ -5,6 +5,7 @@ import {
   getDiscussion,
   createDiscussion,
   closeDiscussion,
+  updateDiscussionSessionId,
   addDiscussionMessage,
   getDiscussionMessages,
   getTaskRequest,
@@ -86,6 +87,35 @@ router.get('/discussions/:discussionId', requireAuth, (req: Request, res: Respon
   const activity = getDiscussionActivity(discussion.id) || null;
   const running = isDiscussionRunning(discussion.id);
   res.json({ discussion: { ...discussion, activity, running }, messages, taskRequests });
+});
+
+// Update discussion session ID
+router.patch('/discussions/:discussionId/session', requireAuth, (req: Request, res: Response) => {
+  const discussion = getDiscussion(req.params.discussionId);
+  if (!discussion) {
+    res.status(404).json({ error: 'Discussion not found' });
+    return;
+  }
+  if (discussion.status !== 'active') {
+    res.status(400).json({ error: 'Discussion is closed' });
+    return;
+  }
+
+  const { claudeSessionId } = req.body;
+  if (!claudeSessionId || typeof claudeSessionId !== 'string') {
+    res.status(400).json({ error: 'claudeSessionId is required' });
+    return;
+  }
+
+  // Basic UUID format validation
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(claudeSessionId)) {
+    res.status(400).json({ error: 'Invalid UUID format' });
+    return;
+  }
+
+  updateDiscussionSessionId(discussion.id, claudeSessionId);
+  res.json({ ok: true, claudeSessionId });
 });
 
 // Send a message to the discussion (launches/resumes Claude)

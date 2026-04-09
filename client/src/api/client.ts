@@ -243,6 +243,12 @@ export const getDiscussionDetail = (discussionId: string) =>
     `/api/discussions/${discussionId}`
   );
 
+export const updateDiscussionSession = (discussionId: string, claudeSessionId: string) =>
+  request<{ ok: boolean; claudeSessionId: string }>(`/api/discussions/${discussionId}/session`, {
+    method: 'PATCH',
+    body: JSON.stringify({ claudeSessionId }),
+  });
+
 export const sendDiscussionMessage = (discussionId: string, message: string) =>
   request<{ ok: boolean }>(`/api/discussions/${discussionId}/message`, {
     method: 'POST',

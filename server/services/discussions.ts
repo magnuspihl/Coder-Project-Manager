@@ -72,6 +72,12 @@ export function closeDiscussion(id: string): void {
     .run(new Date().toISOString(), id);
 }
 
+export function updateDiscussionSessionId(id: string, claudeSessionId: string): void {
+  const db = getDb();
+  db.prepare("UPDATE discussions SET claude_session_id = ?, updated_at = ? WHERE id = ?")
+    .run(claudeSessionId, new Date().toISOString(), id);
+}
+
 export function addDiscussionMessage(
   discussionId: string,
   role: string,
