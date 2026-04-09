@@ -59,6 +59,52 @@ CREATE TABLE IF NOT EXISTS stream_log (
 
 CREATE INDEX IF NOT EXISTS idx_stream_log_task ON stream_log(task_id, id);
 
+-- Discussions table: persistent per-workspace chat sessions
+CREATE TABLE IF NOT EXISTS discussions (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  workspace_name TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  claude_session_id TEXT,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'closed')),
+  project_dir TEXT,
+  ssh_pid INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_discussions_workspace ON discussions(workspace_id, status);
+
+-- Discussion messages table: conversation history per discussion
+CREATE TABLE IF NOT EXISTS discussion_messages (
+  id TEXT PRIMARY KEY,
+  discussion_id TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+  content TEXT NOT NULL,
+  cost REAL,
+  username TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (discussion_id) REFERENCES discussions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_discussion_messages ON discussion_messages(discussion_id, created_at);
+
+-- Task requests: proposed tasks from discussion sessions
+CREATE TABLE IF NOT EXISTS task_requests (
+  id TEXT PRIMARY KEY,
+  discussion_id TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  branch TEXT,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'created', 'dismissed')),
+  created_task_id TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (discussion_id) REFERENCES discussions(id) ON DELETE CASCADE,
+  FOREIGN KEY (created_task_id) REFERENCES tasks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_requests_discussion ON task_requests(discussion_id, status);
+
 -- Sessions table: server-side session storage
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,

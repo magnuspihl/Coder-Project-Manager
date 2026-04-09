@@ -11,6 +11,7 @@ import {
   deleteTask,
   restoreTask,
   createTask,
+  getOrCreateDiscussion,
   type Workspace,
   type Task,
   type TaskCounts,
@@ -19,6 +20,7 @@ import {
 import { playChime } from '../utils/chime';
 import { useDraft, useSessionState } from '../hooks/useDraft';
 import TaskDetailModal from '../components/TaskDetailModal';
+import DiscussionModal from '../components/DiscussionModal';
 
 function timeAgo(iso: string): string {
   const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -86,6 +88,7 @@ export default function WorkspacesPage() {
   const [newTaskBranch, setNewTaskBranch] = useState('');
   const [creatingTask, setCreatingTask] = useState(false);
   const [selectedTaskId, setSelectedTaskId] = useSessionState<string | null>('selectedTaskId', null);
+  const [discussionState, setDiscussionState] = useState<{ id: string; workspaceName: string } | null>(null);
   const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevTaskStatusesRef = useRef<Map<string, string>>(new Map());
   const lastTaskWorkspaceIdRef = useRef<string | null>(null);
@@ -297,6 +300,15 @@ export default function WorkspacesPage() {
     await restoreTask(deletedTaskId);
     setDeletedTaskId(null);
     await loadData();
+  };
+
+  const handleOpenDiscussion = async (workspaceId: string, workspaceName: string) => {
+    try {
+      const { discussion } = await getOrCreateDiscussion(workspaceId);
+      setDiscussionState({ id: discussion.id, workspaceName });
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to open discussion');
+    }
   };
 
   const handleCreateTask = async (workspaceId: string) => {
@@ -597,15 +609,24 @@ export default function WorkspacesPage() {
               )}
             </div>
             {isRunning && (
-              <button
-                onClick={() => { setNewTaskWorkspaceId(ws.id); clearNewTaskPrompt(); setNewTaskBranch(''); }}
-                className="shrink-0 text-xs px-2 py-0.5 bg-blue-600 text-white rounded-full hover:bg-blue-700 transition-colors mt-0.5"
-                title={altNTargetWorkspaceId === ws.id ? 'New task (Alt+N)' : 'New task'}
-              >
-                + Task{altNTargetWorkspaceId === ws.id && (
-                  <span className="ml-1 opacity-70 text-[10px]">Alt+N</span>
-                )}
-              </button>
+              <div className="flex gap-1.5 shrink-0 mt-0.5">
+                <button
+                  onClick={() => handleOpenDiscussion(ws.id, ws.name)}
+                  className="text-xs px-2 py-0.5 bg-purple-600 text-white rounded-full hover:bg-purple-700 transition-colors"
+                  title="Open discussion"
+                >
+                  Chat
+                </button>
+                <button
+                  onClick={() => { setNewTaskWorkspaceId(ws.id); clearNewTaskPrompt(); setNewTaskBranch(''); }}
+                  className="text-xs px-2 py-0.5 bg-blue-600 text-white rounded-full hover:bg-blue-700 transition-colors"
+                  title={altNTargetWorkspaceId === ws.id ? 'New task (Alt+N)' : 'New task'}
+                >
+                  + Task{altNTargetWorkspaceId === ws.id && (
+                    <span className="ml-1 opacity-70 text-[10px]">Alt+N</span>
+                  )}
+                </button>
+              </div>
             )}
           </div>
           {isRunning && newTaskWorkspaceId === ws.id && (
@@ -739,6 +760,15 @@ export default function WorkspacesPage() {
           taskId={selectedTaskId}
           onClose={() => setSelectedTaskId(null)}
           onTaskChanged={loadData}
+        />
+      )}
+
+      {discussionState && (
+        <DiscussionModal
+          discussionId={discussionState.id}
+          workspaceName={discussionState.workspaceName}
+          onClose={() => setDiscussionState(null)}
+          onTaskCreated={loadData}
         />
       )}
     </div>

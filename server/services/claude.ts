@@ -1,10 +1,12 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, deleteCurrentSessionAssistantMessages, updateMessageCost, type Task } from './tasks.js';
+import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, type Discussion } from './discussions.js';
 import { getDb } from '../db/index.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || '50';
 const ALLOWED_TOOLS = process.env.CLAUDE_ALLOWED_TOOLS || 'Read,Edit,Write,Bash,Glob,Grep';
+const DISCUSSION_ALLOWED_TOOLS = 'Read,Bash,Glob,Grep';
 
 // Track active SSH processes per task so we can kill them
 const activeProcesses = new Map<string, ChildProcess>();
@@ -745,3 +747,285 @@ async function processRemainingOutput(task: Task): Promise<void> {
     console.log(`[recovery] Failed to read remaining output:`, (err as Error).message?.slice(0, 100));
   }
 }
+
+// ─── Discussion (workspace chat) support ───────────────────────────────────
+
+const DISCUSSION_PROMPT_PREFIX = `You are in a read-only discussion session for this workspace. You can explore and read code, run read-only shell commands (git log, ls, find, cat, etc.), but you MUST NOT modify, create, or delete any files, make commits, push to git, or change system state. Your tools are limited to Read, Glob, Grep, and Bash.
+
+If the discussion leads to work that should be done, output a task request in this EXACT format (on its own, not inside a code block):
+
+[TASK_REQUEST]
+{"prompt": "detailed task description here", "branch": "optional-branch-name"}
+[/TASK_REQUEST]
+
+The "branch" field is optional — omit it or set it to null if no specific branch is needed. The user will be prompted to approve the task before it runs.
+
+---
+
+`;
+
+/** Remote path for discussion output files */
+function remoteDiscussionOutputPath(discussionId: string): string {
+  return `/tmp/cpm-discussion-${discussionId}.jsonl`;
+}
+
+/** Remote path for discussion exit code file */
+function remoteDiscussionExitCodePath(discussionId: string): string {
+  return `/tmp/cpm-discussion-${discussionId}.exit`;
+}
+
+/**
+ * Parse [TASK_REQUEST] blocks from text and create task_requests entries.
+ */
+function parseTaskRequests(discussionId: string, text: string): void {
+  const regex = /\[TASK_REQUEST\]\s*([\s\S]*?)\s*\[\/TASK_REQUEST\]/g;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    try {
+      const data = JSON.parse(match[1]);
+      if (data.prompt && typeof data.prompt === 'string') {
+        const branch = typeof data.branch === 'string' ? data.branch : undefined;
+        createTaskRequest(discussionId, data.prompt, branch);
+        console.log(`[discussion] Task request created for discussion ${discussionId}`);
+      }
+    } catch {
+      console.log(`[discussion] Failed to parse task request JSON`);
+    }
+  }
+}
+
+/**
+ * Launch or resume a discussion session on a remote workspace.
+ */
+export async function launchDiscussion(
+  discussion: Discussion,
+  message: string,
+  isResume: boolean,
+  username?: string
+): Promise<void> {
+  const prompt = DISCUSSION_PROMPT_PREFIX + message;
+
+  // Auto-detect project directory if not already set
+  if (!discussion.project_dir) {
+    const detected = await detectProjectDir(discussion.workspace_name);
+    if (detected) {
+      discussion.project_dir = detected;
+      getDb().prepare('UPDATE discussions SET project_dir = ? WHERE id = ?').run(detected, discussion.id);
+    }
+  }
+
+  // Build the claude command
+  const claudeParts: string[] = [];
+  claudeParts.push('claude');
+  claudeParts.push('-p', shellEscape(isResume ? message : prompt));
+
+  if (isResume && discussion.claude_session_id) {
+    claudeParts.push('--resume', shellEscape(discussion.claude_session_id));
+  } else if (discussion.claude_session_id) {
+    claudeParts.push('--session-id', shellEscape(discussion.claude_session_id));
+  }
+
+  claudeParts.push('--output-format', 'stream-json');
+  claudeParts.push('--verbose');
+  claudeParts.push('--allowedTools', shellEscape(DISCUSSION_ALLOWED_TOOLS));
+  claudeParts.push('--max-turns', MAX_TURNS);
+
+  const claudeCmd = claudeParts.join(' ');
+  const outputFile = remoteDiscussionOutputPath(discussion.id);
+  const exitFile = remoteDiscussionExitCodePath(discussion.id);
+
+  let remoteCmd = '';
+  if (discussion.project_dir) {
+    remoteCmd += `cd ${shellEscape(discussion.project_dir)} && `;
+  }
+  remoteCmd += `rm -f ${shellEscape(exitFile)} && `;
+  remoteCmd += `${claudeCmd} > ${shellEscape(outputFile)} 2>&1; `;
+  remoteCmd += `echo $? > ${shellEscape(exitFile)}`;
+
+  console.log('[discussion] Launching on workspace:', discussion.workspace_name);
+
+  try {
+    // Update status
+    getDb().prepare("UPDATE discussions SET updated_at = ? WHERE id = ?")
+      .run(new Date().toISOString(), discussion.id);
+    taskActivity.set(`disc:${discussion.id}`, { timestamp: new Date().toISOString(), summary: 'Starting discussion session' });
+
+    // Clean stale files
+    try {
+      await sshExec(discussion.workspace_name,
+        `rm -f ${shellEscape(outputFile)} ${shellEscape(exitFile)}`
+      );
+    } catch {
+      // Non-fatal
+    }
+
+    // Spawn SSH
+    const sshProcess = spawn('coder', ['ssh', discussion.workspace_name, '--', remoteCmd], {
+      env: { ...process.env, CODER_URL },
+      stdio: 'ignore',
+      detached: true,
+    });
+
+    getDb().prepare('UPDATE discussions SET ssh_pid = ? WHERE id = ?').run(sshProcess.pid ?? null, discussion.id);
+    activeProcesses.set(`disc:${discussion.id}`, sshProcess);
+    sshProcess.unref();
+
+    // Poll output
+    startDiscussionPolling(discussion);
+
+  } catch (err) {
+    const errorMsg = (err as Error).message || 'Failed to launch discussion';
+    console.error('[discussion] Launch failed:', errorMsg);
+    addDiscussionMessage(discussion.id, 'system', `Error: ${errorMsg}`);
+  }
+}
+
+/**
+ * Cancel/stop an active discussion's SSH process.
+ */
+export function stopDiscussion(discussionId: string): void {
+  const proc = activeProcesses.get(`disc:${discussionId}`);
+  if (proc) {
+    proc.kill();
+    activeProcesses.delete(`disc:${discussionId}`);
+  }
+  stopPolling(`disc:${discussionId}`);
+  taskActivity.delete(`disc:${discussionId}`);
+  getDb().prepare('UPDATE discussions SET ssh_pid = NULL WHERE id = ?').run(discussionId);
+}
+
+export function getDiscussionActivity(discussionId: string): TaskActivity | undefined {
+  return taskActivity.get(`disc:${discussionId}`);
+}
+
+/**
+ * Check if a discussion is currently running (has an active SSH process).
+ */
+export function isDiscussionRunning(discussionId: string): boolean {
+  return activeProcesses.has(`disc:${discussionId}`) || activePollers.has(`disc:${discussionId}`);
+}
+
+/**
+ * Poll remote output file for a discussion session.
+ */
+function startDiscussionPolling(discussion: Discussion): void {
+  const pollKey = `disc:${discussion.id}`;
+  stopPolling(pollKey);
+
+  // Clear stream log and current-session assistant messages
+  getDb().prepare('DELETE FROM stream_log WHERE task_id = ?').run(pollKey);
+  deleteCurrentDiscussionAssistantMessages(discussion.id);
+
+  let linesRead = 0;
+  let lastSavedMessageId: string | null = null;
+  let lastSavedMessageText: string | null = null;
+  let consecutiveErrors = 0;
+  let partialLine = '';
+  let polling = false;
+
+  const poll = async () => {
+    if (polling) return;
+    polling = true;
+    try {
+      const outputFile = remoteDiscussionOutputPath(discussion.id);
+      const exitFile = remoteDiscussionExitCodePath(discussion.id);
+
+      const output = await sshExec(discussion.workspace_name,
+        `tail -n +${linesRead + 1} ${shellEscape(outputFile)} 2>/dev/null; echo '---CPM_EXIT_CHECK---'; cat ${shellEscape(exitFile)} 2>/dev/null || echo 'RUNNING'`,
+        20000,
+      );
+
+      consecutiveErrors = 0;
+
+      const markerIdx = output.indexOf('---CPM_EXIT_CHECK---');
+      const jsonPart = markerIdx >= 0 ? output.slice(0, markerIdx) : output;
+      const exitPart = markerIdx >= 0 ? output.slice(markerIdx + '---CPM_EXIT_CHECK---'.length).trim() : 'RUNNING';
+
+      if (jsonPart.trim() || partialLine) {
+        const fullData = partialLine + jsonPart;
+        partialLine = '';
+
+        const allLines = fullData.split('\n');
+        const lastElement = allLines[allLines.length - 1];
+        if (lastElement && lastElement.trim()) {
+          partialLine = allLines.pop()!;
+        }
+
+        for (const line of allLines) {
+          linesRead++;
+          if (!line.trim()) continue;
+
+          let event: { type: string; [key: string]: unknown };
+          try {
+            event = JSON.parse(line);
+          } catch {
+            continue;
+          }
+
+          try {
+            // Update activity
+            const now = new Date().toISOString();
+            if (event.type === 'assistant' && event.message) {
+              const msg = event.message as { content?: Array<{ type: string; text?: string }> };
+              if (msg.content) {
+                for (const block of msg.content) {
+                  if (block.type === 'text' && block.text) {
+                    taskActivity.set(`disc:${discussion.id}`, { timestamp: now, summary: block.text.slice(0, 200).replace(/\n/g, ' ') });
+                    // Save and check for task requests
+                    const dmsg = addDiscussionMessage(discussion.id, 'assistant', block.text);
+                    lastSavedMessageId = dmsg.id;
+                    lastSavedMessageText = block.text;
+                    parseTaskRequests(discussion.id, block.text);
+                  } else if (block.type === 'tool_use') {
+                    taskActivity.set(`disc:${discussion.id}`, { timestamp: now, summary: `Using ${(block as { name?: string }).name || 'tool'}` });
+                  }
+                }
+              }
+            } else if (event.type === 'result') {
+              const resultText = extractResultText(event);
+              if (resultText && resultText !== lastSavedMessageText) {
+                const dmsg = addDiscussionMessage(discussion.id, 'assistant', resultText, event.total_cost_usd as number | undefined);
+                lastSavedMessageId = dmsg.id;
+                lastSavedMessageText = resultText;
+                parseTaskRequests(discussion.id, resultText);
+              } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
+                // Update cost on last message
+                getDb().prepare('UPDATE discussion_messages SET cost = ? WHERE id = ?').run(event.total_cost_usd, lastSavedMessageId);
+              }
+            }
+          } catch (eventErr) {
+            console.error(`[discussion-poller] Error processing event:`, (eventErr as Error).message?.slice(0, 200));
+          }
+        }
+      }
+
+      if (exitPart !== 'RUNNING') {
+        console.log(`[discussion-poller] Discussion ${discussion.id} finished (exit: ${exitPart})`);
+        stopPolling(pollKey);
+        taskActivity.delete(`disc:${discussion.id}`);
+        activeProcesses.delete(`disc:${discussion.id}`);
+        getDb().prepare('UPDATE discussions SET ssh_pid = NULL WHERE id = ?').run(discussion.id);
+
+        // Discussion doesn't change status on completion — it stays 'active'
+        // and waits for the next user message.
+      }
+    } catch (err) {
+      consecutiveErrors++;
+      console.log(`[discussion-poller] Error (${consecutiveErrors}):`, (err as Error).message?.slice(0, 100));
+
+      if (consecutiveErrors > 20) {
+        console.log(`[discussion-poller] Too many errors, stopping polling for discussion ${discussion.id}`);
+        stopPolling(pollKey);
+        taskActivity.delete(`disc:${discussion.id}`);
+        addDiscussionMessage(discussion.id, 'system', 'Error: Lost connection to workspace');
+      }
+    } finally {
+      polling = false;
+    }
+  };
+
+  const interval = setInterval(poll, 5000);
+  activePollers.set(pollKey, interval);
+  poll();
+}
+

@@ -10,6 +10,7 @@ import { existsSync } from 'fs';
 import authRoutes from './routes/auth.js';
 import workspaceRoutes from './routes/workspaces.js';
 import taskRoutes from './routes/tasks.js';
+import discussionRoutes from './routes/discussions.js';
 
 // Initialize database on import
 import './db/index.js';
@@ -29,6 +30,7 @@ app.use(cookieParser());
 app.use('/auth', authRoutes);
 app.use('/api/workspaces', workspaceRoutes);
 app.use('/api', taskRoutes);
+app.use('/api', discussionRoutes);
 
 // Serve static files in production
 const clientDist = join(__dirname, '../dist/client');
