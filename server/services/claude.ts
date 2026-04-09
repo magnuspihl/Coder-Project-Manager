@@ -7,7 +7,7 @@ import { handleTaskLaunchGit, handleTaskResumeGit } from './git.js';
 const CODER_URL = process.env.CODER_URL || '';
 const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || '50';
 const ALLOWED_TOOLS = process.env.CLAUDE_ALLOWED_TOOLS || 'Read,Edit,Write,Bash,Glob,Grep';
-const DISCUSSION_ALLOWED_TOOLS = 'Read,Bash,Glob,Grep';
+const DISCUSSION_ALLOWED_TOOLS = 'Read,Bash,Glob,Grep,mcp__coder__coder_report_task';
 
 // Track active SSH processes per task so we can kill them
 const activeProcesses = new Map<string, ChildProcess>();
