@@ -205,6 +205,7 @@ export interface Discussion {
   claude_session_id: string | null;
   status: string;
   project_dir: string | null;
+  full_access: number;
   ssh_pid: number | null;
   activity: TaskActivity | null;
   running: boolean;
@@ -231,6 +232,15 @@ export interface TaskRequestItem {
   created_task_id: string | null;
   created_at: string;
 }
+
+export const getDiscussionSettings = (workspaceId: string) =>
+  request<{ fullAccess: boolean }>(`/api/workspaces/${workspaceId}/discussion-settings`);
+
+export const updateDiscussionSettings = (workspaceId: string, fullAccess: boolean) =>
+  request<{ ok: boolean; fullAccess: boolean }>(`/api/workspaces/${workspaceId}/discussion-settings`, {
+    method: 'PATCH',
+    body: JSON.stringify({ fullAccess }),
+  });
 
 export const getOrCreateDiscussion = (workspaceId: string) =>
   request<{ discussion: Discussion; messages: DiscussionMessage[]; taskRequests: TaskRequestItem[] }>(

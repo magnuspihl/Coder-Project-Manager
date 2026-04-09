@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS discussions (
   claude_session_id TEXT,
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'closed')),
   project_dir TEXT,
+  full_access INTEGER NOT NULL DEFAULT 0,
   ssh_pid INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -104,6 +105,13 @@ CREATE TABLE IF NOT EXISTS task_requests (
 );
 
 CREATE INDEX IF NOT EXISTS idx_task_requests_discussion ON task_requests(discussion_id, status);
+
+-- Workspace settings: persistent per-workspace configuration
+CREATE TABLE IF NOT EXISTS workspace_settings (
+  workspace_id TEXT PRIMARY KEY,
+  discussion_full_access INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 
 -- Sessions table: server-side session storage
 CREATE TABLE IF NOT EXISTS sessions (

@@ -819,7 +819,8 @@ export async function launchDiscussion(
   isResume: boolean,
   username?: string
 ): Promise<void> {
-  const prompt = DISCUSSION_PROMPT_PREFIX + message;
+  const isFullAccess = discussion.full_access === 1;
+  const prompt = isFullAccess ? message : DISCUSSION_PROMPT_PREFIX + message;
 
   // Auto-detect project directory if not already set
   if (!discussion.project_dir) {
@@ -871,7 +872,9 @@ export async function launchDiscussion(
 
   claudeParts.push('--output-format', 'stream-json');
   claudeParts.push('--verbose');
-  claudeParts.push('--allowedTools', shellEscape(DISCUSSION_ALLOWED_TOOLS));
+  if (!isFullAccess) {
+    claudeParts.push('--allowedTools', shellEscape(DISCUSSION_ALLOWED_TOOLS));
+  }
   claudeParts.push('--max-turns', MAX_TURNS);
 
   const claudeCmd = claudeParts.join(' ');
