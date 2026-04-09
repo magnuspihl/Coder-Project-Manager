@@ -12,8 +12,8 @@ export default function Layout({
   const { theme, setTheme } = useTheme();
 
   return (
-    <div className="min-h-screen">
-      <header className="bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 px-6 py-3 flex items-center justify-between">
+    <div className="h-screen flex flex-col overflow-hidden">
+      <header className="flex-shrink-0 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 px-6 py-3 flex items-center justify-between">
         <span className="text-lg font-semibold text-gray-900 dark:text-gray-100">
           Coder Project Manager
         </span>
@@ -52,7 +52,7 @@ export default function Layout({
           </div>
         </div>
       </header>
-      <main className="px-6 py-8">{children}</main>
+      <main className="flex-1 px-6 py-6 overflow-hidden flex flex-col">{children}</main>
     </div>
   );
 }

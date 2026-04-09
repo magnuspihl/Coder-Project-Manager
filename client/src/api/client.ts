@@ -81,6 +81,8 @@ export interface Task {
   failed_reason: string | null;
   verification_url: string | null;
   branch: string | null;
+  git_branch: string | null;
+  github_repo_url: string | null;
   total_input_tokens: number;
   total_output_tokens: number;
   total_cost_usd?: number;
@@ -140,7 +142,7 @@ export interface TokenTotals {
 }
 
 export const getWorkspaces = () =>
-  request<{ workspaces: Workspace[]; taskCounts: Record<string, TaskCounts>; tokenTotals: Record<string, TokenTotals> }>('/api/workspaces');
+  request<{ workspaces: Workspace[]; taskCounts: Record<string, TaskCounts>; tokenTotals: Record<string, TokenTotals>; githubRepoUrls: Record<string, string> }>('/api/workspaces');
 
 export const getWorkspace = (id: string) =>
   request<{ workspace: Workspace }>(`/api/workspaces/${id}`);

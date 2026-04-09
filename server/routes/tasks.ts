@@ -14,6 +14,7 @@ import {
   getMessageCount,
   getTaskCostUsd,
   getTaskCostsByWorkspace,
+  getWorkingTask,
 } from '../services/tasks.js';
 import { processQueue, resumeTask, cancelTask, getTaskActivity, getTaskStreamLog, getTaskStreamLogAfter } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
@@ -155,7 +156,17 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
   }
 
   addMessage(task.id, 'user', message, undefined, req.user!.username);
-  // Resume bypasses the queue — this task is already "active"
+
+  // If another task is currently working on this workspace, queue the reply
+  // instead of resuming immediately — only one Claude session at a time.
+  const working = getWorkingTask(task.workspace_id);
+  if (working) {
+    updateTaskStatus(task.id, 'queued');
+    res.json({ task: getTask(task.id) });
+    return;
+  }
+
+  // No other task working — resume immediately
   await resumeTask(task, message);
   res.json({ task: getTask(task.id) });
 });

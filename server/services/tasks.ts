@@ -17,6 +17,8 @@ export interface Task {
   verification_url: string | null;
   branch: string | null;
   ssh_pid: number | null;
+  git_branch: string | null;
+  github_repo_url: string | null;
   total_input_tokens: number;
   total_output_tokens: number;
   created_at: string;
@@ -110,6 +112,21 @@ export interface WorkspaceTokenTotals {
 // Cache for token totals — recomputed at most once per 30 seconds
 let tokenTotalsCache: { data: Record<string, WorkspaceTokenTotals>; timestamp: number } | null = null;
 const TOKEN_TOTALS_CACHE_MS = 30_000;
+
+export function getGithubRepoUrlsByWorkspace(): Record<string, string> {
+  const db = getDb();
+  const rows = db.prepare(
+    `SELECT workspace_id, github_repo_url
+     FROM tasks
+     WHERE github_repo_url IS NOT NULL AND deleted_at IS NULL
+     GROUP BY workspace_id`
+  ).all() as Array<{ workspace_id: string; github_repo_url: string }>;
+  const result: Record<string, string> = {};
+  for (const row of rows) {
+    result[row.workspace_id] = row.github_repo_url;
+  }
+  return result;
+}
 
 export function getTokenTotalsByWorkspace(): Record<string, WorkspaceTokenTotals> {
   const now = Date.now();

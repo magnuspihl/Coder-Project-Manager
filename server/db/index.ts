@@ -87,6 +87,12 @@ export function getDb(): Database.Database {
     if (!cols.some(c => c.name === 'branch')) {
       db.exec("ALTER TABLE tasks ADD COLUMN branch TEXT");
     }
+    if (!cols.some(c => c.name === 'git_branch')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN git_branch TEXT");
+    }
+    if (!cols.some(c => c.name === 'github_repo_url')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN github_repo_url TEXT");
+    }
 
     // Messages migrations
     const msgCols = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;

@@ -2,6 +2,7 @@ import { spawn, execFile, ChildProcess } from 'child_process';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, deleteCurrentSessionAssistantMessages, updateMessageCost, type Task } from './tasks.js';
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, type Discussion } from './discussions.js';
 import { getDb } from '../db/index.js';
+import { handleTaskLaunchGit, handleTaskResumeGit } from './git.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || '50';
@@ -149,6 +150,19 @@ export async function processQueue(workspaceId: string): Promise<void> {
       return;
     }
 
+    // Check if this is a resume-pending task (was awaiting_feedback, user replied,
+    // but another task was working so it was re-queued). Detect by checking if the
+    // task already has a session and the last message is from the user.
+    if (next.claude_session_id) {
+      const msgs = getMessages(next.id);
+      const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+      if (lastMsg && lastMsg.role === 'user' && msgs.some(m => m.role === 'assistant')) {
+        // This task has a prior session and a pending user reply — resume it
+        await launchTask(next, true, lastMsg.content);
+        return;
+      }
+    }
+
     await launchTask(next);
   };
 
@@ -213,8 +227,9 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     }
   }
 
-  // If a branch was specified, check it out before launching Claude
+  // Git branch management
   if (task.branch && task.project_dir && !isResume) {
+    // User specified a branch override — check it out directly
     const ws = task.workspace_name;
     const dir = shellEscape(task.project_dir);
     const branch = task.branch;
@@ -222,20 +237,17 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
       console.log(`[claude-executor] Checking out branch '${branch}' on workspace ${ws}`);
       await sshExec(ws, `cd ${dir} && git fetch origin`, 30000);
 
-      // Check if the branch exists on origin
       const remoteRef = await sshExec(ws,
         `cd ${dir} && git ls-remote --heads origin ${shellEscape(branch)}`,
         15000
       );
 
       if (remoteRef && remoteRef.includes(branch)) {
-        // Branch exists on origin — check it out and pull
         await sshExec(ws,
           `cd ${dir} && git checkout ${shellEscape(branch)} && git pull origin ${shellEscape(branch)}`,
           30000
         );
       } else {
-        // Branch doesn't exist — create it
         await sshExec(ws, `cd ${dir} && git checkout -b ${shellEscape(branch)}`, 15000);
       }
       addMessage(task.id, 'system', `Checked out branch \`${branch}\`.`);
@@ -247,6 +259,10 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
       processQueue(task.workspace_id).catch(() => {});
       return;
     }
+  } else if (isResume) {
+    await handleTaskResumeGit(task);
+  } else {
+    await handleTaskLaunchGit(task);
   }
 
   // Build the claude command

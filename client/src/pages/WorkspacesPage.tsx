@@ -78,6 +78,7 @@ export default function WorkspacesPage() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [taskCounts, setTaskCounts] = useState<Record<string, TaskCounts>>({});
   const [tokenTotals, setTokenTotals] = useState<Record<string, TokenTotals>>({});
+  const [githubRepoUrls, setGithubRepoUrls] = useState<Record<string, string>>({});
   const [tasksByWorkspace, setTasksByWorkspace] = useState<Record<string, Task[]>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -95,10 +96,11 @@ export default function WorkspacesPage() {
 
   const loadData = async () => {
     try {
-      const { workspaces: ws, taskCounts: tc, tokenTotals: tt } = await getWorkspaces();
+      const { workspaces: ws, taskCounts: tc, tokenTotals: tt, githubRepoUrls: gh } = await getWorkspaces();
       setWorkspaces(ws);
       setTaskCounts(tc);
       setTokenTotals(tt || {});
+      setGithubRepoUrls(gh || {});
       setError('');
 
       // Fetch tasks for running workspaces in parallel
@@ -347,6 +349,27 @@ export default function WorkspacesPage() {
       <div className="text-xs text-gray-400 dark:text-gray-500 mt-1">
         {new Date(task.created_at).toLocaleString()}
       </div>
+      {task.git_branch && (
+        <div className="mt-1">
+          {task.github_repo_url ? (
+            <a
+              href={`${task.github_repo_url}/tree/${task.git_branch}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => e.stopPropagation()}
+              className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors font-mono"
+            >
+              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path d="M11.75 2.5a.75.75 0 0 1 0 1.5h-.75v4h.75a.75.75 0 0 1 0 1.5h-.75v.75a4.25 4.25 0 0 1-8.5 0V9.5H2a.75.75 0 0 1 0-1.5h.75V4H2a.75.75 0 0 1 0-1.5h3.5a.75.75 0 0 1 0 1.5H4.25v4h1.5V4H4.5a.75.75 0 0 1 0-1.5h3.5a.75.75 0 0 1 0 1.5H7.25v4h1.5v-4H8a.75.75 0 0 1 0-1.5ZM9.5 9.5h-4v.75a2.75 2.75 0 1 0 5.5 0V9.5h-.75Z" /></svg>
+              {task.git_branch}
+            </a>
+          ) : (
+            <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 font-mono">
+              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path d="M11.75 2.5a.75.75 0 0 1 0 1.5h-.75v4h.75a.75.75 0 0 1 0 1.5h-.75v.75a4.25 4.25 0 0 1-8.5 0V9.5H2a.75.75 0 0 1 0-1.5h.75V4H2a.75.75 0 0 1 0-1.5h3.5a.75.75 0 0 1 0 1.5H4.25v4h1.5V4H4.5a.75.75 0 0 1 0-1.5h3.5a.75.75 0 0 1 0 1.5H7.25v4h1.5v-4H8a.75.75 0 0 1 0-1.5ZM9.5 9.5h-4v.75a2.75 2.75 0 1 0 5.5 0V9.5h-.75Z" /></svg>
+              {task.git_branch}
+            </span>
+          )}
+        </div>
+      )}
       {task.status === 'working' && task.activity && (
         <div className="mt-2 flex items-center gap-2 text-xs text-blue-600 dark:text-blue-400">
           <div className="animate-spin h-3 w-3 border-[1.5px] border-blue-600 dark:border-blue-400 border-t-transparent rounded-full" />
@@ -451,6 +474,7 @@ export default function WorkspacesPage() {
     const tasks = tasksByWorkspace[ws.id] || [];
     const openPorts = getOpenPorts(ws);
     const apps = getApps(ws);
+    const githubRepoUrl = githubRepoUrls[ws.id] || tasks.find(t => t.github_repo_url)?.github_repo_url || null;
 
     return (
       <div
@@ -491,8 +515,21 @@ export default function WorkspacesPage() {
               ) : null}
             </div>
           </div>
-          {(apps.length > 0 || openPorts.length > 0) && (
+          {(apps.length > 0 || openPorts.length > 0 || githubRepoUrl) && (
             <div className="flex items-center gap-1.5 flex-wrap mb-1">
+              {githubRepoUrl && (
+                <a
+                  href={githubRepoUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="shrink-0 hover:opacity-80 transition-opacity"
+                  title="GitHub repository"
+                >
+                  <svg className="h-4 w-4 text-gray-400 dark:text-gray-500 hover:text-gray-900 dark:hover:text-gray-100" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" />
+                  </svg>
+                </a>
+              )}
               {apps.map((app) => {
                 // Prefer the site's own favicon over the Coder-registered icon
                 const iconSrc = app.favicon_url || app.icon;
@@ -567,13 +604,6 @@ export default function WorkspacesPage() {
             <div className="min-w-0">
               <div className="text-xs text-gray-500 dark:text-gray-400 space-y-0.5">
                 <div>{ws.template_name}</div>
-                {agent.name && (
-                  <div>
-                    <span className={agent.connected ? 'text-green-600 dark:text-green-400' : 'text-gray-400 dark:text-gray-500'}>
-                      {agent.name} ({agent.connected ? 'connected' : 'disconnected'})
-                    </span>
-                  </div>
-                )}
               </div>
               {counts && (
                 <div className="flex gap-2 mt-1 text-xs flex-wrap">
@@ -688,7 +718,7 @@ export default function WorkspacesPage() {
         </div>
 
         {/* Task list */}
-        <div className="flex-1 overflow-y-auto p-3 space-y-2" style={{ maxHeight: 'calc(100vh - 220px)' }}>
+        <div className="flex-1 overflow-y-auto p-3 space-y-2 min-h-0">
           {!isRunning ? (
             <p className="text-xs text-amber-600 dark:text-amber-400 px-1">Workspace must be running to execute tasks</p>
           ) : tasks.length === 0 ? (
@@ -703,7 +733,7 @@ export default function WorkspacesPage() {
   };
 
   return (
-    <div>
+    <div className="flex flex-col flex-1 min-h-0">
       {error && workspaces.length > 0 && (
         <div className="mb-3 flex items-center justify-between gap-2 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-400 text-sm px-3 py-2 rounded-lg">
           <span>Connection error: {error}</span>
@@ -714,7 +744,7 @@ export default function WorkspacesPage() {
           </button>
         </div>
       )}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex-shrink-0 flex items-center justify-between mb-4">
         <h2 className="text-xl font-semibold">Workspaces</h2>
         {stoppedWorkspaces.length > 0 && (
           <button
@@ -729,7 +759,7 @@ export default function WorkspacesPage() {
       {workspaces.length === 0 ? (
         <p className="text-gray-500 dark:text-gray-400">No workspaces found.</p>
       ) : (
-        <div className="flex gap-4 overflow-x-auto pb-4" style={{ minHeight: '300px' }}>
+        <div className="flex gap-4 overflow-x-auto pb-4 flex-1 min-h-0">
           {runningWorkspaces.map(renderWorkspaceColumn)}
           {showStopped && stoppedWorkspaces.map(renderWorkspaceColumn)}
         </div>
