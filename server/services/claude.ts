@@ -830,12 +830,28 @@ export async function launchDiscussion(
     }
   }
 
+  // Check if the session already exists on the remote workspace
+  // (e.g. user pasted an existing session ID via the edit field)
+  let remoteSessionExists = isResume;
+  if (!isResume && discussion.claude_session_id) {
+    try {
+      const checkResult = await sshExec(discussion.workspace_name,
+        `find ~/.claude/projects/ -name '${discussion.claude_session_id}.jsonl' 2>/dev/null | head -1`
+      );
+      if (checkResult.trim()) {
+        remoteSessionExists = true;
+      }
+    } catch {
+      // Non-fatal — assume new session
+    }
+  }
+
   // Build the claude command
   const claudeParts: string[] = [];
   claudeParts.push('claude');
-  claudeParts.push('-p', shellEscape(isResume ? message : prompt));
+  claudeParts.push('-p', shellEscape(remoteSessionExists ? message : prompt));
 
-  if (isResume && discussion.claude_session_id) {
+  if (remoteSessionExists && discussion.claude_session_id) {
     claudeParts.push('--resume', shellEscape(discussion.claude_session_id));
   } else if (discussion.claude_session_id) {
     claudeParts.push('--session-id', shellEscape(discussion.claude_session_id));
