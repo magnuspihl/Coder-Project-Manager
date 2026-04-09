@@ -80,6 +80,7 @@ export interface Task {
   claude_session_id: string | null;
   failed_reason: string | null;
   verification_url: string | null;
+  branch: string | null;
   total_input_tokens: number;
   total_output_tokens: number;
   total_cost_usd?: number;
@@ -157,10 +158,10 @@ export const getProjects = (workspaceId: string) =>
 export const getTasks = (workspaceId: string) =>
   request<{ tasks: Task[] }>(`/api/workspaces/${workspaceId}/tasks`);
 
-export const createTask = (workspaceId: string, prompt: string) =>
+export const createTask = (workspaceId: string, prompt: string, branch?: string) =>
   request<{ task: Task }>(`/api/workspaces/${workspaceId}/tasks`, {
     method: 'POST',
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify({ prompt, ...(branch ? { branch } : {}) }),
   });
 
 export const getTaskDetail = (taskId: string) =>

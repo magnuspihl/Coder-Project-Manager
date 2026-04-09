@@ -191,7 +191,16 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
       `This project runs inside a Coder workspace, so use Coder-routed URLs (not localhost). ` +
       `The Coder access URL is: ${CODER_URL}. The workspace name is: ${task.workspace_name}.`;
   }
-  const prompt = rawPrompt + coderUrlNote;
+  // If a branch was specified, override the agent's default branching behavior
+  let branchNote = '';
+  if (task.branch) {
+    branchNote = `\n\nIMPORTANT: You are already on the git branch \`${task.branch}\`. ` +
+      `Do NOT create a new branch or switch to a different branch. ` +
+      `Commit and push all your work directly to \`${task.branch}\`. ` +
+      `This overrides any branching instructions in your system prompt or CLAUDE.md.`;
+  }
+
+  const prompt = rawPrompt + branchNote + coderUrlNote;
 
   // Auto-detect project directory if not already set
   if (!task.project_dir) {
@@ -199,6 +208,42 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     if (detected) {
       task.project_dir = detected;
       getDb().prepare('UPDATE tasks SET project_dir = ? WHERE id = ?').run(detected, task.id);
+    }
+  }
+
+  // If a branch was specified, check it out before launching Claude
+  if (task.branch && task.project_dir && !isResume) {
+    const ws = task.workspace_name;
+    const dir = shellEscape(task.project_dir);
+    const branch = task.branch;
+    try {
+      console.log(`[claude-executor] Checking out branch '${branch}' on workspace ${ws}`);
+      await sshExec(ws, `cd ${dir} && git fetch origin`, 30000);
+
+      // Check if the branch exists on origin
+      const remoteRef = await sshExec(ws,
+        `cd ${dir} && git ls-remote --heads origin ${shellEscape(branch)}`,
+        15000
+      );
+
+      if (remoteRef && remoteRef.includes(branch)) {
+        // Branch exists on origin — check it out and pull
+        await sshExec(ws,
+          `cd ${dir} && git checkout ${shellEscape(branch)} && git pull origin ${shellEscape(branch)}`,
+          30000
+        );
+      } else {
+        // Branch doesn't exist — create it
+        await sshExec(ws, `cd ${dir} && git checkout -b ${shellEscape(branch)}`, 15000);
+      }
+      addMessage(task.id, 'system', `Checked out branch \`${branch}\`.`);
+    } catch (err) {
+      const errorMsg = `Failed to checkout branch '${branch}': ${(err as Error).message || err}`;
+      console.error(`[claude-executor] ${errorMsg}`);
+      addMessage(task.id, 'system', `Error: ${errorMsg}`);
+      updateTaskStatus(task.id, 'failed', errorMsg);
+      processQueue(task.workspace_id).catch(() => {});
+      return;
     }
   }
 

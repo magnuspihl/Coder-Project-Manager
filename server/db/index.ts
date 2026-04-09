@@ -84,6 +84,10 @@ export function getDb(): Database.Database {
       db.exec("PRAGMA foreign_keys=ON");
     }
 
+    if (!cols.some(c => c.name === 'branch')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN branch TEXT");
+    }
+
     // Messages migrations
     const msgCols = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
     if (!msgCols.some(c => c.name === 'username')) {

@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   claude_session_id TEXT,
   failed_reason TEXT,
   verification_url TEXT,
+  branch TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT,

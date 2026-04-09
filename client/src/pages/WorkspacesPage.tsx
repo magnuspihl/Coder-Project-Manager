@@ -83,6 +83,7 @@ export default function WorkspacesPage() {
   const [deletedTaskId, setDeletedTaskId] = useState<string | null>(null);
   const [newTaskWorkspaceId, setNewTaskWorkspaceId] = useSessionState<string | null>('newTaskWorkspaceId', null);
   const [newTaskPrompt, setNewTaskPrompt, clearNewTaskPrompt] = useDraft('newTaskPrompt');
+  const [newTaskBranch, setNewTaskBranch] = useState('');
   const [creatingTask, setCreatingTask] = useState(false);
   const [selectedTaskId, setSelectedTaskId] = useSessionState<string | null>('selectedTaskId', null);
   const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -231,6 +232,7 @@ export default function WorkspacesPage() {
       e.preventDefault();
       setNewTaskWorkspaceId(target);
       clearNewTaskPrompt();
+      setNewTaskBranch('');
     };
     window.addEventListener('keydown', handleAltN);
     return () => window.removeEventListener('keydown', handleAltN);
@@ -301,9 +303,11 @@ export default function WorkspacesPage() {
     if (!newTaskPrompt.trim()) return;
     setCreatingTask(true);
     try {
-      await createTask(workspaceId, newTaskPrompt.trim());
+      const branch = newTaskBranch.trim() || undefined;
+      await createTask(workspaceId, newTaskPrompt.trim(), branch);
       lastTaskWorkspaceIdRef.current = workspaceId;
       clearNewTaskPrompt();
+      setNewTaskBranch('');
       setNewTaskWorkspaceId(null);
       await loadData();
     } catch (err: unknown) {
@@ -594,7 +598,7 @@ export default function WorkspacesPage() {
             </div>
             {isRunning && (
               <button
-                onClick={() => { setNewTaskWorkspaceId(ws.id); clearNewTaskPrompt(); }}
+                onClick={() => { setNewTaskWorkspaceId(ws.id); clearNewTaskPrompt(); setNewTaskBranch(''); }}
                 className="shrink-0 text-xs px-2 py-0.5 bg-blue-600 text-white rounded-full hover:bg-blue-700 transition-colors mt-0.5"
                 title={altNTargetWorkspaceId === ws.id ? 'New task (Alt+N)' : 'New task'}
               >
@@ -617,11 +621,30 @@ export default function WorkspacesPage() {
                   if (e.key === 'Escape') {
                     setNewTaskWorkspaceId(null);
                     clearNewTaskPrompt();
+                    setNewTaskBranch('');
                   }
                 }}
                 placeholder="What should Claude do?"
                 className="w-full text-sm border border-gray-300 dark:border-gray-700 rounded-md p-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 resize-none focus:outline-none focus:ring-1 focus:ring-blue-500"
                 rows={2}
+                disabled={creatingTask}
+              />
+              <input
+                type="text"
+                value={newTaskBranch}
+                onChange={(e) => setNewTaskBranch(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                    handleCreateTask(ws.id);
+                  }
+                  if (e.key === 'Escape') {
+                    setNewTaskWorkspaceId(null);
+                    clearNewTaskPrompt();
+                    setNewTaskBranch('');
+                  }
+                }}
+                placeholder="Branch name (optional)"
+                className="w-full text-sm border border-gray-300 dark:border-gray-700 rounded-md p-1.5 mt-1 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
                 disabled={creatingTask}
               />
               <div className="flex gap-2 mt-1">
@@ -633,7 +656,7 @@ export default function WorkspacesPage() {
                   {creatingTask ? 'Creating...' : 'Create'}
                 </button>
                 <button
-                  onClick={() => { setNewTaskWorkspaceId(null); clearNewTaskPrompt(); }}
+                  onClick={() => { setNewTaskWorkspaceId(null); clearNewTaskPrompt(); setNewTaskBranch(''); }}
                   className="text-xs px-3 py-1 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
                 >
                   Cancel
