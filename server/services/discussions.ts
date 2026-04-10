@@ -187,3 +187,23 @@ export function dismissTaskRequest(id: string): void {
   const db = getDb();
   db.prepare("UPDATE task_requests SET status = 'dismissed' WHERE id = ?").run(id);
 }
+
+/**
+ * Get the latest non-user discussion message timestamp per workspace.
+ * Only considers active discussions. Returns a map of workspace_id → ISO timestamp.
+ */
+export function getLatestDiscussionMessageByWorkspace(): Record<string, string> {
+  const db = getDb();
+  const rows = db.prepare(
+    `SELECT d.workspace_id, MAX(dm.created_at) as latest_at
+     FROM discussion_messages dm
+     JOIN discussions d ON dm.discussion_id = d.id
+     WHERE d.status = 'active' AND dm.role != 'user'
+     GROUP BY d.workspace_id`
+  ).all() as Array<{ workspace_id: string; latest_at: string }>;
+  const result: Record<string, string> = {};
+  for (const row of rows) {
+    result[row.workspace_id] = row.latest_at;
+  }
+  return result;
+}

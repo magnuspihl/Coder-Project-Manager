@@ -79,6 +79,7 @@ export default function WorkspacesPage() {
   const [taskCounts, setTaskCounts] = useState<Record<string, TaskCounts>>({});
   const [tokenTotals, setTokenTotals] = useState<Record<string, TokenTotals>>({});
   const [githubRepoUrls, setGithubRepoUrls] = useState<Record<string, string>>({});
+  const [latestDiscussionMessages, setLatestDiscussionMessages] = useState<Record<string, string>>({});
   const [tasksByWorkspace, setTasksByWorkspace] = useState<Record<string, Task[]>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -96,11 +97,12 @@ export default function WorkspacesPage() {
 
   const loadData = async () => {
     try {
-      const { workspaces: ws, taskCounts: tc, tokenTotals: tt, githubRepoUrls: gh } = await getWorkspaces();
+      const { workspaces: ws, taskCounts: tc, tokenTotals: tt, githubRepoUrls: gh, latestDiscussionMessages: ldm } = await getWorkspaces();
       setWorkspaces(ws);
       setTaskCounts(tc);
       setTokenTotals(tt || {});
       setGithubRepoUrls(gh || {});
+      setLatestDiscussionMessages(ldm || {});
       setError('');
 
       // Fetch tasks for running workspaces in parallel
@@ -304,9 +306,33 @@ export default function WorkspacesPage() {
     await loadData();
   };
 
+  const markChatSeen = (workspaceId: string) => {
+    try {
+      const seen = JSON.parse(localStorage.getItem('chatLastSeen') || '{}');
+      seen[workspaceId] = new Date().toISOString();
+      localStorage.setItem('chatLastSeen', JSON.stringify(seen));
+    } catch { /* ignore */ }
+  };
+
+  const getChatLastSeen = (workspaceId: string): string | null => {
+    try {
+      const seen = JSON.parse(localStorage.getItem('chatLastSeen') || '{}');
+      return seen[workspaceId] || null;
+    } catch { return null; }
+  };
+
+  const hasUnreadChat = (workspaceId: string): boolean => {
+    const latest = latestDiscussionMessages[workspaceId];
+    if (!latest) return false;
+    const lastSeen = getChatLastSeen(workspaceId);
+    if (!lastSeen) return true; // never opened → unread if any messages exist
+    return latest > lastSeen;
+  };
+
   const handleOpenDiscussion = async (workspaceId: string, workspaceName: string) => {
     try {
       const { discussion } = await getOrCreateDiscussion(workspaceId);
+      markChatSeen(workspaceId);
       setDiscussionState({ id: discussion.id, workspaceId, workspaceName });
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to open discussion');
@@ -642,10 +668,13 @@ export default function WorkspacesPage() {
               <div className="flex gap-1.5 shrink-0 mt-0.5">
                 <button
                   onClick={() => handleOpenDiscussion(ws.id, ws.name)}
-                  className="text-xs px-2 py-0.5 bg-purple-600 text-white rounded-full hover:bg-purple-700 transition-colors"
+                  className="relative text-xs px-2 py-0.5 bg-purple-600 text-white rounded-full hover:bg-purple-700 transition-colors"
                   title="Open discussion"
                 >
                   Chat
+                  {hasUnreadChat(ws.id) && !discussionState && (
+                    <span className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-red-500 rounded-full border border-white dark:border-gray-900" />
+                  )}
                 </button>
                 <button
                   onClick={() => { setNewTaskWorkspaceId(ws.id); clearNewTaskPrompt(); setNewTaskBranch(''); }}
@@ -798,7 +827,7 @@ export default function WorkspacesPage() {
           discussionId={discussionState.id}
           workspaceId={discussionState.workspaceId}
           workspaceName={discussionState.workspaceName}
-          onClose={() => setDiscussionState(null)}
+          onClose={() => { markChatSeen(discussionState.workspaceId); setDiscussionState(null); }}
           onTaskCreated={loadData}
         />
       )}
