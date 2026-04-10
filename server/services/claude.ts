@@ -305,7 +305,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   // Build the remote command:
   // - Write output directly to a file (no stdout pipe — avoids SIGPIPE on server restart)
   // - Capture Claude's exit code
-  let remoteCmd = '';
+  let remoteCmd = 'export PATH="$HOME/.local/bin:$PATH" && ';
   if (task.project_dir) {
     remoteCmd += `cd ${shellEscape(task.project_dir)} && `;
   }
@@ -933,7 +933,7 @@ export async function launchDiscussion(
   const outputFile = remoteDiscussionOutputPath(discussion.id);
   const exitFile = remoteDiscussionExitCodePath(discussion.id);
 
-  let remoteCmd = '';
+  let remoteCmd = 'export PATH="$HOME/.local/bin:$PATH" && ';
   if (sessionWorkDir) {
     remoteCmd += `cd ${shellEscape(sessionWorkDir)} && `;
   }
