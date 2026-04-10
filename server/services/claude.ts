@@ -665,6 +665,7 @@ function startFilePolling(task: Task): void {
 
         // Check if this was a rate limit failure
         const rlInfo = rateLimitInfo.get(task.id);
+        rateLimitInfo.delete(task.id);
         const isRateLimited = rlInfo && rlInfo.resetsAt * 1000 > Date.now();
 
         if (isRateLimited) {
@@ -1112,6 +1113,7 @@ function startDiscussionPolling(discussion: Discussion): void {
         stopPolling(pollKey);
         taskActivity.delete(`disc:${discussion.id}`);
         activeProcesses.delete(`disc:${discussion.id}`);
+        rateLimitInfo.delete(`disc:${discussion.id}`);
         getDb().prepare('UPDATE discussions SET ssh_pid = NULL WHERE id = ?').run(discussion.id);
 
         // Surface errors to the user
