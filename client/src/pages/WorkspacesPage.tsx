@@ -75,7 +75,7 @@ function getApps(workspace: Workspace) {
   return workspace.apps || [];
 }
 
-export default function WorkspacesPage() {
+export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: string | null }) {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [taskCounts, setTaskCounts] = useState<Record<string, TaskCounts>>({});
   const [tokenTotals, setTokenTotals] = useState<Record<string, TokenTotals>>({});
@@ -165,7 +165,7 @@ export default function WorkspacesPage() {
 
   // Sorted running workspaces (used for Alt+N targeting, Space shortcut, and rendering)
   const runningWorkspaces = useMemo(() => workspaces
-    .filter((ws) => ws.latest_build.status === 'running')
+    .filter((ws) => ws.latest_build.status === 'running' && ws.id !== selfWorkspaceId)
     .sort((a, b) => {
       const aCounts = taskCounts[a.id];
       const bCounts = taskCounts[b.id];
@@ -190,8 +190,8 @@ export default function WorkspacesPage() {
   }, [tasksByWorkspace]);
 
   const stoppedWorkspaces = useMemo(() =>
-    workspaces.filter((ws) => ws.latest_build.status !== 'running'),
-    [workspaces]
+    workspaces.filter((ws) => ws.latest_build.status !== 'running' && ws.id !== selfWorkspaceId),
+    [workspaces, selfWorkspaceId]
   );
 
   // FLIP animation for workspace lane reordering

@@ -129,6 +129,8 @@ router.get('/config', (_req: Request, res: Response) => {
   res.json({
     oauth_enabled: !!OAUTH_CLIENT_ID,
     coder_url: CODER_URL,
+    self_workspace_id: process.env.CODER_WORKSPACE_ID || null,
+    self_workspace_name: process.env.CODER_WORKSPACE_NAME || null,
   });
 });
 

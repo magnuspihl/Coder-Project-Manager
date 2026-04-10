@@ -117,7 +117,7 @@ export interface StreamLogEntry {
 
 // Auth
 export const getAuthConfig = () =>
-  request<{ oauth_enabled: boolean; coder_url: string }>('/auth/config');
+  request<{ oauth_enabled: boolean; coder_url: string; self_workspace_id: string | null; self_workspace_name: string | null }>('/auth/config');
 
 export const tokenLogin = (token: string) =>
   request<{ user: User }>('/auth/token-login', {
