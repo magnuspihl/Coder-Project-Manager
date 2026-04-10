@@ -656,7 +656,7 @@ function startFilePolling(task: Task): void {
         }
       }
 
-      if (exitPart !== 'RUNNING') {
+      if (exitPart !== 'RUNNING' && exitPart !== '') {
         const exitCode = parseInt(exitPart, 10);
         console.log(`[claude-poller] Task ${task.id} finished with exit code ${exitCode}`);
         stopPolling(task.id);
@@ -1106,7 +1106,7 @@ function startDiscussionPolling(discussion: Discussion): void {
         }
       }
 
-      if (exitPart !== 'RUNNING') {
+      if (exitPart !== 'RUNNING' && exitPart !== '') {
         console.log(`[discussion-poller] Discussion ${discussion.id} finished (exit: ${exitPart})`);
         stopPolling(pollKey);
         taskActivity.delete(`disc:${discussion.id}`);
