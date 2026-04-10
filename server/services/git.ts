@@ -23,8 +23,11 @@ function fetchGitHubToken(): Promise<string | null> {
  */
 async function sshGh(workspaceName: string, command: string, timeout = 30000): Promise<string> {
   const token = await fetchGitHubToken();
-  const tokenPrefix = token ? `GH_TOKEN=${token} ` : '';
-  return sshExec(workspaceName, `${tokenPrefix}${command}`, timeout);
+  if (token) {
+    // Export GH_TOKEN inside a shell so && chains work correctly over SSH
+    return sshExec(workspaceName, `export GH_TOKEN=${shellEscape(token)} && ${command}`, timeout);
+  }
+  return sshExec(workspaceName, command, timeout);
 }
 
 /**
