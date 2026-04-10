@@ -67,6 +67,11 @@ export interface TaskActivity {
   summary: string;
 }
 
+export interface RateLimitInfo {
+  resetsAt: number;
+  rateLimitType: string;
+}
+
 export interface Task {
   id: string;
   workspace_id: string;
@@ -90,6 +95,7 @@ export interface Task {
   updated_at: string;
   completed_at: string | null;
   activity: TaskActivity | null;
+  rate_limit: RateLimitInfo | null;
 }
 
 export interface Message {
@@ -209,6 +215,7 @@ export interface Discussion {
   ssh_pid: number | null;
   activity: TaskActivity | null;
   running: boolean;
+  rate_limit: RateLimitInfo | null;
   created_at: string;
   updated_at: string;
 }

@@ -17,7 +17,7 @@ import {
   setDiscussionFullAccess,
 } from '../services/discussions.js';
 import { createTask } from '../services/tasks.js';
-import { launchDiscussion, stopDiscussion, getDiscussionActivity, isDiscussionRunning } from '../services/claude.js';
+import { launchDiscussion, stopDiscussion, getDiscussionActivity, isDiscussionRunning, getRateLimitInfo } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { processQueue } from '../services/claude.js';
@@ -35,7 +35,8 @@ router.post('/workspaces/:workspaceId/discussion', requireAuth, async (req: Requ
     const taskRequests = getPendingTaskRequests(discussion.id);
     const activity = getDiscussionActivity(discussion.id) || null;
     const running = isDiscussionRunning(discussion.id);
-    res.json({ discussion: { ...discussion, activity, running }, messages, taskRequests });
+    const rateLimit = getRateLimitInfo(`disc:${discussion.id}`) || null;
+    res.json({ discussion: { ...discussion, activity, running, rate_limit: rateLimit }, messages, taskRequests });
     return;
   }
 
@@ -91,7 +92,8 @@ router.get('/discussions/:discussionId', requireAuth, (req: Request, res: Respon
   const taskRequests = getPendingTaskRequests(discussion.id);
   const activity = getDiscussionActivity(discussion.id) || null;
   const running = isDiscussionRunning(discussion.id);
-  res.json({ discussion: { ...discussion, activity, running }, messages, taskRequests });
+  const rateLimit = getRateLimitInfo(`disc:${discussion.id}`) || null;
+  res.json({ discussion: { ...discussion, activity, running, rate_limit: rateLimit }, messages, taskRequests });
 });
 
 // Update discussion session ID

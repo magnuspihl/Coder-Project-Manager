@@ -13,6 +13,7 @@ import {
   type StreamLogEntry,
 } from '../api/client';
 import { playChime } from '../utils/chime';
+import RateLimitBanner from './RateLimitBanner';
 import { useDraft } from '../hooks/useDraft';
 import { linkify } from '../utils/linkify';
 import Markdown from './Markdown';
@@ -478,17 +479,30 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
               {(task.status === 'failed' || task.status === 'cancelled') && (
                 <div className="space-y-2">
-                  {task.failed_reason && (
-                    <div className="text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 p-3 rounded-md">
-                      {task.failed_reason}
-                    </div>
+                  {task.failed_reason?.startsWith('rate_limited:') ? (
+                    <RateLimitBanner
+                      rateLimit={{
+                        resetsAt: parseInt(task.failed_reason.split(':')[1], 10),
+                        rateLimitType: 'usage limit',
+                      }}
+                      onResume={handleRetry}
+                      resumeLabel="Retry"
+                    />
+                  ) : (
+                    <>
+                      {task.failed_reason && (
+                        <div className="text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 p-3 rounded-md">
+                          {task.failed_reason}
+                        </div>
+                      )}
+                      <button
+                        onClick={handleRetry}
+                        className="bg-blue-600 text-white text-sm px-4 py-2 rounded-md hover:bg-blue-700"
+                      >
+                        Retry
+                      </button>
+                    </>
                   )}
-                  <button
-                    onClick={handleRetry}
-                    className="bg-blue-600 text-white text-sm px-4 py-2 rounded-md hover:bg-blue-700"
-                  >
-                    Retry
-                  </button>
                 </div>
               )}
 

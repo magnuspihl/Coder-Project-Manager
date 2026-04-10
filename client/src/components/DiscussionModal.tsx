@@ -14,6 +14,7 @@ import {
 import { useDraft } from '../hooks/useDraft';
 import { linkify } from '../utils/linkify';
 import Markdown from './Markdown';
+import RateLimitBanner from './RateLimitBanner';
 
 function timeAgo(iso: string): string {
   const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -340,6 +341,14 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                     </p>
                   )}
                 </div>
+              )}
+
+              {/* Rate limit banner */}
+              {!discussion.running && discussion.rate_limit && (
+                <RateLimitBanner
+                  rateLimit={discussion.rate_limit}
+                  resumeLabel="Send again"
+                />
               )}
 
               {/* Pending task requests */}
