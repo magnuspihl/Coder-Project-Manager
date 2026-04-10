@@ -4,13 +4,11 @@ import { useTheme } from '../hooks/useTheme';
 
 export default function Layout({
   children,
-  onOpenSelfChat,
-  selfChatUnread,
+  selfChatUrl,
 }: {
   user?: User;
   onLogout?: () => void;
-  onOpenSelfChat?: () => void;
-  selfChatUnread?: boolean;
+  selfChatUrl?: string | null;
   children: ReactNode;
 }) {
   const { theme, setTheme } = useTheme();
@@ -22,20 +20,19 @@ export default function Layout({
           Coder Project Manager
         </span>
         <div className="flex items-center gap-4">
-          {onOpenSelfChat && (
-            <button
-              onClick={onOpenSelfChat}
-              className="relative text-xs px-3 py-1.5 bg-purple-600 text-white rounded-full hover:bg-purple-700 transition-colors flex items-center gap-1.5"
-              title="Chat with this workspace's assistant"
+          {selfChatUrl && (
+            <a
+              href={selfChatUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-xs px-3 py-1.5 bg-purple-600 text-white rounded-full hover:bg-purple-700 transition-colors flex items-center gap-1.5 no-underline"
+              title="Open assistant chat"
             >
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
               </svg>
               Assistant
-              {selfChatUnread && (
-                <span className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-red-500 rounded-full border border-white dark:border-gray-900" />
-              )}
-            </button>
+            </a>
           )}
           <div className="flex items-center bg-gray-100 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-0.5">
             {([
