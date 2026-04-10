@@ -6,6 +6,7 @@ import {
   completeTask,
   reopenTask,
   retryTask,
+  interruptTask,
   cancelTask,
   deleteTask,
   type Task,
@@ -218,6 +219,12 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const handleReopen = async () => {
     await reopenTask(taskId);
     closeAndNotify();
+  };
+
+  const handleInterrupt = async () => {
+    await interruptTask(taskId);
+    if (onTaskChanged) onTaskChanged();
+    await loadData();
   };
 
   const handleCancel = async () => {
@@ -515,7 +522,24 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                 </button>
               )}
 
-              {(task.status === 'working' || task.status === 'queued') && (
+              {task.status === 'working' && (
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={handleInterrupt}
+                    className="bg-amber-500 text-white text-sm px-4 py-2 rounded-md hover:bg-amber-600 font-medium"
+                  >
+                    Interrupt
+                  </button>
+                  <button
+                    onClick={handleCancel}
+                    className="text-sm text-red-500 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300"
+                  >
+                    Cancel Task
+                  </button>
+                </div>
+              )}
+
+              {task.status === 'queued' && (
                 <button
                   onClick={handleCancel}
                   className="text-sm text-red-500 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 mt-2"
