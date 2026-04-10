@@ -16,7 +16,7 @@ import {
   getTaskCostsByWorkspace,
   getWorkingTask,
 } from '../services/tasks.js';
-import { processQueue, resumeTask, cancelTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter } from '../services/claude.js';
+import { processQueue, resumeTask, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { getDb } from '../db/index.js';
@@ -231,6 +231,24 @@ router.post('/tasks/:taskId/retry', requireAuth, async (req: Request, res: Respo
 
   // Let the queue processor decide whether to start it now
   await processQueue(task.workspace_id);
+
+  res.json({ task: getTask(task.id) });
+});
+
+// Interrupt a working task (kills process but transitions to 'awaiting_feedback' so user can continue)
+router.post('/tasks/:taskId/interrupt', requireAuth, (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+
+  if (task.status !== 'working') {
+    res.status(400).json({ error: 'Only working tasks can be interrupted' });
+    return;
+  }
+
+  interruptTask(task.id);
 
   res.json({ task: getTask(task.id) });
 });

@@ -1,4 +1,5 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
+import crypto from 'crypto';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, deleteCurrentSessionAssistantMessages, updateMessageCost, type Task } from './tasks.js';
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, type Discussion } from './discussions.js';
 import { getDb } from '../db/index.js';
@@ -302,9 +303,14 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   const outputFile = remoteOutputPath(task.id);
   const exitFile = remoteExitCodePath(task.id);
 
+  // Generate a launch nonce to prevent stale exit file races.
+  // The nonce is written into the exit file so the poller can distinguish
+  // a fresh exit from a leftover file from a previous launch.
+  const launchNonce = crypto.randomBytes(4).toString('hex');
+
   // Build the remote command:
   // - Write output directly to a file (no stdout pipe — avoids SIGPIPE on server restart)
-  // - Capture Claude's exit code
+  // - Capture Claude's exit code with the launch nonce prefix
   let remoteCmd = 'export PATH="$HOME/.local/bin:$PATH" && ';
   if (task.project_dir) {
     remoteCmd += `cd ${shellEscape(task.project_dir)} && `;
@@ -312,7 +318,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   // Exit file is pre-cleaned above, but rm again in case the pre-clean SSH failed
   remoteCmd += `rm -f ${shellEscape(exitFile)} && `;
   remoteCmd += `${claudeCmd} > ${shellEscape(outputFile)} 2>&1; `;
-  remoteCmd += `echo $? > ${shellEscape(exitFile)}`;
+  remoteCmd += `echo '${launchNonce}:'$? > ${shellEscape(exitFile)}`;
 
   console.log('[claude-executor] Launching on workspace:', task.workspace_name);
   console.log('[claude-executor] Project dir:', task.project_dir || '(none - home dir)');
@@ -350,7 +356,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     sshProcess.unref();
 
     // Observe the task by polling the remote output file
-    startFilePolling(task);
+    startFilePolling(task, launchNonce);
 
   } catch (err) {
     const errorMsg = (err as Error).message || 'Failed to launch Claude';
@@ -424,19 +430,40 @@ export function cancelTask(workspaceId: string): void {
     .get(workspaceId) as { id: string; workspace_name: string; ssh_pid: number | null } | undefined;
 
   if (task) {
-    // Kill the SSH process — this will also kill Claude on the remote side
-    const proc = activeProcesses.get(task.id);
-    if (proc) {
-      proc.kill();
-      activeProcesses.delete(task.id);
-    } else if (task.ssh_pid) {
-      // Orphaned process — kill by PID
-      try { process.kill(task.ssh_pid); } catch {}
-    }
-    stopPolling(task.id);
-    taskActivity.delete(task.id);
-    db.prepare('UPDATE tasks SET ssh_pid = NULL WHERE id = ?').run(task.id);
+    killTaskProcess(task.id, task.ssh_pid);
   }
+}
+
+/**
+ * Interrupt a running task — kills the process but transitions to awaiting_feedback
+ * so the user can continue the conversation (like Ctrl+C in the CLI).
+ */
+export function interruptTask(taskId: string): void {
+  const db = getDb();
+  const task = db.prepare("SELECT id, workspace_name, ssh_pid FROM tasks WHERE id = ? AND status = 'working'")
+    .get(taskId) as { id: string; workspace_name: string; ssh_pid: number | null } | undefined;
+
+  if (task) {
+    killTaskProcess(task.id, task.ssh_pid);
+    addMessage(task.id, 'system', 'Task was interrupted by user.');
+    updateTaskStatus(task.id, 'awaiting_feedback');
+  }
+}
+
+/** Kill the SSH process for a task and clean up tracking state. */
+function killTaskProcess(taskId: string, sshPid: number | null): void {
+  const db = getDb();
+  const proc = activeProcesses.get(taskId);
+  if (proc) {
+    proc.kill();
+    activeProcesses.delete(taskId);
+  } else if (sshPid) {
+    // Orphaned process — kill by PID
+    try { process.kill(sshPid); } catch {}
+  }
+  stopPolling(taskId);
+  taskActivity.delete(taskId);
+  db.prepare('UPDATE tasks SET ssh_pid = NULL WHERE id = ?').run(taskId);
 }
 
 function stopPolling(taskId: string): void {
