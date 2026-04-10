@@ -625,10 +625,10 @@ function startFilePolling(task: Task): void {
           try {
             processEvent(task.id, event);
 
-            // Track rate limit events — only when actually limited, not on every request
+            // Track rate limit events — only when actually rate-limited (not warnings)
             if (event.type === 'rate_limit_event') {
               const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string; status?: string } | undefined;
-              if (info?.status && info.status !== 'allowed' && info?.resetsAt && info.resetsAt * 1000 > Date.now()) {
+              if (info?.status === 'rate_limited' && info?.resetsAt && info.resetsAt * 1000 > Date.now()) {
                 rateLimitInfo.set(task.id, { resetsAt: info.resetsAt, rateLimitType: info.rateLimitType || 'unknown' });
               }
             }
@@ -1083,10 +1083,10 @@ function startDiscussionPolling(discussion: Discussion): void {
           }
 
           try {
-            // Track rate limit events
+            // Track rate limit events — only when actually rate-limited (not warnings)
             if (event.type === 'rate_limit_event') {
               const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string; status?: string } | undefined;
-              if (info?.status && info.status !== 'allowed' && info?.resetsAt && info.resetsAt * 1000 > Date.now()) {
+              if (info?.status === 'rate_limited' && info?.resetsAt && info.resetsAt * 1000 > Date.now()) {
                 rateLimitInfo.set(`disc:${discussion.id}`, { resetsAt: info.resetsAt, rateLimitType: info.rateLimitType || 'unknown' });
               }
             }
