@@ -322,7 +322,9 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                       ? 'bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800 ml-8'
                       : msg.role === 'assistant'
                       ? 'bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 mr-8'
-                      : 'bg-purple-50 dark:bg-purple-900/20 border border-purple-100 dark:border-purple-800 text-purple-700 dark:text-purple-400 text-sm'
+                      : msg.content.startsWith('Error:')
+                      ? 'bg-red-50 dark:bg-red-900/20 border border-red-100 dark:border-red-800 text-red-700 dark:text-red-400 text-sm'
+                      : 'bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 text-sm'
                   }`}
                 >
                   <div className="flex items-center justify-between mb-1">
