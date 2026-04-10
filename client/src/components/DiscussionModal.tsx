@@ -314,7 +314,14 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                 </div>
               )}
 
-              {messages.map((msg) => (
+              {messages.filter((msg) => {
+                // Hide messages that are entirely task request blocks
+                if (msg.role === 'assistant') {
+                  const stripped = msg.content.replace(/\[TASK_REQUEST\]\s*[\s\S]*?\s*\[\/TASK_REQUEST\]/g, '').trim();
+                  if (!stripped) return false;
+                }
+                return true;
+              }).map((msg) => (
                 <div
                   key={msg.id}
                   className={`rounded-lg p-4 ${
@@ -341,7 +348,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                     </div>
                   </div>
                   {msg.role === 'assistant' ? (
-                    <Markdown content={msg.content} />
+                    <Markdown content={msg.content.replace(/\[TASK_REQUEST\]\s*[\s\S]*?\s*\[\/TASK_REQUEST\]/g, '').trim()} />
                   ) : (
                     <div className="text-sm whitespace-pre-wrap">{linkify(msg.content)}</div>
                   )}
