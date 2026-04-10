@@ -43,6 +43,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const [editingSession, setEditingSession] = useState(false);
   const [sessionIdDraft, setSessionIdDraft] = useState('');
   const [sessionError, setSessionError] = useState('');
+  const [processingRequest, setProcessingRequest] = useState<string | null>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
   const scrollBodyRef = useRef<HTMLDivElement>(null);
   const initialScrollDone = useRef(false);
@@ -150,14 +151,26 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   };
 
   const handleApprove = async (requestId: string) => {
-    await approveTaskRequest(discussionId, requestId);
-    onTaskCreated?.();
-    await loadData();
+    if (processingRequest) return;
+    setProcessingRequest(requestId);
+    try {
+      await approveTaskRequest(discussionId, requestId);
+      onTaskCreated?.();
+      await loadData();
+    } finally {
+      setProcessingRequest(null);
+    }
   };
 
   const handleDismiss = async (requestId: string) => {
-    await dismissTaskRequest(discussionId, requestId);
-    await loadData();
+    if (processingRequest) return;
+    setProcessingRequest(requestId);
+    try {
+      await dismissTaskRequest(discussionId, requestId);
+      await loadData();
+    } finally {
+      setProcessingRequest(null);
+    }
   };
 
   const handleToggleFullAccess = async () => {
@@ -377,15 +390,17 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                   <div className="flex gap-2">
                     <button
                       onClick={() => handleApprove(tr.id)}
-                      className="text-xs px-3 py-1.5 bg-green-600 text-white rounded hover:bg-green-700"
+                      disabled={processingRequest !== null}
+                      className="text-xs px-3 py-1.5 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
-                      Create Task
+                      {processingRequest === tr.id ? 'Creating...' : 'Create Task'}
                     </button>
                     <button
                       onClick={() => handleDismiss(tr.id)}
-                      className="text-xs px-3 py-1.5 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
+                      disabled={processingRequest !== null}
+                      className="text-xs px-3 py-1.5 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
-                      Dismiss
+                      {processingRequest === tr.id ? 'Dismissing...' : 'Dismiss'}
                     </button>
                   </div>
                 </div>
