@@ -424,19 +424,39 @@ export function cancelTask(workspaceId: string): void {
     .get(workspaceId) as { id: string; workspace_name: string; ssh_pid: number | null } | undefined;
 
   if (task) {
-    // Kill the SSH process — this will also kill Claude on the remote side
-    const proc = activeProcesses.get(task.id);
-    if (proc) {
-      proc.kill();
-      activeProcesses.delete(task.id);
-    } else if (task.ssh_pid) {
-      // Orphaned process — kill by PID
-      try { process.kill(task.ssh_pid); } catch {}
-    }
-    stopPolling(task.id);
-    taskActivity.delete(task.id);
-    db.prepare('UPDATE tasks SET ssh_pid = NULL WHERE id = ?').run(task.id);
+    killTaskProcess(task.id, task.ssh_pid);
   }
+}
+
+/**
+ * Interrupt a running task — kills the process but transitions to awaiting_feedback
+ * so the user can continue the conversation (like Ctrl+C in the CLI).
+ */
+export function interruptTask(taskId: string): void {
+  const db = getDb();
+  const task = db.prepare("SELECT id, workspace_name, ssh_pid FROM tasks WHERE id = ? AND status = 'working'")
+    .get(taskId) as { id: string; workspace_name: string; ssh_pid: number | null } | undefined;
+
+  if (task) {
+    killTaskProcess(task.id, task.ssh_pid);
+    addMessage(task.id, 'system', 'Task was interrupted by user.');
+    updateTaskStatus(task.id, 'awaiting_feedback');
+  }
+}
+
+/** Kill the SSH process for a task and clean up tracking state. */
+function killTaskProcess(taskId: string, sshPid: number | null): void {
+  const db = getDb();
+  const proc = activeProcesses.get(taskId);
+  if (proc) {
+    proc.kill();
+    activeProcesses.delete(taskId);
+  } else if (sshPid) {
+    try { process.kill(sshPid); } catch {}
+  }
+  stopPolling(taskId);
+  taskActivity.delete(taskId);
+  db.prepare('UPDATE tasks SET ssh_pid = NULL WHERE id = ?').run(taskId);
 }
 
 function stopPolling(taskId: string): void {
