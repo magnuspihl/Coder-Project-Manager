@@ -46,6 +46,8 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const overlayRef = useRef<HTMLDivElement>(null);
   const scrollBodyRef = useRef<HTMLDivElement>(null);
   const initialScrollDone = useRef(false);
+  const shouldForceScroll = useRef(false);
+  const prevMessageCount = useRef(0);
 
   const loadData = async () => {
     try {
@@ -72,11 +74,18 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   useEffect(() => {
     if (!loading && scrollBodyRef.current) {
       const el = scrollBodyRef.current;
+      const newMessages = messages.length > prevMessageCount.current;
+      prevMessageCount.current = messages.length;
+
       if (!initialScrollDone.current) {
         requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
         initialScrollDone.current = true;
-      } else {
-        const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+      } else if (shouldForceScroll.current) {
+        shouldForceScroll.current = false;
+        requestAnimationFrame(() => { el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }); });
+      } else if (newMessages) {
+        // Auto-scroll on new messages if user hasn't scrolled far up
+        const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 300;
         if (isNearBottom) {
           requestAnimationFrame(() => { el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }); });
         }
@@ -112,6 +121,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     if (e) e.preventDefault();
     if (!message.trim() || sending) return;
     setSending(true);
+    shouldForceScroll.current = true;
     try {
       await sendDiscussionMessage(discussionId, message.trim());
       clearMessage();
