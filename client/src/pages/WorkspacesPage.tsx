@@ -96,6 +96,7 @@ export default function WorkspacesPage() {
   const lastTaskWorkspaceIdRef = useRef<string | null>(null);
   const laneContainerRef = useRef<HTMLDivElement>(null);
   const prevLaneRectsRef = useRef<Map<string, DOMRect>>(new Map());
+  const prevLaneOrderRef = useRef<string[]>([]);
 
   const loadData = async () => {
     try {
@@ -193,43 +194,55 @@ export default function WorkspacesPage() {
   );
 
   // FLIP animation for workspace lane reordering
+  // Only animate when the actual order of lanes changes, not on every re-render
+  const currentLaneOrder = useMemo(() => runningWorkspaces.map(ws => ws.id), [runningWorkspaces]);
+
   useLayoutEffect(() => {
     const container = laneContainerRef.current;
     if (!container) return;
 
     const lanes = container.querySelectorAll<HTMLElement>('[data-ws-id]');
     const prevRects = prevLaneRectsRef.current;
+    const prevOrder = prevLaneOrderRef.current;
 
-    lanes.forEach(lane => {
-      const id = lane.dataset.wsId!;
-      const prevRect = prevRects.get(id);
-      const currentRect = lane.getBoundingClientRect();
+    // Only animate if the order actually changed (not just content updates)
+    const orderChanged = prevOrder.length > 0 &&
+      (prevOrder.length !== currentLaneOrder.length ||
+       prevOrder.some((id, i) => id !== currentLaneOrder[i]));
 
-      if (prevRect) {
-        const deltaX = prevRect.left - currentRect.left;
+    if (orderChanged) {
+      lanes.forEach(lane => {
+        const id = lane.dataset.wsId!;
+        const prevRect = prevRects.get(id);
+        const currentRect = lane.getBoundingClientRect();
 
-        if (Math.abs(deltaX) > 1) {
-          // Invert: snap to old position
-          lane.style.transform = `translateX(${deltaX}px)`;
-          lane.style.transition = 'none';
+        if (prevRect) {
+          const deltaX = prevRect.left - currentRect.left;
 
-          // Force reflow so the browser registers the starting position
-          void lane.offsetHeight;
+          if (Math.abs(deltaX) > 1) {
+            // Invert: snap to old position
+            lane.style.transform = `translateX(${deltaX}px)`;
+            lane.style.transition = 'none';
 
-          // Play: animate to the new position
-          lane.style.transition = 'transform 300ms ease-out';
-          lane.style.transform = '';
+            // Force reflow so the browser registers the starting position
+            void lane.offsetHeight;
+
+            // Play: animate to the new position
+            lane.style.transition = 'transform 300ms ease-out';
+            lane.style.transform = '';
+          }
         }
-      }
-    });
+      });
+    }
 
-    // Snapshot current positions for next render
+    // Always snapshot current positions for next render
     const newRects = new Map<string, DOMRect>();
     lanes.forEach(lane => {
       newRects.set(lane.dataset.wsId!, lane.getBoundingClientRect());
     });
     prevLaneRectsRef.current = newRects;
-  }, [runningWorkspaces, showStopped, stoppedWorkspaces]);
+    prevLaneOrderRef.current = currentLaneOrder;
+  }, [currentLaneOrder, showStopped, stoppedWorkspaces]);
 
   // Compute which task the Space shortcut would open
   const spaceTargetTaskId = useMemo(() => {
