@@ -273,8 +273,8 @@ export async function handleTaskCompletionGit(task: Task): Promise<void> {
 // ─── Task Reopen: new feature branch ────────────────────────────────────
 
 /**
- * When a completed task is reopened, create a new feature branch for continued work.
- * Stores the new branch name on the task.
+ * When a task is reopened, check out its existing branch if it still exists.
+ * Only create a new branch if the previous one was deleted (e.g. merged and cleaned up).
  */
 export async function handleTaskReopenGit(task: Task): Promise<void> {
   const dir = await resolveProjectDir(task);
@@ -284,6 +284,27 @@ export async function handleTaskReopenGit(task: Task): Promise<void> {
 
   try {
     if (!await hasGitRepo(ws, dir)) return;
+
+    // If the task already has a branch, check if it still exists locally
+    const existingBranch = task.git_branch;
+    if (existingBranch) {
+      try {
+        await sshExec(ws, `cd ${dir} && git rev-parse --verify ${existingBranch} 2>/dev/null`);
+        // Branch still exists — just check it out
+        await sshExec(ws, `cd ${dir} && git checkout ${existingBranch}`, 15000);
+        addMessage(task.id, 'system', `Switched back to existing branch \`${existingBranch}\`.`);
+        return;
+      } catch {
+        // Branch doesn't exist locally — check remote
+        try {
+          await sshExec(ws, `cd ${dir} && git fetch origin ${existingBranch} 2>/dev/null && git checkout -b ${existingBranch} origin/${existingBranch}`, 30000);
+          addMessage(task.id, 'system', `Checked out existing remote branch \`${existingBranch}\`.`);
+          return;
+        } catch {
+          // Branch is gone entirely — fall through to create a new one
+        }
+      }
+    }
 
     const defaultBranch = await getDefaultBranch(ws, dir);
     await sshExec(ws, `cd ${dir} && git checkout ${defaultBranch}`, 15000);
