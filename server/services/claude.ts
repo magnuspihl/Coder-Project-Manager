@@ -922,7 +922,9 @@ export async function launchDiscussion(
 
   claudeParts.push('--output-format', 'stream-json');
   claudeParts.push('--verbose');
-  if (!isFullAccess) {
+  if (isFullAccess) {
+    claudeParts.push('--dangerously-skip-permissions');
+  } else {
     claudeParts.push('--allowedTools', shellEscape(DISCUSSION_ALLOWED_TOOLS));
   }
   claudeParts.push('--max-turns', MAX_TURNS);
