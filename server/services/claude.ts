@@ -1107,14 +1107,35 @@ function startDiscussionPolling(discussion: Discussion): void {
       }
 
       if (exitPart !== 'RUNNING' && exitPart !== '') {
+        const exitCode = parseInt(exitPart, 10);
         console.log(`[discussion-poller] Discussion ${discussion.id} finished (exit: ${exitPart})`);
         stopPolling(pollKey);
         taskActivity.delete(`disc:${discussion.id}`);
         activeProcesses.delete(`disc:${discussion.id}`);
         getDb().prepare('UPDATE discussions SET ssh_pid = NULL WHERE id = ?').run(discussion.id);
 
-        // Discussion doesn't change status on completion — it stays 'active'
-        // and waits for the next user message.
+        // Surface errors to the user
+        if (exitCode !== 0 && !isNaN(exitCode)) {
+          // Try to extract error details from the output file (stderr is mixed in)
+          let errorDetail = '';
+          try {
+            const lastLines = await sshExec(discussion.workspace_name,
+              `tail -5 ${shellEscape(outputFile)} 2>/dev/null | grep -v '^{' | head -3`,
+              10000
+            );
+            if (lastLines.trim()) {
+              errorDetail = ': ' + lastLines.trim().split('\n').join(' ').slice(0, 200);
+            }
+          } catch { /* ignore */ }
+
+          const errorMessages: Record<number, string> = {
+            127: 'Claude CLI not found. The workspace may need the Claude Code CLI installed.',
+            126: 'Claude CLI is not executable.',
+            1: 'Claude exited with an error' + errorDetail,
+          };
+          const msg = errorMessages[exitCode] || `Claude exited with code ${exitCode}${errorDetail}`;
+          addDiscussionMessage(discussion.id, 'system', `Error: ${msg}`);
+        }
       }
     } catch (err) {
       consecutiveErrors++;
