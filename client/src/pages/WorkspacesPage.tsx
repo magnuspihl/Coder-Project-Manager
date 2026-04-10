@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
 import {
   getWorkspaces,
   getTasks,
@@ -94,6 +94,8 @@ export default function WorkspacesPage() {
   const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevTaskStatusesRef = useRef<Map<string, string>>(new Map());
   const lastTaskWorkspaceIdRef = useRef<string | null>(null);
+  const laneContainerRef = useRef<HTMLDivElement>(null);
+  const prevLaneRectsRef = useRef<Map<string, DOMRect>>(new Map());
 
   const loadData = async () => {
     try {
@@ -189,6 +191,45 @@ export default function WorkspacesPage() {
     workspaces.filter((ws) => ws.latest_build.status !== 'running'),
     [workspaces]
   );
+
+  // FLIP animation for workspace lane reordering
+  useLayoutEffect(() => {
+    const container = laneContainerRef.current;
+    if (!container) return;
+
+    const lanes = container.querySelectorAll<HTMLElement>('[data-ws-id]');
+    const prevRects = prevLaneRectsRef.current;
+
+    lanes.forEach(lane => {
+      const id = lane.dataset.wsId!;
+      const prevRect = prevRects.get(id);
+      const currentRect = lane.getBoundingClientRect();
+
+      if (prevRect) {
+        const deltaX = prevRect.left - currentRect.left;
+
+        if (Math.abs(deltaX) > 1) {
+          // Invert: snap to old position
+          lane.style.transform = `translateX(${deltaX}px)`;
+          lane.style.transition = 'none';
+
+          // Force reflow so the browser registers the starting position
+          void lane.offsetHeight;
+
+          // Play: animate to the new position
+          lane.style.transition = 'transform 300ms ease-out';
+          lane.style.transform = '';
+        }
+      }
+    });
+
+    // Snapshot current positions for next render
+    const newRects = new Map<string, DOMRect>();
+    lanes.forEach(lane => {
+      newRects.set(lane.dataset.wsId!, lane.getBoundingClientRect());
+    });
+    prevLaneRectsRef.current = newRects;
+  }, [runningWorkspaces, showStopped, stoppedWorkspaces]);
 
   // Compute which task the Space shortcut would open
   const spaceTargetTaskId = useMemo(() => {
@@ -505,6 +546,7 @@ export default function WorkspacesPage() {
     return (
       <div
         key={ws.id}
+        data-ws-id={ws.id}
         className={`flex-shrink-0 w-80 flex flex-col rounded-lg border ${
           isRunning
             ? 'bg-gray-50 dark:bg-gray-900/50 border-gray-200 dark:border-gray-800'
@@ -788,7 +830,7 @@ export default function WorkspacesPage() {
       {workspaces.length === 0 ? (
         <p className="text-gray-500 dark:text-gray-400">No workspaces found.</p>
       ) : (
-        <div className="flex gap-4 overflow-x-auto pb-4 flex-1 min-h-0">
+        <div ref={laneContainerRef} className="flex gap-4 overflow-x-auto pb-4 flex-1 min-h-0">
           {runningWorkspaces.map(renderWorkspaceColumn)}
           {showStopped && stoppedWorkspaces.map(renderWorkspaceColumn)}
         </div>
