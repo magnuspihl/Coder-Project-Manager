@@ -9,6 +9,7 @@ export interface Discussion {
   claude_session_id: string | null;
   status: string;
   project_dir: string | null;
+  full_access: number;
   ssh_pid: number | null;
   created_at: string;
   updated_at: string;
@@ -53,23 +54,49 @@ export function createDiscussion(params: {
   workspaceId: string;
   workspaceName: string;
   userId: string;
+  fullAccess?: boolean;
 }): Discussion {
   const db = getDb();
   const id = uuid();
   const claudeSessionId = uuid();
+  const fullAccess = params.fullAccess ? 1 : 0;
 
   db.prepare(
-    `INSERT INTO discussions (id, workspace_id, workspace_name, user_id, claude_session_id, status)
-     VALUES (?, ?, ?, ?, ?, 'active')`
-  ).run(id, params.workspaceId, params.workspaceName, params.userId, claudeSessionId);
+    `INSERT INTO discussions (id, workspace_id, workspace_name, user_id, claude_session_id, full_access, status)
+     VALUES (?, ?, ?, ?, ?, ?, 'active')`
+  ).run(id, params.workspaceId, params.workspaceName, params.userId, claudeSessionId, fullAccess);
 
   return getDiscussion(id)!;
+}
+
+// Workspace settings
+
+export function getDiscussionFullAccess(workspaceId: string): boolean {
+  const db = getDb();
+  const row = db.prepare('SELECT discussion_full_access FROM workspace_settings WHERE workspace_id = ?')
+    .get(workspaceId) as { discussion_full_access: number } | undefined;
+  return row?.discussion_full_access === 1;
+}
+
+export function setDiscussionFullAccess(workspaceId: string, fullAccess: boolean): void {
+  const db = getDb();
+  db.prepare(
+    `INSERT INTO workspace_settings (workspace_id, discussion_full_access, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(workspace_id) DO UPDATE SET discussion_full_access = ?, updated_at = ?`
+  ).run(workspaceId, fullAccess ? 1 : 0, new Date().toISOString(), fullAccess ? 1 : 0, new Date().toISOString());
 }
 
 export function closeDiscussion(id: string): void {
   const db = getDb();
   db.prepare("UPDATE discussions SET status = 'closed', updated_at = ? WHERE id = ?")
     .run(new Date().toISOString(), id);
+}
+
+export function updateDiscussionFullAccess(id: string, fullAccess: boolean): void {
+  const db = getDb();
+  db.prepare("UPDATE discussions SET full_access = ?, updated_at = ? WHERE id = ?")
+    .run(fullAccess ? 1 : 0, new Date().toISOString(), id);
 }
 
 export function updateDiscussionSessionId(id: string, claudeSessionId: string): void {

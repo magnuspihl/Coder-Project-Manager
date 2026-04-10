@@ -4,6 +4,7 @@ import {
   sendDiscussionMessage,
   closeDiscussion,
   updateDiscussionSession,
+  updateDiscussionSettings,
   approveTaskRequest,
   dismissTaskRequest,
   type Discussion,
@@ -13,6 +14,7 @@ import {
 import { useDraft } from '../hooks/useDraft';
 import { linkify } from '../utils/linkify';
 import Markdown from './Markdown';
+import RateLimitBanner from './RateLimitBanner';
 
 function timeAgo(iso: string): string {
   const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -25,12 +27,13 @@ function timeAgo(iso: string): string {
 
 interface DiscussionModalProps {
   discussionId: string;
+  workspaceId: string;
   workspaceName: string;
   onClose: () => void;
   onTaskCreated?: () => void;
 }
 
-export default function DiscussionModal({ discussionId, workspaceName, onClose, onTaskCreated }: DiscussionModalProps) {
+export default function DiscussionModal({ discussionId, workspaceId, workspaceName, onClose, onTaskCreated }: DiscussionModalProps) {
   const [discussion, setDiscussion] = useState<Discussion | null>(null);
   const [messages, setMessages] = useState<DiscussionMessage[]>([]);
   const [taskRequests, setTaskRequests] = useState<TaskRequestItem[]>([]);
@@ -147,6 +150,18 @@ export default function DiscussionModal({ discussionId, workspaceName, onClose, 
     await loadData();
   };
 
+  const handleToggleFullAccess = async () => {
+    if (!discussion || discussion.running) return;
+    const newValue = !discussion.full_access;
+    try {
+      await updateDiscussionSettings(workspaceId, newValue);
+      // Update local state immediately
+      setDiscussion({ ...discussion, full_access: newValue ? 1 : 0 });
+    } catch {
+      // ignore
+    }
+  };
+
   const handleEditSession = () => {
     setSessionIdDraft(discussion?.claude_session_id || '');
     setSessionError('');
@@ -237,6 +252,25 @@ export default function DiscussionModal({ discussionId, workspaceName, onClose, 
                 {sessionError && (
                   <p className="text-[10px] text-red-500 mt-0.5">{sessionError}</p>
                 )}
+                {/* Full Access toggle */}
+                <div className="flex items-center gap-1.5 mt-1.5">
+                  <span className="text-[10px] text-gray-400 dark:text-gray-500 uppercase tracking-wide shrink-0">Access</span>
+                  <button
+                    onClick={handleToggleFullAccess}
+                    disabled={discussion.running}
+                    className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
+                      discussion.full_access ? 'bg-amber-500' : 'bg-gray-300 dark:bg-gray-600'
+                    } ${discussion.running ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                    title={discussion.full_access ? 'Full access — Claude can modify files' : 'Read-only — Claude can only read and explore'}
+                  >
+                    <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${
+                      discussion.full_access ? 'translate-x-3.5' : 'translate-x-0.5'
+                    }`} />
+                  </button>
+                  <span className={`text-[10px] ${discussion.full_access ? 'text-amber-600 dark:text-amber-400' : 'text-gray-400 dark:text-gray-500'}`}>
+                    {discussion.full_access ? 'Full Access' : 'Read-Only'}
+                  </span>
+                </div>
               </div>
               <button
                 onClick={closeModal}
@@ -307,6 +341,14 @@ export default function DiscussionModal({ discussionId, workspaceName, onClose, 
                     </p>
                   )}
                 </div>
+              )}
+
+              {/* Rate limit banner */}
+              {!discussion.running && discussion.rate_limit && (
+                <RateLimitBanner
+                  rateLimit={discussion.rate_limit}
+                  resumeLabel="Send again"
+                />
               )}
 
               {/* Pending task requests */}

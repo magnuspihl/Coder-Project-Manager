@@ -16,7 +16,7 @@ import {
   getTaskCostsByWorkspace,
   getWorkingTask,
 } from '../services/tasks.js';
-import { processQueue, resumeTask, cancelTask, getTaskActivity, getTaskStreamLog, getTaskStreamLogAfter } from '../services/claude.js';
+import { processQueue, resumeTask, cancelTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { getDb } from '../db/index.js';
@@ -31,6 +31,7 @@ router.get('/workspaces/:workspaceId/tasks', requireAuth, (req: Request, res: Re
     ...t,
     activity: t.status === 'working' ? getTaskActivity(t.id) || null : null,
     total_cost_usd: costs[t.id] || 0,
+    rate_limit: getRateLimitInfo(t.id) || null,
   }));
   res.json({ tasks });
 });
@@ -104,7 +105,8 @@ router.get('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
   const totalMessages = limit ? getMessageCount(req.params.taskId) : messages.length;
   const activity = task.status === 'working' ? getTaskActivity(task.id) || null : null;
   const totalCostUsd = getTaskCostUsd(task.id);
-  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd }, messages, totalMessages });
+  const rateLimit = getRateLimitInfo(task.id) || null;
+  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages });
 });
 
 // Get stream log for a task (loaded on demand)

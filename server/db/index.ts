@@ -94,6 +94,12 @@ export function getDb(): Database.Database {
       db.exec("ALTER TABLE tasks ADD COLUMN github_repo_url TEXT");
     }
 
+    // Discussions migrations
+    const discCols = db.prepare("PRAGMA table_info(discussions)").all() as Array<{ name: string }>;
+    if (!discCols.some(c => c.name === 'full_access')) {
+      db.exec("ALTER TABLE discussions ADD COLUMN full_access INTEGER NOT NULL DEFAULT 0");
+    }
+
     // Messages migrations
     const msgCols = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
     if (!msgCols.some(c => c.name === 'username')) {

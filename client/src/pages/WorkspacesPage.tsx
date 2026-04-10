@@ -89,7 +89,7 @@ export default function WorkspacesPage() {
   const [newTaskBranch, setNewTaskBranch] = useState('');
   const [creatingTask, setCreatingTask] = useState(false);
   const [selectedTaskId, setSelectedTaskId] = useSessionState<string | null>('selectedTaskId', null);
-  const [discussionState, setDiscussionState] = useState<{ id: string; workspaceName: string } | null>(null);
+  const [discussionState, setDiscussionState] = useState<{ id: string; workspaceId: string; workspaceName: string } | null>(null);
   const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevTaskStatusesRef = useRef<Map<string, string>>(new Map());
   const lastTaskWorkspaceIdRef = useRef<string | null>(null);
@@ -307,7 +307,7 @@ export default function WorkspacesPage() {
   const handleOpenDiscussion = async (workspaceId: string, workspaceName: string) => {
     try {
       const { discussion } = await getOrCreateDiscussion(workspaceId);
-      setDiscussionState({ id: discussion.id, workspaceName });
+      setDiscussionState({ id: discussion.id, workspaceId, workspaceName });
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to open discussion');
     }
@@ -796,6 +796,7 @@ export default function WorkspacesPage() {
       {discussionState && (
         <DiscussionModal
           discussionId={discussionState.id}
+          workspaceId={discussionState.workspaceId}
           workspaceName={discussionState.workspaceName}
           onClose={() => setDiscussionState(null)}
           onTaskCreated={loadData}

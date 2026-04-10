@@ -6,15 +6,18 @@ import {
   createDiscussion,
   closeDiscussion,
   updateDiscussionSessionId,
+  updateDiscussionFullAccess,
   addDiscussionMessage,
   getDiscussionMessages,
   getTaskRequest,
   getPendingTaskRequests,
   approveTaskRequest,
   dismissTaskRequest,
+  getDiscussionFullAccess,
+  setDiscussionFullAccess,
 } from '../services/discussions.js';
 import { createTask } from '../services/tasks.js';
-import { launchDiscussion, stopDiscussion, getDiscussionActivity, isDiscussionRunning } from '../services/claude.js';
+import { launchDiscussion, stopDiscussion, getDiscussionActivity, isDiscussionRunning, getRateLimitInfo } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { processQueue } from '../services/claude.js';
@@ -32,7 +35,8 @@ router.post('/workspaces/:workspaceId/discussion', requireAuth, async (req: Requ
     const taskRequests = getPendingTaskRequests(discussion.id);
     const activity = getDiscussionActivity(discussion.id) || null;
     const running = isDiscussionRunning(discussion.id);
-    res.json({ discussion: { ...discussion, activity, running }, messages, taskRequests });
+    const rateLimit = getRateLimitInfo(`disc:${discussion.id}`) || null;
+    res.json({ discussion: { ...discussion, activity, running, rate_limit: rateLimit }, messages, taskRequests });
     return;
   }
 
@@ -66,10 +70,12 @@ router.post('/workspaces/:workspaceId/discussion', requireAuth, async (req: Requ
     }
   }
 
+  const fullAccess = getDiscussionFullAccess(workspaceId);
   discussion = createDiscussion({
     workspaceId,
     workspaceName: workspace.name,
     userId: req.user!.id,
+    fullAccess,
   });
 
   res.status(201).json({ discussion: { ...discussion, activity: null, running: false }, messages: [], taskRequests: [] });
@@ -86,7 +92,8 @@ router.get('/discussions/:discussionId', requireAuth, (req: Request, res: Respon
   const taskRequests = getPendingTaskRequests(discussion.id);
   const activity = getDiscussionActivity(discussion.id) || null;
   const running = isDiscussionRunning(discussion.id);
-  res.json({ discussion: { ...discussion, activity, running }, messages, taskRequests });
+  const rateLimit = getRateLimitInfo(`disc:${discussion.id}`) || null;
+  res.json({ discussion: { ...discussion, activity, running, rate_limit: rateLimit }, messages, taskRequests });
 });
 
 // Update discussion session ID
@@ -227,6 +234,29 @@ router.post('/discussions/:discussionId/task-requests/:requestId/dismiss', requi
 
   dismissTaskRequest(taskRequest.id);
   res.json({ ok: true });
+});
+
+// Get workspace discussion settings
+router.get('/workspaces/:workspaceId/discussion-settings', requireAuth, (req: Request, res: Response) => {
+  const fullAccess = getDiscussionFullAccess(req.params.workspaceId);
+  res.json({ fullAccess });
+});
+
+// Update workspace discussion settings (persists across discussions)
+router.patch('/workspaces/:workspaceId/discussion-settings', requireAuth, (req: Request, res: Response) => {
+  const { fullAccess } = req.body;
+  if (typeof fullAccess !== 'boolean') {
+    res.status(400).json({ error: 'fullAccess must be a boolean' });
+    return;
+  }
+  // Persist for future discussions
+  setDiscussionFullAccess(req.params.workspaceId, fullAccess);
+  // Also update the current active discussion if one exists
+  const active = getActiveDiscussion(req.params.workspaceId);
+  if (active) {
+    updateDiscussionFullAccess(active.id, fullAccess);
+  }
+  res.json({ ok: true, fullAccess });
 });
 
 export default router;

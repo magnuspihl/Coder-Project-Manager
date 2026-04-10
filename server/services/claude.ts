@@ -22,6 +22,23 @@ export interface TaskActivity {
 }
 const taskActivity = new Map<string, TaskActivity>();
 
+// Track rate limit info per task/discussion
+export interface RateLimitInfo {
+  resetsAt: number; // Unix timestamp (seconds)
+  rateLimitType: string;
+}
+const rateLimitInfo = new Map<string, RateLimitInfo>();
+
+export function getRateLimitInfo(key: string): RateLimitInfo | undefined {
+  const info = rateLimitInfo.get(key);
+  if (info && info.resetsAt * 1000 < Date.now()) {
+    // Expired, clean up
+    rateLimitInfo.delete(key);
+    return undefined;
+  }
+  return info;
+}
+
 export function getTaskActivity(taskId: string): TaskActivity | undefined {
   return taskActivity.get(taskId);
 }
@@ -588,6 +605,14 @@ function startFilePolling(task: Task): void {
           try {
             processEvent(task.id, event);
 
+            // Track rate limit events
+            if (event.type === 'rate_limit_event') {
+              const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string; status?: string } | undefined;
+              if (info?.resetsAt && info.resetsAt * 1000 > Date.now()) {
+                rateLimitInfo.set(task.id, { resetsAt: info.resetsAt, rateLimitType: info.rateLimitType || 'unknown' });
+              }
+            }
+
             // Save each assistant turn's text as a message immediately,
             // so it appears in the chat UI while the task is still working.
             if (event.type === 'assistant' && (event.message as { content?: unknown })?.content) {
@@ -638,7 +663,15 @@ function startFilePolling(task: Task): void {
         taskActivity.delete(task.id);
         getDb().prepare('UPDATE tasks SET ssh_pid = NULL WHERE id = ?').run(task.id);
 
-        if (resultError) {
+        // Check if this was a rate limit failure
+        const rlInfo = rateLimitInfo.get(task.id);
+        const isRateLimited = rlInfo && rlInfo.resetsAt * 1000 > Date.now();
+
+        if (isRateLimited) {
+          const resetTime = new Date(rlInfo!.resetsAt * 1000).toISOString();
+          addMessage(task.id, 'system', `Rate limited — resets at ${resetTime}`);
+          updateTaskStatus(task.id, 'failed', `rate_limited:${rlInfo!.resetsAt}`);
+        } else if (resultError) {
           addMessage(task.id, 'system', `Error: ${resultError}`);
           updateTaskStatus(task.id, 'failed', resultError);
         } else if (exitCode === 0 || isNaN(exitCode)) {
@@ -819,7 +852,8 @@ export async function launchDiscussion(
   isResume: boolean,
   username?: string
 ): Promise<void> {
-  const prompt = DISCUSSION_PROMPT_PREFIX + message;
+  const isFullAccess = discussion.full_access === 1;
+  const prompt = isFullAccess ? message : DISCUSSION_PROMPT_PREFIX + message;
 
   // Auto-detect project directory if not already set
   if (!discussion.project_dir) {
@@ -871,7 +905,9 @@ export async function launchDiscussion(
 
   claudeParts.push('--output-format', 'stream-json');
   claudeParts.push('--verbose');
-  claudeParts.push('--allowedTools', shellEscape(DISCUSSION_ALLOWED_TOOLS));
+  if (!isFullAccess) {
+    claudeParts.push('--allowedTools', shellEscape(DISCUSSION_ALLOWED_TOOLS));
+  }
   claudeParts.push('--max-turns', MAX_TURNS);
 
   const claudeCmd = claudeParts.join(' ');
@@ -1007,6 +1043,14 @@ function startDiscussionPolling(discussion: Discussion): void {
           }
 
           try {
+            // Track rate limit events
+            if (event.type === 'rate_limit_event') {
+              const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string } | undefined;
+              if (info?.resetsAt && info.resetsAt * 1000 > Date.now()) {
+                rateLimitInfo.set(`disc:${discussion.id}`, { resetsAt: info.resetsAt, rateLimitType: info.rateLimitType || 'unknown' });
+              }
+            }
+
             // Update activity
             const now = new Date().toISOString();
             if (event.type === 'assistant' && event.message) {
