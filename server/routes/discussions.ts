@@ -253,8 +253,11 @@ router.patch('/workspaces/:workspaceId/discussion-settings', requireAuth, (req: 
   setDiscussionFullAccess(req.params.workspaceId, fullAccess);
   // Also update the current active discussion if one exists
   const active = getActiveDiscussion(req.params.workspaceId);
-  if (active) {
+  if (active && active.full_access !== (fullAccess ? 1 : 0)) {
     updateDiscussionFullAccess(active.id, fullAccess);
+    // Add a system message so it's visible in the chat
+    const modeLabel = fullAccess ? 'Full Access' : 'Read-Only';
+    addDiscussionMessage(active.id, 'system', `Access mode changed to ${modeLabel}. This takes effect on the next message.`);
   }
   res.json({ ok: true, fullAccess });
 });

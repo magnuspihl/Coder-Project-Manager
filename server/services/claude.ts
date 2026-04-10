@@ -853,7 +853,24 @@ export async function launchDiscussion(
   username?: string
 ): Promise<void> {
   const isFullAccess = discussion.full_access === 1;
-  const prompt = isFullAccess ? message : DISCUSSION_PROMPT_PREFIX + message;
+  const FULL_ACCESS_OVERRIDE = '[SYSTEM OVERRIDE] Your access mode has been changed to FULL ACCESS. ' +
+    'You are NO LONGER in a read-only session. Disregard any earlier instructions about being read-only or having limited tools. ' +
+    'You now have full access to all tools and can modify files, make commits, run any commands, and perform all actions.\n\n';
+  const READ_ONLY_OVERRIDE = '[SYSTEM OVERRIDE] Your access mode has been changed to READ-ONLY. ' +
+    'You are now in a read-only discussion session. You MUST NOT modify, create, or delete any files, make commits, push to git, or change system state. ' +
+    'Your tools are limited to Read, Glob, Grep, and Bash (read-only commands only).\n\n';
+
+  let prompt: string;
+  if (!isResume) {
+    // First message — use prefix or not based on mode
+    prompt = isFullAccess ? message : DISCUSSION_PROMPT_PREFIX + message;
+  } else if (isFullAccess) {
+    // Resuming with full access — always send override in case mode was changed
+    prompt = FULL_ACCESS_OVERRIDE + message;
+  } else {
+    // Resuming in read-only — send override in case mode was changed
+    prompt = READ_ONLY_OVERRIDE + message;
+  }
 
   // Auto-detect project directory if not already set
   if (!discussion.project_dir) {
