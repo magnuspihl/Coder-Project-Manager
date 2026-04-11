@@ -39,6 +39,34 @@ export function getRateLimitInfo(key: string): RateLimitInfo | undefined {
   return info;
 }
 
+// Track Claude account usage per workspace (from rate_limit_event utilization)
+export interface WorkspaceUsage {
+  utilization: number; // 0-1 fraction
+  rateLimitType: string;
+  resetsAt: number;
+  updatedAt: number; // Date.now() when last updated
+}
+const workspaceUsage = new Map<string, WorkspaceUsage>();
+
+function updateWorkspaceUsage(workspaceName: string, info: { utilization?: number; rateLimitType?: string; resetsAt?: number }): void {
+  if (typeof info.utilization === 'number') {
+    workspaceUsage.set(workspaceName, {
+      utilization: info.utilization,
+      rateLimitType: info.rateLimitType || 'unknown',
+      resetsAt: info.resetsAt || 0,
+      updatedAt: Date.now(),
+    });
+  }
+}
+
+export function getWorkspaceUsages(): Record<string, WorkspaceUsage> {
+  const result: Record<string, WorkspaceUsage> = {};
+  for (const [name, usage] of workspaceUsage) {
+    result[name] = usage;
+  }
+  return result;
+}
+
 export function getTaskActivity(taskId: string): TaskActivity | undefined {
   return taskActivity.get(taskId);
 }
@@ -625,11 +653,14 @@ function startFilePolling(task: Task): void {
           try {
             processEvent(task.id, event);
 
-            // Track rate limit events — only when actually rate-limited (not warnings)
+            // Track rate limit events
             if (event.type === 'rate_limit_event') {
-              const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string; status?: string } | undefined;
-              if (info?.status === 'rate_limited' && info?.resetsAt && info.resetsAt * 1000 > Date.now()) {
-                rateLimitInfo.set(task.id, { resetsAt: info.resetsAt, rateLimitType: info.rateLimitType || 'unknown' });
+              const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string; status?: string; utilization?: number } | undefined;
+              if (info) {
+                updateWorkspaceUsage(task.workspace_name, info);
+                if (info.status === 'rate_limited' && info.resetsAt && info.resetsAt * 1000 > Date.now()) {
+                  rateLimitInfo.set(task.id, { resetsAt: info.resetsAt, rateLimitType: info.rateLimitType || 'unknown' });
+                }
               }
             }
 
@@ -1083,11 +1114,14 @@ function startDiscussionPolling(discussion: Discussion): void {
           }
 
           try {
-            // Track rate limit events — only when actually rate-limited (not warnings)
+            // Track rate limit events
             if (event.type === 'rate_limit_event') {
-              const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string; status?: string } | undefined;
-              if (info?.status === 'rate_limited' && info?.resetsAt && info.resetsAt * 1000 > Date.now()) {
-                rateLimitInfo.set(`disc:${discussion.id}`, { resetsAt: info.resetsAt, rateLimitType: info.rateLimitType || 'unknown' });
+              const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string; status?: string; utilization?: number } | undefined;
+              if (info) {
+                updateWorkspaceUsage(discussion.workspace_name, info);
+                if (info.status === 'rate_limited' && info.resetsAt && info.resetsAt * 1000 > Date.now()) {
+                  rateLimitInfo.set(`disc:${discussion.id}`, { resetsAt: info.resetsAt, rateLimitType: info.rateLimitType || 'unknown' });
+                }
               }
             }
 

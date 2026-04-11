@@ -147,8 +147,15 @@ export interface TokenTotals {
   total_cost_usd: number;
 }
 
+export interface ClaudeUsage {
+  utilization: number;
+  rateLimitType: string;
+  resetsAt: number;
+  updatedAt: number;
+}
+
 export const getWorkspaces = () =>
-  request<{ workspaces: Workspace[]; taskCounts: Record<string, TaskCounts>; tokenTotals: Record<string, TokenTotals>; githubRepoUrls: Record<string, string>; latestDiscussionMessages: Record<string, string> }>('/api/workspaces');
+  request<{ workspaces: Workspace[]; taskCounts: Record<string, TaskCounts>; tokenTotals: Record<string, TokenTotals>; githubRepoUrls: Record<string, string>; latestDiscussionMessages: Record<string, string>; claudeUsage: Record<string, ClaudeUsage> }>('/api/workspaces');
 
 export const getWorkspace = (id: string) =>
   request<{ workspace: Workspace }>(`/api/workspaces/${id}`);

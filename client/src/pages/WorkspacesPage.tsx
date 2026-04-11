@@ -17,6 +17,7 @@ import {
   type Task,
   type TaskCounts,
   type TokenTotals,
+  type ClaudeUsage,
 } from '../api/client';
 import { playChime } from '../utils/chime';
 import { useDraft, useSessionState } from '../hooks/useDraft';
@@ -81,6 +82,7 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
   const [tokenTotals, setTokenTotals] = useState<Record<string, TokenTotals>>({});
   const [githubRepoUrls, setGithubRepoUrls] = useState<Record<string, string>>({});
   const [latestDiscussionMessages, setLatestDiscussionMessages] = useState<Record<string, string>>({});
+  const [claudeUsage, setClaudeUsage] = useState<Record<string, ClaudeUsage>>({});
   const [tasksByWorkspace, setTasksByWorkspace] = useState<Record<string, Task[]>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -101,12 +103,13 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
 
   const loadData = async () => {
     try {
-      const { workspaces: ws, taskCounts: tc, tokenTotals: tt, githubRepoUrls: gh, latestDiscussionMessages: ldm } = await getWorkspaces();
+      const { workspaces: ws, taskCounts: tc, tokenTotals: tt, githubRepoUrls: gh, latestDiscussionMessages: ldm, claudeUsage: cu } = await getWorkspaces();
       setWorkspaces(ws);
       setTaskCounts(tc);
       setTokenTotals(tt || {});
       setGithubRepoUrls(gh || {});
       setLatestDiscussionMessages(ldm || {});
+      setClaudeUsage(cu || {});
       setError('');
 
       // Fetch tasks for running workspaces in parallel
@@ -735,6 +738,33 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
                   {tokens.total_cost_usd > 0 && (
                     <span className={tokens.total_input_tokens > 0 || tokens.total_output_tokens > 0 ? 'ml-1.5' : ''}>${tokens.total_cost_usd.toFixed(2)}</span>
                   )}
+                </div>
+              )}
+              {claudeUsage[ws.name] && (
+                <div className="mt-1" title={`Claude ${claudeUsage[ws.name].rateLimitType.replace(/_/g, ' ')} usage: ${Math.round(claudeUsage[ws.name].utilization * 100)}%`}>
+                  <div className="flex items-center gap-1.5">
+                    <div className="flex-1 h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+                      <div
+                        className={`h-full rounded-full transition-all ${
+                          claudeUsage[ws.name].utilization >= 0.9
+                            ? 'bg-red-500'
+                            : claudeUsage[ws.name].utilization >= 0.75
+                              ? 'bg-amber-500'
+                              : 'bg-blue-500'
+                        }`}
+                        style={{ width: `${Math.min(100, Math.round(claudeUsage[ws.name].utilization * 100))}%` }}
+                      />
+                    </div>
+                    <span className={`text-[10px] font-mono ${
+                      claudeUsage[ws.name].utilization >= 0.9
+                        ? 'text-red-500'
+                        : claudeUsage[ws.name].utilization >= 0.75
+                          ? 'text-amber-500'
+                          : 'text-gray-400 dark:text-gray-500'
+                    }`}>
+                      {Math.round(claudeUsage[ws.name].utilization * 100)}%
+                    </span>
+                  </div>
                 </div>
               )}
             </div>
