@@ -248,6 +248,20 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
     prevLaneOrderRef.current = currentLaneOrder;
   }, [currentLaneOrder, showStopped, stoppedWorkspaces]);
 
+  // Equalize workspace header heights across all visible lanes
+  useLayoutEffect(() => {
+    const container = laneContainerRef.current;
+    if (!container) return;
+    const headers = container.querySelectorAll<HTMLElement>('[data-ws-header]');
+    // Reset to auto so we measure natural heights
+    headers.forEach(h => { h.style.minHeight = ''; });
+    let max = 0;
+    headers.forEach(h => { max = Math.max(max, h.offsetHeight); });
+    if (max > 0) {
+      headers.forEach(h => { h.style.minHeight = `${max}px`; });
+    }
+  });
+
   // Compute which task the Space shortcut would open
   const spaceTargetTaskId = useMemo(() => {
     for (const ws of runningWorkspaces) {
@@ -589,7 +603,7 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
         }`}
       >
         {/* Workspace header */}
-        <div className="p-4 border-b border-gray-200 dark:border-gray-800">
+        <div className="p-4 border-b border-gray-200 dark:border-gray-800" data-ws-header>
           <div className="flex items-center justify-between mb-1">
             <span className="font-medium text-gray-900 dark:text-gray-100 truncate">
               {ws.name}
