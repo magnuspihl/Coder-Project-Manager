@@ -1,5 +1,5 @@
 import { sshExec, detectProjectDir } from './claude.js';
-import { addMessage, updateTaskStatus, type Task } from './tasks.js';
+import { addMessage, updateTaskStatus, getTask, type Task } from './tasks.js';
 import { getDb } from '../db/index.js';
 import { execFile } from 'child_process';
 
@@ -138,7 +138,10 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
       // Pull may fail if no remote — continue anyway
     }
 
-    const branchName = generateBranchName(task);
+    // Re-read the task to pick up the LLM-generated title (may have arrived
+    // while we were doing git checkout/pull above)
+    const freshTask = getTask(task.id) || task;
+    const branchName = generateBranchName(freshTask);
     await sshExec(ws, `cd ${dir} && git checkout -b ${branchName}`, 15000);
 
     storeTaskBranch(task.id, branchName);
