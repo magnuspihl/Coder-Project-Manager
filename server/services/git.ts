@@ -224,16 +224,24 @@ export async function handleTaskCompletionGit(task: Task): Promise<void> {
     await sshExec(ws, `cd ${dir} && git checkout ${branch}`, 15000);
 
     // Ensure all changes are committed and pushed
-    const status = await sshExec(ws, `cd ${dir} && git status --porcelain`);
-    if (status) {
-      await sshExec(ws, `cd ${dir} && git add -A && git commit -m "Final changes for task ${task.id}"`, 30000);
+    try {
+      const status = await sshExec(ws, `cd ${dir} && git status --porcelain`);
+      if (status.trim()) {
+        await sshExec(ws, `cd ${dir} && git add -A && git commit -m "Final changes for task ${task.id}"`, 30000);
+      }
+    } catch {
+      // Commit may fail if there's nothing to commit — that's fine
     }
 
-    // Push the branch
+    // Push the branch (may fail if nothing to push — also fine)
     try {
       await sshExec(ws, `cd ${dir} && git push -u origin ${branch}`, 30000);
     } catch {
-      await sshExec(ws, `cd ${dir} && git push origin ${branch}`, 30000);
+      try {
+        await sshExec(ws, `cd ${dir} && git push origin ${branch}`, 30000);
+      } catch {
+        // Nothing to push — continue to check if there's anything to PR
+      }
     }
 
     // Check if there are commits to PR
@@ -242,7 +250,12 @@ export async function handleTaskCompletionGit(task: Task): Promise<void> {
       `cd ${dir} && git rev-list --count origin/${defaultBranch}..${branch} 2>/dev/null || echo 0`
     );
     if (parseInt(count, 10) <= 0) {
-      addMessage(task.id, 'system', `Branch \`${branch}\` has no new commits ahead of ${defaultBranch}. No PR created.`);
+      // No changes to merge — clean up the empty branch and complete normally
+      try {
+        await sshExec(ws, `cd ${dir} && git checkout ${defaultBranch}`, 15000);
+        await sshExec(ws, `cd ${dir} && git branch -d ${branch} 2>/dev/null`, 10000);
+      } catch { /* ignore cleanup errors */ }
+      addMessage(task.id, 'system', `No changes to merge. Branch \`${branch}\` cleaned up.`);
       return;
     }
 
