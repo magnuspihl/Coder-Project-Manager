@@ -63,13 +63,20 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     }
   };
 
+  const discussionRunningRef = useRef(false);
+  discussionRunningRef.current = !!discussion?.running;
+
   useEffect(() => {
-    const poll = async () => { await loadData(); };
-    poll();
-    const pollMs = discussion?.running ? 3000 : 10000;
-    const interval = setInterval(poll, pollMs);
-    return () => clearInterval(interval);
-  }, [discussionId, discussion?.running]);
+    loadData();
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = () => {
+      loadData().finally(() => {
+        timer = setTimeout(tick, discussionRunningRef.current ? 3000 : 10000);
+      });
+    };
+    timer = setTimeout(tick, 3000);
+    return () => clearTimeout(timer);
+  }, [discussionId]);
 
   // Scroll to bottom
   useEffect(() => {

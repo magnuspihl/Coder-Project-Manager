@@ -157,14 +157,21 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
   const hasActiveTasks = Object.values(taskCounts).some(
     tc => tc.working > 0 || tc.queued > 0
   );
+  const pollMsRef = useRef(5000);
+  pollMsRef.current = hasActiveTasks ? 5000 : 15000;
 
   useEffect(() => {
     loadData();
-    // Poll faster when tasks are active, slower when idle
-    const pollMs = hasActiveTasks ? 5000 : 15000;
-    const interval = setInterval(loadData, pollMs);
-    return () => clearInterval(interval);
-  }, [hasActiveTasks]);
+    // Use dynamic interval that reads current poll frequency from ref
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = () => {
+      loadData().finally(() => {
+        timer = setTimeout(tick, pollMsRef.current);
+      });
+    };
+    timer = setTimeout(tick, pollMsRef.current);
+    return () => clearTimeout(timer);
+  }, []);
 
   // Sorted running workspaces (used for Alt+N targeting, Space shortcut, and rendering)
   const runningWorkspaces = useMemo(() => workspaces
@@ -246,9 +253,11 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
     });
     prevLaneRectsRef.current = newRects;
     prevLaneOrderRef.current = currentLaneOrder;
-  }, [currentLaneOrder, showStopped, stoppedWorkspaces]);
+  }, [currentLaneOrder, showStopped]);
 
   // Equalize workspace header heights across all visible lanes
+  // Re-run when the set of visible workspaces changes or usage data arrives
+  const headerDeps = runningWorkspaces.map(ws => ws.id).join(',') + '|' + Object.keys(claudeUsage).join(',');
   useLayoutEffect(() => {
     const container = laneContainerRef.current;
     if (!container) return;
@@ -260,7 +269,7 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
     if (max > 0) {
       headers.forEach(h => { h.style.minHeight = `${max}px`; });
     }
-  });
+  }, [headerDeps, showStopped]);
 
   // Compute which task the Space shortcut would open
   const spaceTargetTaskId = useMemo(() => {
@@ -271,15 +280,25 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
     return null;
   }, [runningWorkspaces, sortedTasksByWorkspace]);
 
-  // Space shortcut to open the top-left task (uses memoized data)
+  // Stable refs for keyboard handler data (avoids recreating listeners on poll)
+  const runningWorkspacesRef = useRef(runningWorkspaces);
+  runningWorkspacesRef.current = runningWorkspaces;
+  const sortedTasksRef = useRef(sortedTasksByWorkspace);
+  sortedTasksRef.current = sortedTasksByWorkspace;
+  const selectedTaskIdRef = useRef(selectedTaskId);
+  selectedTaskIdRef.current = selectedTaskId;
+  const newTaskWorkspaceIdRef = useRef(newTaskWorkspaceId);
+  newTaskWorkspaceIdRef.current = newTaskWorkspaceId;
+
+  // Space shortcut to open the top-left task (uses refs for stable listener)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== ' ') return;
-      if (selectedTaskId || newTaskWorkspaceId) return;
+      if (selectedTaskIdRef.current || newTaskWorkspaceIdRef.current) return;
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (e.target as HTMLElement)?.isContentEditable) return;
-      for (const ws of runningWorkspaces) {
-        const sorted = sortedTasksByWorkspace[ws.id] || [];
+      for (const ws of runningWorkspacesRef.current) {
+        const sorted = sortedTasksRef.current[ws.id] || [];
         if (sorted.length > 0) {
           e.preventDefault();
           setSelectedTaskId(sorted[0].id);
@@ -289,7 +308,7 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [runningWorkspaces, sortedTasksByWorkspace, selectedTaskId, newTaskWorkspaceId]);
+  }, []);
 
   // Compute the target workspace for Alt+N: last-created-in workspace, or left-most running
   const getAltNTargetWorkspaceId = (): string | null => {
@@ -301,11 +320,11 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
 
   const altNTargetWorkspaceId = getAltNTargetWorkspaceId();
 
-  // Alt+N shortcut to open new task form
+  // Alt+N shortcut to open new task form (uses refs for stable listener)
   useEffect(() => {
     const handleAltN = (e: KeyboardEvent) => {
       if (!e.altKey || e.key.toLowerCase() !== 'n') return;
-      if (selectedTaskId || newTaskWorkspaceId) return;
+      if (selectedTaskIdRef.current || newTaskWorkspaceIdRef.current) return;
       const target = getAltNTargetWorkspaceId();
       if (!target) return;
       e.preventDefault();
@@ -315,7 +334,7 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
     };
     window.addEventListener('keydown', handleAltN);
     return () => window.removeEventListener('keydown', handleAltN);
-  }, [workspaces, taskCounts, selectedTaskId, newTaskWorkspaceId]);
+  }, []);
 
   const handleStop = async (e: React.MouseEvent, id: string, name: string) => {
     e.preventDefault();

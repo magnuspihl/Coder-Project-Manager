@@ -82,15 +82,23 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   };
 
   // Load stream log only when panel is open, using incremental fetching
+  const logOpenRef = useRef(logOpen);
+  logOpenRef.current = logOpen;
+  const taskStatusRef = useRef(task?.status);
+  taskStatusRef.current = task?.status;
+
   const loadStreamLog = async () => {
     try {
       const afterId = maxStreamLogIdRef.current;
       const { streamLog: newEntries } = await getStreamLog(taskId, afterId || undefined);
       if (newEntries.length > 0) {
         if (afterId === 0) {
-          setStreamLog(newEntries);
+          setStreamLog(newEntries.slice(-500));
         } else {
-          setStreamLog(prev => [...prev, ...newEntries]);
+          setStreamLog(prev => {
+            const combined = [...prev, ...newEntries];
+            return combined.length > 500 ? combined.slice(-500) : combined;
+          });
         }
         const lastEntry = newEntries[newEntries.length - 1];
         if (lastEntry?.id) maxStreamLogIdRef.current = lastEntry.id;
@@ -102,19 +110,23 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
   // Single unified poll: fetch task detail, and stream log when needed
   useEffect(() => {
-    const isWorking = task?.status === 'working';
-    const needsStreamLog = logOpen || isWorking;
-
     const poll = async () => {
       await loadData();
-      if (needsStreamLog) await loadStreamLog();
+      const isWorking = taskStatusRef.current === 'working';
+      if (logOpenRef.current || isWorking) await loadStreamLog();
     };
 
     poll();
-    const pollMs = isWorking ? 3000 : 10000;
-    const interval = setInterval(poll, pollMs);
-    return () => clearInterval(interval);
-  }, [taskId, task?.status, logOpen]);
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = () => {
+      poll().finally(() => {
+        const pollMs = taskStatusRef.current === 'working' ? 3000 : 10000;
+        timer = setTimeout(tick, pollMs);
+      });
+    };
+    timer = setTimeout(tick, taskStatusRef.current === 'working' ? 3000 : 10000);
+    return () => clearTimeout(timer);
+  }, [taskId]);
 
   // Scroll to bottom on initial load and when new messages arrive
   useEffect(() => {
@@ -170,14 +182,14 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') closeModal();
-      if (e.altKey && e.key === 'c' && task?.status === 'awaiting_feedback') {
+      if (e.altKey && e.key === 'c' && taskStatusRef.current === 'awaiting_feedback') {
         e.preventDefault();
         handleComplete();
       }
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [onClose, task?.status]);
+  }, []);
 
   const closeAndNotify = () => {
     onTaskChanged?.();
