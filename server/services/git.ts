@@ -1,5 +1,5 @@
 import { sshExec, detectProjectDir } from './claude.js';
-import { addMessage, type Task } from './tasks.js';
+import { addMessage, updateTaskStatus, type Task } from './tasks.js';
 import { getDb } from '../db/index.js';
 import { execFile } from 'child_process';
 
@@ -263,10 +263,14 @@ export async function handleTaskCompletionGit(task: Task): Promise<void> {
       // Switch back to default branch
       await sshExec(ws, `cd ${dir} && git checkout ${defaultBranch} && git pull origin ${defaultBranch}`, 30000);
     } catch (mergeErr: any) {
-      addMessage(task.id, 'system', `PR created but merge failed: ${mergeErr.message || mergeErr}. Manual merge may be needed.`);
+      const reason = `PR created but merge failed: ${mergeErr.message || mergeErr}. Manual merge may be needed.`;
+      addMessage(task.id, 'system', `Error: ${reason}`);
+      updateTaskStatus(task.id, 'failed', `merge_failed: ${reason}`);
     }
   } catch (err: any) {
-    addMessage(task.id, 'system', `Git PR/merge failed: ${err.message || err}`);
+    const reason = `Git PR/merge failed: ${err.message || err}`;
+    addMessage(task.id, 'system', `Error: ${reason}`);
+    updateTaskStatus(task.id, 'failed', `merge_failed: ${reason}`);
   }
 }
 
