@@ -260,14 +260,19 @@ export const updateDiscussionSettings = (workspaceId: string, fullAccess: boolea
   });
 
 export const getOrCreateDiscussion = (workspaceId: string) =>
-  request<{ discussion: Discussion; messages: DiscussionMessage[]; taskRequests: TaskRequestItem[] }>(
+  request<{ discussion: Discussion; messages: DiscussionMessage[]; totalMessages?: number; taskRequests: TaskRequestItem[] }>(
     `/api/workspaces/${workspaceId}/discussion`,
     { method: 'POST' }
   );
 
-export const getDiscussionDetail = (discussionId: string) =>
-  request<{ discussion: Discussion; messages: DiscussionMessage[]; taskRequests: TaskRequestItem[] }>(
-    `/api/discussions/${discussionId}`
+export const getDiscussionDetail = (discussionId: string, afterId?: string) =>
+  request<{ discussion: Discussion; messages: DiscussionMessage[]; totalMessages: number; taskRequests: TaskRequestItem[] }>(
+    `/api/discussions/${discussionId}${afterId ? `?after=${afterId}` : ''}`
+  );
+
+export const getOlderDiscussionMessages = (discussionId: string, beforeId: string, limit = 50) =>
+  request<{ messages: DiscussionMessage[] }>(
+    `/api/discussions/${discussionId}/messages?before=${beforeId}&limit=${limit}`
   );
 
 export const updateDiscussionSession = (discussionId: string, claudeSessionId: string) =>

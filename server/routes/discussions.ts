@@ -9,6 +9,8 @@ import {
   updateDiscussionFullAccess,
   addDiscussionMessage,
   getDiscussionMessages,
+  getDiscussionMessageCount,
+  getDiscussionMessagesAfterId,
   getTaskRequest,
   getPendingTaskRequests,
   approveTaskRequest,
@@ -31,12 +33,13 @@ router.post('/workspaces/:workspaceId/discussion', requireAuth, async (req: Requ
   // Check for existing active discussion
   let discussion = getActiveDiscussion(workspaceId);
   if (discussion) {
-    const messages = getDiscussionMessages(discussion.id);
+    const messages = getDiscussionMessages(discussion.id, 50);
+    const totalMessages = getDiscussionMessageCount(discussion.id);
     const taskRequests = getPendingTaskRequests(discussion.id);
     const activity = getDiscussionActivity(discussion.id) || null;
     const running = isDiscussionRunning(discussion.id);
     const rateLimit = getRateLimitInfo(`disc:${discussion.id}`) || null;
-    res.json({ discussion: { ...discussion, activity, running, rate_limit: rateLimit }, messages, taskRequests });
+    res.json({ discussion: { ...discussion, activity, running, rate_limit: rateLimit }, messages, totalMessages, taskRequests });
     return;
   }
 
@@ -81,19 +84,40 @@ router.post('/workspaces/:workspaceId/discussion', requireAuth, async (req: Requ
   res.status(201).json({ discussion: { ...discussion, activity: null, running: false }, messages: [], taskRequests: [] });
 });
 
-// Get discussion details
+// Get discussion details (supports incremental polling via ?after=<messageId>)
 router.get('/discussions/:discussionId', requireAuth, (req: Request, res: Response) => {
   const discussion = getDiscussion(req.params.discussionId);
   if (!discussion) {
     res.status(404).json({ error: 'Discussion not found' });
     return;
   }
-  const messages = getDiscussionMessages(discussion.id);
+  const afterId = req.query.after as string | undefined;
+  const messages = afterId
+    ? getDiscussionMessagesAfterId(discussion.id, afterId)
+    : getDiscussionMessages(discussion.id, 50);
+  const totalMessages = getDiscussionMessageCount(discussion.id);
   const taskRequests = getPendingTaskRequests(discussion.id);
   const activity = getDiscussionActivity(discussion.id) || null;
   const running = isDiscussionRunning(discussion.id);
   const rateLimit = getRateLimitInfo(`disc:${discussion.id}`) || null;
-  res.json({ discussion: { ...discussion, activity, running, rate_limit: rateLimit }, messages, taskRequests });
+  res.json({ discussion: { ...discussion, activity, running, rate_limit: rateLimit }, messages, totalMessages, taskRequests });
+});
+
+// Load older messages before a given message ID
+router.get('/discussions/:discussionId/messages', requireAuth, (req: Request, res: Response) => {
+  const discussion = getDiscussion(req.params.discussionId);
+  if (!discussion) {
+    res.status(404).json({ error: 'Discussion not found' });
+    return;
+  }
+  const beforeId = req.query.before as string;
+  const limit = Math.min(parseInt(req.query.limit as string, 10) || 50, 200);
+  if (!beforeId) {
+    res.status(400).json({ error: 'before parameter required' });
+    return;
+  }
+  const messages = getDiscussionMessages(discussion.id, limit, beforeId);
+  res.json({ messages });
 });
 
 // Update discussion session ID

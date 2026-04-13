@@ -121,11 +121,40 @@ export function addDiscussionMessage(
   return { id, discussion_id: discussionId, role, content, cost: cost ?? null, username: username ?? null, created_at: now };
 }
 
-export function getDiscussionMessages(discussionId: string): DiscussionMessage[] {
+export function getDiscussionMessages(discussionId: string, limit?: number, beforeId?: string): DiscussionMessage[] {
   const db = getDb();
+  if (limit && beforeId) {
+    // Fetch older messages before a given ID
+    const ref = db.prepare('SELECT created_at FROM discussion_messages WHERE id = ?').get(beforeId) as { created_at: string } | undefined;
+    if (!ref) return [];
+    return db.prepare(
+      'SELECT * FROM discussion_messages WHERE discussion_id = ? AND (created_at < ? OR (created_at = ? AND id < ?)) ORDER BY created_at DESC, id DESC LIMIT ?'
+    ).all(discussionId, ref.created_at, ref.created_at, beforeId, limit).reverse() as DiscussionMessage[];
+  }
+  if (limit) {
+    // Fetch the latest N messages
+    return db.prepare(
+      'SELECT * FROM (SELECT * FROM discussion_messages WHERE discussion_id = ? ORDER BY created_at DESC, id DESC LIMIT ?) sub ORDER BY created_at ASC, id ASC'
+    ).all(discussionId, limit) as DiscussionMessage[];
+  }
   return db.prepare(
     'SELECT * FROM discussion_messages WHERE discussion_id = ? ORDER BY created_at ASC'
   ).all(discussionId) as DiscussionMessage[];
+}
+
+export function getDiscussionMessageCount(discussionId: string): number {
+  const db = getDb();
+  const row = db.prepare('SELECT COUNT(*) as cnt FROM discussion_messages WHERE discussion_id = ?').get(discussionId) as { cnt: number };
+  return row.cnt;
+}
+
+export function getDiscussionMessagesAfterId(discussionId: string, afterId: string): DiscussionMessage[] {
+  const db = getDb();
+  const ref = db.prepare('SELECT created_at FROM discussion_messages WHERE id = ?').get(afterId) as { created_at: string } | undefined;
+  if (!ref) return [];
+  return db.prepare(
+    'SELECT * FROM discussion_messages WHERE discussion_id = ? AND (created_at > ? OR (created_at = ? AND id > ?)) ORDER BY created_at ASC, id ASC'
+  ).all(discussionId, ref.created_at, ref.created_at, afterId) as DiscussionMessage[];
 }
 
 /**

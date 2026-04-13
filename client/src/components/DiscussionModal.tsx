@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, type FormEvent } from 'react';
 import {
   getDiscussionDetail,
+  getOlderDiscussionMessages,
   sendDiscussionMessage,
   closeDiscussion,
   updateDiscussionSession,
@@ -50,34 +51,79 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const shouldForceScroll = useRef(false);
   const prevMessageCount = useRef(0);
 
+  const [totalMessages, setTotalMessages] = useState(0);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const lastDiscJsonRef = useRef('');
-  const lastMsgsJsonRef = useRef('');
   const lastTrJsonRef = useRef('');
   const discussionRunningRef = useRef(false);
+  const lastMessageIdRef = useRef<string | null>(null);
+  const initialLoadDone = useRef(false);
 
+  // Initial load: fetch latest 50 messages
+  // Subsequent polls: only fetch messages after the last known ID
   const loadData = async () => {
     try {
-      const data = await getDiscussionDetail(discussionId);
+      const afterId = initialLoadDone.current ? lastMessageIdRef.current || undefined : undefined;
+      const data = await getDiscussionDetail(discussionId, afterId || undefined);
+
+      // Update discussion metadata
       const dJson = JSON.stringify(data.discussion);
       if (dJson !== lastDiscJsonRef.current) {
         lastDiscJsonRef.current = dJson;
         setDiscussion(data.discussion);
         discussionRunningRef.current = !!data.discussion?.running;
       }
-      const mJson = JSON.stringify(data.messages);
-      if (mJson !== lastMsgsJsonRef.current) {
-        lastMsgsJsonRef.current = mJson;
-        setMessages(data.messages);
-      }
+
+      setTotalMessages(data.totalMessages);
+
+      // Update task requests
       const trJson = JSON.stringify(data.taskRequests);
       if (trJson !== lastTrJsonRef.current) {
         lastTrJsonRef.current = trJson;
         setTaskRequests(data.taskRequests);
       }
+
+      // Messages
+      if (!initialLoadDone.current) {
+        // First load — set all messages
+        setMessages(data.messages);
+        if (data.messages.length > 0) {
+          lastMessageIdRef.current = data.messages[data.messages.length - 1].id;
+        }
+        initialLoadDone.current = true;
+      } else if (data.messages.length > 0) {
+        // Incremental — append new messages
+        setMessages(prev => [...prev, ...data.messages]);
+        lastMessageIdRef.current = data.messages[data.messages.length - 1].id;
+      }
     } catch {
       // ignore
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadOlderMessages = async () => {
+    if (loadingOlder || messages.length === 0) return;
+    setLoadingOlder(true);
+    try {
+      const scrollEl = scrollBodyRef.current;
+      const prevScrollHeight = scrollEl?.scrollHeight || 0;
+
+      const { messages: older } = await getOlderDiscussionMessages(discussionId, messages[0].id, 50);
+      if (older.length > 0) {
+        setMessages(prev => [...older, ...prev]);
+        // Preserve scroll position after prepending
+        requestAnimationFrame(() => {
+          if (scrollEl) {
+            scrollEl.scrollTop += scrollEl.scrollHeight - prevScrollHeight;
+          }
+        });
+      }
+    } catch {
+      // ignore
+    } finally {
+      setLoadingOlder(false);
     }
   };
 
@@ -89,7 +135,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
         if (!cancelled) timer = setTimeout(tick, discussionRunningRef.current ? 3000 : 10000);
       });
     };
-    tick(); // Initial load + start chain
+    tick();
     return () => { cancelled = true; clearTimeout(timer); };
   }, [discussionId]);
 
@@ -333,6 +379,18 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
               {messages.length === 0 && !discussion.running && (
                 <div className="text-center text-gray-400 dark:text-gray-500 text-sm py-8">
                   Start a conversation about this workspace. Claude can read code but won't modify anything.
+                </div>
+              )}
+
+              {totalMessages > messages.length && (
+                <div className="text-center py-2">
+                  <button
+                    onClick={loadOlderMessages}
+                    disabled={loadingOlder}
+                    className="text-xs text-blue-500 hover:text-blue-600 dark:text-blue-400 dark:hover:text-blue-300 disabled:opacity-50"
+                  >
+                    {loadingOlder ? 'Loading...' : `Load earlier messages (${totalMessages - messages.length} more)`}
+                  </button>
                 </div>
               )}
 
