@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react';
+import { useState, memo, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -18,7 +18,7 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-export default function Markdown({ content }: { content: string }) {
+export default memo(function Markdown({ content }: { content: string }) {
   return (
     <div className="markdown-body text-sm">
       <ReactMarkdown
@@ -102,4 +102,4 @@ export default function Markdown({ content }: { content: string }) {
       />
     </div>
   );
-}
+})

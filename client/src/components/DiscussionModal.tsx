@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, type FormEvent } from 'react';
+import { useState, useEffect, useRef, useMemo, memo, type FormEvent } from 'react';
 import {
   getDiscussionDetail,
   getOlderDiscussionMessages,
@@ -16,6 +16,47 @@ import { useDraft } from '../hooks/useDraft';
 import { linkify } from '../utils/linkify';
 import Markdown from './Markdown';
 import RateLimitBanner from './RateLimitBanner';
+
+const TASK_REQUEST_RE = /\[TASK_REQUEST\]\s*[\s\S]*?\s*\[\/TASK_REQUEST\]/g;
+
+const MessageRow = memo(function MessageRow({ msg }: { msg: DiscussionMessage }) {
+  const strippedContent = msg.role === 'assistant'
+    ? msg.content.replace(TASK_REQUEST_RE, '').trim()
+    : msg.content;
+
+  return (
+    <div
+      className={`rounded-lg p-4 ${
+        msg.role === 'user'
+          ? 'bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800 ml-8'
+          : msg.role === 'assistant'
+          ? 'bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 mr-8'
+          : msg.content.startsWith('Error:')
+          ? 'bg-red-50 dark:bg-red-900/20 border border-red-100 dark:border-red-800 text-red-700 dark:text-red-400 text-sm'
+          : 'bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 text-sm'
+      }`}
+    >
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase">
+          {msg.role === 'user' && msg.username ? msg.username : msg.role}
+        </span>
+        <div className="flex items-center gap-2">
+          {msg.cost && (
+            <span className="text-xs text-gray-400 dark:text-gray-500">${msg.cost.toFixed(4)}</span>
+          )}
+          <span className="text-xs text-gray-400 dark:text-gray-500">
+            {new Date(msg.created_at).toLocaleTimeString()}
+          </span>
+        </div>
+      </div>
+      {msg.role === 'assistant' ? (
+        <Markdown content={strippedContent} />
+      ) : (
+        <div className="text-sm whitespace-pre-wrap">{linkify(msg.content)}</div>
+      )}
+    </div>
+  );
+});
 
 function timeAgo(iso: string): string {
   const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -147,7 +188,8 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
       prevMessageCount.current = messages.length;
 
       if (!initialScrollDone.current) {
-        requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
+        // Double-rAF ensures DOM is fully painted before scrolling
+        requestAnimationFrame(() => { requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; }); });
         initialScrollDone.current = true;
       } else if (shouldForceScroll.current) {
         shouldForceScroll.current = false;
@@ -169,6 +211,18 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     window.addEventListener('popstate', handlePopState);
     return () => { window.removeEventListener('popstate', handlePopState); };
   }, []);
+
+  // Memoize filtered message list so we don't re-filter/re-render on every poll
+  const visibleMessages = useMemo(() =>
+    messages.filter((msg) => {
+      if (msg.role === 'assistant') {
+        const stripped = msg.content.replace(TASK_REQUEST_RE, '').trim();
+        if (!stripped) return false;
+      }
+      return true;
+    }),
+    [messages]
+  );
 
   const closeModal = () => {
     if (window.history.state?.modal === 'discussion') {
@@ -394,45 +448,8 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                 </div>
               )}
 
-              {messages.filter((msg) => {
-                // Hide messages that are entirely task request blocks
-                if (msg.role === 'assistant') {
-                  const stripped = msg.content.replace(/\[TASK_REQUEST\]\s*[\s\S]*?\s*\[\/TASK_REQUEST\]/g, '').trim();
-                  if (!stripped) return false;
-                }
-                return true;
-              }).map((msg) => (
-                <div
-                  key={msg.id}
-                  className={`rounded-lg p-4 ${
-                    msg.role === 'user'
-                      ? 'bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800 ml-8'
-                      : msg.role === 'assistant'
-                      ? 'bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 mr-8'
-                      : msg.content.startsWith('Error:')
-                      ? 'bg-red-50 dark:bg-red-900/20 border border-red-100 dark:border-red-800 text-red-700 dark:text-red-400 text-sm'
-                      : 'bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 text-sm'
-                  }`}
-                >
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase">
-                      {msg.role === 'user' && msg.username ? msg.username : msg.role}
-                    </span>
-                    <div className="flex items-center gap-2">
-                      {msg.cost && (
-                        <span className="text-xs text-gray-400 dark:text-gray-500">${msg.cost.toFixed(4)}</span>
-                      )}
-                      <span className="text-xs text-gray-400 dark:text-gray-500">
-                        {new Date(msg.created_at).toLocaleTimeString()}
-                      </span>
-                    </div>
-                  </div>
-                  {msg.role === 'assistant' ? (
-                    <Markdown content={msg.content.replace(/\[TASK_REQUEST\]\s*[\s\S]*?\s*\[\/TASK_REQUEST\]/g, '').trim()} />
-                  ) : (
-                    <div className="text-sm whitespace-pre-wrap">{linkify(msg.content)}</div>
-                  )}
-                </div>
+              {visibleMessages.map((msg) => (
+                <MessageRow key={msg.id} msg={msg} />
               ))}
 
               {/* Working indicator */}
