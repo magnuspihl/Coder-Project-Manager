@@ -20,7 +20,7 @@ import { processQueue, resumeTask, cancelTask, interruptTask, getTaskActivity, g
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { getDb } from '../db/index.js';
-import { handleTaskCompletionGit, handleTaskReopenGit } from '../services/git.js';
+import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch } from '../services/git.js';
 
 const router = Router();
 
@@ -211,6 +211,28 @@ router.post('/tasks/:taskId/reopen', requireAuth, async (req: Request, res: Resp
   handleTaskReopenGit(task).catch(() => {});
 
   res.json({ task: getTask(task.id) });
+});
+
+// Switch workspace to a task's branch
+router.post('/tasks/:taskId/checkout', requireAuth, async (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  // Don't allow checkout while an agent is working on this workspace
+  const working = getWorkingTask(task.workspace_id);
+  if (working) {
+    res.status(409).json({ error: 'Cannot switch branches while a task is running on this workspace' });
+    return;
+  }
+  try {
+    const message = await checkoutTaskBranch(task);
+    addMessage(task.id, 'system', message);
+    res.json({ ok: true, message });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to checkout branch' });
+  }
 });
 
 // Retry a failed task

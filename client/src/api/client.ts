@@ -200,6 +200,9 @@ export const reopenTask = (taskId: string) =>
 export const retryTask = (taskId: string) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/retry`, { method: 'POST' });
 
+export const checkoutTaskBranch = (taskId: string) =>
+  request<{ ok: boolean; message: string }>(`/api/tasks/${taskId}/checkout`, { method: 'POST' });
+
 export const interruptTask = (taskId: string) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/interrupt`, { method: 'POST' });
 

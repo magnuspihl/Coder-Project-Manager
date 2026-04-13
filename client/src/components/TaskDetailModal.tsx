@@ -9,6 +9,7 @@ import {
   interruptTask,
   cancelTask,
   deleteTask,
+  checkoutTaskBranch,
   type Task,
   type Message,
   type StreamLogEntry,
@@ -58,6 +59,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [reply, setReply, clearReply] = useDraft(`reply:${taskId}`);
   const [sending, setSending] = useState(false);
   const [idCopied, setIdCopied] = useState(false);
+  const [checkingOut, setCheckingOut] = useState(false);
   const prevStatusRef = useRef<string | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
@@ -246,6 +248,19 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     closeAndNotify();
   };
 
+  const handleCheckout = async () => {
+    if (!task?.git_branch) return;
+    setCheckingOut(true);
+    try {
+      await checkoutTaskBranch(taskId);
+      await loadData();
+    } catch (err: any) {
+      alert(err?.message || 'Failed to switch branch');
+    } finally {
+      setCheckingOut(false);
+    }
+  };
+
   const handleInterrupt = async () => {
     await interruptTask(taskId);
     if (onTaskChanged) onTaskChanged();
@@ -314,22 +329,38 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                     </span>
                   )}
                   {task.git_branch && (
-                    task.github_repo_url ? (
-                      <a
-                        href={`${task.github_repo_url}/tree/${task.git_branch}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors font-mono"
-                      >
-                        <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path fillRule="evenodd" d="M11.75 2.5a.75.75 0 0 1 .75.75v7.5a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.75Zm-8.5 0a.75.75 0 0 1 .75.75v3.402c.458-.204.96-.319 1.489-.319A4.265 4.265 0 0 1 9.49 9.39V3.25a.75.75 0 0 1 1.5 0v7.5a.75.75 0 0 1-1.5 0v-.156a2.765 2.765 0 0 0-3.999-2.473A2.766 2.766 0 0 0 4 10.75v.001a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.751Z" clipRule="evenodd" /></svg>
-                        {task.git_branch}
-                      </a>
-                    ) : (
-                      <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 font-mono">
-                        <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path fillRule="evenodd" d="M11.75 2.5a.75.75 0 0 1 .75.75v7.5a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.75Zm-8.5 0a.75.75 0 0 1 .75.75v3.402c.458-.204.96-.319 1.489-.319A4.265 4.265 0 0 1 9.49 9.39V3.25a.75.75 0 0 1 1.5 0v7.5a.75.75 0 0 1-1.5 0v-.156a2.765 2.765 0 0 0-3.999-2.473A2.766 2.766 0 0 0 4 10.75v.001a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.751Z" clipRule="evenodd" /></svg>
-                        {task.git_branch}
-                      </span>
-                    )
+                    <span className="inline-flex items-center gap-0">
+                      {task.github_repo_url ? (
+                        <a
+                          href={`${task.github_repo_url}/tree/${task.git_branch}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-l bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors font-mono"
+                        >
+                          <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path fillRule="evenodd" d="M11.75 2.5a.75.75 0 0 1 .75.75v7.5a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.75Zm-8.5 0a.75.75 0 0 1 .75.75v3.402c.458-.204.96-.319 1.489-.319A4.265 4.265 0 0 1 9.49 9.39V3.25a.75.75 0 0 1 1.5 0v7.5a.75.75 0 0 1-1.5 0v-.156a2.765 2.765 0 0 0-3.999-2.473A2.766 2.766 0 0 0 4 10.75v.001a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.751Z" clipRule="evenodd" /></svg>
+                          {task.git_branch}
+                        </a>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-l bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 font-mono">
+                          <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path fillRule="evenodd" d="M11.75 2.5a.75.75 0 0 1 .75.75v7.5a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.75Zm-8.5 0a.75.75 0 0 1 .75.75v3.402c.458-.204.96-.319 1.489-.319A4.265 4.265 0 0 1 9.49 9.39V3.25a.75.75 0 0 1 1.5 0v7.5a.75.75 0 0 1-1.5 0v-.156a2.765 2.765 0 0 0-3.999-2.473A2.766 2.766 0 0 0 4 10.75v.001a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.751Z" clipRule="evenodd" /></svg>
+                          {task.git_branch}
+                        </span>
+                      )}
+                      {task.status !== 'working' && (
+                        <button
+                          onClick={handleCheckout}
+                          disabled={checkingOut}
+                          className="text-xs px-1.5 py-0.5 rounded-r bg-gray-100 dark:bg-gray-800 text-gray-400 dark:text-gray-500 hover:text-green-600 dark:hover:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/20 transition-colors border-l border-gray-200 dark:border-gray-700 disabled:opacity-50"
+                          title="Switch workspace to this branch"
+                        >
+                          {checkingOut ? (
+                            <div className="w-3 h-3 border border-current border-t-transparent rounded-full animate-spin" />
+                          ) : (
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" /></svg>
+                          )}
+                        </button>
+                      )}
+                    </span>
                   )}
                   {task.verification_url && (
                     <a

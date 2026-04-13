@@ -191,6 +191,33 @@ export async function handleTaskResumeGit(task: Task): Promise<void> {
   }
 }
 
+// ─── Manual branch checkout ─────────────────────────────────────────────
+
+/**
+ * Manually switch a workspace to a task's branch.
+ * Returns a status message. Throws on failure.
+ */
+export async function checkoutTaskBranch(task: Task): Promise<string> {
+  const dir = task.project_dir;
+  if (!dir) throw new Error('No project directory for this task');
+  if (!task.git_branch) throw new Error('No branch associated with this task');
+
+  const ws = task.workspace_name;
+  const currentBranch = (await sshExec(ws, `cd ${dir} && git rev-parse --abbrev-ref HEAD`)).trim();
+  if (currentBranch === task.git_branch) {
+    return `Already on branch \`${task.git_branch}\``;
+  }
+
+  // Stash uncommitted changes before switching
+  const status = await sshExec(ws, `cd ${dir} && git status --porcelain`);
+  if (status.trim()) {
+    await sshExec(ws, `cd ${dir} && git stash push -m "auto-stash before switching to ${task.git_branch}"`, 15000);
+  }
+
+  await sshExec(ws, `cd ${dir} && git checkout ${task.git_branch}`, 15000);
+  return `Switched to branch \`${task.git_branch}\``;
+}
+
 // ─── Task Completion: PR + merge ────────────────────────────────────────
 
 /**
