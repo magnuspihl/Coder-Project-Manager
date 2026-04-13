@@ -183,8 +183,9 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
 
   updateTaskStatus(task.id, 'completed');
 
-  // Completion signals acceptance — create PR and merge the feature branch
-  handleTaskCompletionGit(task).catch(() => {});
+  // Completion signals acceptance — create PR and merge the feature branch.
+  // Must finish before the next task starts to avoid concurrent git operations.
+  await handleTaskCompletionGit(task);
 
   // Let the queue processor start the next task
   await processQueue(task.workspace_id);
