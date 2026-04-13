@@ -13,6 +13,7 @@ import {
   restoreTask,
   createTask,
   getOrCreateDiscussion,
+  checkoutTaskBranch,
   type Workspace,
   type Task,
   type TaskCounts,
@@ -405,6 +406,20 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
     await loadData();
   };
 
+  const [checkingOutTaskId, setCheckingOutTaskId] = useState<string | null>(null);
+  const handleCheckoutBranch = async (e: React.MouseEvent, taskId: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setCheckingOutTaskId(taskId);
+    try {
+      await checkoutTaskBranch(taskId);
+    } catch (err: any) {
+      alert(err.message || 'Failed to checkout branch');
+    } finally {
+      setCheckingOutTaskId(null);
+    }
+  };
+
   const handleUndo = async () => {
     if (!deletedTaskId) return;
     if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
@@ -483,7 +498,7 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
         {new Date(task.created_at).toLocaleString()}
       </div>
       {task.git_branch && (
-        <div className="mt-1">
+        <div className="mt-1 flex items-center gap-1">
           {task.github_repo_url ? (
             <a
               href={`${task.github_repo_url}/tree/${task.git_branch}`}
@@ -500,6 +515,22 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
               <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path d="M11.75 2.5a.75.75 0 0 1 0 1.5h-.75v4h.75a.75.75 0 0 1 0 1.5h-.75v.75a4.25 4.25 0 0 1-8.5 0V9.5H2a.75.75 0 0 1 0-1.5h.75V4H2a.75.75 0 0 1 0-1.5h3.5a.75.75 0 0 1 0 1.5H4.25v4h1.5V4H4.5a.75.75 0 0 1 0-1.5h3.5a.75.75 0 0 1 0 1.5H7.25v4h1.5v-4H8a.75.75 0 0 1 0-1.5ZM9.5 9.5h-4v.75a2.75 2.75 0 1 0 5.5 0V9.5h-.75Z" /></svg>
               {task.git_branch}
             </span>
+          )}
+          {task.status !== 'working' && (
+            <button
+              onClick={(e) => handleCheckoutBranch(e, task.id)}
+              disabled={checkingOutTaskId === task.id}
+              className="inline-flex items-center justify-center w-5 h-5 rounded text-gray-400 dark:text-gray-500 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors disabled:opacity-50"
+              title="Switch workspace to this branch"
+            >
+              {checkingOutTaskId === task.id ? (
+                <div className="animate-spin h-3 w-3 border border-current border-t-transparent rounded-full" />
+              ) : (
+                <svg xmlns="http://www.w3.org/2000/svg" className="w-3 h-3" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M10.293 3.293a1 1 0 011.414 0l6 6a1 1 0 010 1.414l-6 6a1 1 0 01-1.414-1.414L14.586 11H3a1 1 0 110-2h11.586l-4.293-4.293a1 1 0 010-1.414z" clipRule="evenodd" />
+                </svg>
+              )}
+            </button>
           )}
         </div>
       )}
