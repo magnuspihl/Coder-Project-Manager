@@ -101,15 +101,25 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
   const prevLaneRectsRef = useRef<Map<string, DOMRect>>(new Map());
   const prevLaneOrderRef = useRef<string[]>([]);
 
+  // Stable-update helper: only set state if JSON representation changed
+  const lastJsonRef = useRef<Record<string, string>>({});
+  function setIfChanged<T>(key: string, setter: React.Dispatch<React.SetStateAction<T>>, value: T) {
+    const json = JSON.stringify(value);
+    if (lastJsonRef.current[key] !== json) {
+      lastJsonRef.current[key] = json;
+      setter(value);
+    }
+  }
+
   const loadData = async () => {
     try {
       const { workspaces: ws, taskCounts: tc, tokenTotals: tt, githubRepoUrls: gh, latestDiscussionMessages: ldm, claudeUsage: cu } = await getWorkspaces();
-      setWorkspaces(ws);
-      setTaskCounts(tc);
-      setTokenTotals(tt || {});
-      setGithubRepoUrls(gh || {});
-      setLatestDiscussionMessages(ldm || {});
-      setClaudeUsage(cu || {});
+      setIfChanged('workspaces', setWorkspaces, ws);
+      setIfChanged('taskCounts', setTaskCounts, tc);
+      setIfChanged('tokenTotals', setTokenTotals, tt || {});
+      setIfChanged('githubRepoUrls', setGithubRepoUrls, gh || {});
+      setIfChanged('latestDiscussionMessages', setLatestDiscussionMessages, ldm || {});
+      setIfChanged('claudeUsage', setClaudeUsage, cu || {});
       setError('');
 
       // Fetch tasks for running workspaces in parallel
@@ -145,7 +155,7 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
       }
       prevTaskStatusesRef.current = next;
 
-      setTasksByWorkspace(tasksMap);
+      setIfChanged('tasksByWorkspace', setTasksByWorkspace, tasksMap);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to load');
     } finally {
@@ -161,16 +171,15 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
   pollMsRef.current = hasActiveTasks ? 5000 : 15000;
 
   useEffect(() => {
-    loadData();
-    // Use dynamic interval that reads current poll frequency from ref
     let timer: ReturnType<typeof setTimeout>;
+    let cancelled = false;
     const tick = () => {
       loadData().finally(() => {
-        timer = setTimeout(tick, pollMsRef.current);
+        if (!cancelled) timer = setTimeout(tick, pollMsRef.current);
       });
     };
-    timer = setTimeout(tick, pollMsRef.current);
-    return () => clearTimeout(timer);
+    tick(); // Initial load + start chain
+    return () => { cancelled = true; clearTimeout(timer); };
   }, []);
 
   // Sorted running workspaces (used for Alt+N targeting, Space shortcut, and rendering)

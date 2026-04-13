@@ -50,12 +50,30 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const shouldForceScroll = useRef(false);
   const prevMessageCount = useRef(0);
 
+  const lastDiscJsonRef = useRef('');
+  const lastMsgsJsonRef = useRef('');
+  const lastTrJsonRef = useRef('');
+  const discussionRunningRef = useRef(false);
+
   const loadData = async () => {
     try {
       const data = await getDiscussionDetail(discussionId);
-      setDiscussion(data.discussion);
-      setMessages(data.messages);
-      setTaskRequests(data.taskRequests);
+      const dJson = JSON.stringify(data.discussion);
+      if (dJson !== lastDiscJsonRef.current) {
+        lastDiscJsonRef.current = dJson;
+        setDiscussion(data.discussion);
+        discussionRunningRef.current = !!data.discussion?.running;
+      }
+      const mJson = JSON.stringify(data.messages);
+      if (mJson !== lastMsgsJsonRef.current) {
+        lastMsgsJsonRef.current = mJson;
+        setMessages(data.messages);
+      }
+      const trJson = JSON.stringify(data.taskRequests);
+      if (trJson !== lastTrJsonRef.current) {
+        lastTrJsonRef.current = trJson;
+        setTaskRequests(data.taskRequests);
+      }
     } catch {
       // ignore
     } finally {
@@ -63,19 +81,16 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     }
   };
 
-  const discussionRunningRef = useRef(false);
-  discussionRunningRef.current = !!discussion?.running;
-
   useEffect(() => {
-    loadData();
+    let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
     const tick = () => {
       loadData().finally(() => {
-        timer = setTimeout(tick, discussionRunningRef.current ? 3000 : 10000);
+        if (!cancelled) timer = setTimeout(tick, discussionRunningRef.current ? 3000 : 10000);
       });
     };
-    timer = setTimeout(tick, 3000);
-    return () => clearTimeout(timer);
+    tick(); // Initial load + start chain
+    return () => { cancelled = true; clearTimeout(timer); };
   }, [discussionId]);
 
   // Scroll to bottom

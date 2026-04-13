@@ -65,15 +65,27 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const initialScrollDone = useRef(false);
   const maxStreamLogIdRef = useRef(0);
 
+  const lastTaskJsonRef = useRef('');
+  const lastMessagesJsonRef = useRef('');
+
   const loadData = async () => {
     try {
-      const { task: newTask, messages } = await getTaskDetail(taskId);
+      const { task: newTask, messages: newMessages } = await getTaskDetail(taskId);
       if (prevStatusRef.current && prevStatusRef.current !== 'awaiting_feedback' && newTask.status === 'awaiting_feedback') {
         playChime();
       }
       prevStatusRef.current = newTask.status;
-      setTask(newTask);
-      setMessages(messages);
+      taskStatusRef.current = newTask.status;
+      const taskJson = JSON.stringify(newTask);
+      if (taskJson !== lastTaskJsonRef.current) {
+        lastTaskJsonRef.current = taskJson;
+        setTask(newTask);
+      }
+      const msgsJson = JSON.stringify(newMessages);
+      if (msgsJson !== lastMessagesJsonRef.current) {
+        lastMessagesJsonRef.current = msgsJson;
+        setMessages(newMessages);
+      }
     } catch {
       // ignore
     } finally {
@@ -110,22 +122,23 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
   // Single unified poll: fetch task detail, and stream log when needed
   useEffect(() => {
+    let cancelled = false;
     const poll = async () => {
       await loadData();
       const isWorking = taskStatusRef.current === 'working';
       if (logOpenRef.current || isWorking) await loadStreamLog();
     };
 
-    poll();
     let timer: ReturnType<typeof setTimeout>;
     const tick = () => {
       poll().finally(() => {
+        if (cancelled) return;
         const pollMs = taskStatusRef.current === 'working' ? 3000 : 10000;
         timer = setTimeout(tick, pollMs);
       });
     };
-    timer = setTimeout(tick, taskStatusRef.current === 'working' ? 3000 : 10000);
-    return () => clearTimeout(timer);
+    tick(); // Initial load + start chain
+    return () => { cancelled = true; clearTimeout(timer); };
   }, [taskId]);
 
   // Scroll to bottom on initial load and when new messages arrive
