@@ -1,6 +1,6 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, deleteCurrentSessionAssistantMessages, updateMessageCost, type Task } from './tasks.js';
-import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
+import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
@@ -998,8 +998,10 @@ export async function launchDiscussion(
     prompt = isFullAccess ? message : DISCUSSION_PROMPT_PREFIX + message;
   } else if (participants.length > 0) {
     // Resuming with participants — prepend catch-up if available, skip access override.
-    // The override is only needed for mode toggles, not for multi-agent context.
-    prompt = hostCatchUp ? hostCatchUp + '\n' + message : message;
+    // Always include mention instruction so the agent knows how to reach other agents.
+    const mentionInstr = hostCatchUp ? '' : buildMentionInstruction(discussion.id);
+    const prefix = [hostCatchUp, mentionInstr].filter(Boolean).join('\n');
+    prompt = prefix ? prefix + '\n' + message : message;
   } else if (isFullAccess) {
     // Resuming with full access, no participants — send override in case mode changed
     prompt = FULL_ACCESS_OVERRIDE + message;
@@ -1341,12 +1343,17 @@ export async function launchParticipantDiscussion(
   // Build catch-up context unless the caller already included it in the message.
   const catchUp = skipCatchUp ? '' : buildCatchUpContext(discussion.id, participant.id);
 
+  // Include mention instruction if no catch-up (catch-up already has it)
+  const mentionInstr = catchUp ? '' : buildMentionInstruction(discussion.id);
+
   let prompt: string;
   if (!isResume) {
     const prefix = isFullAccess ? '' : DISCUSSION_PROMPT_PREFIX;
-    prompt = prefix + (catchUp ? catchUp + '\n' + message : message);
+    const context = [mentionInstr].filter(Boolean).join('\n');
+    prompt = prefix + (context ? context + '\n' : '') + message;
   } else {
-    prompt = catchUp ? catchUp + '\n' + message : message;
+    const context = [catchUp, mentionInstr].filter(Boolean).join('\n');
+    prompt = context ? context + '\n' + message : message;
   }
 
   // Auto-detect project directory if not already set

@@ -356,8 +356,33 @@ export function buildCatchUpContext(discussionId: string, participantId: string)
     const cleanContent = msg.content.replace(/\[MENTION:[^\]]+\]/g, '').trim();
     lines.push(`[${label}]: ${cleanContent}`);
   }
-  lines.push('[END CONTEXT — the user is now addressing you directly]\n');
+  // List all agents in the discussion so the agent knows who it can mention
+  const allParticipants = db.prepare(
+    "SELECT workspace_name FROM discussion_participants WHERE discussion_id = ? AND status = 'active'"
+  ).all(discussionId) as Array<{ workspace_name: string }>;
+  const agentNames = [hostName, ...allParticipants.map(p => p.workspace_name)];
+
+  lines.push('[END CONTEXT]');
+  lines.push(`Agents in this discussion: ${agentNames.join(', ')}. To direct a message to another agent, include [MENTION:workspace_name] at the end of your response (e.g. [MENTION:${agentNames[0]}]). The mentioned agent will receive the conversation and can respond.`);
+  lines.push('');
   return lines.join('\n');
+}
+
+/**
+ * Build a short instruction telling an agent about other participants and the mention system.
+ * Used when there's no catch-up context but participants exist.
+ */
+export function buildMentionInstruction(discussionId: string): string {
+  const db = getDb();
+  const disc = db.prepare('SELECT workspace_name FROM discussions WHERE id = ?').get(discussionId) as { workspace_name: string } | undefined;
+  const hostName = disc?.workspace_name || 'Host';
+  const participants = db.prepare(
+    "SELECT workspace_name FROM discussion_participants WHERE discussion_id = ? AND status = 'active'"
+  ).all(discussionId) as Array<{ workspace_name: string }>;
+  if (participants.length === 0) return '';
+
+  const agentNames = [hostName, ...participants.map(p => p.workspace_name)];
+  return `[Multi-agent discussion. Agents: ${agentNames.join(', ')}. To direct a message to another agent, include [MENTION:workspace_name] at the end of your response. The mentioned agent will receive the conversation and can respond.]`;
 }
 
 /**
