@@ -16,6 +16,7 @@ export interface Task {
   failed_reason: string | null;
   verification_url: string | null;
   branch: string | null;
+  model: string | null;
   ssh_pid: number | null;
   git_branch: string | null;
   github_repo_url: string | null;
@@ -212,6 +213,7 @@ export function createTask(params: {
   prompt: string;
   projectDir?: string;
   branch?: string;
+  model?: string;
 }): Task {
   const db = getDb();
   const id = uuid();
@@ -227,9 +229,9 @@ export function createTask(params: {
   const title = generateTitleFallback(params.prompt);
 
   db.prepare(
-    `INSERT INTO tasks (id, workspace_id, workspace_name, user_id, title, prompt, status, position, project_dir, claude_session_id, branch)
-     VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`
-  ).run(id, params.workspaceId, params.workspaceName, params.userId, title, params.prompt, position, params.projectDir || null, claudeSessionId, params.branch || null);
+    `INSERT INTO tasks (id, workspace_id, workspace_name, user_id, title, prompt, status, position, project_dir, claude_session_id, branch, model)
+     VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`
+  ).run(id, params.workspaceId, params.workspaceName, params.userId, title, params.prompt, position, params.projectDir || null, claudeSessionId, params.branch || null, params.model || null);
 
   // Store the initial prompt as a user message
   addMessage(id, 'user', params.prompt, undefined, params.username);

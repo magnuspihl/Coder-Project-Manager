@@ -326,6 +326,10 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   claudeParts.push('--allowedTools', shellEscape(ALLOWED_TOOLS));
   claudeParts.push('--max-turns', MAX_TURNS);
 
+  if (task.model) {
+    claudeParts.push('--model', shellEscape(task.model));
+  }
+
   const claudeCmd = claudeParts.join(' ');
   const outputFile = remoteOutputPath(task.id);
   const exitFile = remoteExitCodePath(task.id);

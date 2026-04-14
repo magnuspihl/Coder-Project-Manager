@@ -14,7 +14,9 @@ import {
   createTask,
   getOrCreateDiscussion,
   checkoutTaskBranch,
+  getModels,
   type Workspace,
+  type ModelInfo,
   type Task,
   type TaskCounts,
   type TokenTotals,
@@ -92,6 +94,9 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
   const [newTaskWorkspaceId, setNewTaskWorkspaceId] = useSessionState<string | null>('newTaskWorkspaceId', null);
   const [newTaskPrompt, setNewTaskPrompt, clearNewTaskPrompt] = useDraft('newTaskPrompt');
   const [newTaskBranch, setNewTaskBranch] = useState('');
+  const [newTaskModel, setNewTaskModel] = useState('');
+  const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
+  const [loadingModels, setLoadingModels] = useState(false);
   const [creatingTask, setCreatingTask] = useState(false);
   const [selectedTaskId, setSelectedTaskId] = useSessionState<string | null>('selectedTaskId', null);
   const [discussionState, setDiscussionState] = useState<{ id: string; workspaceId: string; workspaceName: string } | null>(null);
@@ -346,6 +351,22 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
     return () => window.removeEventListener('keydown', handleAltN);
   }, []);
 
+  // Fetch available models when task creation form opens for a workspace
+  useEffect(() => {
+    if (!newTaskWorkspaceId) {
+      setAvailableModels([]);
+      setNewTaskModel('');
+      return;
+    }
+    let cancelled = false;
+    setLoadingModels(true);
+    getModels(newTaskWorkspaceId)
+      .then(({ models }) => { if (!cancelled) setAvailableModels(models); })
+      .catch(() => { if (!cancelled) setAvailableModels([]); })
+      .finally(() => { if (!cancelled) setLoadingModels(false); });
+    return () => { cancelled = true; };
+  }, [newTaskWorkspaceId]);
+
   const handleStop = async (e: React.MouseEvent, id: string, name: string) => {
     e.preventDefault();
     e.stopPropagation();
@@ -466,10 +487,12 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
     setCreatingTask(true);
     try {
       const branch = newTaskBranch.trim() || undefined;
-      await createTask(workspaceId, newTaskPrompt.trim(), branch);
+      const model = newTaskModel || undefined;
+      await createTask(workspaceId, newTaskPrompt.trim(), branch, model);
       lastTaskWorkspaceIdRef.current = workspaceId;
       clearNewTaskPrompt();
       setNewTaskBranch('');
+      setNewTaskModel('');
       setNewTaskWorkspaceId(null);
       await loadData();
     } catch (err: unknown) {
@@ -494,8 +517,13 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
           {task.status.replace('_', ' ')}
         </span>
       </div>
-      <div className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-        {new Date(task.created_at).toLocaleString()}
+      <div className="flex items-center gap-2 text-xs text-gray-400 dark:text-gray-500 mt-1">
+        <span>{new Date(task.created_at).toLocaleString()}</span>
+        {task.model && (
+          <span className="px-1.5 py-0.5 rounded bg-purple-50 dark:bg-purple-900/20 text-purple-600 dark:text-purple-400 font-medium">
+            {task.model.replace(/^claude-/, '')}
+          </span>
+        )}
       </div>
       {task.git_branch && (
         <div className="mt-1 flex items-center gap-1">
@@ -904,6 +932,17 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
                 className="w-full text-sm border border-gray-300 dark:border-gray-700 rounded-md p-1.5 mt-1 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
                 disabled={creatingTask}
               />
+              <select
+                value={newTaskModel}
+                onChange={(e) => setNewTaskModel(e.target.value)}
+                className="w-full text-sm border border-gray-300 dark:border-gray-700 rounded-md p-1.5 mt-1 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                disabled={creatingTask || loadingModels}
+              >
+                <option value="">{loadingModels ? 'Loading models...' : 'Default model'}</option>
+                {availableModels.map((m) => (
+                  <option key={m.id} value={m.id}>{m.display_name}</option>
+                ))}
+              </select>
               <div className="flex gap-2 mt-1">
                 <button
                   onClick={() => handleCreateTask(ws.id)}

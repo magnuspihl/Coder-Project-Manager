@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   failed_reason TEXT,
   verification_url TEXT,
   branch TEXT,
+  model TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT,

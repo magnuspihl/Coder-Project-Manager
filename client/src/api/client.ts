@@ -88,6 +88,7 @@ export interface Task {
   branch: string | null;
   git_branch: string | null;
   github_repo_url: string | null;
+  model: string | null;
   total_input_tokens: number;
   total_output_tokens: number;
   total_cost_usd?: number;
@@ -169,14 +170,22 @@ export const startWorkspace = (id: string) =>
 export const getProjects = (workspaceId: string) =>
   request<{ projects: string[] }>(`/api/workspaces/${workspaceId}/projects`);
 
+export interface ModelInfo {
+  id: string;
+  display_name: string;
+}
+
+export const getModels = (workspaceId: string) =>
+  request<{ models: ModelInfo[] }>(`/api/workspaces/${workspaceId}/models`);
+
 // Tasks
 export const getTasks = (workspaceId: string) =>
   request<{ tasks: Task[] }>(`/api/workspaces/${workspaceId}/tasks`);
 
-export const createTask = (workspaceId: string, prompt: string, branch?: string) =>
+export const createTask = (workspaceId: string, prompt: string, branch?: string, model?: string) =>
   request<{ task: Task }>(`/api/workspaces/${workspaceId}/tasks`, {
     method: 'POST',
-    body: JSON.stringify({ prompt, ...(branch ? { branch } : {}) }),
+    body: JSON.stringify({ prompt, ...(branch ? { branch } : {}), ...(model ? { model } : {}) }),
   });
 
 export const getTaskDetail = (taskId: string) =>

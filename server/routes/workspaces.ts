@@ -6,6 +6,7 @@ import { getTaskCountsByWorkspace, getTokenTotalsByWorkspace, getGithubRepoUrlsB
 import { getLatestDiscussionMessageByWorkspace } from '../services/discussions.js';
 import { getWorkspaceUsages } from '../services/claude.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
+import { getModelsForWorkspace } from '../services/models.js';
 
 const router = Router();
 
@@ -141,6 +142,19 @@ router.get('/:id/projects', requireAuth, async (req: Request, res: Response) => 
   });
 
   res.json({ projects: dirs });
+});
+
+// Get available Claude models for a workspace
+router.get('/:workspaceId/models', requireAuth, async (req: Request, res: Response) => {
+  const workspace = await withTokenRefresh(req, res, (token) => getWorkspace(token, req.params.workspaceId), 'Failed to fetch workspace');
+  if (!workspace) return;
+
+  try {
+    const models = await getModelsForWorkspace(workspace.name);
+    res.json({ models });
+  } catch {
+    res.status(500).json({ error: 'Failed to fetch models' });
+  }
 });
 
 export default router;

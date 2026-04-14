@@ -304,6 +304,11 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                     {task.status.replace('_', ' ')}
                   </span>
                   <span className="text-xs text-gray-400 dark:text-gray-500">{task.workspace_name}</span>
+                  {task.model && (
+                    <span className="text-xs px-1.5 py-0.5 rounded bg-purple-50 dark:bg-purple-900/20 text-purple-600 dark:text-purple-400 font-medium">
+                      {task.model.replace(/^claude-/, '')}
+                    </span>
+                  )}
                   <button
                     onClick={() => {
                       navigator.clipboard.writeText(task.id);

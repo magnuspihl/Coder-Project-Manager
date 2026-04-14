@@ -93,6 +93,9 @@ export function getDb(): Database.Database {
     if (!cols.some(c => c.name === 'github_repo_url')) {
       db.exec("ALTER TABLE tasks ADD COLUMN github_repo_url TEXT");
     }
+    if (!cols.some(c => c.name === 'model')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN model TEXT");
+    }
 
     // Discussions migrations
     const discCols = db.prepare("PRAGMA table_info(discussions)").all() as Array<{ name: string }>;
