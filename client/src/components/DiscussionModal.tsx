@@ -49,11 +49,7 @@ const MessageRow = memo(function MessageRow({ msg }: { msg: DiscussionMessage })
           </span>
         </div>
       </div>
-      {msg.role === 'assistant' ? (
-        <Markdown content={strippedContent} />
-      ) : (
-        <div className="text-sm whitespace-pre-wrap">{linkify(msg.content)}</div>
-      )}
+      <Markdown content={msg.role === 'assistant' ? strippedContent : msg.content} />
     </div>
   );
 });

@@ -421,11 +421,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                       </span>
                     </div>
                   </div>
-                  {msg.role === 'assistant' ? (
-                    <Markdown content={msg.content} />
-                  ) : (
-                    <div className="text-sm whitespace-pre-wrap">{linkify(msg.content)}</div>
-                  )}
+                  <Markdown content={msg.content} />
                 </div>
               ))}
 
