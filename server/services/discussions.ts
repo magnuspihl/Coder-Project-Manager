@@ -352,7 +352,9 @@ export function buildCatchUpContext(discussionId: string, participantId: string)
       // Assistant — use workspace name to distinguish agents
       label = msg.username || hostName;
     }
-    lines.push(`[${label}]: ${msg.content}`);
+    // Strip mention tags from context messages
+    const cleanContent = msg.content.replace(/\[MENTION:[^\]]+\]/g, '').trim();
+    lines.push(`[${label}]: ${cleanContent}`);
   }
   lines.push('[END CONTEXT — the user is now addressing you directly]\n');
   return lines.join('\n');

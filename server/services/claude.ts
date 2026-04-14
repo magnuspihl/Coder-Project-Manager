@@ -1,6 +1,6 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, deleteCurrentSessionAssistantMessages, updateMessageCost, type Task } from './tasks.js';
-import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, type Discussion, type DiscussionParticipant } from './discussions.js';
+import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
@@ -913,6 +913,60 @@ function parseTaskRequests(discussionId: string, text: string): void {
 }
 
 /**
+ * Parse [MENTION:workspace_name] tags from assistant text and auto-trigger
+ * catch-up for the mentioned agent. Strips the tag from the message.
+ */
+function parseMentions(discussion: Discussion, text: string, sourceParticipantId: string | null): void {
+  const mentionRe = /\[MENTION:([^\]]+)\]/g;
+  let match;
+  const mentioned = new Set<string>();
+  while ((match = mentionRe.exec(text)) !== null) {
+    mentioned.add(match[1].trim());
+  }
+  if (mentioned.size === 0) return;
+
+  const participants = getDiscussionParticipants(discussion.id);
+
+  for (const name of mentioned) {
+    // Check if it's the host workspace
+    if (name === discussion.workspace_name && sourceParticipantId !== null) {
+      // Mentioned the host — trigger host catch-up (async, fire-and-forget)
+      const hostCatchUp = buildCatchUpContext(discussion.id, '__host__');
+      if (hostCatchUp) {
+        const nudge = hostCatchUp + '\n' + MENTION_NUDGE;
+        const messages = getDiscussionMessages(discussion.id);
+        const isResume = messages.some(m => m.role === 'assistant' && !m.participant_id);
+        console.log(`[mention] ${name} mentioned by participant, triggering host catch-up`);
+        launchDiscussion(discussion, nudge, isResume, undefined, true).catch(err => {
+          console.error('[mention] Failed to launch host catch-up:', (err as Error).message?.slice(0, 100));
+        });
+      }
+      continue;
+    }
+
+    // Check if it's a participant
+    const participant = participants.find(p => p.workspace_name === name);
+    if (participant && participant.id !== sourceParticipantId) {
+      const catchUp = buildCatchUpContext(discussion.id, participant.id);
+      if (catchUp) {
+        const nudge = catchUp + '\n' + MENTION_NUDGE;
+        const messages = getDiscussionMessages(discussion.id);
+        const isResume = messages.some(m => m.role === 'assistant' && m.participant_id === participant.id);
+        console.log(`[mention] ${name} mentioned, triggering participant catch-up`);
+        launchParticipantDiscussion(discussion, participant, nudge, isResume, undefined, true).catch(err => {
+          console.error('[mention] Failed to launch participant catch-up:', (err as Error).message?.slice(0, 100));
+        });
+      }
+    }
+  }
+}
+
+const MENTION_NUDGE = 'Another agent has mentioned you in the conversation. Review the context above. ' +
+  'If you have something relevant to respond with, please do. ' +
+  'If the conversation doesn\'t require your input, just say so briefly (e.g. "Nothing to add from my side."). ' +
+  'You can mention other agents by including [MENTION:workspace_name] in your response to bring them into the conversation.';
+
+/**
  * Launch or resume a discussion session on a remote workspace.
  */
 export async function launchDiscussion(
@@ -1212,6 +1266,11 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
         activeProcesses.delete(`disc:${discussion.id}`);
         rateLimitInfo.delete(`disc:${discussion.id}`);
         getDb().prepare('UPDATE discussions SET ssh_pid = NULL WHERE id = ?').run(discussion.id);
+
+        // Check for agent mentions in the last response (host = null source)
+        if (exitCode === 0 && lastSavedMessageText) {
+          parseMentions(discussion, lastSavedMessageText, null);
+        }
 
         // Surface errors to the user
         if (exitCode !== 0 && !isNaN(exitCode)) {
@@ -1521,6 +1580,11 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
         stopPolling(pollKey);
         taskActivity.delete(pollKey);
         activeProcesses.delete(pollKey);
+
+        // Check for agent mentions in the last response
+        if (exitCode === 0 && lastSavedMessageText) {
+          parseMentions(discussion, lastSavedMessageText, participant.id);
+        }
 
         if (exitCode !== 0 && !isNaN(exitCode)) {
           addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`);

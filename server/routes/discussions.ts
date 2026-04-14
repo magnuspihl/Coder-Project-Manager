@@ -26,7 +26,9 @@ import {
 
 const CATCHUP_NUDGE = 'The user has switched to you. Review the conversation context above. ' +
   'If you have something relevant to add — a response, a question, or useful context — please do. ' +
-  'If the conversation doesn\'t concern you or you have nothing to add, just say so briefly (e.g. "Nothing to add from my side.").';
+  'If the conversation doesn\'t concern you or you have nothing to add, just say so briefly (e.g. "Nothing to add from my side."). ' +
+  'To direct a message to another agent in this discussion, include [MENTION:workspace_name] at the end of your response ' +
+  '(e.g. [MENTION:Sheets]). That agent will automatically receive your message and can respond.';
 import { createTask } from '../services/tasks.js';
 import {
   launchDiscussion, stopDiscussion, getDiscussionActivity, isDiscussionRunning, getRateLimitInfo,

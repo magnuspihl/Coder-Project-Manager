@@ -27,10 +27,11 @@ import Markdown from './Markdown';
 import RateLimitBanner from './RateLimitBanner';
 
 const TASK_REQUEST_RE = /\[TASK_REQUEST\]\s*[\s\S]*?\s*\[\/TASK_REQUEST\]/g;
+const MENTION_RE = /\[MENTION:[^\]]+\]/g;
 
 const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName }: { msg: DiscussionMessage; hostWorkspaceName?: string }) {
   const strippedContent = msg.role === 'assistant'
-    ? msg.content.replace(TASK_REQUEST_RE, '').trim()
+    ? msg.content.replace(TASK_REQUEST_RE, '').replace(MENTION_RE, '').trim()
     : msg.content;
 
   // Determine the label for assistant messages
