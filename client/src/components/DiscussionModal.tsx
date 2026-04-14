@@ -12,8 +12,6 @@ import {
   addDiscussionParticipant,
   removeDiscussionParticipant,
   sendParticipantMessage,
-  sendHostCatchUp,
-  sendParticipantCatchUp,
   getWorkspaces,
   type Discussion,
   type DiscussionMessage,
@@ -267,22 +265,10 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     ? participants.find(p => p.id === targetId)?.workspace_name || 'participant'
     : workspaceName;
 
-  const handleSwitchTarget = async (newTargetId: string | null) => {
+  const handleSwitchTarget = (newTargetId: string | null) => {
     if (newTargetId === targetId) return;
     if (isAnyRunning || sending) return;
     setTargetId(newTargetId);
-
-    // Auto-send catch-up context to the newly selected agent
-    try {
-      if (newTargetId === null) {
-        await sendHostCatchUp(discussionId);
-      } else {
-        await sendParticipantCatchUp(discussionId, newTargetId);
-      }
-      await loadData();
-    } catch {
-      // Catch-up failed (e.g. 409 agent running, or no new context) — that's fine
-    }
   };
 
   const handleInvite = async (ws: Workspace) => {
