@@ -201,6 +201,24 @@ router.post('/discussions/:discussionId/close', requireAuth, (req: Request, res:
   res.json({ ok: true });
 });
 
+// Interrupt a running discussion (kills process but keeps discussion active)
+router.post('/discussions/:discussionId/interrupt', requireAuth, (req: Request, res: Response) => {
+  const discussion = getDiscussion(req.params.discussionId);
+  if (!discussion) {
+    res.status(404).json({ error: 'Discussion not found' });
+    return;
+  }
+  if (!isDiscussionRunning(discussion.id)) {
+    res.status(400).json({ error: 'Discussion is not running' });
+    return;
+  }
+
+  stopDiscussion(discussion.id);
+  addDiscussionMessage(discussion.id, 'system', 'Discussion was interrupted by user.');
+
+  res.json({ ok: true });
+});
+
 // Approve a task request (creates a real task)
 router.post('/discussions/:discussionId/task-requests/:requestId/approve', requireAuth, async (req: Request, res: Response) => {
   const discussion = getDiscussion(req.params.discussionId);

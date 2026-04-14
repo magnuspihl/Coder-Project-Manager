@@ -303,6 +303,9 @@ export const sendDiscussionMessage = (discussionId: string, message: string) =>
 export const closeDiscussion = (discussionId: string) =>
   request<{ ok: boolean }>(`/api/discussions/${discussionId}/close`, { method: 'POST' });
 
+export const interruptDiscussion = (discussionId: string) =>
+  request<{ ok: boolean }>(`/api/discussions/${discussionId}/interrupt`, { method: 'POST' });
+
 export const approveTaskRequest = (discussionId: string, requestId: string) =>
   request<{ task: Task }>(`/api/discussions/${discussionId}/task-requests/${requestId}/approve`, { method: 'POST' });
 
