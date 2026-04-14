@@ -21,7 +21,12 @@ import {
   removeParticipant,
   getParticipants,
   getParticipant,
+  buildCatchUpContext,
 } from '../services/discussions.js';
+
+const CATCHUP_NUDGE = 'The user has switched to you. Review the conversation context above. ' +
+  'If you have something relevant to add — a response, a question, or useful context — please do. ' +
+  'If the conversation doesn\'t concern you or you have nothing to add, just say so briefly (e.g. "Nothing to add from my side.").';
 import { createTask } from '../services/tasks.js';
 import {
   launchDiscussion, stopDiscussion, getDiscussionActivity, isDiscussionRunning, getRateLimitInfo,
@@ -457,6 +462,57 @@ router.post('/discussions/:discussionId/participants/:participantId/message', re
   await launchParticipantDiscussion(discussion, participant, message, isResume, req.user!.username);
 
   res.json({ ok: true });
+});
+
+// Send catch-up context to the host agent (no user message, just context)
+router.post('/discussions/:discussionId/catchup', requireAuth, async (req: Request, res: Response) => {
+  const discussion = getDiscussion(req.params.discussionId);
+  if (!discussion) { res.status(404).json({ error: 'Discussion not found' }); return; }
+  if (discussion.status !== 'active') { res.status(400).json({ error: 'Discussion is closed' }); return; }
+
+  const allParticipantIds = getParticipants(discussion.id).map(p => p.id);
+  if (isAnyAgentRunning(discussion.id, allParticipantIds)) {
+    res.status(409).json({ error: 'An agent is currently processing.' }); return;
+  }
+
+  const catchUp = buildCatchUpContext(discussion.id, '__host__');
+  if (!catchUp) { res.json({ ok: true, skipped: true }); return; }
+
+  const nudge = catchUp + '\n' + CATCHUP_NUDGE;
+
+  const messages = getDiscussionMessages(discussion.id);
+  const isResume = messages.some(m => m.role === 'assistant' && !m.participant_id);
+
+  await launchDiscussion(discussion, nudge, isResume, req.user!.username, true);
+  res.json({ ok: true, skipped: false });
+});
+
+// Send catch-up context to a participant agent (no user message, just context)
+router.post('/discussions/:discussionId/participants/:participantId/catchup', requireAuth, async (req: Request, res: Response) => {
+  const discussion = getDiscussion(req.params.discussionId);
+  if (!discussion) { res.status(404).json({ error: 'Discussion not found' }); return; }
+  if (discussion.status !== 'active') { res.status(400).json({ error: 'Discussion is closed' }); return; }
+
+  const participant = getParticipant(req.params.participantId);
+  if (!participant || participant.discussion_id !== discussion.id || participant.status !== 'active') {
+    res.status(404).json({ error: 'Participant not found' }); return;
+  }
+
+  const allParticipantIds = getParticipants(discussion.id).map(p => p.id);
+  if (isAnyAgentRunning(discussion.id, allParticipantIds)) {
+    res.status(409).json({ error: 'An agent is currently processing.' }); return;
+  }
+
+  const catchUp = buildCatchUpContext(discussion.id, participant.id);
+  if (!catchUp) { res.json({ ok: true, skipped: true }); return; }
+
+  const nudge = catchUp + '\n' + CATCHUP_NUDGE;
+
+  const messages = getDiscussionMessages(discussion.id);
+  const isResume = messages.some(m => m.role === 'assistant' && m.participant_id === participant.id);
+
+  await launchParticipantDiscussion(discussion, participant, nudge, isResume, req.user!.username, true);
+  res.json({ ok: true, skipped: false });
 });
 
 export default router;

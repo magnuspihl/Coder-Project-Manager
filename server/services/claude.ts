@@ -919,7 +919,8 @@ export async function launchDiscussion(
   discussion: Discussion,
   message: string,
   isResume: boolean,
-  username?: string
+  username?: string,
+  skipCatchUp?: boolean
 ): Promise<void> {
   const isFullAccess = discussion.full_access === 1;
   const FULL_ACCESS_OVERRIDE = '[SYSTEM OVERRIDE] Your access mode has been changed to FULL ACCESS. ' +
@@ -933,8 +934,7 @@ export async function launchDiscussion(
   // the host's own session doesn't contain messages from other agents.
   const participants = getDiscussionParticipants(discussion.id);
   let hostCatchUp = '';
-  if (participants.length > 0 && isResume) {
-    // Use null participantId to get messages since last host assistant message
+  if (participants.length > 0 && isResume && !skipCatchUp) {
     hostCatchUp = buildCatchUpContext(discussion.id, '__host__');
   }
 
@@ -1270,14 +1270,13 @@ export async function launchParticipantDiscussion(
   participant: DiscussionParticipant,
   message: string,
   isResume: boolean,
-  username?: string
+  username?: string,
+  skipCatchUp?: boolean
 ): Promise<void> {
   const isFullAccess = discussion.full_access === 1;
 
-  // Always build catch-up context — the participant's own session doesn't
-  // contain messages from other agents or the host, so we need to feed them
-  // the conversation they missed every time.
-  const catchUp = buildCatchUpContext(discussion.id, participant.id);
+  // Build catch-up context unless the caller already included it in the message.
+  const catchUp = skipCatchUp ? '' : buildCatchUpContext(discussion.id, participant.id);
 
   let prompt: string;
   if (!isResume) {

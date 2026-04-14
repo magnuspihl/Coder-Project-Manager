@@ -12,6 +12,8 @@ import {
   addDiscussionParticipant,
   removeDiscussionParticipant,
   sendParticipantMessage,
+  sendHostCatchUp,
+  sendParticipantCatchUp,
   getWorkspaces,
   type Discussion,
   type DiscussionMessage,
@@ -263,6 +265,24 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const targetName = targetId
     ? participants.find(p => p.id === targetId)?.workspace_name || 'participant'
     : workspaceName;
+
+  const handleSwitchTarget = async (newTargetId: string | null) => {
+    if (newTargetId === targetId) return;
+    if (isAnyRunning || sending) return;
+    setTargetId(newTargetId);
+
+    // Auto-send catch-up context to the newly selected agent
+    try {
+      if (newTargetId === null) {
+        await sendHostCatchUp(discussionId);
+      } else {
+        await sendParticipantCatchUp(discussionId, newTargetId);
+      }
+      await loadData();
+    } catch {
+      // Catch-up failed (e.g. 409 agent running, or no new context) — that's fine
+    }
+  };
 
   const handleInvite = async (ws: Workspace) => {
     try {
@@ -622,7 +642,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                   <span className="text-[10px] text-gray-400 dark:text-gray-500 uppercase tracking-wide mr-1">Talk to:</span>
                   {/* Host tab */}
                   <button
-                    onClick={() => setTargetId(null)}
+                    onClick={() => handleSwitchTarget(null)}
                     className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
                       targetId === null
                         ? 'bg-purple-100 dark:bg-purple-900/40 border-purple-300 dark:border-purple-700 text-purple-700 dark:text-purple-300 font-medium'
@@ -636,7 +656,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                   {participants.map(p => (
                     <div key={p.id} className="flex items-center gap-0">
                       <button
-                        onClick={() => setTargetId(p.id)}
+                        onClick={() => handleSwitchTarget(p.id)}
                         className={`text-xs px-2.5 py-1 rounded-l-full border transition-colors ${
                           targetId === p.id
                             ? 'bg-teal-100 dark:bg-teal-900/40 border-teal-300 dark:border-teal-700 text-teal-700 dark:text-teal-300 font-medium'

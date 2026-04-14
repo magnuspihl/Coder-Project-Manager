@@ -341,3 +341,9 @@ export const sendParticipantMessage = (discussionId: string, participantId: stri
     method: 'POST',
     body: JSON.stringify({ message }),
   });
+
+export const sendHostCatchUp = (discussionId: string) =>
+  request<{ ok: boolean; skipped: boolean }>(`/api/discussions/${discussionId}/catchup`, { method: 'POST' });
+
+export const sendParticipantCatchUp = (discussionId: string, participantId: string) =>
+  request<{ ok: boolean; skipped: boolean }>(`/api/discussions/${discussionId}/participants/${participantId}/catchup`, { method: 'POST' });
