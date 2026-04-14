@@ -929,16 +929,23 @@ export async function launchDiscussion(
     'You are now in a read-only discussion session. You MUST NOT modify, create, or delete any files, make commits, push to git, or change system state. ' +
     'Your tools are limited to Read, Glob, Grep, and Bash (read-only commands only).\n\n';
 
+  // Build catch-up context for the host if there are participants —
+  // the host's own session doesn't contain messages from other agents.
+  const participants = getDiscussionParticipants(discussion.id);
+  let hostCatchUp = '';
+  if (participants.length > 0 && isResume) {
+    // Use null participantId to get messages since last host assistant message
+    hostCatchUp = buildCatchUpContext(discussion.id, '__host__');
+  }
+
   let prompt: string;
   if (!isResume) {
     // First message — use prefix or not based on mode
     prompt = isFullAccess ? message : DISCUSSION_PROMPT_PREFIX + message;
   } else if (isFullAccess) {
-    // Resuming with full access — always send override in case mode was changed
-    prompt = FULL_ACCESS_OVERRIDE + message;
+    prompt = FULL_ACCESS_OVERRIDE + (hostCatchUp ? hostCatchUp + '\n' : '') + message;
   } else {
-    // Resuming in read-only — send override in case mode was changed
-    prompt = READ_ONLY_OVERRIDE + message;
+    prompt = READ_ONLY_OVERRIDE + (hostCatchUp ? hostCatchUp + '\n' : '') + message;
   }
 
   // Auto-detect project directory if not already set
@@ -979,9 +986,12 @@ export async function launchDiscussion(
   }
 
   // Build the claude command
+  // When there are participants, always send the full prompt (with catch-up context)
+  // even on resume, since the host's session doesn't contain participant messages.
   const claudeParts: string[] = [];
+  const useFullPrompt = participants.length > 0;
   claudeParts.push('claude');
-  claudeParts.push('-p', shellEscape(remoteSessionExists ? message : prompt));
+  claudeParts.push('-p', shellEscape(remoteSessionExists && !useFullPrompt ? message : prompt));
 
   if (remoteSessionExists && discussion.claude_session_id) {
     claudeParts.push('--resume', shellEscape(discussion.claude_session_id));
@@ -1258,11 +1268,10 @@ export async function launchParticipantDiscussion(
 ): Promise<void> {
   const isFullAccess = discussion.full_access === 1;
 
-  // Build catch-up context if resuming an idle participant
-  let catchUp = '';
-  if (isResume) {
-    catchUp = buildCatchUpContext(discussion.id, participant.id);
-  }
+  // Always build catch-up context — the participant's own session doesn't
+  // contain messages from other agents or the host, so we need to feed them
+  // the conversation they missed every time.
+  const catchUp = buildCatchUpContext(discussion.id, participant.id);
 
   let prompt: string;
   if (!isResume) {
@@ -1302,8 +1311,11 @@ export async function launchParticipantDiscussion(
   }
 
   // Build claude command
+  // Always send the full prompt (with catch-up context) for participants,
+  // even on resume — the participant's own session doesn't contain messages
+  // from other agents, so catch-up context is essential.
   const claudeParts: string[] = ['claude'];
-  claudeParts.push('-p', shellEscape(remoteSessionExists ? message : prompt));
+  claudeParts.push('-p', shellEscape(prompt));
 
   if (remoteSessionExists && participant.claude_session_id) {
     claudeParts.push('--resume', shellEscape(participant.claude_session_id));

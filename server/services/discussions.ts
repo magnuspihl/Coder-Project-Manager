@@ -265,15 +265,21 @@ export function updateParticipantProjectDir(participantId: string, projectDir: s
 }
 
 /**
- * Build catch-up context for a participant that has been idle.
- * Returns formatted text of all messages since the participant's last response.
+ * Build catch-up context for an agent that has been idle.
+ * participantId: the participant's ID, or '__host__' for the host agent.
+ * Returns formatted text of all messages since the agent's last response.
  */
 export function buildCatchUpContext(discussionId: string, participantId: string): string {
   const db = getDb();
-  // Find the last assistant message from this participant
-  const lastMsg = db.prepare(
-    "SELECT created_at FROM discussion_messages WHERE discussion_id = ? AND participant_id = ? AND role = 'assistant' ORDER BY created_at DESC LIMIT 1"
-  ).get(discussionId, participantId) as { created_at: string } | undefined;
+  // Find the last assistant message from this agent
+  const isHost = participantId === '__host__';
+  const lastMsg = isHost
+    ? db.prepare(
+        "SELECT created_at FROM discussion_messages WHERE discussion_id = ? AND participant_id IS NULL AND role = 'assistant' ORDER BY created_at DESC LIMIT 1"
+      ).get(discussionId) as { created_at: string } | undefined
+    : db.prepare(
+        "SELECT created_at FROM discussion_messages WHERE discussion_id = ? AND participant_id = ? AND role = 'assistant' ORDER BY created_at DESC LIMIT 1"
+      ).get(discussionId, participantId) as { created_at: string } | undefined;
 
   let messages: DiscussionMessage[];
   if (lastMsg) {
@@ -287,18 +293,50 @@ export function buildCatchUpContext(discussionId: string, participantId: string)
     ).all(discussionId) as DiscussionMessage[];
   }
 
+  // Exclude the latest user message directed at this agent (it's already in the -p prompt)
+  // and exclude this agent's own messages (it already has those in its session)
+  const selfId = isHost ? null : participantId;
+  messages = messages.filter(msg => {
+    // Skip this agent's own assistant messages (it has them in its session already)
+    if (msg.role === 'assistant') {
+      if (isHost && !msg.participant_id) return false;
+      if (!isHost && msg.participant_id === selfId) return false;
+    }
+    return true;
+  });
+
+  // Drop the very last message if it's the user message directed at this agent
+  // (that message is being sent as the -p prompt)
+  if (messages.length > 0) {
+    const last = messages[messages.length - 1];
+    if (last.role === 'user') {
+      if (isHost && !last.participant_id) messages.pop();
+      else if (!isHost && last.participant_id === selfId) messages.pop();
+    }
+  }
+
   if (messages.length === 0) return '';
 
-  const lines: string[] = ['[Context: While you were idle, the following conversation happened in this discussion]'];
+  // Look up the discussion to identify the host workspace
+  const disc = db.prepare('SELECT workspace_name FROM discussions WHERE id = ?').get(discussionId) as { workspace_name: string } | undefined;
+  const hostName = disc?.workspace_name || 'Host';
+
+  const lines: string[] = [
+    '[CONVERSATION CONTEXT: This is a multi-agent discussion. The following messages happened while you were idle. Other participants are real AI agents on different workspaces.]'
+  ];
   for (const msg of messages) {
-    const label = msg.role === 'user'
-      ? (msg.username || 'User')
-      : msg.role === 'system'
-        ? 'System'
-        : (msg.username || 'Assistant');
-    lines.push(`${label}: ${msg.content}`);
+    let label: string;
+    if (msg.role === 'user') {
+      label = msg.username || 'User';
+    } else if (msg.role === 'system') {
+      label = 'System';
+    } else {
+      // Assistant — use workspace name to distinguish agents
+      label = msg.username || hostName;
+    }
+    lines.push(`[${label}]: ${msg.content}`);
   }
-  lines.push('[End context. The user is now talking to you directly.]\n');
+  lines.push('[END CONTEXT — the user is now addressing you directly]\n');
   return lines.join('\n');
 }
 
