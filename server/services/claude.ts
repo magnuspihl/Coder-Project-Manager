@@ -347,7 +347,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
 
   // For Ollama models, override the Anthropic endpoint to point to Ollama
   if (isOllama) {
-    remoteCmd += `export ANTHROPIC_BASE_URL="${OLLAMA_BASE_URL}" ANTHROPIC_API_KEY="" && `;
+    remoteCmd += `export ANTHROPIC_BASE_URL="${OLLAMA_BASE_URL}" ANTHROPIC_API_KEY="" ANTHROPIC_AUTH_TOKEN=ollama && `;
   }
   if (task.project_dir) {
     remoteCmd += `cd ${shellEscape(task.project_dir)} && `;
@@ -359,6 +359,8 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
 
   console.log('[claude-executor] Launching on workspace:', task.workspace_name);
   console.log('[claude-executor] Project dir:', task.project_dir || '(none - home dir)');
+  console.log('[claude-executor] Model:', task.model || '(default)', isOllama ? `→ Ollama (${actualModel})` : '');
+  console.log('[claude-executor] Remote cmd:', remoteCmd.slice(0, 300));
 
   try {
     updateTaskStatus(task.id, 'working');
