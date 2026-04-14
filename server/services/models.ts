@@ -3,7 +3,7 @@ import { sshExec } from './claude.js';
 export interface ModelInfo {
   id: string;
   display_name: string;
-  provider: 'anthropic' | 'ollama';
+  provider: 'anthropic' | 'ollama-local' | 'ollama-cloud';
 }
 
 const OLLAMA_BASE_URL = 'http://192.168.1.199:11434';
@@ -66,7 +66,7 @@ async function fetchAnthropicModels(workspaceName: string): Promise<ModelInfo[]>
 
     const models: ModelInfo[] = parsed.data
       .filter((m: any) => m.id && m.display_name)
-      .map((m: any) => ({ id: m.id, display_name: m.display_name, provider: 'anthropic' as const }))
+      .map((m: any) => ({ id: m.id, display_name: m.display_name, provider: 'anthropic' }))
       .sort((a: ModelInfo, b: ModelInfo) => a.display_name.localeCompare(b.display_name));
 
     if (models.length === 0) {
@@ -128,8 +128,8 @@ async function fetchOllamaLocalModels(): Promise<ModelInfo[]> {
       const name = m.name || m.model;
       return {
         id: `ollama/${name}`,
-        display_name: `${name.replace(/:latest$/, '')} (local)`,
-        provider: 'ollama' as const,
+        display_name: name.replace(/:latest$/, ''),
+        provider: 'ollama-local' as const,
       };
     });
   } catch {
@@ -161,8 +161,8 @@ async function fetchOllamaCloudModels(): Promise<ModelInfo[]> {
 
     return names.map(name => ({
       id: `ollama/${name}:cloud`,
-      display_name: `${name} (cloud)`,
-      provider: 'ollama' as const,
+      display_name: name,
+      provider: 'ollama-cloud' as const,
     }));
   } catch {
     return [];

@@ -952,9 +952,16 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
                     ))}
                   </optgroup>
                 )}
-                {availableModels.some(m => m.provider === 'ollama') && (
-                  <optgroup label="Ollama">
-                    {availableModels.filter(m => m.provider === 'ollama').map((m) => (
+                {availableModels.some(m => m.provider === 'ollama-local') && (
+                  <optgroup label="Ollama (local)">
+                    {availableModels.filter(m => m.provider === 'ollama-local').map((m) => (
+                      <option key={m.id} value={m.id}>{m.display_name}</option>
+                    ))}
+                  </optgroup>
+                )}
+                {availableModels.some(m => m.provider === 'ollama-cloud') && (
+                  <optgroup label="Ollama (cloud)">
+                    {availableModels.filter(m => m.provider === 'ollama-cloud').map((m) => (
                       <option key={m.id} value={m.id}>{m.display_name}</option>
                     ))}
                   </optgroup>
