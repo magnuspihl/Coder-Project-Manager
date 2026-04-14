@@ -942,10 +942,16 @@ export async function launchDiscussion(
   if (!isResume) {
     // First message — use prefix or not based on mode
     prompt = isFullAccess ? message : DISCUSSION_PROMPT_PREFIX + message;
+  } else if (hostCatchUp) {
+    // Resuming with multi-agent catch-up — just prepend the context.
+    // No need for access override (mode hasn't changed mid-conversation).
+    prompt = hostCatchUp + '\n' + message;
   } else if (isFullAccess) {
-    prompt = FULL_ACCESS_OVERRIDE + (hostCatchUp ? hostCatchUp + '\n' : '') + message;
+    // Resuming with full access, no participants — send override in case mode changed
+    prompt = FULL_ACCESS_OVERRIDE + message;
   } else {
-    prompt = READ_ONLY_OVERRIDE + (hostCatchUp ? hostCatchUp + '\n' : '') + message;
+    // Resuming in read-only, no participants — send override in case mode changed
+    prompt = READ_ONLY_OVERRIDE + message;
   }
 
   // Auto-detect project directory if not already set
