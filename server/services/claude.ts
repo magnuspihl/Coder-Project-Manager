@@ -1,6 +1,6 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, deleteCurrentSessionAssistantMessages, updateMessageCost, type Task } from './tasks.js';
-import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, type Discussion } from './discussions.js';
+import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
@@ -1060,6 +1060,12 @@ export function stopDiscussion(discussionId: string): void {
   stopPolling(`disc:${discussionId}`);
   taskActivity.delete(`disc:${discussionId}`);
   getDb().prepare('UPDATE discussions SET ssh_pid = NULL WHERE id = ?').run(discussionId);
+
+  // Also stop any active participants
+  const participants = getDiscussionParticipants(discussionId);
+  for (const p of participants) {
+    stopParticipant(p.id);
+  }
 }
 
 export function getDiscussionActivity(discussionId: string): TaskActivity | undefined {
@@ -1219,6 +1225,295 @@ function startDiscussionPolling(discussion: Discussion): void {
         stopPolling(pollKey);
         taskActivity.delete(`disc:${discussion.id}`);
         addDiscussionMessage(discussion.id, 'system', 'Error: Lost connection to workspace');
+      }
+    } finally {
+      polling = false;
+    }
+  };
+
+  const interval = setInterval(poll, 5000);
+  activePollers.set(pollKey, interval);
+  poll();
+}
+
+// ─── Multi-agent participant support ──────────────────────────────
+
+function remoteParticipantOutputPath(participantId: string): string {
+  return `/tmp/cpm-disc-participant-${participantId}.jsonl`;
+}
+
+function remoteParticipantExitCodePath(participantId: string): string {
+  return `/tmp/cpm-disc-participant-${participantId}.exit`;
+}
+
+/**
+ * Launch or resume a participant's Claude session on their workspace.
+ */
+export async function launchParticipantDiscussion(
+  discussion: Discussion,
+  participant: DiscussionParticipant,
+  message: string,
+  isResume: boolean,
+  username?: string
+): Promise<void> {
+  const isFullAccess = discussion.full_access === 1;
+
+  // Build catch-up context if resuming an idle participant
+  let catchUp = '';
+  if (isResume) {
+    catchUp = buildCatchUpContext(discussion.id, participant.id);
+  }
+
+  let prompt: string;
+  if (!isResume) {
+    const prefix = isFullAccess ? '' : DISCUSSION_PROMPT_PREFIX;
+    prompt = prefix + (catchUp ? catchUp + '\n' + message : message);
+  } else {
+    prompt = catchUp ? catchUp + '\n' + message : message;
+  }
+
+  // Auto-detect project directory if not already set
+  if (!participant.project_dir) {
+    const detected = await detectProjectDir(participant.workspace_name);
+    if (detected) {
+      participant.project_dir = detected;
+      updateParticipantProjectDir(participant.id, detected);
+    }
+  }
+
+  // Check if session already exists on remote
+  let remoteSessionExists = isResume;
+  let sessionWorkDir = participant.project_dir;
+  if (participant.claude_session_id) {
+    try {
+      const checkResult = await sshExec(participant.workspace_name,
+        `find ~/.claude/projects/ -name '${participant.claude_session_id}.jsonl' 2>/dev/null | head -1`
+      );
+      if (checkResult.trim()) {
+        remoteSessionExists = true;
+        const projectDirEncoded = participant.project_dir
+          ? '-' + participant.project_dir.replace(/^\//, '').replace(/\//g, '-')
+          : null;
+        if (projectDirEncoded && !checkResult.includes(`/projects/${projectDirEncoded}/`)) {
+          sessionWorkDir = '/home/coder';
+        }
+      }
+    } catch { /* Non-fatal */ }
+  }
+
+  // Build claude command
+  const claudeParts: string[] = ['claude'];
+  claudeParts.push('-p', shellEscape(remoteSessionExists ? message : prompt));
+
+  if (remoteSessionExists && participant.claude_session_id) {
+    claudeParts.push('--resume', shellEscape(participant.claude_session_id));
+  } else if (participant.claude_session_id) {
+    claudeParts.push('--session-id', shellEscape(participant.claude_session_id));
+  }
+
+  claudeParts.push('--output-format', 'stream-json');
+  claudeParts.push('--verbose');
+  if (isFullAccess) {
+    claudeParts.push('--dangerously-skip-permissions');
+  } else {
+    claudeParts.push('--allowedTools', shellEscape(DISCUSSION_ALLOWED_TOOLS));
+  }
+  claudeParts.push('--max-turns', MAX_TURNS);
+
+  const claudeCmd = claudeParts.join(' ');
+  const outputFile = remoteParticipantOutputPath(participant.id);
+  const exitFile = remoteParticipantExitCodePath(participant.id);
+
+  let remoteCmd = 'export PATH="$HOME/.local/bin:$PATH" && ';
+  if (sessionWorkDir) {
+    remoteCmd += `cd ${shellEscape(sessionWorkDir)} && `;
+  }
+  remoteCmd += `rm -f ${shellEscape(exitFile)} && `;
+  remoteCmd += `${claudeCmd} > ${shellEscape(outputFile)} 2>&1; `;
+  remoteCmd += `echo $? > ${shellEscape(exitFile)}`;
+
+  console.log('[participant] Launching on workspace:', participant.workspace_name, 'for discussion:', discussion.id);
+
+  try {
+    const pollKey = `disc-p:${participant.id}`;
+    taskActivity.set(pollKey, { timestamp: new Date().toISOString(), summary: 'Starting participant session' });
+
+    // Clean stale files
+    try {
+      await sshExec(participant.workspace_name, `rm -f ${shellEscape(outputFile)} ${shellEscape(exitFile)}`);
+    } catch { /* Non-fatal */ }
+
+    // Spawn SSH
+    const sshProcess = spawn('coder', ['ssh', participant.workspace_name, '--', remoteCmd], {
+      env: { ...process.env, CODER_URL },
+      stdio: 'ignore',
+      detached: true,
+    });
+
+    activeProcesses.set(pollKey, sshProcess);
+    sshProcess.unref();
+
+    // Poll output
+    startParticipantPolling(discussion, participant);
+
+  } catch (err) {
+    const errorMsg = (err as Error).message || 'Failed to launch participant session';
+    console.error('[participant] Launch failed:', errorMsg);
+    addDiscussionMessage(discussion.id, 'system', `Error launching ${participant.workspace_name}: ${errorMsg}`);
+  }
+}
+
+export function stopParticipant(participantId: string): void {
+  const pollKey = `disc-p:${participantId}`;
+  const proc = activeProcesses.get(pollKey);
+  if (proc) {
+    proc.kill();
+    activeProcesses.delete(pollKey);
+  }
+  stopPolling(pollKey);
+  taskActivity.delete(pollKey);
+}
+
+export function isParticipantRunning(participantId: string): boolean {
+  const pollKey = `disc-p:${participantId}`;
+  return activeProcesses.has(pollKey) || activePollers.has(pollKey);
+}
+
+export function getParticipantActivity(participantId: string): TaskActivity | undefined {
+  return taskActivity.get(`disc-p:${participantId}`);
+}
+
+/**
+ * Check if ANY agent (host or participant) is currently running for a discussion.
+ */
+export function isAnyAgentRunning(discussionId: string, participantIds: string[]): boolean {
+  if (isDiscussionRunning(discussionId)) return true;
+  return participantIds.some(pid => isParticipantRunning(pid));
+}
+
+/**
+ * Stop all active participants for a discussion.
+ */
+export function stopAllParticipants(participantIds: string[]): void {
+  for (const pid of participantIds) {
+    stopParticipant(pid);
+  }
+}
+
+/**
+ * Poll remote output file for a participant session.
+ */
+function startParticipantPolling(discussion: Discussion, participant: DiscussionParticipant): void {
+  const pollKey = `disc-p:${participant.id}`;
+  stopPolling(pollKey);
+
+  let linesRead = 0;
+  let lastSavedMessageId: string | null = null;
+  let lastSavedMessageText: string | null = null;
+  let consecutiveErrors = 0;
+  let partialLine = '';
+  let polling = false;
+
+  const poll = async () => {
+    if (polling) return;
+    polling = true;
+    try {
+      const outputFile = remoteParticipantOutputPath(participant.id);
+      const exitFile = remoteParticipantExitCodePath(participant.id);
+
+      const output = await sshExec(participant.workspace_name,
+        `tail -n +${linesRead + 1} ${shellEscape(outputFile)} 2>/dev/null; echo '---CPM_EXIT_CHECK---'; cat ${shellEscape(exitFile)} 2>/dev/null || echo 'RUNNING'`,
+        20000,
+      );
+
+      consecutiveErrors = 0;
+
+      const markerIdx = output.indexOf('---CPM_EXIT_CHECK---');
+      const jsonPart = markerIdx >= 0 ? output.slice(0, markerIdx) : output;
+      const exitPart = markerIdx >= 0 ? output.slice(markerIdx + '---CPM_EXIT_CHECK---'.length).trim() : 'RUNNING';
+
+      if (jsonPart.trim() || partialLine) {
+        const fullData = partialLine + jsonPart;
+        partialLine = '';
+
+        const allLines = fullData.split('\n');
+        const lastElement = allLines[allLines.length - 1];
+        if (lastElement && lastElement.trim()) {
+          partialLine = allLines.pop()!;
+        }
+
+        for (const line of allLines) {
+          linesRead++;
+          if (!line.trim()) continue;
+
+          let event: { type: string; [key: string]: unknown };
+          try {
+            event = JSON.parse(line);
+          } catch { continue; }
+
+          try {
+            // Track rate limit events
+            if (event.type === 'rate_limit_event') {
+              const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string; status?: string; utilization?: number } | undefined;
+              if (info) {
+                updateWorkspaceUsage(participant.workspace_name, info);
+              }
+            }
+
+            // Update activity
+            const now = new Date().toISOString();
+            if (event.type === 'assistant' && event.message) {
+              const msg = event.message as { content?: Array<{ type: string; text?: string; name?: string }> };
+              if (msg.content) {
+                for (const block of msg.content) {
+                  if (block.type === 'text' && block.text) {
+                    taskActivity.set(pollKey, { timestamp: now, summary: block.text.slice(0, 200).replace(/\n/g, ' ') });
+                    const dmsg = addDiscussionMessage(discussion.id, 'assistant', block.text, undefined, participant.workspace_name, participant.id);
+                    lastSavedMessageId = dmsg.id;
+                    lastSavedMessageText = block.text;
+                    parseTaskRequests(discussion.id, block.text);
+                  } else if (block.type === 'tool_use') {
+                    taskActivity.set(pollKey, { timestamp: now, summary: `Using ${block.name || 'tool'}` });
+                  }
+                }
+              }
+            } else if (event.type === 'result') {
+              const resultText = extractResultText(event);
+              if (resultText && resultText !== lastSavedMessageText) {
+                const dmsg = addDiscussionMessage(discussion.id, 'assistant', resultText, event.total_cost_usd as number | undefined, participant.workspace_name, participant.id);
+                lastSavedMessageId = dmsg.id;
+                lastSavedMessageText = resultText;
+                parseTaskRequests(discussion.id, resultText);
+              } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
+                getDb().prepare('UPDATE discussion_messages SET cost = ? WHERE id = ?').run(event.total_cost_usd, lastSavedMessageId);
+              }
+            }
+          } catch (eventErr) {
+            console.error(`[participant-poller] Error processing event:`, (eventErr as Error).message?.slice(0, 200));
+          }
+        }
+      }
+
+      if (exitPart !== 'RUNNING' && exitPart !== '') {
+        const exitCode = parseInt(exitPart, 10);
+        console.log(`[participant-poller] Participant ${participant.id} finished (exit: ${exitPart})`);
+        stopPolling(pollKey);
+        taskActivity.delete(pollKey);
+        activeProcesses.delete(pollKey);
+
+        if (exitCode !== 0 && !isNaN(exitCode)) {
+          addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`);
+        }
+      }
+    } catch (err) {
+      consecutiveErrors++;
+      console.log(`[participant-poller] Error (${consecutiveErrors}):`, (err as Error).message?.slice(0, 100));
+
+      if (consecutiveErrors > 20) {
+        console.log(`[participant-poller] Too many errors, stopping polling for participant ${participant.id}`);
+        stopPolling(pollKey);
+        taskActivity.delete(pollKey);
+        addDiscussionMessage(discussion.id, 'system', `Error: Lost connection to ${participant.workspace_name}`);
       }
     } finally {
       polling = false;

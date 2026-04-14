@@ -22,6 +22,18 @@ export interface DiscussionMessage {
   content: string;
   cost: number | null;
   username: string | null;
+  participant_id: string | null;
+  created_at: string;
+}
+
+export interface DiscussionParticipant {
+  id: string;
+  discussion_id: string;
+  workspace_id: string;
+  workspace_name: string;
+  claude_session_id: string | null;
+  project_dir: string | null;
+  status: string;
   created_at: string;
 }
 
@@ -110,15 +122,16 @@ export function addDiscussionMessage(
   role: string,
   content: string,
   cost?: number,
-  username?: string
+  username?: string,
+  participantId?: string
 ): DiscussionMessage {
   const db = getDb();
   const id = uuid();
   const now = new Date().toISOString();
   db.prepare(
-    'INSERT INTO discussion_messages (id, discussion_id, role, content, cost, username, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).run(id, discussionId, role, content, cost ?? null, username ?? null, now);
-  return { id, discussion_id: discussionId, role, content, cost: cost ?? null, username: username ?? null, created_at: now };
+    'INSERT INTO discussion_messages (id, discussion_id, role, content, cost, username, participant_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, discussionId, role, content, cost ?? null, username ?? null, participantId ?? null, now);
+  return { id, discussion_id: discussionId, role, content, cost: cost ?? null, username: username ?? null, participant_id: participantId ?? null, created_at: now };
 }
 
 export function getDiscussionMessages(discussionId: string, limit?: number, beforeId?: string): DiscussionMessage[] {
@@ -215,6 +228,78 @@ export function approveTaskRequest(id: string, createdTaskId: string): void {
 export function dismissTaskRequest(id: string): void {
   const db = getDb();
   db.prepare("UPDATE task_requests SET status = 'dismissed' WHERE id = ?").run(id);
+}
+
+// Participant management
+
+export function addParticipant(discussionId: string, workspaceId: string, workspaceName: string): DiscussionParticipant {
+  const db = getDb();
+  const id = uuid();
+  const claudeSessionId = uuid();
+  db.prepare(
+    'INSERT INTO discussion_participants (id, discussion_id, workspace_id, workspace_name, claude_session_id, status) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(id, discussionId, workspaceId, workspaceName, claudeSessionId, 'active');
+  return db.prepare('SELECT * FROM discussion_participants WHERE id = ?').get(id) as DiscussionParticipant;
+}
+
+export function removeParticipant(participantId: string): void {
+  const db = getDb();
+  db.prepare("UPDATE discussion_participants SET status = 'removed' WHERE id = ?").run(participantId);
+}
+
+export function getParticipants(discussionId: string): DiscussionParticipant[] {
+  const db = getDb();
+  return db.prepare(
+    "SELECT * FROM discussion_participants WHERE discussion_id = ? AND status = 'active' ORDER BY created_at ASC"
+  ).all(discussionId) as DiscussionParticipant[];
+}
+
+export function getParticipant(participantId: string): DiscussionParticipant | undefined {
+  const db = getDb();
+  return db.prepare('SELECT * FROM discussion_participants WHERE id = ?').get(participantId) as DiscussionParticipant | undefined;
+}
+
+export function updateParticipantProjectDir(participantId: string, projectDir: string): void {
+  const db = getDb();
+  db.prepare('UPDATE discussion_participants SET project_dir = ? WHERE id = ?').run(projectDir, participantId);
+}
+
+/**
+ * Build catch-up context for a participant that has been idle.
+ * Returns formatted text of all messages since the participant's last response.
+ */
+export function buildCatchUpContext(discussionId: string, participantId: string): string {
+  const db = getDb();
+  // Find the last assistant message from this participant
+  const lastMsg = db.prepare(
+    "SELECT created_at FROM discussion_messages WHERE discussion_id = ? AND participant_id = ? AND role = 'assistant' ORDER BY created_at DESC LIMIT 1"
+  ).get(discussionId, participantId) as { created_at: string } | undefined;
+
+  let messages: DiscussionMessage[];
+  if (lastMsg) {
+    messages = db.prepare(
+      "SELECT * FROM discussion_messages WHERE discussion_id = ? AND created_at > ? ORDER BY created_at ASC"
+    ).all(discussionId, lastMsg.created_at) as DiscussionMessage[];
+  } else {
+    // Participant has never spoken — get all messages
+    messages = db.prepare(
+      "SELECT * FROM discussion_messages WHERE discussion_id = ? ORDER BY created_at ASC"
+    ).all(discussionId) as DiscussionMessage[];
+  }
+
+  if (messages.length === 0) return '';
+
+  const lines: string[] = ['[Context: While you were idle, the following conversation happened in this discussion]'];
+  for (const msg of messages) {
+    const label = msg.role === 'user'
+      ? (msg.username || 'User')
+      : msg.role === 'system'
+        ? 'System'
+        : (msg.username || 'Assistant');
+    lines.push(`${label}: ${msg.content}`);
+  }
+  lines.push('[End context. The user is now talking to you directly.]\n');
+  return lines.join('\n');
 }
 
 /**

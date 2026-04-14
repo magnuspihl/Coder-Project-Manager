@@ -107,6 +107,21 @@ CREATE TABLE IF NOT EXISTS task_requests (
 
 CREATE INDEX IF NOT EXISTS idx_task_requests_discussion ON task_requests(discussion_id, status);
 
+-- Discussion participants: additional workspace agents in a discussion
+CREATE TABLE IF NOT EXISTS discussion_participants (
+  id TEXT PRIMARY KEY,
+  discussion_id TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  workspace_name TEXT NOT NULL,
+  claude_session_id TEXT,
+  project_dir TEXT,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'removed')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (discussion_id) REFERENCES discussions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_disc_participants ON discussion_participants(discussion_id, status);
+
 -- Workspace settings: persistent per-workspace configuration
 CREATE TABLE IF NOT EXISTS workspace_settings (
   workspace_id TEXT PRIMARY KEY,
