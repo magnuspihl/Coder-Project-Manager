@@ -1054,8 +1054,8 @@ export async function launchDiscussion(
     activeProcesses.set(`disc:${discussion.id}`, sshProcess);
     sshProcess.unref();
 
-    // Poll output
-    startDiscussionPolling(discussion);
+    // Poll output — skip message cleanup for catch-up launches
+    startDiscussionPolling(discussion, skipCatchUp);
 
   } catch (err) {
     const errorMsg = (err as Error).message || 'Failed to launch discussion';
@@ -1098,13 +1098,17 @@ export function isDiscussionRunning(discussionId: string): boolean {
 /**
  * Poll remote output file for a discussion session.
  */
-function startDiscussionPolling(discussion: Discussion): void {
+function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boolean): void {
   const pollKey = `disc:${discussion.id}`;
   stopPolling(pollKey);
 
-  // Clear stream log and current-session assistant messages
+  // Clear stream log and current-session assistant messages (for reconnect dedup).
+  // Skip cleanup for catch-up launches — there's no prior output to de-duplicate,
+  // and cleaning up would delete the host's previous legitimate responses.
   getDb().prepare('DELETE FROM stream_log WHERE task_id = ?').run(pollKey);
-  deleteCurrentDiscussionAssistantMessages(discussion.id);
+  if (!skipMessageCleanup) {
+    deleteCurrentDiscussionAssistantMessages(discussion.id);
+  }
 
   let linesRead = 0;
   let lastSavedMessageId: string | null = null;
