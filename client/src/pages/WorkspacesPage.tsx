@@ -520,8 +520,14 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
       <div className="flex items-center gap-2 text-xs text-gray-400 dark:text-gray-500 mt-1">
         <span>{new Date(task.created_at).toLocaleString()}</span>
         {task.model && (
-          <span className="px-1.5 py-0.5 rounded bg-purple-50 dark:bg-purple-900/20 text-purple-600 dark:text-purple-400 font-medium">
-            {task.model.replace(/^claude-/, '')}
+          <span className={`px-1.5 py-0.5 rounded font-medium ${
+            task.model.startsWith('ollama/')
+              ? 'bg-green-50 dark:bg-green-900/20 text-green-600 dark:text-green-400'
+              : 'bg-purple-50 dark:bg-purple-900/20 text-purple-600 dark:text-purple-400'
+          }`}>
+            {task.model.startsWith('ollama/')
+              ? task.model.slice('ollama/'.length).replace(/:latest$/, '')
+              : task.model.replace(/^claude-/, '')}
           </span>
         )}
       </div>
@@ -939,9 +945,20 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
                 disabled={creatingTask || loadingModels}
               >
                 <option value="">{loadingModels ? 'Loading models...' : 'Default model'}</option>
-                {availableModels.map((m) => (
-                  <option key={m.id} value={m.id}>{m.display_name}</option>
-                ))}
+                {availableModels.some(m => m.provider === 'anthropic') && (
+                  <optgroup label="Claude">
+                    {availableModels.filter(m => m.provider === 'anthropic').map((m) => (
+                      <option key={m.id} value={m.id}>{m.display_name}</option>
+                    ))}
+                  </optgroup>
+                )}
+                {availableModels.some(m => m.provider === 'ollama') && (
+                  <optgroup label="Ollama">
+                    {availableModels.filter(m => m.provider === 'ollama').map((m) => (
+                      <option key={m.id} value={m.id}>{m.display_name}</option>
+                    ))}
+                  </optgroup>
+                )}
               </select>
               <div className="flex gap-2 mt-1">
                 <button

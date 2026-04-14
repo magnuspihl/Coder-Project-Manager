@@ -3,8 +3,10 @@ import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueued
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, type Discussion } from './discussions.js';
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit } from './git.js';
+import { getOllamaBaseUrl } from './models.js';
 
 const CODER_URL = process.env.CODER_URL || '';
+const OLLAMA_BASE_URL = getOllamaBaseUrl();
 const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || '50';
 const ALLOWED_TOOLS = process.env.CLAUDE_ALLOWED_TOOLS || 'Read,Edit,Write,Bash,Glob,Grep';
 const DISCUSSION_ALLOWED_TOOLS = 'Read,Bash,Glob,Grep,mcp__coder__coder_report_task';
@@ -326,8 +328,12 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   claudeParts.push('--allowedTools', shellEscape(ALLOWED_TOOLS));
   claudeParts.push('--max-turns', MAX_TURNS);
 
-  if (task.model) {
-    claudeParts.push('--model', shellEscape(task.model));
+  // Determine if this is an Ollama model (prefixed with "ollama/")
+  const isOllama = task.model?.startsWith('ollama/');
+  const actualModel = isOllama ? task.model!.slice('ollama/'.length) : task.model;
+
+  if (actualModel) {
+    claudeParts.push('--model', shellEscape(actualModel));
   }
 
   const claudeCmd = claudeParts.join(' ');
@@ -338,6 +344,11 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   // - Write output directly to a file (no stdout pipe — avoids SIGPIPE on server restart)
   // - Capture Claude's exit code
   let remoteCmd = 'export PATH="$HOME/.local/bin:$PATH" && ';
+
+  // For Ollama models, override the Anthropic endpoint to point to Ollama
+  if (isOllama) {
+    remoteCmd += `export ANTHROPIC_BASE_URL="${OLLAMA_BASE_URL}" ANTHROPIC_API_KEY="" && `;
+  }
   if (task.project_dir) {
     remoteCmd += `cd ${shellEscape(task.project_dir)} && `;
   }

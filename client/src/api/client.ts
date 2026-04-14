@@ -173,6 +173,7 @@ export const getProjects = (workspaceId: string) =>
 export interface ModelInfo {
   id: string;
   display_name: string;
+  provider: 'anthropic' | 'ollama';
 }
 
 export const getModels = (workspaceId: string) =>

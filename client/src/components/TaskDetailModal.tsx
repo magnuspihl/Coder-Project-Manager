@@ -305,8 +305,14 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   </span>
                   <span className="text-xs text-gray-400 dark:text-gray-500">{task.workspace_name}</span>
                   {task.model && (
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-purple-50 dark:bg-purple-900/20 text-purple-600 dark:text-purple-400 font-medium">
-                      {task.model.replace(/^claude-/, '')}
+                    <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
+                      task.model.startsWith('ollama/')
+                        ? 'bg-green-50 dark:bg-green-900/20 text-green-600 dark:text-green-400'
+                        : 'bg-purple-50 dark:bg-purple-900/20 text-purple-600 dark:text-purple-400'
+                    }`}>
+                      {task.model.startsWith('ollama/')
+                        ? task.model.slice('ollama/'.length).replace(/:latest$/, '')
+                        : task.model.replace(/^claude-/, '')}
                     </span>
                   )}
                   <button
