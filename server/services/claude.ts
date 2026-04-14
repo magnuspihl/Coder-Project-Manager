@@ -942,10 +942,10 @@ export async function launchDiscussion(
   if (!isResume) {
     // First message — use prefix or not based on mode
     prompt = isFullAccess ? message : DISCUSSION_PROMPT_PREFIX + message;
-  } else if (hostCatchUp) {
-    // Resuming with multi-agent catch-up — just prepend the context.
-    // No need for access override (mode hasn't changed mid-conversation).
-    prompt = hostCatchUp + '\n' + message;
+  } else if (participants.length > 0) {
+    // Resuming with participants — prepend catch-up if available, skip access override.
+    // The override is only needed for mode toggles, not for multi-agent context.
+    prompt = hostCatchUp ? hostCatchUp + '\n' + message : message;
   } else if (isFullAccess) {
     // Resuming with full access, no participants — send override in case mode changed
     prompt = FULL_ACCESS_OVERRIDE + message;
