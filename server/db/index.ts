@@ -108,6 +108,12 @@ export function getDb(): Database.Database {
     if (!msgCols.some(c => c.name === 'username')) {
       db.exec("ALTER TABLE messages ADD COLUMN username TEXT");
     }
+
+    // Discussion messages migrations
+    const dmCols = db.prepare("PRAGMA table_info(discussion_messages)").all() as Array<{ name: string }>;
+    if (!dmCols.some(c => c.name === 'participant_id')) {
+      db.exec("ALTER TABLE discussion_messages ADD COLUMN participant_id TEXT");
+    }
   }
   return db;
 }

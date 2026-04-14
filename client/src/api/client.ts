@@ -250,6 +250,20 @@ export interface DiscussionMessage {
   content: string;
   cost: number | null;
   username: string | null;
+  participant_id: string | null;
+  created_at: string;
+}
+
+export interface DiscussionParticipant {
+  id: string;
+  discussion_id: string;
+  workspace_id: string;
+  workspace_name: string;
+  claude_session_id: string | null;
+  project_dir: string | null;
+  status: string;
+  running: boolean;
+  activity: TaskActivity | null;
   created_at: string;
 }
 
@@ -273,13 +287,13 @@ export const updateDiscussionSettings = (workspaceId: string, fullAccess: boolea
   });
 
 export const getOrCreateDiscussion = (workspaceId: string) =>
-  request<{ discussion: Discussion; messages: DiscussionMessage[]; totalMessages?: number; taskRequests: TaskRequestItem[] }>(
+  request<{ discussion: Discussion; messages: DiscussionMessage[]; totalMessages?: number; taskRequests: TaskRequestItem[]; participants: DiscussionParticipant[] }>(
     `/api/workspaces/${workspaceId}/discussion`,
     { method: 'POST' }
   );
 
 export const getDiscussionDetail = (discussionId: string, afterId?: string) =>
-  request<{ discussion: Discussion; messages: DiscussionMessage[]; totalMessages: number; taskRequests: TaskRequestItem[] }>(
+  request<{ discussion: Discussion; messages: DiscussionMessage[]; totalMessages: number; taskRequests: TaskRequestItem[]; participants: DiscussionParticipant[] }>(
     `/api/discussions/${discussionId}${afterId ? `?after=${afterId}` : ''}`
   );
 
@@ -311,3 +325,25 @@ export const approveTaskRequest = (discussionId: string, requestId: string) =>
 
 export const dismissTaskRequest = (discussionId: string, requestId: string) =>
   request<{ ok: boolean }>(`/api/discussions/${discussionId}/task-requests/${requestId}/dismiss`, { method: 'POST' });
+
+// Participants
+export const addDiscussionParticipant = (discussionId: string, workspaceId: string, workspaceName: string) =>
+  request<{ participant: DiscussionParticipant }>(`/api/discussions/${discussionId}/participants`, {
+    method: 'POST',
+    body: JSON.stringify({ workspaceId, workspaceName }),
+  });
+
+export const removeDiscussionParticipant = (discussionId: string, participantId: string) =>
+  request<{ ok: boolean }>(`/api/discussions/${discussionId}/participants/${participantId}`, { method: 'DELETE' });
+
+export const sendParticipantMessage = (discussionId: string, participantId: string, message: string) =>
+  request<{ ok: boolean }>(`/api/discussions/${discussionId}/participants/${participantId}/message`, {
+    method: 'POST',
+    body: JSON.stringify({ message }),
+  });
+
+export const sendHostCatchUp = (discussionId: string) =>
+  request<{ ok: boolean; skipped: boolean }>(`/api/discussions/${discussionId}/catchup`, { method: 'POST' });
+
+export const sendParticipantCatchUp = (discussionId: string, participantId: string) =>
+  request<{ ok: boolean; skipped: boolean }>(`/api/discussions/${discussionId}/participants/${participantId}/catchup`, { method: 'POST' });

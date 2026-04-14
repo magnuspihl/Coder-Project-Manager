@@ -9,9 +9,15 @@ import {
   updateDiscussionSettings,
   approveTaskRequest,
   dismissTaskRequest,
+  addDiscussionParticipant,
+  removeDiscussionParticipant,
+  sendParticipantMessage,
+  getWorkspaces,
   type Discussion,
   type DiscussionMessage,
+  type DiscussionParticipant,
   type TaskRequestItem,
+  type Workspace,
 } from '../api/client';
 import { useDraft } from '../hooks/useDraft';
 import { linkify } from '../utils/linkify';
@@ -19,17 +25,28 @@ import Markdown from './Markdown';
 import RateLimitBanner from './RateLimitBanner';
 
 const TASK_REQUEST_RE = /\[TASK_REQUEST\]\s*[\s\S]*?\s*\[\/TASK_REQUEST\]/g;
+const MENTION_RE = /\[MENTION:[^\]]+\]/g;
 
-const MessageRow = memo(function MessageRow({ msg }: { msg: DiscussionMessage }) {
+const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName }: { msg: DiscussionMessage; hostWorkspaceName?: string }) {
   const strippedContent = msg.role === 'assistant'
-    ? msg.content.replace(TASK_REQUEST_RE, '').trim()
+    ? msg.content.replace(TASK_REQUEST_RE, '').replace(MENTION_RE, '').trim()
     : msg.content;
+
+  // Determine the label for assistant messages
+  const assistantLabel = msg.role === 'assistant'
+    ? (msg.username || hostWorkspaceName || 'assistant')
+    : null;
+
+  // Color-code participant messages differently from host
+  const isParticipantMsg = msg.role === 'assistant' && msg.participant_id;
 
   return (
     <div
       className={`rounded-lg p-4 ${
         msg.role === 'user'
           ? 'bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800 ml-8'
+          : msg.role === 'assistant' && isParticipantMsg
+          ? 'bg-teal-50 dark:bg-teal-900/20 border border-teal-200 dark:border-teal-800 mr-8'
           : msg.role === 'assistant'
           ? 'bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 mr-8'
           : msg.content.startsWith('Error:')
@@ -38,8 +55,8 @@ const MessageRow = memo(function MessageRow({ msg }: { msg: DiscussionMessage })
       }`}
     >
       <div className="flex items-center justify-between mb-1">
-        <span className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase">
-          {msg.role === 'user' && msg.username ? msg.username : msg.role}
+        <span className={`text-xs font-medium uppercase ${isParticipantMsg ? 'text-teal-600 dark:text-teal-400' : 'text-gray-500 dark:text-gray-400'}`}>
+          {msg.role === 'user' && msg.username ? msg.username : assistantLabel || msg.role}
         </span>
         <div className="flex items-center gap-2">
           {msg.cost && (
@@ -97,6 +114,14 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const lastMessageIdRef = useRef<string | null>(null);
   const initialLoadDone = useRef(false);
 
+  // Multi-agent participant state
+  const [participants, setParticipants] = useState<DiscussionParticipant[]>([]);
+  const [targetId, setTargetId] = useState<string | null>(null); // null = host
+  const [showInviteMenu, setShowInviteMenu] = useState(false);
+  const [availableWorkspaces, setAvailableWorkspaces] = useState<Workspace[]>([]);
+  const [loadingWorkspaces, setLoadingWorkspaces] = useState(false);
+  const lastParticipantsJsonRef = useRef('');
+
   // Initial load: fetch latest 50 messages
   // Subsequent polls: only fetch messages after the last known ID
   const loadData = async () => {
@@ -109,7 +134,16 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
       if (dJson !== lastDiscJsonRef.current) {
         lastDiscJsonRef.current = dJson;
         setDiscussion(data.discussion);
-        discussionRunningRef.current = !!data.discussion?.running;
+        // Running means host OR any participant is running
+        const anyParticipantRunning = (data.participants || []).some(p => p.running);
+        discussionRunningRef.current = !!data.discussion?.running || anyParticipantRunning;
+      }
+
+      // Update participants
+      const pJson = JSON.stringify(data.participants || []);
+      if (pJson !== lastParticipantsJsonRef.current) {
+        lastParticipantsJsonRef.current = pJson;
+        setParticipants(data.participants || []);
       }
 
       setTotalMessages(data.totalMessages);
@@ -221,6 +255,58 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     [messages]
   );
 
+  // Computed: is any agent (host or participant) running?
+  const isAnyRunning = !!(discussion?.running) || participants.some(p => p.running);
+  const runningParticipant = participants.find(p => p.running);
+  const runningAgentName = discussion?.running ? workspaceName : runningParticipant?.workspace_name || null;
+
+  // Target display name
+  const targetName = targetId
+    ? participants.find(p => p.id === targetId)?.workspace_name || 'participant'
+    : workspaceName;
+
+  const handleSwitchTarget = (newTargetId: string | null) => {
+    if (newTargetId === targetId) return;
+    if (isAnyRunning || sending) return;
+    setTargetId(newTargetId);
+  };
+
+  const handleInvite = async (ws: Workspace) => {
+    try {
+      await addDiscussionParticipant(discussionId, ws.id, ws.name);
+      setShowInviteMenu(false);
+      await loadData();
+    } catch (err) {
+      console.error('Failed to invite:', err);
+    }
+  };
+
+  const handleRemoveParticipant = async (participantId: string) => {
+    try {
+      await removeDiscussionParticipant(discussionId, participantId);
+      if (targetId === participantId) setTargetId(null);
+      await loadData();
+    } catch (err) {
+      console.error('Failed to remove participant:', err);
+    }
+  };
+
+  const handleOpenInviteMenu = async () => {
+    setShowInviteMenu(true);
+    setLoadingWorkspaces(true);
+    try {
+      const data = await getWorkspaces();
+      setAvailableWorkspaces(data.workspaces.filter(ws =>
+        ws.id !== workspaceId && // not the host
+        !participants.some(p => p.workspace_id === ws.id) // not already invited
+      ));
+    } catch {
+      setAvailableWorkspaces([]);
+    } finally {
+      setLoadingWorkspaces(false);
+    }
+  };
+
   const closeModal = () => {
     if (window.history.state?.modal === 'discussion') {
       window.history.back();
@@ -243,7 +329,13 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     setSending(true);
     shouldForceScroll.current = true;
     try {
-      await sendDiscussionMessage(discussionId, message.trim());
+      if (targetId) {
+        // Send to participant
+        await sendParticipantMessage(discussionId, targetId, message.trim());
+      } else {
+        // Send to host
+        await sendDiscussionMessage(discussionId, message.trim());
+      }
       clearMessage();
       await loadData();
     } catch (err) {
@@ -446,18 +538,24 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
               )}
 
               {visibleMessages.map((msg) => (
-                <MessageRow key={msg.id} msg={msg} />
+                <MessageRow key={msg.id} msg={msg} hostWorkspaceName={workspaceName} />
               ))}
 
               {/* Working indicator */}
-              {discussion.running && (
-                <div className="text-sm text-purple-600 dark:text-purple-400 p-4 bg-purple-50 dark:bg-purple-900/20 rounded-lg border border-purple-100 dark:border-purple-800">
+              {isAnyRunning && (
+                <div className={`text-sm p-4 rounded-lg border ${
+                  runningParticipant
+                    ? 'text-teal-600 dark:text-teal-400 bg-teal-50 dark:bg-teal-900/20 border-teal-100 dark:border-teal-800'
+                    : 'text-purple-600 dark:text-purple-400 bg-purple-50 dark:bg-purple-900/20 border-purple-100 dark:border-purple-800'
+                }`}>
                   <div className="flex items-center gap-2">
-                    <div className="animate-spin h-4 w-4 border-2 border-purple-600 dark:border-purple-400 border-t-transparent rounded-full" />
-                    <span>Claude is thinking...</span>
-                    {discussion.activity && (
+                    <div className={`animate-spin h-4 w-4 border-2 border-t-transparent rounded-full ${
+                      runningParticipant ? 'border-teal-600 dark:border-teal-400' : 'border-purple-600 dark:border-purple-400'
+                    }`} />
+                    <span>{runningAgentName || 'Agent'} is thinking...</span>
+                    {(discussion.activity || runningParticipant?.activity) && (
                       <span className="text-xs text-gray-400 dark:text-gray-500 ml-auto">
-                        {timeAgo(discussion.activity.timestamp)}
+                        {timeAgo((runningParticipant?.activity || discussion.activity)!.timestamp)}
                       </span>
                     )}
                     <button
@@ -472,9 +570,11 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                       </svg>
                     </button>
                   </div>
-                  {discussion.activity && (
-                    <p className="mt-1 text-xs text-purple-500 dark:text-purple-300 truncate ml-6">
-                      {linkify(discussion.activity.summary)}
+                  {(discussion.activity || runningParticipant?.activity) && (
+                    <p className={`mt-1 text-xs truncate ml-6 ${
+                      runningParticipant ? 'text-teal-500 dark:text-teal-300' : 'text-purple-500 dark:text-purple-300'
+                    }`}>
+                      {linkify((runningParticipant?.activity || discussion.activity)!.summary)}
                     </p>
                   )}
                 </div>
@@ -521,32 +621,154 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
               ))}
             </div>
 
-            {/* Footer: message input + actions */}
+            {/* Footer: target selector + message input + actions */}
             <div className="border-t border-gray-200 dark:border-gray-800 p-5">
+              {/* Target selector — only shown when there are participants */}
+              {participants.length > 0 && (
+                <div className="flex items-center gap-1.5 mb-3 flex-wrap">
+                  <span className="text-[10px] text-gray-400 dark:text-gray-500 uppercase tracking-wide mr-1">Talk to:</span>
+                  {/* Host tab */}
+                  <button
+                    onClick={() => handleSwitchTarget(null)}
+                    className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                      targetId === null
+                        ? 'bg-purple-100 dark:bg-purple-900/40 border-purple-300 dark:border-purple-700 text-purple-700 dark:text-purple-300 font-medium'
+                        : 'border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:border-purple-300 dark:hover:border-purple-700'
+                    }`}
+                  >
+                    {workspaceName}
+                    {discussion.running && <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-purple-500 animate-pulse" />}
+                  </button>
+                  {/* Participant tabs */}
+                  {participants.map(p => (
+                    <div key={p.id} className="flex items-center gap-0">
+                      <button
+                        onClick={() => handleSwitchTarget(p.id)}
+                        className={`text-xs px-2.5 py-1 rounded-l-full border transition-colors ${
+                          targetId === p.id
+                            ? 'bg-teal-100 dark:bg-teal-900/40 border-teal-300 dark:border-teal-700 text-teal-700 dark:text-teal-300 font-medium'
+                            : 'border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:border-teal-300 dark:hover:border-teal-700'
+                        }`}
+                      >
+                        {p.workspace_name}
+                        {p.running && <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-teal-500 animate-pulse" />}
+                      </button>
+                      <button
+                        onClick={() => handleRemoveParticipant(p.id)}
+                        className="text-xs px-1.5 py-1 rounded-r-full border border-l-0 border-gray-200 dark:border-gray-700 text-gray-400 hover:text-red-500 hover:border-red-300 dark:hover:border-red-700 transition-colors"
+                        title={`Remove ${p.workspace_name}`}
+                      >
+                        &times;
+                      </button>
+                    </div>
+                  ))}
+                  {/* Invite button */}
+                  <div className="relative">
+                    <button
+                      onClick={handleOpenInviteMenu}
+                      className="text-xs px-2 py-1 rounded-full border border-dashed border-gray-300 dark:border-gray-600 text-gray-400 dark:text-gray-500 hover:border-green-400 hover:text-green-600 dark:hover:border-green-600 dark:hover:text-green-400 transition-colors"
+                    >
+                      + Invite
+                    </button>
+                    {showInviteMenu && (
+                      <div className="absolute bottom-full left-0 mb-1 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl z-50 min-w-[200px] max-h-[200px] overflow-y-auto">
+                        {loadingWorkspaces ? (
+                          <div className="p-3 text-xs text-gray-400 dark:text-gray-500">Loading workspaces...</div>
+                        ) : availableWorkspaces.length === 0 ? (
+                          <div className="p-3 text-xs text-gray-400 dark:text-gray-500">No other workspaces available</div>
+                        ) : (
+                          availableWorkspaces.map(ws => (
+                            <button
+                              key={ws.id}
+                              onClick={() => handleInvite(ws)}
+                              className="w-full text-left text-xs px-3 py-2 hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300 border-b border-gray-100 dark:border-gray-800 last:border-0"
+                            >
+                              {ws.name}
+                            </button>
+                          ))
+                        )}
+                        <button
+                          onClick={() => setShowInviteMenu(false)}
+                          className="w-full text-center text-[10px] py-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 border-t border-gray-100 dark:border-gray-800"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
               <form onSubmit={handleSend} className="flex flex-col gap-2">
                 <textarea
                   value={message}
                   onChange={(e) => setMessage(e.target.value)}
                   onKeyDown={handleKeyDown}
-                  placeholder={discussion.running ? 'Claude is thinking...' : 'Ask about the codebase...'}
+                  placeholder={isAnyRunning ? `${runningAgentName || 'Agent'} is thinking...` : `Message ${targetName}...`}
                   rows={3}
                   autoFocus
-                  disabled={sending || discussion.running}
-                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 resize-y disabled:opacity-50"
+                  disabled={sending || isAnyRunning}
+                  className={`w-full px-3 py-2 border bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 resize-y disabled:opacity-50 ${
+                    targetId
+                      ? 'border-teal-300 dark:border-teal-700 focus:ring-teal-500'
+                      : 'border-gray-300 dark:border-gray-700 focus:ring-purple-500'
+                  }`}
                 />
                 <div className="flex items-center justify-between">
-                  <button
-                    onClick={handleClose}
-                    className="text-xs text-red-500 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300"
-                  >
-                    End Discussion
-                  </button>
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={handleClose}
+                      className="text-xs text-red-500 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300"
+                    >
+                      End Discussion
+                    </button>
+                    {/* Invite button when no participants yet */}
+                    {participants.length === 0 && (
+                      <div className="relative">
+                        <button
+                          onClick={handleOpenInviteMenu}
+                          className="text-xs text-green-500 dark:text-green-400 hover:text-green-700 dark:hover:text-green-300"
+                        >
+                          + Invite Agent
+                        </button>
+                        {showInviteMenu && (
+                          <div className="absolute bottom-full left-0 mb-1 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl z-50 min-w-[200px] max-h-[200px] overflow-y-auto">
+                            {loadingWorkspaces ? (
+                              <div className="p-3 text-xs text-gray-400 dark:text-gray-500">Loading workspaces...</div>
+                            ) : availableWorkspaces.length === 0 ? (
+                              <div className="p-3 text-xs text-gray-400 dark:text-gray-500">No other workspaces available</div>
+                            ) : (
+                              availableWorkspaces.map(ws => (
+                                <button
+                                  key={ws.id}
+                                  onClick={() => handleInvite(ws)}
+                                  className="w-full text-left text-xs px-3 py-2 hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300 border-b border-gray-100 dark:border-gray-800 last:border-0"
+                                >
+                                  {ws.name}
+                                </button>
+                              ))
+                            )}
+                            <button
+                              onClick={() => setShowInviteMenu(false)}
+                              className="w-full text-center text-[10px] py-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 border-t border-gray-100 dark:border-gray-800"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                   <button
                     type="submit"
-                    disabled={sending || !message.trim() || discussion.running}
-                    className="bg-purple-600 text-white text-sm px-4 py-2 rounded-md hover:bg-purple-700 disabled:opacity-50"
+                    disabled={sending || !message.trim() || isAnyRunning}
+                    className={`text-white text-sm px-4 py-2 rounded-md disabled:opacity-50 ${
+                      targetId
+                        ? 'bg-teal-600 hover:bg-teal-700'
+                        : 'bg-purple-600 hover:bg-purple-700'
+                    }`}
                   >
-                    {sending ? 'Sending...' : 'Send (Ctrl+Enter)'}
+                    {sending ? 'Sending...' : `Send to ${targetName} (Ctrl+Enter)`}
                   </button>
                 </div>
               </form>
