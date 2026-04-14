@@ -95,33 +95,78 @@ async function fetchOllamaModels(): Promise<ModelInfo[]> {
     return ollamaCache.models;
   }
 
+  const [local, cloud] = await Promise.all([
+    fetchOllamaLocalModels(),
+    fetchOllamaCloudModels(),
+  ]);
+
+  // Merge and deduplicate (local models take precedence)
+  const seen = new Set<string>();
+  const models: ModelInfo[] = [];
+  for (const m of [...local, ...cloud]) {
+    if (!seen.has(m.id)) {
+      seen.add(m.id);
+      models.push(m);
+    }
+  }
+  models.sort((a, b) => a.display_name.localeCompare(b.display_name));
+
+  ollamaCache = { models, timestamp: Date.now() };
+  return models;
+}
+
+/** Fetch locally installed models from Ollama's /api/tags endpoint. */
+async function fetchOllamaLocalModels(): Promise<ModelInfo[]> {
   try {
     const res = await fetch(`${OLLAMA_BASE_URL}/api/tags`, { signal: AbortSignal.timeout(5000) });
-    if (!res.ok) return cacheOllama([]);
+    if (!res.ok) return [];
 
     const data = await res.json();
-    if (!data.models || !Array.isArray(data.models)) return cacheOllama([]);
+    if (!data.models || !Array.isArray(data.models)) return [];
 
-    const models: ModelInfo[] = data.models
-      .map((m: any) => {
-        const name = m.name || m.model;
-        return {
-          id: `ollama/${name}`,
-          display_name: name.replace(/:latest$/, ''),
-          provider: 'ollama' as const,
-        };
-      })
-      .sort((a: ModelInfo, b: ModelInfo) => a.display_name.localeCompare(b.display_name));
-
-    return cacheOllama(models);
+    return data.models.map((m: any) => {
+      const name = m.name || m.model;
+      return {
+        id: `ollama/${name}`,
+        display_name: `${name.replace(/:latest$/, '')} (local)`,
+        provider: 'ollama' as const,
+      };
+    });
   } catch {
-    return cacheOllama([]);
+    return [];
   }
 }
 
-function cacheOllama(models: ModelInfo[]): ModelInfo[] {
-  ollamaCache = { models, timestamp: Date.now() };
-  return models;
+// Cache cloud model list separately (changes rarely)
+let ollamaCloudListCache: { names: string[]; timestamp: number } | null = null;
+const CLOUD_LIST_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+/** Scrape available cloud model names from ollama.com/search?c=cloud. */
+async function fetchOllamaCloudModels(): Promise<ModelInfo[]> {
+  try {
+    let names: string[];
+
+    if (ollamaCloudListCache && Date.now() - ollamaCloudListCache.timestamp < CLOUD_LIST_CACHE_TTL_MS) {
+      names = ollamaCloudListCache.names;
+    } else {
+      const res = await fetch('https://ollama.com/search?c=cloud', { signal: AbortSignal.timeout(10000) });
+      if (!res.ok) return [];
+
+      const html = await res.text();
+      // Model links follow the pattern href="/library/<model-name>"
+      const matches = html.matchAll(/href="\/library\/([^"]+)"/g);
+      names = [...new Set([...matches].map(m => m[1]))];
+      ollamaCloudListCache = { names, timestamp: Date.now() };
+    }
+
+    return names.map(name => ({
+      id: `ollama/${name}:cloud`,
+      display_name: `${name} (cloud)`,
+      provider: 'ollama' as const,
+    }));
+  } catch {
+    return [];
+  }
 }
 
 /**
