@@ -281,13 +281,31 @@ export function buildCatchUpContext(discussionId: string, participantId: string)
         "SELECT created_at FROM discussion_messages WHERE discussion_id = ? AND participant_id = ? AND role = 'assistant' ORDER BY created_at DESC LIMIT 1"
       ).get(discussionId, participantId) as { created_at: string } | undefined;
 
+  // Determine the earliest point to include messages from.
+  // For participants: never earlier than when they were invited (created_at).
+  // For the host: no floor needed (host was always part of the discussion).
+  let floor: string | null = null;
+  if (!isHost) {
+    const participant = db.prepare(
+      "SELECT created_at FROM discussion_participants WHERE id = ?"
+    ).get(participantId) as { created_at: string } | undefined;
+    floor = participant?.created_at || null;
+  }
+
   let messages: DiscussionMessage[];
   if (lastMsg) {
+    // Use whichever is later: last message or invite time
+    const since = floor && floor > lastMsg.created_at ? floor : lastMsg.created_at;
     messages = db.prepare(
       "SELECT * FROM discussion_messages WHERE discussion_id = ? AND created_at > ? ORDER BY created_at ASC"
-    ).all(discussionId, lastMsg.created_at) as DiscussionMessage[];
+    ).all(discussionId, since) as DiscussionMessage[];
+  } else if (floor) {
+    // Participant has never spoken — only get messages since they were invited
+    messages = db.prepare(
+      "SELECT * FROM discussion_messages WHERE discussion_id = ? AND created_at >= ? ORDER BY created_at ASC"
+    ).all(discussionId, floor) as DiscussionMessage[];
   } else {
-    // Participant has never spoken — get all messages
+    // Host has never spoken and no floor — get all messages
     messages = db.prepare(
       "SELECT * FROM discussion_messages WHERE discussion_id = ? ORDER BY created_at ASC"
     ).all(discussionId) as DiscussionMessage[];
