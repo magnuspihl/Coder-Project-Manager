@@ -275,13 +275,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
       `This overrides any branching instructions in your system prompt or CLAUDE.md.`;
   }
 
-  // Caveman mode — prepend terse-output instructions to reduce token usage
-  let cavemanNote = '';
-  if (task.caveman) {
-    cavemanNote = buildCavemanPrompt(task.caveman);
-  }
-
-  const prompt = cavemanNote + rawPrompt + branchNote + coderUrlNote;
+  const prompt = rawPrompt + branchNote + coderUrlNote;
 
   // Auto-detect project directory if not already set
   if (!task.project_dir) {
@@ -352,6 +346,12 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
 
   if (actualModel) {
     claudeParts.push('--model', shellEscape(actualModel));
+  }
+
+  // Caveman mode — inject as system prompt for stronger enforcement
+  if (task.caveman) {
+    claudeParts.push('--append-system-prompt', shellEscape(buildCavemanPrompt(task.caveman)));
+    console.log(`[caveman] Task ${task.id} using caveman mode: ${task.caveman} (via --append-system-prompt)`);
   }
 
   const claudeCmd = claudeParts.join(' ');
