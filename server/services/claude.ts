@@ -73,6 +73,18 @@ export function getTaskActivity(taskId: string): TaskActivity | undefined {
   return taskActivity.get(taskId);
 }
 
+// Caveman mode prompt — reduces output token usage by forcing terse communication
+function buildCavemanPrompt(intensity: string): string {
+  const level = intensity || 'full';
+  const rules: Record<string, string> = {
+    lite: 'Respond concisely. No filler words (just/really/basically/actually/simply), no pleasantries (sure/certainly/of course/happy to), no hedging. Keep articles and full sentences. Professional but tight.',
+    full: 'Respond terse like smart caveman. Drop articles (a/an/the), filler, pleasantries, hedging. Fragments OK. Short synonyms (big not extensive, fix not "implement a solution for"). Technical terms exact. Code blocks unchanged. Pattern: [thing] [action] [reason]. [next step].',
+    ultra: 'Maximum compression. Drop articles, filler, conjunctions. Abbreviate (DB/auth/config/req/res/fn/impl). Arrows for causality (X → Y). One word when one word enough. Technical terms exact. Code blocks unchanged.',
+  };
+  const rule = rules[level] || rules.full;
+  return `[OUTPUT MODE: ${level.toUpperCase()} — ${rule} Drop caveman for: security warnings, irreversible action confirmations. Code/commits/PRs: write normally.]\n\n`;
+}
+
 // Stream log per task — persisted to database
 export interface StreamLogEntry {
   timestamp: string;
@@ -263,7 +275,13 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
       `This overrides any branching instructions in your system prompt or CLAUDE.md.`;
   }
 
-  const prompt = rawPrompt + branchNote + coderUrlNote;
+  // Caveman mode — prepend terse-output instructions to reduce token usage
+  let cavemanNote = '';
+  if (task.caveman) {
+    cavemanNote = buildCavemanPrompt(task.caveman);
+  }
+
+  const prompt = cavemanNote + rawPrompt + branchNote + coderUrlNote;
 
   // Auto-detect project directory if not already set
   if (!task.project_dir) {

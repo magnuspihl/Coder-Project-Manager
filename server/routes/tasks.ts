@@ -38,7 +38,7 @@ router.get('/workspaces/:workspaceId/tasks', requireAuth, (req: Request, res: Re
 
 // Create a new task
 router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, res: Response) => {
-  const { prompt, branch, model } = req.body;
+  const { prompt, branch, model, caveman } = req.body;
   if (!prompt) {
     res.status(400).json({ error: 'Prompt is required' });
     return;
@@ -83,6 +83,7 @@ router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, 
       prompt,
       branch: typeof branch === 'string' ? branch.trim() : undefined,
       model: typeof model === 'string' ? model.trim() : undefined,
+      caveman: typeof caveman === 'string' && ['lite', 'full', 'ultra'].includes(caveman) ? caveman : undefined,
     });
 
     await processQueue(req.params.workspaceId);
