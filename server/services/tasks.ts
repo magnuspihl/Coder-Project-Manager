@@ -20,6 +20,7 @@ export interface Task {
   ssh_pid: number | null;
   git_branch: string | null;
   github_repo_url: string | null;
+  caveman: string | null;
   total_input_tokens: number;
   total_output_tokens: number;
   created_at: string;
@@ -214,6 +215,7 @@ export function createTask(params: {
   projectDir?: string;
   branch?: string;
   model?: string;
+  caveman?: string;
 }): Task {
   const db = getDb();
   const id = uuid();
@@ -229,9 +231,9 @@ export function createTask(params: {
   const title = generateTitleFallback(params.prompt);
 
   db.prepare(
-    `INSERT INTO tasks (id, workspace_id, workspace_name, user_id, title, prompt, status, position, project_dir, claude_session_id, branch, model)
-     VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`
-  ).run(id, params.workspaceId, params.workspaceName, params.userId, title, params.prompt, position, params.projectDir || null, claudeSessionId, params.branch || null, params.model || null);
+    `INSERT INTO tasks (id, workspace_id, workspace_name, user_id, title, prompt, status, position, project_dir, claude_session_id, branch, model, caveman)
+     VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)`
+  ).run(id, params.workspaceId, params.workspaceName, params.userId, title, params.prompt, position, params.projectDir || null, claudeSessionId, params.branch || null, params.model || null, params.caveman || null);
 
   // Store the initial prompt as a user message
   addMessage(id, 'user', params.prompt, undefined, params.username);

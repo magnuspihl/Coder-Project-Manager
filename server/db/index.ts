@@ -109,6 +109,10 @@ export function getDb(): Database.Database {
       db.exec("ALTER TABLE messages ADD COLUMN username TEXT");
     }
 
+    if (!cols.some(c => c.name === 'caveman')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN caveman TEXT");
+    }
+
     // Discussion messages migrations
     const dmCols = db.prepare("PRAGMA table_info(discussion_messages)").all() as Array<{ name: string }>;
     if (!dmCols.some(c => c.name === 'participant_id')) {

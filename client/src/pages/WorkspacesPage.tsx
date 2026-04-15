@@ -95,6 +95,7 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
   const [newTaskPrompt, setNewTaskPrompt, clearNewTaskPrompt] = useDraft('newTaskPrompt');
   const [newTaskBranch, setNewTaskBranch] = useState('');
   const [newTaskModel, setNewTaskModel] = useState('');
+  const [newTaskCaveman, setNewTaskCaveman] = useState('');
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
   const [creatingTask, setCreatingTask] = useState(false);
@@ -488,11 +489,13 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
     try {
       const branch = newTaskBranch.trim() || undefined;
       const model = newTaskModel || undefined;
-      await createTask(workspaceId, newTaskPrompt.trim(), branch, model);
+      const caveman = newTaskCaveman || undefined;
+      await createTask(workspaceId, newTaskPrompt.trim(), branch, model, caveman);
       lastTaskWorkspaceIdRef.current = workspaceId;
       clearNewTaskPrompt();
       setNewTaskBranch('');
       setNewTaskModel('');
+      setNewTaskCaveman('');
       setNewTaskWorkspaceId(null);
       await loadData();
     } catch (err: unknown) {
@@ -966,6 +969,17 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
                     ))}
                   </optgroup>
                 )}
+              </select>
+              <select
+                value={newTaskCaveman}
+                onChange={(e) => setNewTaskCaveman(e.target.value)}
+                className="w-full text-sm border border-gray-300 dark:border-gray-700 rounded-md p-1.5 mt-1 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                disabled={creatingTask}
+              >
+                <option value="">Caveman mode (off)</option>
+                <option value="lite">Caveman: Lite — no filler, full sentences</option>
+                <option value="full">Caveman: Full — fragments, no articles</option>
+                <option value="ultra">Caveman: Ultra — max compression</option>
               </select>
               <div className="flex gap-2 mt-1">
                 <button

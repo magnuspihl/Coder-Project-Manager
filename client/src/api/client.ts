@@ -183,10 +183,10 @@ export const getModels = (workspaceId: string) =>
 export const getTasks = (workspaceId: string) =>
   request<{ tasks: Task[] }>(`/api/workspaces/${workspaceId}/tasks`);
 
-export const createTask = (workspaceId: string, prompt: string, branch?: string, model?: string) =>
+export const createTask = (workspaceId: string, prompt: string, branch?: string, model?: string, caveman?: string) =>
   request<{ task: Task }>(`/api/workspaces/${workspaceId}/tasks`, {
     method: 'POST',
-    body: JSON.stringify({ prompt, ...(branch ? { branch } : {}), ...(model ? { model } : {}) }),
+    body: JSON.stringify({ prompt, ...(branch ? { branch } : {}), ...(model ? { model } : {}), ...(caveman ? { caveman } : {}) }),
   });
 
 export const getTaskDetail = (taskId: string) =>
