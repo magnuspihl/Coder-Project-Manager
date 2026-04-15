@@ -16,6 +16,11 @@ import discussionRoutes from './routes/discussions.js';
 import './db/index.js';
 import { reconnectWorkingTasks } from './services/claude.js';
 
+// Prevent unhandled promise rejections from crashing the server
+process.on('unhandledRejection', (reason) => {
+  console.error('[server] Unhandled rejection:', reason instanceof Error ? reason.message.slice(0, 200) : String(reason).slice(0, 200));
+});
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
@@ -43,5 +48,7 @@ if (existsSync(clientDist)) {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Coder Project Manager running on http://localhost:${PORT}`);
-  reconnectWorkingTasks();
+  reconnectWorkingTasks().catch(err => {
+    console.error('[recovery] Unhandled error during task reconnect:', (err as Error).message?.slice(0, 200));
+  });
 });
