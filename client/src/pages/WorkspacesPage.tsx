@@ -665,6 +665,11 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
           )}
         </div>
         <div className="flex items-center gap-2">
+          {task.caveman && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 font-medium" title={`Caveman mode: ${task.caveman}`}>
+              {task.caveman === 'ultra' ? '🦴 ultra' : task.caveman === 'full' ? '🦴 full' : '🦴 lite'}
+            </span>
+          )}
           {(task.total_input_tokens > 0 || task.total_output_tokens > 0) && (
             <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono" title={`In: ${task.total_input_tokens.toLocaleString()} | Out: ${task.total_output_tokens.toLocaleString()}`}>
               {formatTokens(task.total_input_tokens + task.total_output_tokens)}t

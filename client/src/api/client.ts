@@ -89,6 +89,7 @@ export interface Task {
   git_branch: string | null;
   github_repo_url: string | null;
   model: string | null;
+  caveman: string | null;
   total_input_tokens: number;
   total_output_tokens: number;
   total_cost_usd?: number;
