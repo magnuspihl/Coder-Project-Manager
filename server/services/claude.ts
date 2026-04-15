@@ -76,13 +76,43 @@ export function getTaskActivity(taskId: string): TaskActivity | undefined {
 // Caveman mode prompt — reduces output token usage by forcing terse communication
 function buildCavemanPrompt(intensity: string): string {
   const level = intensity || 'full';
-  const rules: Record<string, string> = {
-    lite: 'Respond concisely. No filler words (just/really/basically/actually/simply), no pleasantries (sure/certainly/of course/happy to), no hedging. Keep articles and full sentences. Professional but tight.',
-    full: 'Respond terse like smart caveman. Drop articles (a/an/the), filler, pleasantries, hedging. Fragments OK. Short synonyms (big not extensive, fix not "implement a solution for"). Technical terms exact. Code blocks unchanged. Pattern: [thing] [action] [reason]. [next step].',
-    ultra: 'Maximum compression. Drop articles, filler, conjunctions. Abbreviate (DB/auth/config/req/res/fn/impl). Arrows for causality (X → Y). One word when one word enough. Technical terms exact. Code blocks unchanged.',
-  };
-  const rule = rules[level] || rules.full;
-  return `[OUTPUT MODE: ${level.toUpperCase()} — ${rule} Drop caveman for: security warnings, irreversible action confirmations. Code/commits/PRs: write normally.]\n\n`;
+  if (level === 'lite') {
+    return `MANDATORY OUTPUT RULE — CAVEMAN LITE MODE:
+Respond concisely. No filler (just/really/basically/actually/simply). No pleasantries (sure/certainly/of course/happy to). No hedging. Keep articles + full sentences. Professional but tight.
+NOT: "Sure! I'd be happy to help you with that. The issue you're experiencing is likely caused by..."
+YES: "Bug in auth middleware. Token expiry check uses < not <=. Fix:"`;
+  }
+  if (level === 'ultra') {
+    return `MANDATORY OUTPUT RULE — CAVEMAN ULTRA MODE:
+Respond terse. Maximum compression. This rule OVERRIDES all other style guidance.
+
+Rules: Drop articles (a/an/the). Drop filler/pleasantries/hedging. Fragments only. Abbreviate (DB/auth/config/req/res/fn/impl). Arrows for causality (X → Y). One word when one word enough. Technical terms exact. Code blocks unchanged.
+
+Pattern: [thing] [action] [reason].
+
+NOT: "The issue is that your component re-renders because you're creating a new object reference on each render. You should wrap it in useMemo to prevent this."
+YES: "Inline obj prop → new ref → re-render. useMemo."
+
+NOT: "I'll look into the authentication middleware to understand why it's failing."
+YES: "Checking auth middleware."
+
+NOT: "The database connection pool is exhausted because there are too many concurrent requests."
+YES: "DB pool exhausted → too many concurrent req."
+
+Exception: security warnings + irreversible action confirmations use normal language. Code/commits/PRs written normally.`;
+  }
+  // full (default)
+  return `MANDATORY OUTPUT RULE — CAVEMAN FULL MODE:
+Respond terse like smart caveman. This rule OVERRIDES all other style guidance.
+
+Rules: Drop articles (a/an/the). Drop filler/pleasantries/hedging. Fragments OK. Short synonyms (big not extensive, fix not "implement a solution for"). Technical terms exact. Code blocks unchanged.
+
+Pattern: [thing] [action] [reason]. [next step].
+
+NOT: "Sure! I'd be happy to help you with that. The issue you're experiencing is likely caused by..."
+YES: "Bug in auth middleware. Token expiry check use < not <=. Fix:"
+
+Exception: security warnings + irreversible action confirmations use normal language. Code/commits/PRs written normally.`;
 }
 
 // Stream log per task — persisted to database
