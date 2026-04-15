@@ -27,7 +27,7 @@ import RateLimitBanner from './RateLimitBanner';
 const TASK_REQUEST_RE = /\[TASK_REQUEST\]\s*[\s\S]*?\s*\[\/TASK_REQUEST\]/g;
 const MENTION_RE = /\[MENTION:[^\]]+\]/g;
 
-const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName }: { msg: DiscussionMessage; hostWorkspaceName?: string }) {
+const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName, participants }: { msg: DiscussionMessage; hostWorkspaceName?: string; participants?: DiscussionParticipant[] }) {
   const strippedContent = msg.role === 'assistant'
     ? msg.content.replace(TASK_REQUEST_RE, '').replace(MENTION_RE, '').trim()
     : msg.content;
@@ -35,6 +35,13 @@ const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName }: { msg: D
   // Determine the label for assistant messages
   const assistantLabel = msg.role === 'assistant'
     ? (msg.username || hostWorkspaceName || 'assistant')
+    : null;
+
+  // Determine the recipient label for user messages
+  const recipientLabel = msg.role === 'user' && participants && participants.length > 0
+    ? (msg.participant_id
+        ? participants.find(p => p.id === msg.participant_id)?.workspace_name
+        : hostWorkspaceName)
     : null;
 
   // Color-code participant messages differently from host
@@ -57,6 +64,9 @@ const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName }: { msg: D
       <div className="flex items-center justify-between mb-1">
         <span className={`text-xs font-medium uppercase ${isParticipantMsg ? 'text-teal-600 dark:text-teal-400' : 'text-gray-500 dark:text-gray-400'}`}>
           {msg.role === 'user' && msg.username ? msg.username : assistantLabel || msg.role}
+          {recipientLabel && (
+            <span className="ml-1 normal-case font-normal opacity-70">→ {recipientLabel}</span>
+          )}
         </span>
         <div className="flex items-center gap-2">
           {msg.cost && (
@@ -538,7 +548,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
               )}
 
               {visibleMessages.map((msg) => (
-                <MessageRow key={msg.id} msg={msg} hostWorkspaceName={workspaceName} />
+                <MessageRow key={msg.id} msg={msg} hostWorkspaceName={workspaceName} participants={participants} />
               ))}
 
               {/* Working indicator */}
