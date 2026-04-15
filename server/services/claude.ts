@@ -757,8 +757,7 @@ function startFilePolling(task: Task): void {
                 updateMessageCost(lastSavedMessageId, event.total_cost_usd);
               }
               // Accumulate token usage
-              const inTok = typeof event.total_input_tokens === 'number' ? event.total_input_tokens : 0;
-              const outTok = typeof event.total_output_tokens === 'number' ? event.total_output_tokens : 0;
+              const { inputTokens: inTok, outputTokens: outTok } = extractTokenUsage(event);
               if (inTok > 0 || outTok > 0) {
                 addTokenUsage(task.id, inTok, outTok);
               }
@@ -849,6 +848,35 @@ function extractResultText(event: { [key: string]: unknown }): string {
 }
 
 /**
+ * Extract token usage from a result event.
+ * The CLI stream-json format nests tokens under `usage` and/or `modelUsage`.
+ */
+function extractTokenUsage(event: { [key: string]: unknown }): { inputTokens: number; outputTokens: number } {
+  let inputTokens = 0;
+  let outputTokens = 0;
+
+  // Try modelUsage first (has aggregated per-model totals)
+  const modelUsage = event.modelUsage as Record<string, { inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number }> | undefined;
+  if (modelUsage) {
+    for (const model of Object.values(modelUsage)) {
+      inputTokens += (model.inputTokens || 0) + (model.cacheReadInputTokens || 0) + (model.cacheCreationInputTokens || 0);
+      outputTokens += model.outputTokens || 0;
+    }
+  }
+
+  // Fallback to usage object
+  if (inputTokens === 0 && outputTokens === 0) {
+    const usage = event.usage as { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | undefined;
+    if (usage) {
+      inputTokens = (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
+      outputTokens = usage.output_tokens || 0;
+    }
+  }
+
+  return { inputTokens, outputTokens };
+}
+
+/**
  * Read remaining output from a task that finished while the server was down.
  */
 async function processRemainingOutput(task: Task): Promise<void> {
@@ -897,8 +925,7 @@ async function processRemainingOutput(task: Task): Promise<void> {
           } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
             updateMessageCost(lastSavedMessageId, event.total_cost_usd);
           }
-          const inTok = typeof event.total_input_tokens === 'number' ? event.total_input_tokens : 0;
-          const outTok = typeof event.total_output_tokens === 'number' ? event.total_output_tokens : 0;
+          const { inputTokens: inTok, outputTokens: outTok } = extractTokenUsage(event);
           if (inTok > 0 || outTok > 0) {
             addTokenUsage(task.id, inTok, outTok);
           }

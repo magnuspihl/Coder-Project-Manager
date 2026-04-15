@@ -665,6 +665,11 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
           )}
         </div>
         <div className="flex items-center gap-2">
+          {(task.total_input_tokens > 0 || task.total_output_tokens > 0) && (
+            <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono" title={`In: ${task.total_input_tokens.toLocaleString()} | Out: ${task.total_output_tokens.toLocaleString()}`}>
+              {formatTokens(task.total_input_tokens + task.total_output_tokens)}t
+            </span>
+          )}
           {typeof task.total_cost_usd === 'number' && task.total_cost_usd > 0 && (
             <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono">${task.total_cost_usd.toFixed(2)}</span>
           )}
