@@ -66,6 +66,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [sending, setSending] = useState(false);
   const [idCopied, setIdCopied] = useState(false);
   const [checkingOut, setCheckingOut] = useState(false);
+  const [completing, setCompleting] = useState(false);
   const [participants, setParticipants] = useState<TaskParticipant[]>([]);
   const [targetParticipantId, setTargetParticipantId] = useState<string | null>(null);
   const [showInviteMenu, setShowInviteMenu] = useState(false);
@@ -217,7 +218,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') closeModal();
-      if (e.altKey && e.key === 'c' && taskStatusRef.current === 'awaiting_feedback') {
+      if (e.altKey && e.key === 'c' && taskStatusRef.current === 'awaiting_feedback' && !completing) {
         e.preventDefault();
         handleComplete();
       }
@@ -254,6 +255,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   };
 
   const handleComplete = async () => {
+    setCompleting(true);
     try {
       await completeTask(taskId);
       closeAndNotify();
@@ -263,6 +265,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       } else {
         closeAndNotify();
       }
+    } finally {
+      setCompleting(false);
     }
   };
 
@@ -757,9 +761,10 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   <div className="flex items-center gap-2">
                     <button
                       onClick={handleComplete}
-                      className="bg-green-600 text-white text-sm px-4 py-2 rounded-md hover:bg-green-700"
+                      disabled={completing}
+                      className="bg-green-600 text-white text-sm px-4 py-2 rounded-md hover:bg-green-700 disabled:opacity-50"
                     >
-                      Mark Complete (Alt+C)
+                      {completing ? 'Completing...' : 'Mark Complete (Alt+C)'}
                     </button>
                     <button
                       onClick={handleRetry}
