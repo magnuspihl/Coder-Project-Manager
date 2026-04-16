@@ -41,6 +41,12 @@ import { processQueue } from '../services/claude.js';
 const router = Router();
 
 // Get or create the active discussion for a workspace
+// Check if an active discussion exists for a workspace
+router.get('/workspaces/:workspaceId/discussion/status', requireAuth, (req: Request, res: Response) => {
+  const discussion = getActiveDiscussion(req.params.workspaceId);
+  res.json({ hasActive: !!discussion, discussionId: discussion?.id || null });
+});
+
 router.post('/workspaces/:workspaceId/discussion', requireAuth, async (req: Request, res: Response) => {
   const workspaceId = req.params.workspaceId;
 
@@ -93,11 +99,13 @@ router.post('/workspaces/:workspaceId/discussion', requireAuth, async (req: Requ
   }
 
   const fullAccess = getDiscussionFullAccess(workspaceId);
+  const model = typeof req.body?.model === 'string' ? req.body.model.trim() : undefined;
   discussion = createDiscussion({
     workspaceId,
     workspaceName: workspace.name,
     userId: req.user!.id,
     fullAccess,
+    model: model || undefined,
   });
 
   res.status(201).json({ discussion: { ...discussion, activity: null, running: false }, messages: [], taskRequests: [], participants: [] });

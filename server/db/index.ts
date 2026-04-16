@@ -102,6 +102,9 @@ export function getDb(): Database.Database {
     if (!discCols.some(c => c.name === 'full_access')) {
       db.exec("ALTER TABLE discussions ADD COLUMN full_access INTEGER NOT NULL DEFAULT 0");
     }
+    if (!discCols.some(c => c.name === 'model')) {
+      db.exec("ALTER TABLE discussions ADD COLUMN model TEXT");
+    }
 
     // Messages migrations
     const msgCols = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;

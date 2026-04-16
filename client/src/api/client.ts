@@ -269,6 +269,7 @@ export interface Discussion {
   status: string;
   project_dir: string | null;
   full_access: number;
+  model: string | null;
   ssh_pid: number | null;
   activity: TaskActivity | null;
   running: boolean;
@@ -329,10 +330,13 @@ export const updateDiscussionSettings = (workspaceId: string, fullAccess: boolea
     body: JSON.stringify({ fullAccess }),
   });
 
-export const getOrCreateDiscussion = (workspaceId: string) =>
+export const getDiscussionStatus = (workspaceId: string) =>
+  request<{ hasActive: boolean; discussionId: string | null }>(`/api/workspaces/${workspaceId}/discussion/status`);
+
+export const getOrCreateDiscussion = (workspaceId: string, model?: string) =>
   request<{ discussion: Discussion; messages: DiscussionMessage[]; totalMessages?: number; taskRequests: TaskRequestItem[]; participants: DiscussionParticipant[] }>(
     `/api/workspaces/${workspaceId}/discussion`,
-    { method: 'POST' }
+    { method: 'POST', body: JSON.stringify({ ...(model ? { model } : {}) }) }
   );
 
 export const getDiscussionDetail = (discussionId: string, afterId?: string) =>

@@ -13,6 +13,7 @@ import {
   restoreTask,
   createTask,
   getOrCreateDiscussion,
+  getDiscussionStatus,
   checkoutTaskBranch,
   getModels,
   getGitSettings,
@@ -103,6 +104,11 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
   const [creatingTask, setCreatingTask] = useState(false);
   const [selectedTaskId, setSelectedTaskId] = useSessionState<string | null>('selectedTaskId', null);
   const [discussionState, setDiscussionState] = useState<{ id: string; workspaceId: string; workspaceName: string } | null>(null);
+  const [chatPickerWs, setChatPickerWs] = useState<{ id: string; name: string } | null>(null);
+  const [chatModel, setChatModel] = useState('');
+  const [chatModels, setChatModels] = useState<ModelInfo[]>([]);
+  const [chatModelsLoading, setChatModelsLoading] = useState(false);
+  const [chatCreating, setChatCreating] = useState(false);
   const [settingsOpenWsId, setSettingsOpenWsId] = useState<string | null>(null);
   const [gitPushSettings, setGitPushSettings] = useState<Record<string, boolean>>({});
   const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -495,11 +501,40 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
 
   const handleOpenDiscussion = async (workspaceId: string, workspaceName: string) => {
     try {
-      const { discussion } = await getOrCreateDiscussion(workspaceId);
-      markChatSeen(workspaceId);
-      setDiscussionState({ id: discussion.id, workspaceId, workspaceName });
+      // Check if there's already an active discussion
+      const { hasActive } = await getDiscussionStatus(workspaceId);
+      if (hasActive) {
+        // Open existing discussion directly
+        const { discussion } = await getOrCreateDiscussion(workspaceId);
+        markChatSeen(workspaceId);
+        setDiscussionState({ id: discussion.id, workspaceId, workspaceName });
+      } else {
+        // No active discussion — show model picker before creating
+        setChatPickerWs({ id: workspaceId, name: workspaceName });
+        setChatModel('');
+        setChatModelsLoading(true);
+        getModels(workspaceId)
+          .then(({ models }) => setChatModels(models))
+          .catch(() => setChatModels([]))
+          .finally(() => setChatModelsLoading(false));
+      }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to open discussion');
+    }
+  };
+
+  const handleCreateDiscussion = async () => {
+    if (!chatPickerWs) return;
+    setChatCreating(true);
+    try {
+      const { discussion } = await getOrCreateDiscussion(chatPickerWs.id, chatModel || undefined);
+      markChatSeen(chatPickerWs.id);
+      setDiscussionState({ id: discussion.id, workspaceId: chatPickerWs.id, workspaceName: chatPickerWs.name });
+      setChatPickerWs(null);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to create discussion');
+    } finally {
+      setChatCreating(false);
     }
   };
 
@@ -1161,6 +1196,60 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
           onClose={() => setSelectedTaskId(null)}
           onTaskChanged={loadData}
         />
+      )}
+
+      {chatPickerWs && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+          <div className="bg-white dark:bg-gray-950 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 w-full max-w-sm p-5 space-y-4">
+            <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100">
+              New Chat with {chatPickerWs.name}
+            </h3>
+            <select
+              value={chatModel}
+              onChange={(e) => setChatModel(e.target.value)}
+              className="w-full text-sm border border-gray-300 dark:border-gray-700 rounded-md p-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-1 focus:ring-purple-500"
+              disabled={chatCreating || chatModelsLoading}
+            >
+              <option value="">{chatModelsLoading ? 'Loading models...' : 'Default model'}</option>
+              {chatModels.some(m => m.provider === 'anthropic') && (
+                <optgroup label="Claude">
+                  {chatModels.filter(m => m.provider === 'anthropic').map((m) => (
+                    <option key={m.id} value={m.id}>{m.display_name}</option>
+                  ))}
+                </optgroup>
+              )}
+              {chatModels.some(m => m.provider === 'ollama-local') && (
+                <optgroup label="Ollama (local)">
+                  {chatModels.filter(m => m.provider === 'ollama-local').map((m) => (
+                    <option key={m.id} value={m.id}>{m.display_name}</option>
+                  ))}
+                </optgroup>
+              )}
+              {chatModels.some(m => m.provider === 'ollama-cloud') && (
+                <optgroup label="Ollama (cloud)">
+                  {chatModels.filter(m => m.provider === 'ollama-cloud').map((m) => (
+                    <option key={m.id} value={m.id}>{m.display_name}</option>
+                  ))}
+                </optgroup>
+              )}
+            </select>
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => setChatPickerWs(null)}
+                className="text-sm px-3 py-1.5 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleCreateDiscussion}
+                disabled={chatCreating}
+                className="text-sm px-4 py-1.5 bg-purple-600 text-white rounded-md hover:bg-purple-700 disabled:opacity-50"
+              >
+                {chatCreating ? 'Starting...' : 'Start Chat'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {discussionState && (

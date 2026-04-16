@@ -455,6 +455,17 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                     {discussion.running ? 'thinking...' : 'active'}
                   </span>
                   <span className="text-xs text-gray-400 dark:text-gray-500">{workspaceName}</span>
+                  {discussion.model && (
+                    <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
+                      discussion.model.startsWith('ollama/')
+                        ? 'bg-green-50 dark:bg-green-900/20 text-green-600 dark:text-green-400'
+                        : 'bg-purple-50 dark:bg-purple-900/20 text-purple-600 dark:text-purple-400'
+                    }`}>
+                      {discussion.model.startsWith('ollama/')
+                        ? discussion.model.slice('ollama/'.length).replace(/:latest$/, '')
+                        : discussion.model.replace(/^claude-/, '')}
+                    </span>
+                  )}
                   {discussion.running && discussion.activity && (
                     <span className="text-xs text-gray-400 dark:text-gray-500">
                       Last activity {timeAgo(discussion.activity.timestamp)}

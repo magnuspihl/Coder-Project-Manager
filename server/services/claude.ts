@@ -1152,6 +1152,13 @@ export async function launchDiscussion(
   }
   claudeParts.push('--max-turns', MAX_TURNS);
 
+  // Model override
+  if (discussion.model) {
+    const isOllama = discussion.model.startsWith('ollama/');
+    const actualModel = isOllama ? discussion.model.slice('ollama/'.length) : discussion.model;
+    claudeParts.push('--model', shellEscape(actualModel));
+  }
+
   const claudeCmd = claudeParts.join(' ');
   const outputFile = remoteDiscussionOutputPath(discussion.id);
   const exitFile = remoteDiscussionExitCodePath(discussion.id);

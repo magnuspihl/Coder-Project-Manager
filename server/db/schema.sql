@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS discussions (
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'closed')),
   project_dir TEXT,
   full_access INTEGER NOT NULL DEFAULT 0,
+  model TEXT,
   ssh_pid INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),

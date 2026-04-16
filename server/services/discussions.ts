@@ -10,6 +10,7 @@ export interface Discussion {
   status: string;
   project_dir: string | null;
   full_access: number;
+  model: string | null;
   ssh_pid: number | null;
   created_at: string;
   updated_at: string;
@@ -67,6 +68,7 @@ export function createDiscussion(params: {
   workspaceName: string;
   userId: string;
   fullAccess?: boolean;
+  model?: string;
 }): Discussion {
   const db = getDb();
   const id = uuid();
@@ -74,9 +76,9 @@ export function createDiscussion(params: {
   const fullAccess = params.fullAccess ? 1 : 0;
 
   db.prepare(
-    `INSERT INTO discussions (id, workspace_id, workspace_name, user_id, claude_session_id, full_access, status)
-     VALUES (?, ?, ?, ?, ?, ?, 'active')`
-  ).run(id, params.workspaceId, params.workspaceName, params.userId, claudeSessionId, fullAccess);
+    `INSERT INTO discussions (id, workspace_id, workspace_name, user_id, claude_session_id, full_access, model, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`
+  ).run(id, params.workspaceId, params.workspaceName, params.userId, claudeSessionId, fullAccess, params.model || null);
 
   return getDiscussion(id)!;
 }
