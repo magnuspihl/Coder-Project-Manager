@@ -356,13 +356,23 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
     return () => window.removeEventListener('keydown', handleAltN);
   }, []);
 
-  // Fetch available models when task creation form opens for a workspace
+  // Fetch available models and restore saved defaults when task creation form opens
   useEffect(() => {
     if (!newTaskWorkspaceId) {
       setAvailableModels([]);
       setNewTaskModel('');
+      setNewTaskCaveman('');
       return;
     }
+    // Restore per-workspace defaults
+    try {
+      const defaults = JSON.parse(localStorage.getItem('taskDefaults') || '{}');
+      const ws = defaults[newTaskWorkspaceId];
+      if (ws) {
+        setNewTaskModel(ws.model || '');
+        setNewTaskCaveman(ws.caveman || '');
+      }
+    } catch { /* ignore */ }
     let cancelled = false;
     setLoadingModels(true);
     getModels(newTaskWorkspaceId)
@@ -528,6 +538,12 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
       const model = newTaskModel || undefined;
       const caveman = newTaskCaveman || undefined;
       await createTask(workspaceId, newTaskPrompt.trim(), branch, model, caveman);
+      // Save model and caveman as defaults for this workspace
+      try {
+        const defaults = JSON.parse(localStorage.getItem('taskDefaults') || '{}');
+        defaults[workspaceId] = { model: newTaskModel, caveman: newTaskCaveman };
+        localStorage.setItem('taskDefaults', JSON.stringify(defaults));
+      } catch { /* ignore */ }
       lastTaskWorkspaceIdRef.current = workspaceId;
       clearNewTaskPrompt();
       setNewTaskBranch('');
