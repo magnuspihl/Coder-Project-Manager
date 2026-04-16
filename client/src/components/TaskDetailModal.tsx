@@ -626,7 +626,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                 </button>
               )}
 
-              {(task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled') && (
+              {(task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled' || task.status === 'awaiting_feedback') && (
                 <button
                   onClick={handleDelete}
                   className="text-sm text-red-500 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 mt-2"
