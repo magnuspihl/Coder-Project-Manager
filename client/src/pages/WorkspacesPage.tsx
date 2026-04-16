@@ -390,7 +390,13 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
   const handleComplete = async (e: React.MouseEvent, taskId: string) => {
     e.preventDefault();
     e.stopPropagation();
-    await completeTask(taskId);
+    try {
+      await completeTask(taskId);
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes('uncommitted')) {
+        alert(err.message);
+      }
+    }
     await loadData();
   };
 
@@ -789,7 +795,7 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
                   onChange={() => handleToggleGitPush(ws.id)}
                   className="rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500 h-3.5 w-3.5"
                 />
-                <span className="text-gray-600 dark:text-gray-300">Git push enabled</span>
+                <span className="text-gray-600 dark:text-gray-300">Allow git remote operations</span>
               </label>
             </div>
           )}
