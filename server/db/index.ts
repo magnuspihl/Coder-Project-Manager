@@ -108,6 +108,9 @@ export function getDb(): Database.Database {
     if (!msgCols.some(c => c.name === 'username')) {
       db.exec("ALTER TABLE messages ADD COLUMN username TEXT");
     }
+    if (!msgCols.some(c => c.name === 'participant_id')) {
+      db.exec("ALTER TABLE messages ADD COLUMN participant_id TEXT");
+    }
 
     if (!cols.some(c => c.name === 'caveman')) {
       db.exec("ALTER TABLE tasks ADD COLUMN caveman TEXT");
