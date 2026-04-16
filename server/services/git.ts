@@ -347,9 +347,26 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
     const freshTask = getTask(task.id) || task;
     const branchName = generateBranchName(freshTask);
 
-    // Create branch, commit, push
-    await sshExec(ws, `cd ${dir} && git checkout -b ${branchName}`, 15000);
-    await sshExec(ws, `cd ${dir} && git add -A && git commit -m ${shellEscape(freshTask.title || 'Task changes')}`, 30000);
+    // Create branch (or switch to it if it already exists), commit, push
+    const currentBranch = (await sshExec(ws, `cd ${dir} && git rev-parse --abbrev-ref HEAD`)).trim();
+    if (currentBranch === branchName) {
+      // Already on the right branch (e.g. reopen → complete retry)
+    } else {
+      try {
+        await sshExec(ws, `cd ${dir} && git checkout -b ${branchName}`, 15000);
+      } catch {
+        // Branch already exists — switch to it
+        await sshExec(ws, `cd ${dir} && git checkout ${branchName}`, 15000);
+      }
+    }
+    // Stage and commit (skip if nothing actually staged — worktrees/submodules can show as modified but not stageable)
+    await sshExec(ws, `cd ${dir} && git add -A`);
+    const staged = await sshExec(ws, `cd ${dir} && git diff --cached --name-only`);
+    if (!staged.trim()) {
+      // Nothing actually committable — bail out cleanly
+      return true;
+    }
+    await sshExec(ws, `cd ${dir} && git commit -m ${shellEscape(freshTask.title || 'Task changes')}`, 30000);
     storeTaskBranch(task.id, branchName);
 
     // Detect and store the GitHub repo URL
@@ -369,13 +386,24 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       }
     }
 
-    // Create PR
+    // Create PR (check if one already exists for this branch)
     const prTitle = freshTask.title || `Task: ${freshTask.prompt.slice(0, 60)}`;
     const prBody = `Automated PR for completed task.\n\n**Task:** ${freshTask.title}\n**Task ID:** ${freshTask.id}`;
-    const prUrl = await sshGh(ws,
-      `cd ${dir} && gh pr create --base ${defaultBranch} --head ${branchName} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`
-    );
-    addMessage(task.id, 'system', `Pull request created: ${prUrl}`);
+    let prUrl: string;
+    try {
+      const existingPr = await sshGh(ws, `cd ${dir} && gh pr view ${branchName} --json url --jq .url 2>/dev/null`);
+      if (existingPr.trim()) {
+        prUrl = existingPr.trim();
+        addMessage(task.id, 'system', `Existing pull request found: ${prUrl}`);
+      } else {
+        throw new Error('no existing PR');
+      }
+    } catch {
+      prUrl = await sshGh(ws,
+        `cd ${dir} && gh pr create --base ${defaultBranch} --head ${branchName} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`
+      );
+      addMessage(task.id, 'system', `Pull request created: ${prUrl}`);
+    }
 
     // Merge
     try {
