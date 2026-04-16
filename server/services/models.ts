@@ -17,6 +17,7 @@ const OLLAMA_CACHE_TTL_MS = 5 * 60 * 1000; // Shorter — models can be pulled/r
 
 // Fallback list when Anthropic API fetch fails
 const FALLBACK_ANTHROPIC: ModelInfo[] = [
+  { id: 'claude-opus-4-7', display_name: 'Claude Opus 4.7', provider: 'anthropic' },
   { id: 'claude-opus-4-6', display_name: 'Claude Opus 4.6', provider: 'anthropic' },
   { id: 'claude-sonnet-4-6', display_name: 'Claude Sonnet 4.6', provider: 'anthropic' },
   { id: 'claude-haiku-4-5-20251001', display_name: 'Claude Haiku 4.5', provider: 'anthropic' },
