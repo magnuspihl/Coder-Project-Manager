@@ -10,9 +10,15 @@ import {
   cancelTask,
   deleteTask,
   checkoutTaskBranch,
+  addTaskParticipant,
+  removeTaskParticipant,
+  sendTaskParticipantMessage,
+  getWorkspaces,
   type Task,
   type Message,
   type StreamLogEntry,
+  type TaskParticipant,
+  type Workspace,
 } from '../api/client';
 import { playChime } from '../utils/chime';
 import RateLimitBanner from './RateLimitBanner';
@@ -60,6 +66,12 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [sending, setSending] = useState(false);
   const [idCopied, setIdCopied] = useState(false);
   const [checkingOut, setCheckingOut] = useState(false);
+  const [participants, setParticipants] = useState<TaskParticipant[]>([]);
+  const [targetParticipantId, setTargetParticipantId] = useState<string | null>(null);
+  const [showInviteMenu, setShowInviteMenu] = useState(false);
+  const [availableWorkspaces, setAvailableWorkspaces] = useState<Workspace[]>([]);
+  const [loadingWorkspaces, setLoadingWorkspaces] = useState(false);
+  const lastParticipantsJsonRef = useRef('');
   const prevStatusRef = useRef<string | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
@@ -72,7 +84,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
   const loadData = async () => {
     try {
-      const { task: newTask, messages: newMessages } = await getTaskDetail(taskId);
+      const { task: newTask, messages: newMessages, participants: newParticipants } = await getTaskDetail(taskId);
       if (prevStatusRef.current && prevStatusRef.current !== 'awaiting_feedback' && newTask.status === 'awaiting_feedback') {
         playChime();
       }
@@ -88,6 +100,11 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
         lastMessagesJsonRef.current = msgsJson;
         setMessages(newMessages);
       }
+      const pJson = JSON.stringify(newParticipants || []);
+      if (pJson !== lastParticipantsJsonRef.current) {
+        lastParticipantsJsonRef.current = pJson;
+        setParticipants(newParticipants || []);
+      }
     } catch {
       // ignore
     } finally {
@@ -100,6 +117,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   logOpenRef.current = logOpen;
   const taskStatusRef = useRef(task?.status);
   taskStatusRef.current = task?.status;
+  const participantsRef = useRef(participants);
+  participantsRef.current = participants;
 
   const loadStreamLog = async () => {
     try {
@@ -135,7 +154,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     const tick = () => {
       poll().finally(() => {
         if (cancelled) return;
-        const pollMs = taskStatusRef.current === 'working' ? 3000 : 10000;
+        const anyPRunning = participantsRef.current.some(p => p.running);
+        const pollMs = (taskStatusRef.current === 'working' || anyPRunning) ? 3000 : 10000;
         timer = setTimeout(tick, pollMs);
       });
     };
@@ -286,6 +306,60 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     closeAndNotify();
   };
 
+  // Participant handlers
+  const handleOpenInviteMenu = async () => {
+    setShowInviteMenu(true);
+    if (availableWorkspaces.length === 0) {
+      setLoadingWorkspaces(true);
+      try {
+        const { workspaces } = await getWorkspaces();
+        const hostWsId = task?.workspace_id;
+        const participantWsIds = new Set(participants.map(p => p.workspace_id));
+        setAvailableWorkspaces(workspaces.filter(ws =>
+          ws.id !== hostWsId && !participantWsIds.has(ws.id) &&
+          ws.latest_build?.status === 'running'
+        ));
+      } catch { /* ignore */ }
+      setLoadingWorkspaces(false);
+    }
+  };
+
+  const handleInvite = async (ws: Workspace) => {
+    setShowInviteMenu(false);
+    try {
+      await addTaskParticipant(taskId, ws.id, ws.name);
+      setAvailableWorkspaces(prev => prev.filter(w => w.id !== ws.id));
+      await loadData();
+    } catch { /* ignore */ }
+  };
+
+  const handleRemoveParticipant = async (participantId: string) => {
+    try {
+      await removeTaskParticipant(taskId, participantId);
+      if (targetParticipantId === participantId) setTargetParticipantId(null);
+      await loadData();
+    } catch { /* ignore */ }
+  };
+
+  const handleSendToParticipant = async (e?: FormEvent) => {
+    if (e) e.preventDefault();
+    if (!reply.trim() || !targetParticipantId) return;
+    setSending(true);
+    try {
+      await sendTaskParticipantMessage(taskId, targetParticipantId, reply.trim());
+      clearReply();
+      await loadData();
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('currently processing')) {
+        // Don't clear, let user retry
+      }
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const anyParticipantRunning = participants.some(p => p.running);
+
   const handleOverlayClick = (e: React.MouseEvent) => {
     if (e.target === overlayRef.current) closeModal();
   };
@@ -416,33 +490,51 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
             {/* Scrollable body */}
             <div ref={scrollBodyRef} className="flex-1 overflow-y-auto p-5 space-y-4">
               {/* Conversation */}
-              {messages.map((msg) => (
-                <div
-                  key={msg.id}
-                  className={`rounded-lg p-4 ${
-                    msg.role === 'user'
-                      ? 'bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800 ml-8'
-                      : msg.role === 'assistant'
-                      ? 'bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 mr-8'
-                      : msg.content.startsWith('Error:')
-                      ? 'bg-red-50 dark:bg-red-900/20 border border-red-100 dark:border-red-800 text-red-700 dark:text-red-400 text-sm'
-                      : 'bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 text-sm'
-                  }`}
-                >
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase">{msg.role === 'user' && msg.username ? msg.username : msg.role}</span>
-                    <div className="flex items-center gap-2">
-                      {msg.cost && (
-                        <span className="text-xs text-gray-400 dark:text-gray-500">${msg.cost.toFixed(4)}</span>
-                      )}
-                      <span className="text-xs text-gray-400 dark:text-gray-500">
-                        {new Date(msg.created_at).toLocaleTimeString()}
+              {messages.map((msg) => {
+                const isParticipantMsg = msg.role === 'assistant' && msg.participant_id;
+                const participantName = msg.participant_id
+                  ? participants.find(p => p.id === msg.participant_id)?.workspace_name
+                  : null;
+                // For user messages targeted at a participant, show the recipient
+                const recipientLabel = msg.role === 'user' && msg.participant_id && participants.length > 0
+                  ? participants.find(p => p.id === msg.participant_id)?.workspace_name
+                  : null;
+
+                return (
+                  <div
+                    key={msg.id}
+                    className={`rounded-lg p-4 ${
+                      msg.role === 'user'
+                        ? 'bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800 ml-8'
+                        : msg.role === 'assistant' && isParticipantMsg
+                        ? 'bg-teal-50 dark:bg-teal-900/20 border border-teal-200 dark:border-teal-800 mr-8'
+                        : msg.role === 'assistant'
+                        ? 'bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 mr-8'
+                        : msg.content.startsWith('Error:')
+                        ? 'bg-red-50 dark:bg-red-900/20 border border-red-100 dark:border-red-800 text-red-700 dark:text-red-400 text-sm'
+                        : 'bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 text-sm'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-1">
+                      <span className={`text-xs font-medium uppercase ${isParticipantMsg ? 'text-teal-600 dark:text-teal-400' : 'text-gray-500 dark:text-gray-400'}`}>
+                        {msg.role === 'user' && msg.username ? msg.username : (isParticipantMsg && participantName) ? participantName : msg.role}
+                        {recipientLabel && (
+                          <span className="ml-1 normal-case font-normal opacity-70">→ {recipientLabel}</span>
+                        )}
                       </span>
+                      <div className="flex items-center gap-2">
+                        {msg.cost && (
+                          <span className="text-xs text-gray-400 dark:text-gray-500">${msg.cost.toFixed(4)}</span>
+                        )}
+                        <span className="text-xs text-gray-400 dark:text-gray-500">
+                          {new Date(msg.created_at).toLocaleTimeString()}
+                        </span>
+                      </div>
                     </div>
+                    <Markdown content={msg.content} />
                   </div>
-                  <Markdown content={msg.content} />
-                </div>
-              ))}
+                );
+              })}
 
               {task.status === 'working' && (() => {
                 // Extract assistant text from stream log to show as a live message
@@ -481,6 +573,26 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   </>
                 );
               })()}
+
+              {/* Participant thinking indicator */}
+              {participants.filter(p => p.running).map(p => (
+                <div key={`running-${p.id}`} className="text-sm text-teal-600 dark:text-teal-400 p-4 bg-teal-50 dark:bg-teal-900/20 rounded-lg border border-teal-100 dark:border-teal-800">
+                  <div className="flex items-center gap-2">
+                    <div className="animate-spin h-4 w-4 border-2 border-teal-600 dark:border-teal-400 border-t-transparent rounded-full" />
+                    <span>{p.workspace_name} is thinking...</span>
+                    {p.activity && (
+                      <span className="text-xs text-gray-400 dark:text-gray-500 ml-auto">
+                        Last activity {timeAgo(p.activity.timestamp)}
+                      </span>
+                    )}
+                  </div>
+                  {p.activity && (
+                    <p className="mt-1 text-xs text-teal-500 dark:text-teal-300 truncate ml-6">
+                      {linkify(p.activity.summary)}
+                    </p>
+                  )}
+                </div>
+              ))}
 
               {/* Stream Log */}
               {streamLog.length > 0 && (
@@ -527,25 +639,122 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
             <div className="border-t border-gray-200 dark:border-gray-800 p-5">
               {task.status === 'awaiting_feedback' && (
                 <div className="space-y-3">
-                  <form onSubmit={handleReply} className="flex flex-col gap-2">
-                    <textarea
-                      value={reply}
-                      onChange={(e) => setReply(e.target.value)}
-                      onKeyDown={handleReplyKeyDown}
-                      placeholder="Reply with feedback..."
-                      rows={3}
-                      autoFocus
-                      className="w-full px-3 py-2 border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
-                    />
-                    <button
-                      type="submit"
-                      disabled={sending || !reply.trim()}
-                      className="bg-blue-600 text-white text-sm px-4 py-2 rounded-md hover:bg-blue-700 disabled:opacity-50 self-end"
-                    >
-                      {sending ? 'Sending...' : 'Reply (Ctrl+Enter)'}
-                    </button>
-                  </form>
-                  <div className="flex gap-2">
+                  {/* Participant target selector */}
+                  {participants.length > 0 && (
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <button
+                        onClick={() => setTargetParticipantId(null)}
+                        className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                          !targetParticipantId
+                            ? 'bg-blue-100 dark:bg-blue-900/40 border-blue-300 dark:border-blue-700 text-blue-700 dark:text-blue-300 font-medium'
+                            : 'border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:border-blue-300 dark:hover:border-blue-700'
+                        }`}
+                      >
+                        Task Agent
+                      </button>
+                      {participants.map(p => (
+                        <div key={p.id} className="flex items-center gap-0">
+                          <button
+                            onClick={() => setTargetParticipantId(p.id)}
+                            className={`text-xs px-2.5 py-1 rounded-l-full border transition-colors ${
+                              targetParticipantId === p.id
+                                ? 'bg-teal-100 dark:bg-teal-900/40 border-teal-300 dark:border-teal-700 text-teal-700 dark:text-teal-300 font-medium'
+                                : 'border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:border-teal-300 dark:hover:border-teal-700'
+                            }`}
+                          >
+                            {p.workspace_name}
+                            {p.running && <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-teal-500 animate-pulse" />}
+                          </button>
+                          <button
+                            onClick={() => handleRemoveParticipant(p.id)}
+                            className="text-xs px-1.5 py-1 rounded-r-full border border-l-0 border-gray-200 dark:border-gray-700 text-gray-400 hover:text-red-500 hover:border-red-300 dark:hover:border-red-700 transition-colors"
+                            title={`Remove ${p.workspace_name}`}
+                          >
+                            &times;
+                          </button>
+                        </div>
+                      ))}
+                      {/* Invite button in selector bar */}
+                      <div className="relative">
+                        <button
+                          onClick={handleOpenInviteMenu}
+                          className="text-xs px-2 py-1 rounded-full border border-dashed border-gray-300 dark:border-gray-600 text-gray-400 dark:text-gray-500 hover:border-green-400 hover:text-green-600 dark:hover:border-green-600 dark:hover:text-green-400 transition-colors"
+                        >
+                          + Invite
+                        </button>
+                        {showInviteMenu && (
+                          <div className="absolute bottom-full left-0 mb-1 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl z-50 min-w-[200px] max-h-[200px] overflow-y-auto">
+                            {loadingWorkspaces ? (
+                              <div className="p-3 text-xs text-gray-400 dark:text-gray-500">Loading workspaces...</div>
+                            ) : availableWorkspaces.length === 0 ? (
+                              <div className="p-3 text-xs text-gray-400 dark:text-gray-500">No other workspaces available</div>
+                            ) : (
+                              availableWorkspaces.map(ws => (
+                                <button
+                                  key={ws.id}
+                                  onClick={() => handleInvite(ws)}
+                                  className="w-full text-left text-xs px-3 py-2 hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300 border-b border-gray-100 dark:border-gray-800 last:border-0"
+                                >
+                                  {ws.name}
+                                </button>
+                              ))
+                            )}
+                            <button
+                              onClick={() => setShowInviteMenu(false)}
+                              className="w-full text-center text-[10px] py-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 border-t border-gray-100 dark:border-gray-800"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {targetParticipantId ? (
+                    /* Sending to a participant */
+                    <form onSubmit={handleSendToParticipant} className="flex flex-col gap-2">
+                      <textarea
+                        value={reply}
+                        onChange={(e) => setReply(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); handleSendToParticipant(); } }}
+                        placeholder={anyParticipantRunning ? 'Advisor is thinking...' : `Ask ${participants.find(p => p.id === targetParticipantId)?.workspace_name || 'advisor'}...`}
+                        rows={3}
+                        autoFocus
+                        disabled={sending || anyParticipantRunning}
+                        className="w-full px-3 py-2 border border-teal-300 dark:border-teal-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-teal-500 resize-y disabled:opacity-50"
+                      />
+                      <button
+                        type="submit"
+                        disabled={sending || !reply.trim() || anyParticipantRunning}
+                        className="bg-teal-600 text-white text-sm px-4 py-2 rounded-md hover:bg-teal-700 disabled:opacity-50 self-end"
+                      >
+                        {sending ? 'Sending...' : 'Ask Advisor (Ctrl+Enter)'}
+                      </button>
+                    </form>
+                  ) : (
+                    /* Sending to the task agent (normal reply) */
+                    <form onSubmit={handleReply} className="flex flex-col gap-2">
+                      <textarea
+                        value={reply}
+                        onChange={(e) => setReply(e.target.value)}
+                        onKeyDown={handleReplyKeyDown}
+                        placeholder={anyParticipantRunning ? 'Advisor is thinking...' : 'Reply with feedback...'}
+                        rows={3}
+                        autoFocus
+                        disabled={anyParticipantRunning}
+                        className="w-full px-3 py-2 border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y disabled:opacity-50"
+                      />
+                      <button
+                        type="submit"
+                        disabled={sending || !reply.trim() || anyParticipantRunning}
+                        className="bg-blue-600 text-white text-sm px-4 py-2 rounded-md hover:bg-blue-700 disabled:opacity-50 self-end"
+                      >
+                        {sending ? 'Sending...' : 'Reply (Ctrl+Enter)'}
+                      </button>
+                    </form>
+                  )}
+                  <div className="flex items-center gap-2">
                     <button
                       onClick={handleComplete}
                       className="bg-green-600 text-white text-sm px-4 py-2 rounded-md hover:bg-green-700"
@@ -558,6 +767,42 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                     >
                       Retry
                     </button>
+                    {/* Invite button when no participants yet */}
+                    {participants.length === 0 && (
+                      <div className="relative">
+                        <button
+                          onClick={handleOpenInviteMenu}
+                          className="text-xs text-green-500 dark:text-green-400 hover:text-green-700 dark:hover:text-green-300 ml-2"
+                        >
+                          + Invite Advisor
+                        </button>
+                        {showInviteMenu && (
+                          <div className="absolute bottom-full left-0 mb-1 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl z-50 min-w-[200px] max-h-[200px] overflow-y-auto">
+                            {loadingWorkspaces ? (
+                              <div className="p-3 text-xs text-gray-400 dark:text-gray-500">Loading workspaces...</div>
+                            ) : availableWorkspaces.length === 0 ? (
+                              <div className="p-3 text-xs text-gray-400 dark:text-gray-500">No other workspaces available</div>
+                            ) : (
+                              availableWorkspaces.map(ws => (
+                                <button
+                                  key={ws.id}
+                                  onClick={() => handleInvite(ws)}
+                                  className="w-full text-left text-xs px-3 py-2 hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300 border-b border-gray-100 dark:border-gray-800 last:border-0"
+                                >
+                                  {ws.name}
+                                </button>
+                              ))
+                            )}
+                            <button
+                              onClick={() => setShowInviteMenu(false)}
+                              className="w-full text-center text-[10px] py-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 border-t border-gray-100 dark:border-gray-800"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

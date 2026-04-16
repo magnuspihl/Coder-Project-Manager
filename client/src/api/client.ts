@@ -107,6 +107,20 @@ export interface Message {
   content: string;
   cost: number | null;
   username: string | null;
+  participant_id: string | null;
+  created_at: string;
+}
+
+export interface TaskParticipant {
+  id: string;
+  task_id: string;
+  workspace_id: string;
+  workspace_name: string;
+  claude_session_id: string | null;
+  project_dir: string | null;
+  status: string;
+  running: boolean;
+  activity: TaskActivity | null;
   created_at: string;
 }
 
@@ -191,7 +205,7 @@ export const createTask = (workspaceId: string, prompt: string, branch?: string,
   });
 
 export const getTaskDetail = (taskId: string) =>
-  request<{ task: Task; messages: Message[] }>(`/api/tasks/${taskId}`);
+  request<{ task: Task; messages: Message[]; participants: TaskParticipant[] }>(`/api/tasks/${taskId}`);
 
 export const getStreamLog = (taskId: string, afterId?: number) =>
   request<{ streamLog: StreamLogEntry[] }>(`/api/tasks/${taskId}/stream-log${afterId ? `?after=${afterId}` : ''}`);
@@ -225,6 +239,25 @@ export const deleteTask = (taskId: string) =>
 
 export const restoreTask = (taskId: string) =>
   request<{ ok: boolean; task: Task }>(`/api/tasks/${taskId}/restore`, { method: 'POST' });
+
+// Task Participants
+export const getTaskParticipants = (taskId: string) =>
+  request<{ participants: TaskParticipant[] }>(`/api/tasks/${taskId}/participants`);
+
+export const addTaskParticipant = (taskId: string, workspaceId: string, workspaceName: string) =>
+  request<{ participant: TaskParticipant }>(`/api/tasks/${taskId}/participants`, {
+    method: 'POST',
+    body: JSON.stringify({ workspaceId, workspaceName }),
+  });
+
+export const removeTaskParticipant = (taskId: string, participantId: string) =>
+  request<{ ok: boolean }>(`/api/tasks/${taskId}/participants/${participantId}`, { method: 'DELETE' });
+
+export const sendTaskParticipantMessage = (taskId: string, participantId: string, message: string) =>
+  request<{ ok: boolean }>(`/api/tasks/${taskId}/participants/${participantId}/message`, {
+    method: 'POST',
+    body: JSON.stringify({ message }),
+  });
 
 // Discussions
 export interface Discussion {

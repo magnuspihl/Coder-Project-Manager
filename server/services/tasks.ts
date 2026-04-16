@@ -34,6 +34,18 @@ export interface Message {
   role: string;
   content: string;
   cost: number | null;
+  participant_id: string | null;
+  created_at: string;
+}
+
+export interface TaskParticipant {
+  id: string;
+  task_id: string;
+  workspace_id: string;
+  workspace_name: string;
+  claude_session_id: string | null;
+  project_dir: string | null;
+  status: string;
   created_at: string;
 }
 
@@ -303,13 +315,13 @@ function extractVerificationUrl(content: string): string | null {
   return match ? match[0] : null;
 }
 
-export function addMessage(taskId: string, role: string, content: string, cost?: number, username?: string): Message {
+export function addMessage(taskId: string, role: string, content: string, cost?: number, username?: string, participantId?: string): Message {
   const db = getDb();
   const id = uuid();
   const now = new Date().toISOString();
   db.prepare(
-    'INSERT INTO messages (id, task_id, role, content, cost, username, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).run(id, taskId, role, content, cost ?? null, username ?? null, now);
+    'INSERT INTO messages (id, task_id, role, content, cost, username, participant_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, taskId, role, content, cost ?? null, username ?? null, participantId ?? null, now);
 
   // Extract verification URL from assistant messages and store on the task
   if (role === 'assistant') {
@@ -320,7 +332,7 @@ export function addMessage(taskId: string, role: string, content: string, cost?:
   }
 
   // Return constructed message without a read-back query
-  return { id, task_id: taskId, role, content, cost: cost ?? null, created_at: now };
+  return { id, task_id: taskId, role, content, cost: cost ?? null, participant_id: participantId ?? null, created_at: now };
 }
 
 export function addTokenUsage(taskId: string, inputTokens: number, outputTokens: number): void {
@@ -375,4 +387,117 @@ export function updateMessageCost(messageId: string, cost: number): void {
   const db = getDb();
   db.prepare('UPDATE messages SET cost = ? WHERE id = ?').run(cost, messageId);
   invalidateTokenTotalsCache();
+}
+
+// ─── Task Participants ──────────────────────────────────────────────────
+
+export function addTaskParticipant(taskId: string, workspaceId: string, workspaceName: string): TaskParticipant {
+  const db = getDb();
+  const id = uuid();
+  const claudeSessionId = uuid();
+  db.prepare(
+    'INSERT INTO task_participants (id, task_id, workspace_id, workspace_name, claude_session_id, status) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(id, taskId, workspaceId, workspaceName, claudeSessionId, 'active');
+  return db.prepare('SELECT * FROM task_participants WHERE id = ?').get(id) as TaskParticipant;
+}
+
+export function removeTaskParticipant(participantId: string): void {
+  const db = getDb();
+  db.prepare("UPDATE task_participants SET status = 'removed' WHERE id = ?").run(participantId);
+}
+
+export function getTaskParticipants(taskId: string): TaskParticipant[] {
+  const db = getDb();
+  return db.prepare(
+    "SELECT * FROM task_participants WHERE task_id = ? AND status = 'active' ORDER BY created_at ASC"
+  ).all(taskId) as TaskParticipant[];
+}
+
+export function getTaskParticipant(participantId: string): TaskParticipant | undefined {
+  const db = getDb();
+  return db.prepare('SELECT * FROM task_participants WHERE id = ?').get(participantId) as TaskParticipant | undefined;
+}
+
+export function updateTaskParticipantProjectDir(participantId: string, projectDir: string): void {
+  const db = getDb();
+  db.prepare('UPDATE task_participants SET project_dir = ? WHERE id = ?').run(projectDir, participantId);
+}
+
+/**
+ * Build catch-up context for a task participant.
+ * Returns formatted text of task messages since the participant's last response.
+ */
+export function buildTaskParticipantContext(taskId: string, participantId: string): string {
+  const db = getDb();
+
+  // Find the participant's invite time (floor)
+  const participant = db.prepare(
+    "SELECT created_at FROM task_participants WHERE id = ?"
+  ).get(participantId) as { created_at: string } | undefined;
+  const floor = participant?.created_at || null;
+
+  // Find last assistant message from this participant
+  const lastMsg = db.prepare(
+    "SELECT created_at FROM messages WHERE task_id = ? AND participant_id = ? AND role = 'assistant' ORDER BY created_at DESC LIMIT 1"
+  ).get(taskId, participantId) as { created_at: string } | undefined;
+
+  let messages: Message[];
+  if (lastMsg) {
+    const since = floor && floor > lastMsg.created_at ? floor : lastMsg.created_at;
+    messages = db.prepare(
+      "SELECT * FROM messages WHERE task_id = ? AND created_at > ? ORDER BY created_at ASC"
+    ).all(taskId, since) as Message[];
+  } else if (floor) {
+    messages = db.prepare(
+      "SELECT * FROM messages WHERE task_id = ? AND created_at >= ? ORDER BY created_at ASC"
+    ).all(taskId, floor) as Message[];
+  } else {
+    messages = db.prepare(
+      "SELECT * FROM messages WHERE task_id = ? ORDER BY created_at ASC"
+    ).all(taskId) as Message[];
+  }
+
+  // Exclude this participant's own messages (it has them in its session)
+  messages = messages.filter(msg => {
+    if (msg.role === 'assistant' && msg.participant_id === participantId) return false;
+    return true;
+  });
+
+  // Drop the last user message directed at this participant (it's the -p prompt)
+  if (messages.length > 0) {
+    const last = messages[messages.length - 1];
+    if (last.role === 'user' && last.participant_id === participantId) messages.pop();
+  }
+
+  if (messages.length === 0) return '';
+
+  // Get the task for context
+  const task = db.prepare('SELECT workspace_name, title, prompt FROM tasks WHERE id = ?').get(taskId) as { workspace_name: string; title: string; prompt: string } | undefined;
+  const hostName = task?.workspace_name || 'Host';
+
+  // Get all active participants for agent listing
+  const allParticipants = db.prepare(
+    "SELECT id, workspace_name FROM task_participants WHERE task_id = ? AND status = 'active'"
+  ).all(taskId) as Array<{ id: string; workspace_name: string }>;
+  const participantNameMap = new Map(allParticipants.map(p => [p.id, p.workspace_name]));
+  const agentNames = [hostName, ...allParticipants.map(p => p.workspace_name)];
+
+  const lines: string[] = [
+    `[TASK CONTEXT: You have been invited as an advisory participant to a task on workspace "${hostName}". The task is: "${task?.title || 'Unknown'}". Your role is to provide discussion and advice — you are NOT making code changes to the task's workspace. The following messages are from the task conversation.]`
+  ];
+  for (const msg of messages) {
+    let label: string;
+    if (msg.role === 'user') {
+      label = 'User';
+    } else if (msg.role === 'system') {
+      label = 'System';
+    } else {
+      label = (msg.participant_id && participantNameMap.get(msg.participant_id)) || hostName;
+    }
+    lines.push(`[${label}]: ${msg.content}`);
+  }
+  lines.push('[END CONTEXT]');
+  lines.push(`Agents in this task: ${agentNames.join(', ')}.`);
+  lines.push('');
+  return lines.join('\n');
 }

@@ -15,8 +15,12 @@ import {
   getTaskCostUsd,
   getTaskCostsByWorkspace,
   getWorkingTask,
+  addTaskParticipant,
+  removeTaskParticipant,
+  getTaskParticipants,
+  getTaskParticipant,
 } from '../services/tasks.js';
-import { processQueue, resumeTask, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter } from '../services/claude.js';
+import { processQueue, resumeTask, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { getDb } from '../db/index.js';
@@ -108,7 +112,12 @@ router.get('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
   const activity = task.status === 'working' ? getTaskActivity(task.id) || null : null;
   const totalCostUsd = getTaskCostUsd(task.id);
   const rateLimit = getRateLimitInfo(task.id) || null;
-  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages });
+  const participants = getTaskParticipants(task.id).map(p => ({
+    ...p,
+    running: isTaskParticipantRunning(p.id),
+    activity: getTaskParticipantActivity(p.id) || null,
+  }));
+  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages, participants });
 });
 
 // Get stream log for a task (loaded on demand)
@@ -334,6 +343,119 @@ router.post('/tasks/:taskId/restore', requireAuth, (req: Request, res: Response)
   }
   restoreTask(task.id);
   res.json({ ok: true, task: getTask(task.id) });
+});
+
+// --- Task Participants (advisory agents) ---
+
+// List participants for a task
+router.get('/tasks/:taskId/participants', requireAuth, (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  const participants = getTaskParticipants(task.id).map(p => ({
+    ...p,
+    running: isTaskParticipantRunning(p.id),
+    activity: getTaskParticipantActivity(p.id) || null,
+  }));
+  res.json({ participants });
+});
+
+// Invite a workspace as a participant
+router.post('/tasks/:taskId/participants', requireAuth, (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+
+  const { workspaceId, workspaceName } = req.body;
+  if (!workspaceId || !workspaceName) {
+    res.status(400).json({ error: 'workspaceId and workspaceName are required' });
+    return;
+  }
+
+  // Can't add the task's own workspace
+  if (workspaceId === task.workspace_id) {
+    res.status(400).json({ error: 'Cannot add the task workspace as a participant' });
+    return;
+  }
+
+  // Check not already a participant
+  const existing = getTaskParticipants(task.id);
+  if (existing.some(p => p.workspace_id === workspaceId)) {
+    res.status(409).json({ error: 'Workspace is already a participant' });
+    return;
+  }
+
+  const participant = addTaskParticipant(task.id, workspaceId, workspaceName);
+  addMessage(task.id, 'system', `${workspaceName} joined as an advisor.`);
+
+  res.status(201).json({ participant: { ...participant, running: false, activity: null } });
+});
+
+// Remove a participant
+router.delete('/tasks/:taskId/participants/:participantId', requireAuth, (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+
+  const participant = getTaskParticipant(req.params.participantId);
+  if (!participant || participant.task_id !== task.id || participant.status !== 'active') {
+    res.status(404).json({ error: 'Participant not found' });
+    return;
+  }
+
+  if (isTaskParticipantRunning(participant.id)) {
+    stopTaskParticipant(participant.id);
+  }
+
+  removeTaskParticipant(participant.id);
+  addMessage(task.id, 'system', `${participant.workspace_name} left the task.`);
+
+  res.json({ ok: true });
+});
+
+// Send a message to a task participant
+router.post('/tasks/:taskId/participants/:participantId/message', requireAuth, async (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+
+  const participant = getTaskParticipant(req.params.participantId);
+  if (!participant || participant.task_id !== task.id || participant.status !== 'active') {
+    res.status(404).json({ error: 'Participant not found' });
+    return;
+  }
+
+  const { message } = req.body;
+  if (!message || typeof message !== 'string') {
+    res.status(400).json({ error: 'Message is required' });
+    return;
+  }
+
+  // Check no participant is currently running for this task
+  const allParticipants = getTaskParticipants(task.id);
+  if (allParticipants.some(p => isTaskParticipantRunning(p.id))) {
+    res.status(409).json({ error: 'A participant agent is currently processing. Wait for it to finish.' });
+    return;
+  }
+
+  // Store user message tagged with participant
+  addMessage(task.id, 'user', message, undefined, req.user!.username, participant.id);
+
+  // Check if this participant has spoken before (to determine resume)
+  const msgs = getMessages(req.params.taskId);
+  const isResume = msgs.some(m => m.role === 'assistant' && m.participant_id === participant.id);
+
+  await launchTaskParticipant(task, participant, message, isResume);
+
+  res.json({ ok: true });
 });
 
 export default router;
