@@ -15,6 +15,8 @@ import {
   getOrCreateDiscussion,
   checkoutTaskBranch,
   getModels,
+  getGitSettings,
+  updateGitSettings,
   type Workspace,
   type ModelInfo,
   type Task,
@@ -101,6 +103,8 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
   const [creatingTask, setCreatingTask] = useState(false);
   const [selectedTaskId, setSelectedTaskId] = useSessionState<string | null>('selectedTaskId', null);
   const [discussionState, setDiscussionState] = useState<{ id: string; workspaceId: string; workspaceName: string } | null>(null);
+  const [settingsOpenWsId, setSettingsOpenWsId] = useState<string | null>(null);
+  const [gitPushSettings, setGitPushSettings] = useState<Record<string, boolean>>({});
   const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevTaskStatusesRef = useRef<Map<string, string>>(new Map());
   const lastTaskWorkspaceIdRef = useRef<string | null>(null);
@@ -483,6 +487,33 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
     }
   };
 
+  const handleToggleSettings = async (workspaceId: string) => {
+    if (settingsOpenWsId === workspaceId) {
+      setSettingsOpenWsId(null);
+      return;
+    }
+    setSettingsOpenWsId(workspaceId);
+    // Fetch current git push setting
+    if (!(workspaceId in gitPushSettings)) {
+      try {
+        const { gitPushEnabled } = await getGitSettings(workspaceId);
+        setGitPushSettings(prev => ({ ...prev, [workspaceId]: gitPushEnabled }));
+      } catch { /* default shown as true */ }
+    }
+  };
+
+  const handleToggleGitPush = async (workspaceId: string) => {
+    const current = gitPushSettings[workspaceId] ?? true;
+    const next = !current;
+    setGitPushSettings(prev => ({ ...prev, [workspaceId]: next }));
+    try {
+      await updateGitSettings(workspaceId, next);
+    } catch {
+      // Revert on failure
+      setGitPushSettings(prev => ({ ...prev, [workspaceId]: current }));
+    }
+  };
+
   const handleCreateTask = async (workspaceId: string) => {
     if (!newTaskPrompt.trim()) return;
     setCreatingTask(true);
@@ -736,8 +767,32 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
                   </svg>
                 </button>
               ) : null}
+              {isRunning && (
+                <button
+                  onClick={() => handleToggleSettings(ws.id)}
+                  className={`p-0.5 transition-colors ${settingsOpenWsId === ws.id ? 'text-blue-500 dark:text-blue-400' : 'text-gray-300 dark:text-gray-600 hover:text-gray-500 dark:hover:text-gray-400'}`}
+                  title="Workspace settings"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
+                    <path fillRule="evenodd" d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z" clipRule="evenodd" />
+                  </svg>
+                </button>
+              )}
             </div>
           </div>
+          {settingsOpenWsId === ws.id && (
+            <div className="flex items-center gap-2 px-2 py-1.5 bg-gray-100 dark:bg-gray-800 rounded text-xs mb-1">
+              <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={gitPushSettings[ws.id] ?? true}
+                  onChange={() => handleToggleGitPush(ws.id)}
+                  className="rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500 h-3.5 w-3.5"
+                />
+                <span className="text-gray-600 dark:text-gray-300">Git push enabled</span>
+              </label>
+            </div>
+          )}
           {(apps.length > 0 || openPorts.length > 0 || githubRepoUrl) && (
             <div className="flex items-center gap-1.5 flex-wrap mb-1">
               {githubRepoUrl && (
