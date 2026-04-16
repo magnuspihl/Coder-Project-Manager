@@ -1,5 +1,5 @@
 import { sshExec, detectProjectDir } from './claude.js';
-import { addMessage, updateTaskStatus, getTask, type Task } from './tasks.js';
+import { addMessage, getTask, type Task } from './tasks.js';
 import { getDb } from '../db/index.js';
 import { execFile } from 'child_process';
 
@@ -328,8 +328,6 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       // Remote disabled: refuse completion if there are uncommitted changes
       if (hasChanges) {
         addMessage(task.id, 'system', 'Cannot complete: there are uncommitted changes. Please handle git operations manually before completing this task.');
-        // Revert status back to awaiting_feedback
-        updateTaskStatus(task.id, 'awaiting_feedback');
         return false;
       }
       return true;

@@ -192,15 +192,14 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
     return;
   }
 
-  updateTaskStatus(task.id, 'completed');
-
-  // Handle git operations — may block completion if remote is disabled and changes exist
+  // Handle git operations before marking complete — may block completion if remote is disabled and changes exist
   const allowed = await handleTaskCompletionGit(task);
   if (!allowed) {
-    // Status was reverted to awaiting_feedback by handleTaskCompletionGit
     res.status(409).json({ error: 'Cannot complete: uncommitted git changes exist. Please handle git operations manually first.', task: getTask(task.id) });
     return;
   }
+
+  updateTaskStatus(task.id, 'completed');
 
   // Let the queue processor start the next task
   await processQueue(task.workspace_id);
