@@ -24,7 +24,6 @@ function fetchGitHubToken(): Promise<string | null> {
 async function sshGh(workspaceName: string, command: string, timeout = 30000): Promise<string> {
   const token = await fetchGitHubToken();
   if (token) {
-    // Export GH_TOKEN inside a shell so && chains work correctly over SSH
     return sshExec(workspaceName, `export GH_TOKEN=${shellEscape(token)} && ${command}`, timeout);
   }
   return sshExec(workspaceName, command, timeout);
@@ -113,11 +112,44 @@ async function hasGitRepo(workspaceName: string, projectDir: string): Promise<bo
   }
 }
 
-// ─── Task Launch: create a feature branch ───────────────────────────────
+/**
+ * Check if git remote operations are allowed for a workspace.
+ */
+function isRemoteAllowed(workspaceId: string): boolean {
+  const row = getDb().prepare('SELECT git_push_enabled FROM workspace_settings WHERE workspace_id = ?')
+    .get(workspaceId) as { git_push_enabled: number } | undefined;
+  return row?.git_push_enabled !== 0; // default true
+}
+
+/**
+ * Get the stash message tag for a task.
+ */
+function stashTag(taskId: string): string {
+  return `cpm-task-${taskId}`;
+}
+
+/**
+ * Find the stash index for a given task, or -1 if not found.
+ */
+async function findStashIndex(workspaceName: string, projectDir: string, taskId: string): Promise<number> {
+  try {
+    const list = await sshExec(workspaceName, `cd ${projectDir} && git stash list --format='%gd %s'`);
+    const tag = stashTag(taskId);
+    for (const line of list.split('\n')) {
+      if (line.includes(tag)) {
+        const match = line.match(/^stash@\{(\d+)\}/);
+        if (match) return parseInt(match[1], 10);
+      }
+    }
+  } catch { /* no stashes or no git */ }
+  return -1;
+}
+
+// ─── Task Launch: detect repo URL, no branching ─────────────────────────
 
 /**
  * Called when a NEW task is about to be launched (not a resume).
- * Creates a feature branch off the default branch and stores it on the task.
+ * Detects and stores the GitHub repo URL for UI linking.
  */
 export async function handleTaskLaunchGit(task: Task): Promise<void> {
   const dir = task.project_dir;
@@ -128,112 +160,82 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
   try {
     if (!await hasGitRepo(ws, dir)) return;
 
-    const defaultBranch = await getDefaultBranch(ws, dir);
-
-    // Make sure we're on the default branch and up to date
-    await sshExec(ws, `cd ${dir} && git checkout ${defaultBranch}`, 15000);
-    try {
-      await sshExec(ws, `cd ${dir} && git pull origin ${defaultBranch}`, 30000);
-    } catch {
-      // Pull may fail if no remote — continue anyway
-    }
-
-    // Re-read the task to pick up the LLM-generated title (may have arrived
-    // while we were doing git checkout/pull above)
-    const freshTask = getTask(task.id) || task;
-    const branchName = generateBranchName(freshTask);
-    await sshExec(ws, `cd ${dir} && git checkout -b ${branchName}`, 15000);
-
-    storeTaskBranch(task.id, branchName);
-    task.git_branch = branchName;
-
     // Detect and store the GitHub repo URL for UI linking
     const repoUrl = await detectGitHubRepoUrl(ws, dir);
     if (repoUrl) {
       storeTaskRepoUrl(task.id, repoUrl);
       task.github_repo_url = repoUrl;
     }
-
-    console.log(`[git] Created branch ${branchName} for task ${task.id}`);
   } catch (err: any) {
-    console.error(`[git] Failed to create branch for task ${task.id}:`, err.message);
-    // Non-fatal — Claude can still work on whatever branch is active
+    console.error(`[git] Launch git setup failed for task ${task.id}:`, err.message);
   }
 }
 
-/**
- * Check if git push is enabled for a workspace.
- */
-function isGitPushEnabled(workspaceId: string): boolean {
-  const row = getDb().prepare('SELECT git_push_enabled FROM workspace_settings WHERE workspace_id = ?')
-    .get(workspaceId) as { git_push_enabled: number } | undefined;
-  return row?.git_push_enabled !== 0; // default true
-}
-
-// ─── Task Pause: commit (and optionally push) on awaiting_feedback ──────
+// ─── Stash Away: stash changes when switching away from a task ──────────
 
 /**
- * Called when a task transitions to awaiting_feedback.
- * Commits any uncommitted changes and pushes if allowed.
+ * Called when switching away from a task (pause, or another task starting).
+ * Stashes any uncommitted changes (including untracked files) with a named tag.
  */
-export async function handleTaskPauseGit(task: Task): Promise<void> {
+export async function handleStashAway(task: Task): Promise<void> {
   const dir = task.project_dir;
-  if (!dir || !task.git_branch) return;
+  if (!dir) return;
 
   const ws = task.workspace_name;
 
   try {
     if (!await hasGitRepo(ws, dir)) return;
 
-    // Commit any uncommitted changes
     const status = await sshExec(ws, `cd ${dir} && git status --porcelain`);
-    if (status.trim()) {
-      await sshExec(ws, `cd ${dir} && git add -A && git commit -m "WIP: auto-commit for task ${task.id.slice(0, 8)}"`, 30000);
-      console.log(`[git] Auto-committed changes on ${task.git_branch} for task ${task.id}`);
+    if (!status.trim()) {
+      console.log(`[git] No changes to stash for task ${task.id}`);
+      return;
     }
 
-    // Push if enabled for this workspace
-    if (isGitPushEnabled(task.workspace_id)) {
-      try {
-        await sshExec(ws, `cd ${dir} && git push -u origin ${task.git_branch}`, 30000);
-      } catch {
-        // Push may fail (no remote, auth, etc.) — non-fatal
-      }
-    }
+    await sshExec(ws, `cd ${dir} && git stash push --include-untracked -m "${stashTag(task.id)}"`, 30000);
+    console.log(`[git] Stashed changes for task ${task.id}`);
   } catch (err: any) {
-    console.error(`[git] Auto-commit on pause failed for task ${task.id}:`, err.message);
-    // Non-fatal — don't block the status transition
+    console.error(`[git] Stash failed for task ${task.id}:`, err.message);
   }
 }
 
-// ─── Task Resume: switch to the task's branch ───────────────────────────
+// ─── Stash Restore: restore changes when switching to a task ────────────
 
 /**
- * Called before a task is resumed (feedback reply).
- * Switches the workspace to the task's stored branch.
+ * Called when switching to a task (resume, or task starting that has a prior stash).
+ * Pops the task's stash if one exists.
  */
-export async function handleTaskResumeGit(task: Task): Promise<void> {
+export async function handleStashRestore(task: Task): Promise<void> {
   const dir = task.project_dir;
-  if (!dir || !task.git_branch) return;
+  if (!dir) return;
 
   const ws = task.workspace_name;
 
   try {
-    const currentBranch = await sshExec(ws, `cd ${dir} && git rev-parse --abbrev-ref HEAD`);
-    if (currentBranch === task.git_branch) return; // Already on correct branch
+    if (!await hasGitRepo(ws, dir)) return;
 
-    // Stash any uncommitted changes from the current branch before switching
-    const status = await sshExec(ws, `cd ${dir} && git status --porcelain`);
-    if (status) {
-      await sshExec(ws, `cd ${dir} && git stash push -m "auto-stash before switching to ${task.git_branch}"`, 15000);
+    const idx = await findStashIndex(ws, dir, task.id);
+    if (idx < 0) {
+      console.log(`[git] No stash found for task ${task.id}`);
+      return;
     }
 
-    await sshExec(ws, `cd ${dir} && git checkout ${task.git_branch}`, 15000);
-    console.log(`[git] Switched to branch ${task.git_branch} for task ${task.id}`);
+    await sshExec(ws, `cd ${dir} && git stash pop stash@{${idx}}`, 30000);
+    console.log(`[git] Restored stash for task ${task.id}`);
   } catch (err: any) {
-    console.error(`[git] Failed to switch to branch ${task.git_branch}:`, err.message);
-    addMessage(task.id, 'system', `Warning: could not switch to branch \`${task.git_branch}\`: ${err.message}`);
+    console.error(`[git] Stash restore failed for task ${task.id}:`, err.message);
+    addMessage(task.id, 'system', `Warning: could not restore stashed changes: ${err.message}`);
   }
+}
+
+// ─── Task Resume: restore stash ─────────────────────────────────────────
+
+/**
+ * Called before a task is resumed (feedback reply).
+ * Restores the task's stash if one exists.
+ */
+export async function handleTaskResumeGit(task: Task): Promise<void> {
+  await handleStashRestore(task);
 }
 
 // ─── Manual branch checkout ─────────────────────────────────────────────
@@ -256,195 +258,121 @@ export async function checkoutTaskBranch(task: Task): Promise<string> {
   // Stash uncommitted changes before switching
   const status = await sshExec(ws, `cd ${dir} && git status --porcelain`);
   if (status.trim()) {
-    await sshExec(ws, `cd ${dir} && git stash push -m "auto-stash before switching to ${task.git_branch}"`, 15000);
+    await sshExec(ws, `cd ${dir} && git stash push --include-untracked -m "auto-stash before switching to ${task.git_branch}"`, 15000);
   }
 
   await sshExec(ws, `cd ${dir} && git checkout ${task.git_branch}`, 15000);
   return `Switched to branch \`${task.git_branch}\``;
 }
 
-// ─── Task Completion: PR + merge ────────────────────────────────────────
+// ─── Task Completion ────────────────────────────────────────────────────
 
 /**
- * After a task is marked complete, check for a feature branch and create a PR + merge.
- * This is a best-effort operation — failures are logged as system messages on the task
- * but do not block task completion.
+ * After a task is marked complete:
+ * - If remote allowed: create branch, commit, push, PR, merge
+ * - If remote disabled: refuse if there are uncommitted changes
+ *
+ * Returns true if completion is allowed, false if blocked.
  */
-export async function handleTaskCompletionGit(task: Task): Promise<void> {
+export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
   const dir = await resolveProjectDir(task);
-  if (!dir) return;
+  if (!dir) return true; // no project dir — nothing to do
 
   const ws = task.workspace_name;
 
   try {
-    // Use stored branch name, or detect current branch
-    let branch = task.git_branch;
-    if (!branch) {
-      try {
-        const current = await sshExec(ws, `cd ${dir} && git rev-parse --abbrev-ref HEAD`);
-        if (current && current !== 'main' && current !== 'master') {
-          branch = current;
-        }
-      } catch {
-        // ignore
+    if (!await hasGitRepo(ws, dir)) return true;
+
+    // First, restore any stash for this task
+    const stashIdx = await findStashIndex(ws, dir, task.id);
+    if (stashIdx >= 0) {
+      await sshExec(ws, `cd ${dir} && git stash pop stash@{${stashIdx}}`, 30000);
+    }
+
+    const remoteAllowed = isRemoteAllowed(task.workspace_id);
+
+    // Check for uncommitted changes
+    const status = await sshExec(ws, `cd ${dir} && git status --porcelain`);
+    const hasChanges = !!status.trim();
+
+    if (!remoteAllowed) {
+      // Remote disabled: refuse completion if there are uncommitted changes
+      if (hasChanges) {
+        addMessage(task.id, 'system', 'Cannot complete: there are uncommitted changes. Please handle git operations manually before completing this task.');
+        // Revert status back to awaiting_feedback
+        updateTaskStatus(task.id, 'awaiting_feedback');
+        return false;
       }
+      return true;
     }
 
-    if (!branch) {
-      // On main/master or no git — nothing to do
-      return;
-    }
-
-    // Switch to the task's branch to ensure we're committing on the right one
-    await sshExec(ws, `cd ${dir} && git checkout ${branch}`, 15000);
-
-    // Ensure all changes are committed and pushed
-    try {
-      const status = await sshExec(ws, `cd ${dir} && git status --porcelain`);
-      if (status.trim()) {
-        await sshExec(ws, `cd ${dir} && git add -A && git commit -m "Final changes for task ${task.id}"`, 30000);
-      }
-    } catch {
-      // Commit may fail if there's nothing to commit — that's fine
-    }
-
-    // Push the branch if enabled for this workspace
-    const pushEnabled = isGitPushEnabled(task.workspace_id);
-    if (pushEnabled) {
-      try {
-        await sshExec(ws, `cd ${dir} && git push -u origin ${branch}`, 30000);
-      } catch {
-        try {
-          await sshExec(ws, `cd ${dir} && git push origin ${branch}`, 30000);
-        } catch {
-          // Nothing to push — continue to check if there's anything to PR
-        }
-      }
-    }
-
-    // If push is disabled, skip PR/merge — just commit locally
-    if (!pushEnabled) {
-      addMessage(task.id, 'system', `Changes committed locally on branch \`${branch}\`. Push disabled for this workspace.`);
-      return;
-    }
-
-    // Check if there are commits to PR
-    const defaultBranch = await getDefaultBranch(ws, dir);
-    const count = await sshExec(ws,
-      `cd ${dir} && git rev-list --count origin/${defaultBranch}..${branch} 2>/dev/null || echo 0`
-    );
-    if (parseInt(count, 10) <= 0) {
-      // No changes to merge — clean up the empty branch and complete normally
-      try {
-        await sshExec(ws, `cd ${dir} && git checkout ${defaultBranch}`, 15000);
-        await sshExec(ws, `cd ${dir} && git branch -d ${branch} 2>/dev/null`, 10000);
-      } catch { /* ignore cleanup errors */ }
-      addMessage(task.id, 'system', `No changes to merge. Branch \`${branch}\` cleaned up.`);
-      return;
-    }
-
-    // Create PR using gh CLI (with GH_TOKEN from Coder external auth)
-    const prTitle = task.title || `Task: ${task.prompt.slice(0, 60)}`;
-    const prBody = `Automated PR for completed task.\n\n**Task:** ${task.title}\n**Task ID:** ${task.id}`;
-    const prUrl = await sshGh(ws,
-      `cd ${dir} && gh pr create --base ${defaultBranch} --head ${branch} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`
-    );
-
-    addMessage(task.id, 'system', `Pull request created: ${prUrl}`);
-
-    // Merge the PR
-    try {
-      await sshGh(ws, `cd ${dir} && gh pr merge ${branch} --merge --delete-branch`);
-      addMessage(task.id, 'system', `PR merged and branch \`${branch}\` deleted.`);
-
-      // Switch back to default branch
-      await sshExec(ws, `cd ${dir} && git checkout ${defaultBranch} && git pull origin ${defaultBranch}`, 30000);
-    } catch (mergeErr: any) {
-      const reason = `PR created but merge failed: ${mergeErr.message || mergeErr}. Manual merge may be needed.`;
-      addMessage(task.id, 'system', `Error: ${reason}`);
-      updateTaskStatus(task.id, 'failed', `merge_failed: ${reason}`);
-    }
-  } catch (err: any) {
-    const reason = `Git PR/merge failed: ${err.message || err}`;
-    addMessage(task.id, 'system', `Error: ${reason}`);
-    updateTaskStatus(task.id, 'failed', `merge_failed: ${reason}`);
-  }
-}
-
-// ─── Task Reopen: new feature branch ────────────────────────────────────
-
-/**
- * When a task is reopened, check out its existing branch if it still exists.
- * Only create a new branch if the previous one was deleted (e.g. merged and cleaned up).
- */
-export async function handleTaskReopenGit(task: Task): Promise<void> {
-  const dir = await resolveProjectDir(task);
-  if (!dir) return;
-
-  const ws = task.workspace_name;
-
-  try {
-    if (!await hasGitRepo(ws, dir)) return;
-
-    // If the task already has a branch, check if it still exists locally
-    const existingBranch = task.git_branch;
-    if (existingBranch) {
-      try {
-        await sshExec(ws, `cd ${dir} && git rev-parse --verify ${existingBranch} 2>/dev/null`);
-        // Branch still exists — just check it out
-        await sshExec(ws, `cd ${dir} && git checkout ${existingBranch}`, 15000);
-        addMessage(task.id, 'system', `Switched back to existing branch \`${existingBranch}\`.`);
-        return;
-      } catch {
-        // Branch doesn't exist locally — check remote
-        try {
-          await sshExec(ws, `cd ${dir} && git fetch origin ${existingBranch} 2>/dev/null && git checkout -b ${existingBranch} origin/${existingBranch}`, 30000);
-          addMessage(task.id, 'system', `Checked out existing remote branch \`${existingBranch}\`.`);
-          return;
-        } catch {
-          // Branch is gone entirely — fall through to create a new one
-        }
-      }
+    // Remote allowed: create branch, commit, push, PR, merge
+    if (!hasChanges) {
+      // Nothing to commit — task is done
+      return true;
     }
 
     const defaultBranch = await getDefaultBranch(ws, dir);
-    await sshExec(ws, `cd ${dir} && git checkout ${defaultBranch}`, 15000);
-    try {
-      await sshExec(ws, `cd ${dir} && git pull origin ${defaultBranch}`, 30000);
-    } catch {
-      // continue
-    }
 
-    // Generate a new branch name (append -v2, -v3, etc. if the base name is taken)
-    const baseName = generateBranchName(task);
-    let branchName = baseName;
-    let attempt = 2;
-    while (true) {
-      try {
-        await sshExec(ws, `cd ${dir} && git rev-parse --verify ${branchName} 2>/dev/null`);
-        // Branch exists — try next suffix
-        branchName = `${baseName}-v${attempt}`;
-        attempt++;
-      } catch {
-        // Branch doesn't exist — we can use it
-        break;
-      }
-    }
+    // Re-read task for latest title
+    const freshTask = getTask(task.id) || task;
+    const branchName = generateBranchName(freshTask);
 
+    // Create branch, commit, push
     await sshExec(ws, `cd ${dir} && git checkout -b ${branchName}`, 15000);
-
+    await sshExec(ws, `cd ${dir} && git add -A && git commit -m ${shellEscape(freshTask.title || 'Task changes')}`, 30000);
     storeTaskBranch(task.id, branchName);
 
-    // Detect and store the GitHub repo URL for UI linking
+    // Detect and store the GitHub repo URL
     const repoUrl = await detectGitHubRepoUrl(ws, dir);
     if (repoUrl) {
       storeTaskRepoUrl(task.id, repoUrl);
     }
 
-    addMessage(task.id, 'system', `Created new branch \`${branchName}\` for continued work.`);
+    try {
+      await sshExec(ws, `cd ${dir} && git push -u origin ${branchName}`, 30000);
+    } catch {
+      try {
+        await sshExec(ws, `cd ${dir} && git push origin ${branchName}`, 30000);
+      } catch (pushErr: any) {
+        addMessage(task.id, 'system', `Changes committed on branch \`${branchName}\` but push failed: ${pushErr.message}`);
+        return true;
+      }
+    }
+
+    // Create PR
+    const prTitle = freshTask.title || `Task: ${freshTask.prompt.slice(0, 60)}`;
+    const prBody = `Automated PR for completed task.\n\n**Task:** ${freshTask.title}\n**Task ID:** ${freshTask.id}`;
+    const prUrl = await sshGh(ws,
+      `cd ${dir} && gh pr create --base ${defaultBranch} --head ${branchName} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`
+    );
+    addMessage(task.id, 'system', `Pull request created: ${prUrl}`);
+
+    // Merge
+    try {
+      await sshGh(ws, `cd ${dir} && gh pr merge ${branchName} --merge --delete-branch`);
+      addMessage(task.id, 'system', `PR merged and branch \`${branchName}\` deleted.`);
+      await sshExec(ws, `cd ${dir} && git checkout ${defaultBranch} && git pull origin ${defaultBranch}`, 30000);
+    } catch (mergeErr: any) {
+      addMessage(task.id, 'system', `PR created but merge failed: ${mergeErr.message}. Manual merge may be needed.`);
+    }
+
+    return true;
   } catch (err: any) {
-    addMessage(task.id, 'system', `Failed to create feature branch: ${err.message || err}`);
+    const reason = `Git completion failed: ${err.message || err}`;
+    addMessage(task.id, 'system', `Error: ${reason}`);
+    return true; // Don't block completion on git errors
   }
+}
+
+// ─── Task Reopen ────────────────────────────────────────────────────────
+
+/**
+ * When a task is reopened, nothing special needed — the task just goes
+ * back to awaiting_feedback. Any stash handling happens on next resume.
+ */
+export async function handleTaskReopenGit(_task: Task): Promise<void> {
+  // No-op — stash restore happens when the task is next worked on
 }
 
 /**

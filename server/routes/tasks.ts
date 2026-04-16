@@ -185,9 +185,13 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
 
   updateTaskStatus(task.id, 'completed');
 
-  // Completion signals acceptance — create PR and merge the feature branch.
-  // Must finish before the next task starts to avoid concurrent git operations.
-  await handleTaskCompletionGit(task);
+  // Handle git operations — may block completion if remote is disabled and changes exist
+  const allowed = await handleTaskCompletionGit(task);
+  if (!allowed) {
+    // Status was reverted to awaiting_feedback by handleTaskCompletionGit
+    res.status(409).json({ error: 'Cannot complete: uncommitted git changes exist. Please handle git operations manually first.', task: getTask(task.id) });
+    return;
+  }
 
   // Let the queue processor start the next task
   await processQueue(task.workspace_id);
@@ -209,7 +213,7 @@ router.post('/tasks/:taskId/reopen', requireAuth, async (req: Request, res: Resp
 
   updateTaskStatus(task.id, 'awaiting_feedback');
 
-  // Reopening starts a new feature branch for continued work
+  // Reopen is now a no-op for git — stash handling happens on next resume
   handleTaskReopenGit(task).catch(() => {});
 
   res.json({ task: getTask(task.id) });

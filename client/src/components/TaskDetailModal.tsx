@@ -234,8 +234,16 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   };
 
   const handleComplete = async () => {
-    await completeTask(taskId);
-    closeAndNotify();
+    try {
+      await completeTask(taskId);
+      closeAndNotify();
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes('uncommitted')) {
+        alert(err.message);
+      } else {
+        closeAndNotify();
+      }
+    }
   };
 
   const handleRetry = async () => {
