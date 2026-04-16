@@ -278,6 +278,15 @@ export interface TaskRequestItem {
   created_at: string;
 }
 
+export const getGitSettings = (workspaceId: string) =>
+  request<{ gitPushEnabled: boolean }>(`/api/workspaces/${workspaceId}/git-settings`);
+
+export const updateGitSettings = (workspaceId: string, gitPushEnabled: boolean) =>
+  request<{ ok: boolean; gitPushEnabled: boolean }>(`/api/workspaces/${workspaceId}/git-settings`, {
+    method: 'PATCH',
+    body: JSON.stringify({ gitPushEnabled }),
+  });
+
 export const getDiscussionSettings = (workspaceId: string) =>
   request<{ fullAccess: boolean }>(`/api/workspaces/${workspaceId}/discussion-settings`);
 

@@ -1,8 +1,8 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
-import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, deleteCurrentSessionAssistantMessages, updateMessageCost, type Task } from './tasks.js';
+import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, type Task } from './tasks.js';
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { getDb } from '../db/index.js';
-import { handleTaskLaunchGit, handleTaskResumeGit } from './git.js';
+import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskPauseGit } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
 
 const CODER_URL = process.env.CODER_URL || '';
@@ -527,13 +527,18 @@ export function cancelTask(workspaceId: string): void {
  */
 export function interruptTask(taskId: string): void {
   const db = getDb();
-  const task = db.prepare("SELECT id, workspace_name, ssh_pid FROM tasks WHERE id = ? AND status = 'working'")
+  const partial = db.prepare("SELECT id, workspace_name, ssh_pid FROM tasks WHERE id = ? AND status = 'working'")
     .get(taskId) as { id: string; workspace_name: string; ssh_pid: number | null } | undefined;
 
-  if (task) {
-    killTaskProcess(task.id, task.ssh_pid);
-    addMessage(task.id, 'system', 'Task was interrupted by user.');
-    updateTaskStatus(task.id, 'awaiting_feedback');
+  if (partial) {
+    killTaskProcess(partial.id, partial.ssh_pid);
+    addMessage(partial.id, 'system', 'Task was interrupted by user.');
+    updateTaskStatus(partial.id, 'awaiting_feedback');
+    // Fetch full task for git operations
+    const fullTask = getTask(partial.id);
+    if (fullTask) {
+      handleTaskPauseGit(fullTask).catch(err => console.error('[git] Pause commit failed:', (err as Error).message?.slice(0, 100)));
+    }
   }
 }
 
@@ -609,6 +614,7 @@ export async function reconnectWorkingTasks(): Promise<void> {
               const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
               if (hasResponse) {
                 updateTaskStatus(task.id, 'awaiting_feedback');
+                await handleTaskPauseGit(task).catch(err => console.error('[git] Pause commit failed:', (err as Error).message?.slice(0, 100)));
               } else {
                 // No response captured — task was likely interrupted. Re-queue for retry.
                 console.log(`[recovery] Task "${task.title}" exited with no response — re-queuing`);
@@ -795,6 +801,7 @@ function startFilePolling(task: Task): void {
           const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
           if (hasResponse) {
             updateTaskStatus(task.id, 'awaiting_feedback');
+            handleTaskPauseGit(task).catch(err => console.error('[git] Pause commit failed:', (err as Error).message?.slice(0, 100)));
           } else {
             // No response captured — re-queue for automatic retry
             console.log(`[claude-poller] Task ${task.id} exited with no response — re-queuing`);

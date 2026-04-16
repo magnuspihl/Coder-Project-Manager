@@ -161,6 +161,51 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
   }
 }
 
+/**
+ * Check if git push is enabled for a workspace.
+ */
+function isGitPushEnabled(workspaceId: string): boolean {
+  const row = getDb().prepare('SELECT git_push_enabled FROM workspace_settings WHERE workspace_id = ?')
+    .get(workspaceId) as { git_push_enabled: number } | undefined;
+  return row?.git_push_enabled !== 0; // default true
+}
+
+// ─── Task Pause: commit (and optionally push) on awaiting_feedback ──────
+
+/**
+ * Called when a task transitions to awaiting_feedback.
+ * Commits any uncommitted changes and pushes if allowed.
+ */
+export async function handleTaskPauseGit(task: Task): Promise<void> {
+  const dir = task.project_dir;
+  if (!dir || !task.git_branch) return;
+
+  const ws = task.workspace_name;
+
+  try {
+    if (!await hasGitRepo(ws, dir)) return;
+
+    // Commit any uncommitted changes
+    const status = await sshExec(ws, `cd ${dir} && git status --porcelain`);
+    if (status.trim()) {
+      await sshExec(ws, `cd ${dir} && git add -A && git commit -m "WIP: auto-commit for task ${task.id.slice(0, 8)}"`, 30000);
+      console.log(`[git] Auto-committed changes on ${task.git_branch} for task ${task.id}`);
+    }
+
+    // Push if enabled for this workspace
+    if (isGitPushEnabled(task.workspace_id)) {
+      try {
+        await sshExec(ws, `cd ${dir} && git push -u origin ${task.git_branch}`, 30000);
+      } catch {
+        // Push may fail (no remote, auth, etc.) — non-fatal
+      }
+    }
+  } catch (err: any) {
+    console.error(`[git] Auto-commit on pause failed for task ${task.id}:`, err.message);
+    // Non-fatal — don't block the status transition
+  }
+}
+
 // ─── Task Resume: switch to the task's branch ───────────────────────────
 
 /**
@@ -263,15 +308,24 @@ export async function handleTaskCompletionGit(task: Task): Promise<void> {
       // Commit may fail if there's nothing to commit — that's fine
     }
 
-    // Push the branch (may fail if nothing to push — also fine)
-    try {
-      await sshExec(ws, `cd ${dir} && git push -u origin ${branch}`, 30000);
-    } catch {
+    // Push the branch if enabled for this workspace
+    const pushEnabled = isGitPushEnabled(task.workspace_id);
+    if (pushEnabled) {
       try {
-        await sshExec(ws, `cd ${dir} && git push origin ${branch}`, 30000);
+        await sshExec(ws, `cd ${dir} && git push -u origin ${branch}`, 30000);
       } catch {
-        // Nothing to push — continue to check if there's anything to PR
+        try {
+          await sshExec(ws, `cd ${dir} && git push origin ${branch}`, 30000);
+        } catch {
+          // Nothing to push — continue to check if there's anything to PR
+        }
       }
+    }
+
+    // If push is disabled, skip PR/merge — just commit locally
+    if (!pushEnabled) {
+      addMessage(task.id, 'system', `Changes committed locally on branch \`${branch}\`. Push disabled for this workspace.`);
+      return;
     }
 
     // Check if there are commits to PR

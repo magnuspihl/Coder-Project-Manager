@@ -113,6 +113,12 @@ export function getDb(): Database.Database {
       db.exec("ALTER TABLE tasks ADD COLUMN caveman TEXT");
     }
 
+    // Workspace settings migrations
+    const wsCols = db.prepare("PRAGMA table_info(workspace_settings)").all() as Array<{ name: string }>;
+    if (!wsCols.some(c => c.name === 'git_push_enabled')) {
+      db.exec("ALTER TABLE workspace_settings ADD COLUMN git_push_enabled INTEGER NOT NULL DEFAULT 1");
+    }
+
     // Discussion messages migrations
     const dmCols = db.prepare("PRAGMA table_info(discussion_messages)").all() as Array<{ name: string }>;
     if (!dmCols.some(c => c.name === 'participant_id')) {

@@ -157,4 +157,28 @@ router.get('/:workspaceId/models', requireAuth, async (req: Request, res: Respon
   }
 });
 
+// Git settings
+import { getDb } from '../db/index.js';
+
+router.get('/:workspaceId/git-settings', requireAuth, (req: Request, res: Response) => {
+  const row = getDb().prepare('SELECT git_push_enabled FROM workspace_settings WHERE workspace_id = ?')
+    .get(req.params.workspaceId) as { git_push_enabled: number } | undefined;
+  res.json({ gitPushEnabled: row?.git_push_enabled !== 0 });
+});
+
+router.patch('/:workspaceId/git-settings', requireAuth, (req: Request, res: Response) => {
+  const { gitPushEnabled } = req.body;
+  if (typeof gitPushEnabled !== 'boolean') {
+    res.status(400).json({ error: 'gitPushEnabled must be a boolean' });
+    return;
+  }
+  const db = getDb();
+  db.prepare(
+    `INSERT INTO workspace_settings (workspace_id, git_push_enabled, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(workspace_id) DO UPDATE SET git_push_enabled = ?, updated_at = ?`
+  ).run(req.params.workspaceId, gitPushEnabled ? 1 : 0, new Date().toISOString(), gitPushEnabled ? 1 : 0, new Date().toISOString());
+  res.json({ ok: true, gitPushEnabled });
+});
+
 export default router;
