@@ -145,6 +145,26 @@ async function findStashIndex(workspaceName: string, projectDir: string, taskId:
   return -1;
 }
 
+/**
+ * Get the last active task ID for a workspace.
+ */
+function getLastActiveTaskId(workspaceId: string): string | null {
+  const row = getDb().prepare('SELECT last_active_task_id FROM workspace_settings WHERE workspace_id = ?')
+    .get(workspaceId) as { last_active_task_id: string | null } | undefined;
+  return row?.last_active_task_id || null;
+}
+
+/**
+ * Set the last active task ID for a workspace.
+ */
+function setLastActiveTaskId(workspaceId: string, taskId: string | null): void {
+  getDb().prepare(`
+    INSERT INTO workspace_settings (workspace_id, last_active_task_id)
+    VALUES (?, ?)
+    ON CONFLICT(workspace_id) DO UPDATE SET last_active_task_id = excluded.last_active_task_id
+  `).run(workspaceId, taskId);
+}
+
 // ─── Task Launch: detect repo URL, no branching ─────────────────────────
 
 /**
@@ -169,73 +189,72 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
   } catch (err: any) {
     console.error(`[git] Launch git setup failed for task ${task.id}:`, err.message);
   }
+
+  // Handle stash switching (stash previous task's changes, restore this task's)
+  await handleSwitchToTask(task);
 }
 
-// ─── Stash Away: stash changes when switching away from a task ──────────
+// ─── Lazy Stash: only stash when another task needs the working tree ────
 
 /**
- * Called when switching away from a task (pause, or another task starting).
- * Stashes any uncommitted changes (including untracked files) with a named tag.
+ * Called when switching TO a task (launch or resume).
+ * If a different task's changes are in the working tree, stash them first,
+ * then restore this task's stash if one exists.
+ * Finally, marks this task as the active one for the workspace.
+ */
+export async function handleSwitchToTask(task: Task): Promise<void> {
+  const dir = task.project_dir;
+  if (!dir) return;
+
+  const ws = task.workspace_name;
+
+  try {
+    if (!await hasGitRepo(ws, dir)) return;
+
+    // Check if another task's changes are in the working tree
+    const lastActiveId = getLastActiveTaskId(task.workspace_id);
+    if (lastActiveId && lastActiveId !== task.id) {
+      // Stash the previous task's changes
+      const status = await sshExec(ws, `cd ${dir} && git status --porcelain`);
+      if (status.trim()) {
+        await sshExec(ws, `cd ${dir} && git stash push --include-untracked -m "${stashTag(lastActiveId)}"`, 30000);
+        console.log(`[git] Stashed changes for previous task ${lastActiveId}`);
+      }
+    }
+
+    // Restore this task's stash if one exists
+    const idx = await findStashIndex(ws, dir, task.id);
+    if (idx >= 0) {
+      await sshExec(ws, `cd ${dir} && git stash pop stash@{${idx}}`, 30000);
+      console.log(`[git] Restored stash for task ${task.id}`);
+    }
+
+    // Mark this task as the active one
+    setLastActiveTaskId(task.workspace_id, task.id);
+  } catch (err: any) {
+    console.error(`[git] Switch-to-task failed for task ${task.id}:`, err.message);
+    addMessage(task.id, 'system', `Warning: git stash switch failed: ${err.message}`);
+  }
+}
+
+/**
+ * Called when a task leaves working state (pause/complete).
+ * Does NOT stash — changes stay in the working tree for review.
+ * Only updates tracking so we know whose changes are there.
  */
 export async function handleStashAway(task: Task): Promise<void> {
-  const dir = task.project_dir;
-  if (!dir) return;
-
-  const ws = task.workspace_name;
-
-  try {
-    if (!await hasGitRepo(ws, dir)) return;
-
-    const status = await sshExec(ws, `cd ${dir} && git status --porcelain`);
-    if (!status.trim()) {
-      console.log(`[git] No changes to stash for task ${task.id}`);
-      return;
-    }
-
-    await sshExec(ws, `cd ${dir} && git stash push --include-untracked -m "${stashTag(task.id)}"`, 30000);
-    console.log(`[git] Stashed changes for task ${task.id}`);
-  } catch (err: any) {
-    console.error(`[git] Stash failed for task ${task.id}:`, err.message);
-  }
+  // No-op: lazy stashing means we leave changes in the working tree.
+  // They'll be stashed later if/when another task needs the working tree.
+  // We keep last_active_task_id pointing at this task so we know whose changes are there.
 }
 
-// ─── Stash Restore: restore changes when switching to a task ────────────
-
-/**
- * Called when switching to a task (resume, or task starting that has a prior stash).
- * Pops the task's stash if one exists.
- */
-export async function handleStashRestore(task: Task): Promise<void> {
-  const dir = task.project_dir;
-  if (!dir) return;
-
-  const ws = task.workspace_name;
-
-  try {
-    if (!await hasGitRepo(ws, dir)) return;
-
-    const idx = await findStashIndex(ws, dir, task.id);
-    if (idx < 0) {
-      console.log(`[git] No stash found for task ${task.id}`);
-      return;
-    }
-
-    await sshExec(ws, `cd ${dir} && git stash pop stash@{${idx}}`, 30000);
-    console.log(`[git] Restored stash for task ${task.id}`);
-  } catch (err: any) {
-    console.error(`[git] Stash restore failed for task ${task.id}:`, err.message);
-    addMessage(task.id, 'system', `Warning: could not restore stashed changes: ${err.message}`);
-  }
-}
-
-// ─── Task Resume: restore stash ─────────────────────────────────────────
+// ─── Task Resume: switch to task (lazy stash + restore) ─────────────────
 
 /**
  * Called before a task is resumed (feedback reply).
- * Restores the task's stash if one exists.
  */
 export async function handleTaskResumeGit(task: Task): Promise<void> {
-  await handleStashRestore(task);
+  await handleSwitchToTask(task);
 }
 
 // ─── Manual branch checkout ─────────────────────────────────────────────
@@ -283,7 +302,17 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
   try {
     if (!await hasGitRepo(ws, dir)) return true;
 
-    // First, restore any stash for this task
+    // If another task's changes are in the working tree, stash them first
+    const lastActiveId = getLastActiveTaskId(task.workspace_id);
+    if (lastActiveId && lastActiveId !== task.id) {
+      const prevStatus = await sshExec(ws, `cd ${dir} && git status --porcelain`);
+      if (prevStatus.trim()) {
+        await sshExec(ws, `cd ${dir} && git stash push --include-untracked -m "${stashTag(lastActiveId)}"`, 30000);
+        console.log(`[git] Stashed previous task ${lastActiveId} changes before completing ${task.id}`);
+      }
+    }
+
+    // Restore this task's stash if one exists
     const stashIdx = await findStashIndex(ws, dir, task.id);
     if (stashIdx >= 0) {
       await sshExec(ws, `cd ${dir} && git stash pop stash@{${stashIdx}}`, 30000);
@@ -357,6 +386,8 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       addMessage(task.id, 'system', `PR created but merge failed: ${mergeErr.message}. Manual merge may be needed.`);
     }
 
+    // Clear active task tracking — this task is done
+    setLastActiveTaskId(task.workspace_id, null);
     return true;
   } catch (err: any) {
     const reason = `Git completion failed: ${err.message || err}`;
