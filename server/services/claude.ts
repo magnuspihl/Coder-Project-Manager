@@ -50,14 +50,87 @@ export interface WorkspaceUsage {
 }
 const workspaceUsage = new Map<string, WorkspaceUsage>();
 
-function updateWorkspaceUsage(workspaceName: string, info: { utilization?: number; rateLimitType?: string; resetsAt?: number }): void {
+// Global rate limit tracking — stores both five_hour and seven_day separately
+// Persisted to SQLite so data survives server restarts
+export interface RateLimitUsage {
+  utilization: number; // 0-1 fraction
+  resetsAt: number;    // Unix timestamp (seconds)
+  updatedAt: number;   // Date.now() ms when last updated
+}
+const globalRateLimits = new Map<string, RateLimitUsage>(); // keyed by rateLimitType
+
+// Load persisted rate limits from DB on first access
+let rateLimitsLoaded = false;
+function ensureRateLimitsLoaded(): void {
+  if (rateLimitsLoaded) return;
+  rateLimitsLoaded = true;
+  try {
+    const db = getDb();
+    const rows = db.prepare('SELECT type, utilization, resets_at, updated_at FROM rate_limits').all() as Array<{
+      type: string; utilization: number; resets_at: number; updated_at: number;
+    }>;
+    for (const row of rows) {
+      globalRateLimits.set(row.type, {
+        utilization: row.utilization,
+        resetsAt: row.resets_at,
+        updatedAt: row.updated_at,
+      });
+    }
+  } catch {
+    // DB not ready yet, will load on next call
+    rateLimitsLoaded = false;
+  }
+}
+
+function persistRateLimit(type: string, usage: RateLimitUsage): void {
+  try {
+    const db = getDb();
+    db.prepare(
+      'INSERT INTO rate_limits (type, utilization, resets_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(type) DO UPDATE SET utilization=excluded.utilization, resets_at=excluded.resets_at, updated_at=excluded.updated_at'
+    ).run(type, usage.utilization, usage.resetsAt, usage.updatedAt);
+  } catch {
+    // Non-critical — best effort persistence
+  }
+}
+
+function updateWorkspaceUsage(_workspaceName: string, info: { utilization?: number; rateLimitType?: string; resetsAt?: number }): void {
   if (typeof info.utilization === 'number') {
-    workspaceUsage.set(workspaceName, {
+    // Legacy per-workspace map (kept for backward compat)
+    workspaceUsage.set(_workspaceName, {
       utilization: info.utilization,
       rateLimitType: info.rateLimitType || 'unknown',
       resetsAt: info.resetsAt || 0,
       updatedAt: Date.now(),
     });
+  }
+  // Always update global limits when we have a type and resetsAt
+  if (info.rateLimitType && info.resetsAt) {
+    ensureRateLimitsLoaded();
+    const existing = globalRateLimits.get(info.rateLimitType);
+    const now = Date.now();
+    // Update if we have utilization, or if the existing entry is stale/missing
+    if (typeof info.utilization === 'number' || !existing || existing.updatedAt < now - 300000) {
+      // If resetsAt changed, this is a new period — don't carry over old utilization
+      const isNewPeriod = existing && existing.resetsAt !== info.resetsAt;
+      const fallbackUtilization = isNewPeriod ? 0 : (existing?.utilization ?? 0);
+      const usage: RateLimitUsage = {
+        utilization: typeof info.utilization === 'number' ? info.utilization : fallbackUtilization,
+        resetsAt: info.resetsAt,
+        updatedAt: now,
+      };
+      globalRateLimits.set(info.rateLimitType, usage);
+      persistRateLimit(info.rateLimitType, usage);
+    }
+
+    // When we see any rate limit event, seed the other limit type if missing
+    // so it shows as indeterminate rather than being invisible
+    const otherType = info.rateLimitType === 'five_hour' ? 'seven_day' : 'five_hour';
+    if (!globalRateLimits.has(otherType)) {
+      // Use a far-future resetsAt so it shows as active/indeterminate
+      const seed: RateLimitUsage = { utilization: 0, resetsAt: Math.floor(now / 1000) + 86400 * 7, updatedAt: now };
+      globalRateLimits.set(otherType, seed);
+      persistRateLimit(otherType, seed);
+    }
   }
 }
 
@@ -65,6 +138,24 @@ export function getWorkspaceUsages(): Record<string, WorkspaceUsage> {
   const result: Record<string, WorkspaceUsage> = {};
   for (const [name, usage] of workspaceUsage) {
     result[name] = usage;
+  }
+  return result;
+}
+
+export function getGlobalRateLimits(): Record<string, RateLimitUsage> {
+  ensureRateLimitsLoaded();
+  const result: Record<string, RateLimitUsage> = {};
+  const now = Date.now();
+  for (const [type, usage] of globalRateLimits) {
+    if (usage.resetsAt * 1000 <= now) {
+      // Reset period has passed — clear stale utilization in the actual map
+      // so it doesn't get carried over when new events arrive without utilization
+      const reset = { ...usage, utilization: 0 };
+      globalRateLimits.set(type, reset);
+      result[type] = reset;
+    } else {
+      result[type] = usage;
+    }
   }
   return result;
 }
