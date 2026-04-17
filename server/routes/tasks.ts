@@ -1,5 +1,4 @@
 import { Router, Request, Response } from 'express';
-import { v4 as uuid } from 'uuid';
 import { requireAuth } from '../middleware/auth.js';
 import {
   listTasks,
@@ -23,7 +22,6 @@ import {
 import { processQueue, resumeTask, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
-import { getDb } from '../db/index.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch } from '../services/git.js';
 
 const router = Router();
@@ -249,7 +247,7 @@ router.post('/tasks/:taskId/checkout', requireAuth, async (req: Request, res: Re
   }
 });
 
-// Retry a failed task
+// Retry a failed task — resumes the existing session with a continuation prompt
 router.post('/tasks/:taskId/retry', requireAuth, async (req: Request, res: Response) => {
   const task = getTask(req.params.taskId);
   if (!task) {
@@ -261,14 +259,18 @@ router.post('/tasks/:taskId/retry', requireAuth, async (req: Request, res: Respo
     return;
   }
 
-  // Generate a new session ID and re-queue
-  const newSessionId = uuid();
-  getDb().prepare('UPDATE tasks SET claude_session_id = ? WHERE id = ?').run(newSessionId, task.id);
-  updateTaskStatus(task.id, 'queued');
+  const continuationPrompt = 'Continue where you left off.';
+  addMessage(task.id, 'user', continuationPrompt, undefined, req.user!.username);
 
-  // Let the queue processor decide whether to start it now
-  await processQueue(task.workspace_id);
+  // If another task is working on this workspace, queue instead of resuming immediately
+  const working = getWorkingTask(task.workspace_id);
+  if (working) {
+    updateTaskStatus(task.id, 'queued');
+    res.json({ task: getTask(task.id) });
+    return;
+  }
 
+  await resumeTask(task, continuationPrompt);
   res.json({ task: getTask(task.id) });
 });
 
