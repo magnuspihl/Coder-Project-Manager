@@ -200,14 +200,47 @@ export interface ModelInfo {
 export const getModels = (workspaceId: string) =>
   request<{ models: ModelInfo[] }>(`/api/workspaces/${workspaceId}/models`);
 
+// Uploads
+export interface Attachment {
+  id: string;
+  task_id: string | null;
+  filename: string;
+  original_name: string;
+  mime_type: string;
+  size: number;
+  created_at: string;
+}
+
+export async function uploadFiles(files: File[]): Promise<Attachment[]> {
+  const formData = new FormData();
+  for (const file of files) {
+    formData.append('files', file);
+  }
+  const res = await fetch('/api/uploads', {
+    method: 'POST',
+    credentials: 'include',
+    body: formData,
+  });
+  if (!res.ok) {
+    if (res.status === 401) {
+      window.dispatchEvent(new Event('auth:expired'));
+      throw new Error('Session expired');
+    }
+    const body = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(body.error || `Upload failed: ${res.status}`);
+  }
+  const data = await res.json();
+  return data.attachments;
+}
+
 // Tasks
 export const getTasks = (workspaceId: string) =>
   request<{ tasks: Task[] }>(`/api/workspaces/${workspaceId}/tasks`);
 
-export const createTask = (workspaceId: string, prompt: string, branch?: string, model?: string, caveman?: string) =>
+export const createTask = (workspaceId: string, prompt: string, branch?: string, model?: string, caveman?: string, attachmentIds?: string[]) =>
   request<{ task: Task }>(`/api/workspaces/${workspaceId}/tasks`, {
     method: 'POST',
-    body: JSON.stringify({ prompt, ...(branch ? { branch } : {}), ...(model ? { model } : {}), ...(caveman ? { caveman } : {}) }),
+    body: JSON.stringify({ prompt, ...(branch ? { branch } : {}), ...(model ? { model } : {}), ...(caveman ? { caveman } : {}), ...(attachmentIds?.length ? { attachmentIds } : {}) }),
   });
 
 export const getTaskDetail = (taskId: string) =>
@@ -216,10 +249,10 @@ export const getTaskDetail = (taskId: string) =>
 export const getStreamLog = (taskId: string, afterId?: number) =>
   request<{ streamLog: StreamLogEntry[] }>(`/api/tasks/${taskId}/stream-log${afterId ? `?after=${afterId}` : ''}`);
 
-export const replyToTask = (taskId: string, message: string) =>
+export const replyToTask = (taskId: string, message: string, attachmentIds?: string[]) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/reply`, {
     method: 'POST',
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, ...(attachmentIds?.length ? { attachmentIds } : {}) }),
   });
 
 export const completeTask = (taskId: string) =>

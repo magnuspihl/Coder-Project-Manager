@@ -11,6 +11,7 @@ import authRoutes from './routes/auth.js';
 import workspaceRoutes from './routes/workspaces.js';
 import taskRoutes from './routes/tasks.js';
 import discussionRoutes from './routes/discussions.js';
+import uploadRoutes from './routes/uploads.js';
 
 // Initialize database on import
 import './db/index.js';
@@ -36,6 +37,7 @@ app.use('/auth', authRoutes);
 app.use('/api/workspaces', workspaceRoutes);
 app.use('/api', taskRoutes);
 app.use('/api', discussionRoutes);
+app.use('/api', uploadRoutes);
 
 // Serve static files in production
 const clientDist = join(__dirname, '../dist/client');

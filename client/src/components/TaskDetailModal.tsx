@@ -14,6 +14,8 @@ import {
   removeTaskParticipant,
   sendTaskParticipantMessage,
   getWorkspaces,
+  uploadFiles,
+  type Attachment,
   type Task,
   type Message,
   type StreamLogEntry,
@@ -64,6 +66,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [loading, setLoading] = useState(true);
   const [reply, setReply, clearReply] = useDraft(`reply:${taskId}`);
   const [sending, setSending] = useState(false);
+  const [replyFiles, setReplyFiles] = useState<Attachment[]>([]);
+  const [uploadingReplyFiles, setUploadingReplyFiles] = useState(false);
+  const replyFileInputRef = useRef<HTMLInputElement>(null);
   const [idCopied, setIdCopied] = useState(false);
   const [checkingOut, setCheckingOut] = useState(false);
   const [completing, setCompleting] = useState(false);
@@ -232,13 +237,30 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     closeModal();
   };
 
+  const handleReplyFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    setUploadingReplyFiles(true);
+    try {
+      const uploaded = await uploadFiles(Array.from(files));
+      setReplyFiles(prev => [...prev, ...uploaded]);
+    } catch {
+      // ignore
+    } finally {
+      setUploadingReplyFiles(false);
+      if (replyFileInputRef.current) replyFileInputRef.current.value = '';
+    }
+  };
+
   const handleReply = async (e?: FormEvent) => {
     if (e) e.preventDefault();
     if (!reply.trim()) return;
     setSending(true);
     try {
-      await replyToTask(taskId, reply.trim());
+      const attachmentIds = replyFiles.length > 0 ? replyFiles.map(f => f.id) : undefined;
+      await replyToTask(taskId, reply.trim(), attachmentIds);
       clearReply();
+      setReplyFiles([]);
       closeAndNotify();
     } catch {
       // ignore

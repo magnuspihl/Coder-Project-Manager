@@ -1,9 +1,11 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
+import { createReadStream } from 'fs';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, type Task, type TaskParticipant } from './tasks.js';
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit, handleStashAway } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
+import { getAttachmentsByTask } from '../routes/uploads.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
@@ -358,6 +360,40 @@ export async function processQueue(workspaceId: string): Promise<void> {
   }
 }
 
+async function transferFilesToWorkspace(workspaceName: string, attachments: any[], remoteDir: string): Promise<Map<string, string>> {
+  const pathMap = new Map<string, string>();
+  if (attachments.length === 0) return pathMap;
+
+  await sshExec(workspaceName, `mkdir -p ${shellEscape(remoteDir)}`, 10000);
+
+  for (const att of attachments) {
+    const remotePath = `${remoteDir}/${att.original_name}`;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawn('coder', [
+          'ssh', workspaceName, '--',
+          `cat > ${shellEscape(remotePath)}`,
+        ], {
+          env: { ...process.env, CODER_URL },
+          stdio: ['pipe', 'ignore', 'pipe'],
+        });
+        const fileStream = createReadStream(att.storage_path);
+        fileStream.pipe(proc.stdin!);
+        fileStream.on('error', (err) => { proc.kill(); reject(err); });
+        proc.on('close', (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`SCP failed for ${att.original_name} (exit ${code})`));
+        });
+        proc.on('error', reject);
+      });
+      pathMap.set(att.id, remotePath);
+    } catch (err) {
+      console.error(`[file-transfer] Failed to transfer ${att.original_name}:`, (err as Error).message?.slice(0, 100));
+    }
+  }
+  return pathMap;
+}
+
 /**
  * Launch a task on its remote workspace via a long-lived SSH connection.
  *
@@ -396,7 +432,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
       `This overrides any branching instructions in your system prompt or CLAUDE.md.`;
   }
 
-  const prompt = rawPrompt + branchNote + coderUrlNote;
+  let prompt = rawPrompt + branchNote + coderUrlNote;
 
   // Auto-detect project directory if not already set
   if (!task.project_dir) {
@@ -443,6 +479,25 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     await handleTaskResumeGit(task);
   } else {
     await handleTaskLaunchGit(task);
+  }
+
+  // Transfer any attached files to the remote workspace
+  const attachments = getAttachmentsByTask(task.id);
+  if (attachments.length > 0) {
+    const remoteAttachDir = `/tmp/cpm-attachments-${task.id}`;
+    try {
+      const pathMap = await transferFilesToWorkspace(task.workspace_name, attachments, remoteAttachDir);
+      if (pathMap.size > 0) {
+        const fileList = Array.from(pathMap.values())
+          .map(p => `- ${p}`)
+          .join('\n');
+        prompt += `\n\nReference files have been provided and placed on this workspace. Use the Read tool to examine them:\n${fileList}`;
+        console.log(`[file-transfer] Transferred ${pathMap.size} file(s) for task ${task.id}`);
+      }
+    } catch (err) {
+      console.error('[file-transfer] Failed:', (err as Error).message?.slice(0, 100));
+      addMessage(task.id, 'system', `Warning: Failed to transfer some attached files to workspace`);
+    }
   }
 
   // Build the claude command

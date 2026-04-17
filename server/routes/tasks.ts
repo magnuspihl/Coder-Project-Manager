@@ -23,6 +23,7 @@ import { processQueue, resumeTask, cancelTask, interruptTask, getTaskActivity, g
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch } from '../services/git.js';
+import { linkAttachmentsToTask, getAttachmentsByTask } from './uploads.js';
 
 const router = Router();
 
@@ -40,7 +41,7 @@ router.get('/workspaces/:workspaceId/tasks', requireAuth, (req: Request, res: Re
 
 // Create a new task
 router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, res: Response) => {
-  const { prompt, branch, model, caveman } = req.body;
+  const { prompt, branch, model, caveman, attachmentIds } = req.body;
   if (!prompt) {
     res.status(400).json({ error: 'Prompt is required' });
     return;
@@ -88,6 +89,10 @@ router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, 
       caveman: typeof caveman === 'string' && ['lite', 'full', 'ultra'].includes(caveman) ? caveman : undefined,
     });
 
+    if (Array.isArray(attachmentIds) && attachmentIds.length > 0) {
+      linkAttachmentsToTask(attachmentIds.filter((id: unknown) => typeof id === 'string'), task.id);
+    }
+
     await processQueue(req.params.workspaceId);
     res.status(201).json({ task: getTask(task.id) });
   } catch (err) {
@@ -115,7 +120,8 @@ router.get('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
     running: isTaskParticipantRunning(p.id),
     activity: getTaskParticipantActivity(p.id) || null,
   }));
-  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages, participants });
+  const attachments = getAttachmentsByTask(task.id);
+  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages, participants, attachments });
 });
 
 // Get stream log for a task (loaded on demand)
@@ -160,13 +166,17 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
     return;
   }
 
-  const { message } = req.body;
+  const { message, attachmentIds } = req.body;
   if (!message || typeof message !== 'string') {
     res.status(400).json({ error: 'Message is required' });
     return;
   }
 
   addMessage(task.id, 'user', message, undefined, req.user!.username);
+
+  if (Array.isArray(attachmentIds) && attachmentIds.length > 0) {
+    linkAttachmentsToTask(attachmentIds.filter((a: unknown) => typeof a === 'string'), task.id);
+  }
 
   // If another task is currently working on this workspace, queue the reply
   // instead of resuming immediately — only one Claude session at a time.
