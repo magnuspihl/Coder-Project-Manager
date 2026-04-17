@@ -540,43 +540,24 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                 );
               })}
 
-              {task.status === 'working' && (() => {
-                // Extract assistant text from stream log to show as a live message
-                const liveText = streamLog
-                  .filter(e => e.type === 'assistant')
-                  .map(e => e.summary)
-                  .join('\n\n');
-
-                return (
-                  <>
-                    {liveText && (
-                      <div className="rounded-lg p-4 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 mr-8 opacity-80">
-                        <div className="flex items-center justify-between mb-1">
-                          <span className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase">assistant</span>
-                          <span className="text-xs text-blue-500 dark:text-blue-400 italic">streaming...</span>
-                        </div>
-                        <Markdown content={liveText} />
-                      </div>
+              {task.status === 'working' && (
+                <div className="text-sm text-blue-600 dark:text-blue-400 p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg border border-blue-100 dark:border-blue-800">
+                  <div className="flex items-center gap-2">
+                    <div className="animate-spin h-4 w-4 border-2 border-blue-600 dark:border-blue-400 border-t-transparent rounded-full" />
+                    <span>Claude is working...</span>
+                    {task.activity && (
+                      <span className="text-xs text-gray-400 dark:text-gray-500 ml-auto">
+                        Last activity {timeAgo(task.activity.timestamp)}
+                      </span>
                     )}
-                    <div className="text-sm text-blue-600 dark:text-blue-400 p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg border border-blue-100 dark:border-blue-800">
-                      <div className="flex items-center gap-2">
-                        <div className="animate-spin h-4 w-4 border-2 border-blue-600 dark:border-blue-400 border-t-transparent rounded-full" />
-                        <span>Claude is working...</span>
-                        {task.activity && (
-                          <span className="text-xs text-gray-400 dark:text-gray-500 ml-auto">
-                            Last activity {timeAgo(task.activity.timestamp)}
-                          </span>
-                        )}
-                      </div>
-                      {task.activity && (
-                        <p className="mt-1 text-xs text-blue-500 dark:text-blue-300 truncate ml-6">
-                          {linkify(task.activity.summary)}
-                        </p>
-                      )}
-                    </div>
-                  </>
-                );
-              })()}
+                  </div>
+                  {task.activity && (
+                    <p className="mt-1 text-xs text-blue-500 dark:text-blue-300 truncate ml-6">
+                      {linkify(task.activity.summary)}
+                    </p>
+                  )}
+                </div>
+              )}
 
               {/* Participant thinking indicator */}
               {participants.filter(p => p.running).map(p => (
