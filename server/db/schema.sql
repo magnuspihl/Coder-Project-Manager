@@ -163,3 +163,11 @@ CREATE INDEX IF NOT EXISTS idx_tasks_deleted ON tasks(deleted_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_workspace_deleted ON tasks(workspace_id, deleted_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+-- Global rate limit tracking (persists across server restarts)
+CREATE TABLE IF NOT EXISTS rate_limits (
+  type TEXT PRIMARY KEY,
+  utilization REAL NOT NULL DEFAULT 0,
+  resets_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);

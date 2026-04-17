@@ -170,8 +170,14 @@ export interface ClaudeUsage {
   updatedAt: number;
 }
 
+export interface RateLimitUsage {
+  utilization: number;
+  resetsAt: number;
+  updatedAt: number;
+}
+
 export const getWorkspaces = () =>
-  request<{ workspaces: Workspace[]; taskCounts: Record<string, TaskCounts>; tokenTotals: Record<string, TokenTotals>; githubRepoUrls: Record<string, string>; latestDiscussionMessages: Record<string, string>; claudeUsage: Record<string, ClaudeUsage> }>('/api/workspaces');
+  request<{ workspaces: Workspace[]; taskCounts: Record<string, TaskCounts>; tokenTotals: Record<string, TokenTotals>; githubRepoUrls: Record<string, string>; latestDiscussionMessages: Record<string, string>; claudeUsage: Record<string, ClaudeUsage>; globalRateLimits: Record<string, RateLimitUsage> }>('/api/workspaces');
 
 export const getWorkspace = (id: string) =>
   request<{ workspace: Workspace }>(`/api/workspaces/${id}`);
