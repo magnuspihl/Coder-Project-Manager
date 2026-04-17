@@ -5,7 +5,7 @@ import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createT
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit, handleStashAway } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
-import { getAttachmentsByTask } from '../routes/uploads.js';
+import { getAttachmentsByTask, type Attachment } from '../routes/uploads.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
@@ -260,6 +260,49 @@ export function sshExec(workspaceName: string, command: string, timeout = 15000)
   });
 }
 
+/**
+ * Copy local files to a remote workspace via coder ssh stdin piping.
+ * Returns array of remote paths where files were placed.
+ */
+async function transferFilesToWorkspace(
+  workspaceName: string,
+  attachments: Attachment[],
+  remoteDir: string,
+): Promise<Map<string, string>> {
+  const pathMap = new Map<string, string>();
+  if (attachments.length === 0) return pathMap;
+
+  // Create the remote directory
+  await sshExec(workspaceName, `mkdir -p ${shellEscape(remoteDir)}`, 10000);
+
+  for (const att of attachments) {
+    const remotePath = `${remoteDir}/${att.original_name}`;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawn('coder', [
+          'ssh', workspaceName, '--',
+          `cat > ${shellEscape(remotePath)}`,
+        ], {
+          env: { ...process.env, CODER_URL },
+          stdio: ['pipe', 'ignore', 'pipe'],
+        });
+        const fileStream = createReadStream(att.storage_path);
+        fileStream.pipe(proc.stdin);
+        fileStream.on('error', (err) => { proc.kill(); reject(err); });
+        proc.on('close', (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`SCP failed for ${att.original_name} (exit ${code})`));
+        });
+        proc.on('error', reject);
+      });
+      pathMap.set(att.id, remotePath);
+    } catch (err) {
+      console.error(`[file-transfer] Failed to transfer ${att.original_name}:`, (err as Error).message?.slice(0, 100));
+    }
+  }
+  return pathMap;
+}
+
 /** Remote path for task output files */
 function remoteOutputPath(taskId: string): string {
   return `/tmp/cpm-task-${taskId}.jsonl`;
@@ -358,40 +401,6 @@ export async function processQueue(workspaceId: string): Promise<void> {
       queueLocks.delete(workspaceId);
     }
   }
-}
-
-async function transferFilesToWorkspace(workspaceName: string, attachments: any[], remoteDir: string): Promise<Map<string, string>> {
-  const pathMap = new Map<string, string>();
-  if (attachments.length === 0) return pathMap;
-
-  await sshExec(workspaceName, `mkdir -p ${shellEscape(remoteDir)}`, 10000);
-
-  for (const att of attachments) {
-    const remotePath = `${remoteDir}/${att.original_name}`;
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const proc = spawn('coder', [
-          'ssh', workspaceName, '--',
-          `cat > ${shellEscape(remotePath)}`,
-        ], {
-          env: { ...process.env, CODER_URL },
-          stdio: ['pipe', 'ignore', 'pipe'],
-        });
-        const fileStream = createReadStream(att.storage_path);
-        fileStream.pipe(proc.stdin!);
-        fileStream.on('error', (err) => { proc.kill(); reject(err); });
-        proc.on('close', (code) => {
-          if (code === 0) resolve();
-          else reject(new Error(`SCP failed for ${att.original_name} (exit ${code})`));
-        });
-        proc.on('error', reject);
-      });
-      pathMap.set(att.id, remotePath);
-    } catch (err) {
-      console.error(`[file-transfer] Failed to transfer ${att.original_name}:`, (err as Error).message?.slice(0, 100));
-    }
-  }
-  return pathMap;
 }
 
 /**

@@ -12,14 +12,13 @@ import {
   deleteTask,
   restoreTask,
   createTask,
-  uploadFiles,
-  type Attachment,
   getOrCreateDiscussion,
   getDiscussionStatus,
   checkoutTaskBranch,
   getModels,
   getGitSettings,
   updateGitSettings,
+  uploadFiles,
   type Workspace,
   type ModelInfo,
   type Task,
@@ -85,7 +84,7 @@ function getApps(workspace: Workspace) {
   return workspace.apps || [];
 }
 
-export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: string | null }) {
+export default function WorkspacesPage() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [taskCounts, setTaskCounts] = useState<Record<string, TaskCounts>>({});
   const [tokenTotals, setTokenTotals] = useState<Record<string, TokenTotals>>({});
@@ -106,9 +105,10 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
   const [creatingTask, setCreatingTask] = useState(false);
-  const [stagedFiles, setStagedFiles] = useState<Attachment[]>([]);
-  const [uploading, setUploading] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [newTaskFiles, setNewTaskFiles] = useState<File[]>([]);
+  const [newTaskAttachmentIds, setNewTaskAttachmentIds] = useState<string[]>([]);
+  const [newTaskUploading, setNewTaskUploading] = useState(false);
+  const newTaskFileInputRef = useRef<HTMLInputElement>(null);
   const [selectedTaskId, setSelectedTaskId] = useSessionState<string | null>('selectedTaskId', null);
   const [discussionState, setDiscussionState] = useState<{ id: string; workspaceId: string; workspaceName: string } | null>(null);
   const [chatPickerWs, setChatPickerWs] = useState<{ id: string; name: string } | null>(null);
@@ -209,7 +209,7 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
 
   // Sorted running workspaces (used for Alt+N targeting, Space shortcut, and rendering)
   const runningWorkspaces = useMemo(() => workspaces
-    .filter((ws) => ws.latest_build.status === 'running' && ws.id !== selfWorkspaceId)
+    .filter((ws) => ws.latest_build.status === 'running')
     .sort((a, b) => {
       const aCounts = taskCounts[a.id];
       const bCounts = taskCounts[b.id];
@@ -234,8 +234,8 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
   }, [tasksByWorkspace]);
 
   const stoppedWorkspaces = useMemo(() =>
-    workspaces.filter((ws) => ws.latest_build.status !== 'running' && ws.id !== selfWorkspaceId),
-    [workspaces, selfWorkspaceId]
+    workspaces.filter((ws) => ws.latest_build.status !== 'running'),
+    [workspaces]
   );
 
   // FLIP animation for workspace lane reordering
@@ -573,23 +573,25 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
     }
   };
 
-  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
+  const handleNewTaskFileSelect = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
-    setUploading(true);
+    const newFiles = Array.from(files);
+    setNewTaskFiles(prev => [...prev, ...newFiles]);
+    setNewTaskUploading(true);
     try {
-      const uploaded = await uploadFiles(Array.from(files));
-      setStagedFiles(prev => [...prev, ...uploaded]);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to upload files');
+      const uploaded = await uploadFiles(newFiles);
+      setNewTaskAttachmentIds(prev => [...prev, ...uploaded.map(a => a.id)]);
+    } catch {
+      setNewTaskFiles(prev => prev.filter(f => !newFiles.includes(f)));
     } finally {
-      setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
+      setNewTaskUploading(false);
+      if (newTaskFileInputRef.current) newTaskFileInputRef.current.value = '';
     }
   };
 
-  const removeStagedFile = (id: string) => {
-    setStagedFiles(prev => prev.filter(f => f.id !== id));
+  const handleRemoveNewTaskFile = (index: number) => {
+    setNewTaskFiles(prev => prev.filter((_, i) => i !== index));
+    setNewTaskAttachmentIds(prev => prev.filter((_, i) => i !== index));
   };
 
   const handleCreateTask = async (workspaceId: string) => {
@@ -599,9 +601,8 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
       const branch = newTaskBranch.trim() || undefined;
       const model = newTaskModel || undefined;
       const caveman = newTaskCaveman || undefined;
-      const attachmentIds = stagedFiles.length > 0 ? stagedFiles.map(f => f.id) : undefined;
-      await createTask(workspaceId, newTaskPrompt.trim(), branch, model, caveman, attachmentIds);
-      // Save model and caveman as defaults for this workspace
+      const attIds = newTaskAttachmentIds.length > 0 ? newTaskAttachmentIds : undefined;
+      await createTask(workspaceId, newTaskPrompt.trim(), branch, model, caveman, attIds);
       try {
         const defaults = JSON.parse(localStorage.getItem('taskDefaults') || '{}');
         defaults[workspaceId] = { model: newTaskModel, caveman: newTaskCaveman };
@@ -612,7 +613,8 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
       setNewTaskBranch('');
       setNewTaskModel('');
       setNewTaskCaveman('');
-      setStagedFiles([]);
+      setNewTaskFiles([]);
+      setNewTaskAttachmentIds([]);
       setNewTaskWorkspaceId(null);
       await loadData();
     } catch (err: unknown) {
@@ -1105,18 +1107,44 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
                 <option value="full">Caveman: Full — fragments, no articles</option>
                 <option value="ultra">Caveman: Ultra — max compression</option>
               </select>
-              {stagedFiles.length > 0 && (
+              {newTaskFiles.length > 0 && (
                 <div className="flex flex-wrap gap-1 mt-1">
-                  {stagedFiles.map(f => (
-                    <span key={f.id} className="inline-flex items-center gap-1 text-xs bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded px-1.5 py-0.5">
-                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
-                      {f.original_name}
-                      <button onClick={() => removeStagedFile(f.id)} className="text-gray-400 hover:text-red-500">&times;</button>
+                  {newTaskFiles.map((f, i) => (
+                    <span key={i} className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+                      <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
+                      <span className="truncate max-w-[120px]">{f.name}</span>
+                      <button type="button" onClick={() => handleRemoveNewTaskFile(i)} className="text-blue-400 hover:text-red-500">&times;</button>
                     </span>
                   ))}
                 </div>
               )}
-              <div className="flex gap-2 mt-1">
+              <div className="flex gap-2 mt-1 items-center">
+                <input
+                  ref={newTaskFileInputRef}
+                  type="file"
+                  multiple
+                  className="hidden"
+                  onChange={(e) => handleNewTaskFileSelect(e.target.files)}
+                />
+                <button
+                  type="button"
+                  onClick={() => newTaskFileInputRef.current?.click()}
+                  disabled={newTaskUploading || creatingTask}
+                  className="text-xs px-2 py-1 border border-gray-300 dark:border-gray-600 rounded text-gray-500 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:border-blue-300 dark:hover:border-blue-600 transition-colors disabled:opacity-50"
+                  title="Attach reference files"
+                >
+                  {newTaskUploading ? (
+                    <span className="flex items-center gap-1">
+                      <div className="w-3 h-3 border border-current border-t-transparent rounded-full animate-spin" />
+                      Uploading...
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1">
+                      <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
+                      Attach
+                    </span>
+                  )}
+                </button>
                 <button
                   onClick={() => handleCreateTask(ws.id)}
                   disabled={creatingTask || !newTaskPrompt.trim()}
@@ -1124,26 +1152,8 @@ export default function WorkspacesPage({ selfWorkspaceId }: { selfWorkspaceId?: 
                 >
                   {creatingTask ? 'Creating...' : 'Create'}
                 </button>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  multiple
-                  className="hidden"
-                  onChange={handleFileSelect}
-                />
                 <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={uploading || creatingTask}
-                  className="text-xs px-2 py-1 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 border border-gray-300 dark:border-gray-600 rounded disabled:opacity-50"
-                  title="Attach files"
-                >
-                  {uploading ? 'Uploading...' : (
-                    <svg className="w-3.5 h-3.5 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
-                  )}
-                </button>
-                <button
-                  onClick={() => { setNewTaskWorkspaceId(null); clearNewTaskPrompt(); setNewTaskBranch(''); setStagedFiles([]); }}
+                  onClick={() => { setNewTaskWorkspaceId(null); clearNewTaskPrompt(); setNewTaskBranch(''); setNewTaskFiles([]); setNewTaskAttachmentIds([]); }}
                   className="text-xs px-3 py-1 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
                 >
                   Cancel

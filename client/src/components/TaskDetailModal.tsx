@@ -15,12 +15,12 @@ import {
   sendTaskParticipantMessage,
   getWorkspaces,
   uploadFiles,
-  type Attachment,
   type Task,
   type Message,
   type StreamLogEntry,
   type TaskParticipant,
   type Workspace,
+  type AttachmentInfo,
 } from '../api/client';
 import { playChime } from '../utils/chime';
 import RateLimitBanner from './RateLimitBanner';
@@ -66,9 +66,6 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [loading, setLoading] = useState(true);
   const [reply, setReply, clearReply] = useDraft(`reply:${taskId}`);
   const [sending, setSending] = useState(false);
-  const [replyFiles, setReplyFiles] = useState<Attachment[]>([]);
-  const [uploadingReplyFiles, setUploadingReplyFiles] = useState(false);
-  const replyFileInputRef = useRef<HTMLInputElement>(null);
   const [idCopied, setIdCopied] = useState(false);
   const [checkingOut, setCheckingOut] = useState(false);
   const [completing, setCompleting] = useState(false);
@@ -77,6 +74,11 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [showInviteMenu, setShowInviteMenu] = useState(false);
   const [availableWorkspaces, setAvailableWorkspaces] = useState<Workspace[]>([]);
   const [loadingWorkspaces, setLoadingWorkspaces] = useState(false);
+  const [attachments, setAttachments] = useState<AttachmentInfo[]>([]);
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const [uploadedAttachmentIds, setUploadedAttachmentIds] = useState<string[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const lastParticipantsJsonRef = useRef('');
   const prevStatusRef = useRef<string | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
@@ -90,7 +92,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
   const loadData = async () => {
     try {
-      const { task: newTask, messages: newMessages, participants: newParticipants } = await getTaskDetail(taskId);
+      const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments } = await getTaskDetail(taskId);
       if (prevStatusRef.current && prevStatusRef.current !== 'awaiting_feedback' && newTask.status === 'awaiting_feedback') {
         playChime();
       }
@@ -111,6 +113,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
         lastParticipantsJsonRef.current = pJson;
         setParticipants(newParticipants || []);
       }
+      if (newAttachments) setAttachments(newAttachments);
     } catch {
       // ignore
     } finally {
@@ -237,30 +240,36 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     closeModal();
   };
 
-  const handleReplyFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
+  const handleFileSelect = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
-    setUploadingReplyFiles(true);
+    const newFiles = Array.from(files);
+    setPendingFiles(prev => [...prev, ...newFiles]);
+    setUploading(true);
     try {
-      const uploaded = await uploadFiles(Array.from(files));
-      setReplyFiles(prev => [...prev, ...uploaded]);
+      const uploaded = await uploadFiles(newFiles);
+      setUploadedAttachmentIds(prev => [...prev, ...uploaded.map(a => a.id)]);
     } catch {
-      // ignore
+      setPendingFiles(prev => prev.filter(f => !newFiles.includes(f)));
     } finally {
-      setUploadingReplyFiles(false);
-      if (replyFileInputRef.current) replyFileInputRef.current.value = '';
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
+  };
+
+  const handleRemovePendingFile = (index: number) => {
+    setPendingFiles(prev => prev.filter((_, i) => i !== index));
+    setUploadedAttachmentIds(prev => prev.filter((_, i) => i !== index));
   };
 
   const handleReply = async (e?: FormEvent) => {
     if (e) e.preventDefault();
-    if (!reply.trim()) return;
+    if (!reply.trim() && uploadedAttachmentIds.length === 0) return;
     setSending(true);
     try {
-      const attachmentIds = replyFiles.length > 0 ? replyFiles.map(f => f.id) : undefined;
-      await replyToTask(taskId, reply.trim(), attachmentIds);
+      await replyToTask(taskId, reply.trim() || 'See attached files.', uploadedAttachmentIds.length > 0 ? uploadedAttachmentIds : undefined);
       clearReply();
-      setReplyFiles([]);
+      setPendingFiles([]);
+      setUploadedAttachmentIds([]);
       closeAndNotify();
     } catch {
       // ignore
@@ -562,6 +571,24 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                 );
               })}
 
+              {attachments.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 px-1">
+                  {attachments.map(att => (
+                    <a
+                      key={att.id}
+                      href={`/api/uploads/${att.id}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 border border-gray-200 dark:border-gray-700 hover:border-blue-300 dark:hover:border-blue-600 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
+                      title={`${att.original_name} (${(att.size / 1024).toFixed(1)} KB)`}
+                    >
+                      <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
+                      {att.original_name}
+                    </a>
+                  ))}
+                </div>
+              )}
+
               {task.status === 'working' && (
                 <div className="text-sm text-blue-600 dark:text-blue-400 p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg border border-blue-100 dark:border-blue-800">
                   <div className="flex items-center gap-2">
@@ -752,13 +779,53 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         disabled={anyParticipantRunning}
                         className="w-full px-3 py-2 border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y disabled:opacity-50"
                       />
-                      <button
-                        type="submit"
-                        disabled={sending || !reply.trim() || anyParticipantRunning}
-                        className="bg-blue-600 text-white text-sm px-4 py-2 rounded-md hover:bg-blue-700 disabled:opacity-50 self-end"
-                      >
-                        {sending ? 'Sending...' : 'Reply (Ctrl+Enter)'}
-                      </button>
+                      {pendingFiles.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5">
+                          {pendingFiles.map((f, i) => (
+                            <span key={i} className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+                              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
+                              {f.name}
+                              <button type="button" onClick={() => handleRemovePendingFile(i)} className="ml-0.5 text-blue-400 hover:text-red-500">&times;</button>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      <div className="flex items-center gap-2">
+                        <input
+                          ref={fileInputRef}
+                          type="file"
+                          multiple
+                          className="hidden"
+                          onChange={(e) => handleFileSelect(e.target.files)}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => fileInputRef.current?.click()}
+                          disabled={uploading || anyParticipantRunning}
+                          className="text-xs px-2.5 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md text-gray-500 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:border-blue-300 dark:hover:border-blue-600 transition-colors disabled:opacity-50"
+                          title="Attach files"
+                        >
+                          {uploading ? (
+                            <span className="flex items-center gap-1">
+                              <div className="w-3 h-3 border border-current border-t-transparent rounded-full animate-spin" />
+                              Uploading...
+                            </span>
+                          ) : (
+                            <span className="flex items-center gap-1">
+                              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
+                              Attach Files
+                            </span>
+                          )}
+                        </button>
+                        <div className="flex-1" />
+                        <button
+                          type="submit"
+                          disabled={sending || (!reply.trim() && uploadedAttachmentIds.length === 0) || anyParticipantRunning}
+                          className="bg-blue-600 text-white text-sm px-4 py-2 rounded-md hover:bg-blue-700 disabled:opacity-50"
+                        >
+                          {sending ? 'Sending...' : 'Reply (Ctrl+Enter)'}
+                        </button>
+                      </div>
                     </form>
                   )}
                   <div className="flex items-center gap-2">

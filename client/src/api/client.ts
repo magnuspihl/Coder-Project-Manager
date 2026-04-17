@@ -201,7 +201,17 @@ export const getModels = (workspaceId: string) =>
   request<{ models: ModelInfo[] }>(`/api/workspaces/${workspaceId}/models`);
 
 // Uploads
-export interface Attachment {
+// Tasks
+export const getTasks = (workspaceId: string) =>
+  request<{ tasks: Task[] }>(`/api/workspaces/${workspaceId}/tasks`);
+
+export const createTask = (workspaceId: string, prompt: string, branch?: string, model?: string, caveman?: string, attachmentIds?: string[]) =>
+  request<{ task: Task }>(`/api/workspaces/${workspaceId}/tasks`, {
+    method: 'POST',
+    body: JSON.stringify({ prompt, ...(branch ? { branch } : {}), ...(model ? { model } : {}), ...(caveman ? { caveman } : {}), ...(attachmentIds?.length ? { attachmentIds } : {}) }),
+  });
+
+export interface AttachmentInfo {
   id: string;
   task_id: string | null;
   filename: string;
@@ -211,7 +221,19 @@ export interface Attachment {
   created_at: string;
 }
 
-export async function uploadFiles(files: File[]): Promise<Attachment[]> {
+export const getTaskDetail = (taskId: string) =>
+  request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[] }>(`/api/tasks/${taskId}`);
+
+export const getStreamLog = (taskId: string, afterId?: number) =>
+  request<{ streamLog: StreamLogEntry[] }>(`/api/tasks/${taskId}/stream-log${afterId ? `?after=${afterId}` : ''}`);
+
+export const replyToTask = (taskId: string, message: string, attachmentIds?: string[]) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}/reply`, {
+    method: 'POST',
+    body: JSON.stringify({ message, ...(attachmentIds?.length ? { attachmentIds } : {}) }),
+  });
+
+export async function uploadFiles(files: File[]): Promise<AttachmentInfo[]> {
   const formData = new FormData();
   for (const file of files) {
     formData.append('files', file);
@@ -232,28 +254,6 @@ export async function uploadFiles(files: File[]): Promise<Attachment[]> {
   const data = await res.json();
   return data.attachments;
 }
-
-// Tasks
-export const getTasks = (workspaceId: string) =>
-  request<{ tasks: Task[] }>(`/api/workspaces/${workspaceId}/tasks`);
-
-export const createTask = (workspaceId: string, prompt: string, branch?: string, model?: string, caveman?: string, attachmentIds?: string[]) =>
-  request<{ task: Task }>(`/api/workspaces/${workspaceId}/tasks`, {
-    method: 'POST',
-    body: JSON.stringify({ prompt, ...(branch ? { branch } : {}), ...(model ? { model } : {}), ...(caveman ? { caveman } : {}), ...(attachmentIds?.length ? { attachmentIds } : {}) }),
-  });
-
-export const getTaskDetail = (taskId: string) =>
-  request<{ task: Task; messages: Message[]; participants: TaskParticipant[] }>(`/api/tasks/${taskId}`);
-
-export const getStreamLog = (taskId: string, afterId?: number) =>
-  request<{ streamLog: StreamLogEntry[] }>(`/api/tasks/${taskId}/stream-log${afterId ? `?after=${afterId}` : ''}`);
-
-export const replyToTask = (taskId: string, message: string, attachmentIds?: string[]) =>
-  request<{ task: Task }>(`/api/tasks/${taskId}/reply`, {
-    method: 'POST',
-    body: JSON.stringify({ message, ...(attachmentIds?.length ? { attachmentIds } : {}) }),
-  });
 
 export const completeTask = (taskId: string) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/complete`, { method: 'POST' });
@@ -430,6 +430,9 @@ export const sendParticipantMessage = (discussionId: string, participantId: stri
 
 export const sendHostCatchUp = (discussionId: string) =>
   request<{ ok: boolean; skipped: boolean }>(`/api/discussions/${discussionId}/catchup`, { method: 'POST' });
+
+export const restartCpm = () =>
+  request<{ ok: boolean; message: string }>('/api/workspaces/restart', { method: 'POST' });
 
 export const sendParticipantCatchUp = (discussionId: string, participantId: string) =>
   request<{ ok: boolean; skipped: boolean }>(`/api/discussions/${discussionId}/participants/${participantId}/catchup`, { method: 'POST' });

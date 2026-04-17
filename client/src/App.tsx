@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { getMe, getAuthConfig, getWorkspaces, type User } from './api/client';
+import { getMe, type User } from './api/client';
 import LoginPage from './pages/LoginPage';
 import WorkspacesPage from './pages/WorkspacesPage';
 import Layout from './components/Layout';
@@ -7,38 +7,13 @@ import Layout from './components/Layout';
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
-  const [selfWorkspaceId, setSelfWorkspaceId] = useState<string | null>(null);
-  const [selfChatUrl, setSelfChatUrl] = useState<string | null>(null);
 
   useEffect(() => {
     getMe()
       .then(({ user }) => setUser(user))
       .catch(() => setUser(null))
       .finally(() => setLoading(false));
-
-    getAuthConfig().then((config) => {
-      setSelfWorkspaceId(config.self_workspace_id);
-    }).catch(() => {});
   }, []);
-
-  // Discover CCW chat URL for self workspace
-  useEffect(() => {
-    if (!selfWorkspaceId) return;
-    const discover = () => {
-      getWorkspaces().then(({ workspaces }) => {
-        const self = workspaces.find(w => w.id === selfWorkspaceId);
-        if (self?.apps) {
-          const ccw = self.apps.find(a => a.slug === 'ccw');
-          if (ccw) {
-            // Append chat/embed/ to the app URL
-            const url = ccw.url.endsWith('/') ? ccw.url + 'chat/embed/' : ccw.url + '/chat/embed/';
-            setSelfChatUrl(url);
-          }
-        }
-      }).catch(() => {});
-    };
-    discover();
-  }, [selfWorkspaceId]);
 
   // Listen for session expiry from API client and redirect to login
   useEffect(() => {
@@ -60,8 +35,8 @@ export default function App() {
   }
 
   return (
-    <Layout user={user} onLogout={() => setUser(null)} selfChatUrl={selfChatUrl}>
-      <WorkspacesPage selfWorkspaceId={selfWorkspaceId} />
+    <Layout>
+      <WorkspacesPage />
     </Layout>
   );
 }

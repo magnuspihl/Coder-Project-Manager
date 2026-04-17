@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { execFile } from 'child_process';
+import { execFile, exec } from 'child_process';
 import { requireAuth } from '../middleware/auth.js';
 import { listWorkspaces, getWorkspace, stopWorkspace, startWorkspace, CoderAuthError } from '../services/coder.js';
 import { getTaskCountsByWorkspace, getTokenTotalsByWorkspace, getGithubRepoUrlsByWorkspace } from '../services/tasks.js';
@@ -98,6 +98,27 @@ router.get('/proxy-icon', requireAuth, async (req: Request, res: Response) => {
   } catch {
     res.status(502).end();
   }
+});
+
+// Restart CPM: rebuild server and exit (the wrapper loop restarts the server)
+router.post('/restart', requireAuth, (req: Request, res: Response) => {
+  const projectRoot = process.cwd();
+  console.log('[restart] Build + restart requested, running npm run build:server...');
+
+  exec('npm run build:server', { cwd: projectRoot, timeout: 120000 }, (err, _stdout, stderr) => {
+    if (err) {
+      console.error('[restart] Build failed:', stderr.slice(0, 500));
+      res.status(500).json({ error: 'Build failed', details: stderr.slice(0, 2000) });
+      return;
+    }
+    console.log('[restart] Build succeeded, exiting for restart...');
+    res.json({ ok: true, message: 'Build succeeded, restarting...' });
+
+    // Give the response time to flush, then exit
+    setTimeout(() => {
+      process.exit(0);
+    }, 500);
+  });
 });
 
 router.get('/:id', requireAuth, async (req: Request, res: Response) => {

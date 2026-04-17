@@ -1,17 +1,37 @@
-import { type ReactNode } from 'react';
-import type { User } from '../api/client';
+import { useState, type ReactNode } from 'react';
+import { restartCpm } from '../api/client';
 import { useTheme } from '../hooks/useTheme';
 
 export default function Layout({
   children,
-  selfChatUrl,
 }: {
-  user?: User;
+  user?: unknown;
   onLogout?: () => void;
   selfChatUrl?: string | null;
   children: ReactNode;
 }) {
   const { theme, setTheme } = useTheme();
+  const [restarting, setRestarting] = useState(false);
+  const [restartError, setRestartError] = useState('');
+
+  const handleRestart = () => {
+    if (!confirm('Restart CPM? This will rebuild and restart the server. Active SSH processes will be reconnected automatically.')) return;
+    setRestarting(true);
+    setRestartError('');
+    restartCpm()
+      .then(() => {
+        // Server will go down — poll until it comes back
+        const poll = setInterval(() => {
+          fetch('/auth/config', { credentials: 'include' })
+            .then(r => { if (r.ok) { clearInterval(poll); window.location.reload(); } })
+            .catch(() => {}); // still down
+        }, 2000);
+      })
+      .catch(err => {
+        setRestarting(false);
+        setRestartError(err.message || 'Restart failed');
+      });
+  };
 
   return (
     <div className="h-screen flex flex-col overflow-hidden">
@@ -20,20 +40,24 @@ export default function Layout({
           Coder Project Manager
         </span>
         <div className="flex items-center gap-4">
-          {selfChatUrl && (
-            <a
-              href={selfChatUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-xs px-3 py-1.5 bg-purple-600 text-white rounded-full hover:bg-purple-700 transition-colors flex items-center gap-1.5 no-underline"
-              title="Open assistant chat"
-            >
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-              </svg>
-              Assistant
-            </a>
+          {restartError && (
+            <span className="text-xs text-red-500">{restartError}</span>
           )}
+          <button
+            onClick={handleRestart}
+            disabled={restarting}
+            className={`text-xs px-3 py-1.5 rounded-full transition-colors flex items-center gap-1.5 ${
+              restarting
+                ? 'bg-gray-400 text-white cursor-not-allowed'
+                : 'bg-gray-600 text-white hover:bg-gray-700'
+            }`}
+            title="Rebuild and restart CPM server"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            </svg>
+            {restarting ? 'Restarting...' : 'Restart CPM'}
+          </button>
           <div className="flex items-center bg-gray-100 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-0.5">
             {([
               { value: 'light' as const, title: 'Light', icon: (
