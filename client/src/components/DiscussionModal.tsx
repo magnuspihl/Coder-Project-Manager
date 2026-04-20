@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo, memo, type FormEvent } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback, memo, type FormEvent } from 'react';
 import {
   getDiscussionDetail,
   getOlderDiscussionMessages,
@@ -20,7 +20,9 @@ import {
   type Workspace,
 } from '../api/client';
 import { useDraft } from '../hooks/useDraft';
+import { useVoiceMode } from '../hooks/useVoiceMode';
 import { linkify } from '../utils/linkify';
+import { playListenChime } from '../utils/listenChime';
 import Markdown from './Markdown';
 import RateLimitBanner from './RateLimitBanner';
 
@@ -131,6 +133,25 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const [availableWorkspaces, setAvailableWorkspaces] = useState<Workspace[]>([]);
   const [loadingWorkspaces, setLoadingWorkspaces] = useState(false);
   const lastParticipantsJsonRef = useRef('');
+
+  // Voice mode state
+  const [voiceModeActive, setVoiceModeActive] = useState(false);
+  const prevIsAnyRunningRef = useRef(false);
+  const voicePendingSendRef = useRef(false);
+
+  const handleVoiceTranscript = useCallback((text: string) => {
+    setMessage(text);
+  }, [setMessage]);
+
+  const handleVoiceSilence = useCallback((finalText: string) => {
+    setMessage(finalText);
+    voicePendingSendRef.current = true;
+  }, [setMessage]);
+
+  const { isSupported: voiceSupported, isListening, startListening, stopListening } = useVoiceMode({
+    onTranscript: handleVoiceTranscript,
+    onSilenceTimeout: handleVoiceSilence,
+  });
 
   // Initial load: fetch latest 50 messages
   // Subsequent polls: only fetch messages after the last known ID
@@ -270,6 +291,16 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const runningParticipant = participants.find(p => p.running);
   const runningAgentName = discussion?.running ? workspaceName : runningParticipant?.workspace_name || null;
 
+  // Voice mode: auto-re-listen when Claude finishes responding
+  useEffect(() => {
+    const wasRunning = prevIsAnyRunningRef.current;
+    prevIsAnyRunningRef.current = isAnyRunning;
+    if (wasRunning && !isAnyRunning && voiceModeActive && !isListening) {
+      playListenChime();
+      startListening();
+    }
+  }, [isAnyRunning, voiceModeActive, isListening, startListening]);
+
   // Target display name
   const targetName = targetId
     ? participants.find(p => p.id === targetId)?.workspace_name || 'participant'
@@ -335,21 +366,19 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
 
   const handleSend = async (e?: FormEvent) => {
     if (e) e.preventDefault();
+    if (isListening) stopListening();
     if (!message.trim() || sending) return;
     setSending(true);
     shouldForceScroll.current = true;
     try {
       if (targetId) {
-        // Send to participant
         await sendParticipantMessage(discussionId, targetId, message.trim());
       } else {
-        // Send to host
         await sendDiscussionMessage(discussionId, message.trim());
       }
       clearMessage();
       await loadData();
     } catch (err) {
-      // Show error inline
       if (err instanceof Error && err.message.includes('currently processing')) {
         // Don't clear message, let user retry
       }
@@ -357,6 +386,14 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
       setSending(false);
     }
   };
+
+  // Voice mode: auto-send when silence timeout sets the pending flag
+  useEffect(() => {
+    if (voicePendingSendRef.current && message.trim()) {
+      voicePendingSendRef.current = false;
+      handleSend();
+    }
+  }, [message]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
@@ -780,17 +817,50 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                       </div>
                     )}
                   </div>
-                  <button
-                    type="submit"
-                    disabled={sending || !message.trim() || isAnyRunning}
-                    className={`text-white text-sm px-4 py-2 rounded-md disabled:opacity-50 ${
-                      targetId
-                        ? 'bg-teal-600 hover:bg-teal-700'
-                        : 'bg-purple-600 hover:bg-purple-700'
-                    }`}
-                  >
-                    {sending ? 'Sending...' : `Send to ${targetName} (Ctrl+Enter)`}
-                  </button>
+                  <div className="flex items-center gap-2">
+                    {isListening && (
+                      <span className="text-xs text-purple-500 dark:text-purple-400 animate-pulse">Listening...</span>
+                    )}
+                    {voiceSupported && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (isListening) {
+                            stopListening();
+                            setVoiceModeActive(false);
+                          } else {
+                            setVoiceModeActive(true);
+                            playListenChime();
+                            startListening();
+                          }
+                        }}
+                        disabled={sending || isAnyRunning}
+                        className={`relative p-2 rounded-md transition-colors disabled:opacity-50 ${
+                          isListening
+                            ? 'text-white bg-purple-600 voice-pulse-ring'
+                            : voiceModeActive
+                            ? 'text-purple-600 dark:text-purple-400 bg-purple-100 dark:bg-purple-900/30 hover:bg-purple-200 dark:hover:bg-purple-900/50'
+                            : 'text-gray-400 dark:text-gray-500 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-900/20'
+                        }`}
+                        title={isListening ? 'Stop listening' : voiceModeActive ? 'Resume listening' : 'Start voice mode'}
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                          <path fillRule="evenodd" d="M7 4a3 3 0 016 0v4a3 3 0 11-6 0V4zm4 10.93A7.001 7.001 0 0017 8a1 1 0 10-2 0A5 5 0 015 8a1 1 0 00-2 0 7.001 7.001 0 006 6.93V17H6a1 1 0 100 2h8a1 1 0 100-2h-3v-2.07z" clipRule="evenodd" />
+                        </svg>
+                      </button>
+                    )}
+                    <button
+                      type="submit"
+                      disabled={sending || !message.trim() || isAnyRunning}
+                      className={`text-white text-sm px-4 py-2 rounded-md disabled:opacity-50 ${
+                        targetId
+                          ? 'bg-teal-600 hover:bg-teal-700'
+                          : 'bg-purple-600 hover:bg-purple-700'
+                      }`}
+                    >
+                      {sending ? 'Sending...' : `Send to ${targetName} (Ctrl+Enter)`}
+                    </button>
+                  </div>
                 </div>
               </form>
             </div>
