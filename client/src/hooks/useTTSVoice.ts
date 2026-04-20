@@ -9,6 +9,8 @@ export interface TTSVoice {
   provider: 'elevenlabs' | 'browser';
   accent?: string;
   category?: string;
+  isCustom?: boolean;
+  description?: string;
 }
 
 interface ElevenLabsVoice {
@@ -17,6 +19,8 @@ interface ElevenLabsVoice {
   category?: string;
   accent?: string;
   style?: string;
+  description?: string;
+  isCustom?: boolean;
 }
 
 interface ElevenLabsResponse {
@@ -51,13 +55,17 @@ export function useTTSVoice() {
           const data: ElevenLabsResponse = await resp.json();
           if (data.enabled && data.voices.length > 0) {
             for (const v of data.voices) {
-              const label = [v.name, v.accent, v.style].filter(Boolean).join(' — ');
+              const parts = [v.name];
+              if (v.description) parts.push(v.description);
+              else if (v.accent) parts.push(v.accent);
               allVoices.push({
                 id: `el:${v.id}`,
-                name: label,
+                name: parts.join(' — '),
                 provider: 'elevenlabs',
                 accent: v.accent,
                 category: v.category,
+                isCustom: !!v.isCustom,
+                description: v.description,
               });
             }
             // Auto-select ElevenLabs default if no selection yet

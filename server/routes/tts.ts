@@ -33,15 +33,31 @@ router.get('/tts/voices', requireAuth, async (_req: Request, res: Response) => {
       headers: { 'xi-api-key': ELEVENLABS_API_KEY },
     });
     if (resp.ok) {
-      const data = await resp.json() as { voices: Array<{ voice_id: string; name: string; category: string; labels?: Record<string, string> }> };
+      const data = await resp.json() as { voices: Array<{ voice_id: string; name: string; category: string; labels?: Record<string, string>; description?: string }> };
       if (data.voices?.length > 0) {
-        const voices = data.voices.map(v => ({
-          id: v.voice_id,
-          name: v.name,
-          category: v.category,
-          accent: v.labels?.accent || '',
-        }));
-        res.json({ voices, enabled: true, defaultVoiceId: DEFAULT_VOICE_ID });
+        const myVoices = data.voices
+          .filter(v => v.category !== 'premade')
+          .map(v => ({
+            id: v.voice_id,
+            name: v.name,
+            category: v.category,
+            accent: v.labels?.accent || '',
+            description: v.labels?.description || v.description || '',
+            isCustom: true,
+          }));
+        const premadeVoices = data.voices
+          .filter(v => v.category === 'premade')
+          .map(v => ({
+            id: v.voice_id,
+            name: v.name,
+            category: v.category,
+            accent: v.labels?.accent || '',
+            description: v.labels?.description || v.description || '',
+            isCustom: false,
+          }));
+        const voices = [...myVoices, ...premadeVoices];
+        const defaultId = myVoices.length > 0 ? myVoices[0].id : DEFAULT_VOICE_ID;
+        res.json({ voices, enabled: true, defaultVoiceId: defaultId });
         return;
       }
     }

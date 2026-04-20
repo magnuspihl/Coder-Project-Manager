@@ -838,20 +838,41 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                     >
                       End Discussion
                     </button>
-                    {ttsVoices.length > 0 && (
-                      <select
-                        value={ttsSelectedId}
-                        onChange={(e) => ttsSelectVoice(e.target.value)}
-                        className="text-[10px] px-1.5 py-0.5 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-500 dark:text-gray-400 focus:outline-none focus:ring-1 focus:ring-purple-500 max-w-[160px]"
-                        title="Text-to-speech voice"
-                      >
-                        {ttsVoices.map(v => (
-                          <option key={v.id} value={v.id}>
-                            {v.name}
-                          </option>
-                        ))}
-                      </select>
-                    )}
+                    {ttsVoices.length > 0 && (() => {
+                      const custom = ttsVoices.filter(v => v.isCustom);
+                      const elevenlabs = ttsVoices.filter(v => v.provider === 'elevenlabs' && !v.isCustom);
+                      const browser = ttsVoices.filter(v => v.provider === 'browser');
+                      return (
+                        <select
+                          value={ttsSelectedId}
+                          onChange={(e) => ttsSelectVoice(e.target.value)}
+                          className="text-[10px] px-1.5 py-0.5 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-500 dark:text-gray-400 focus:outline-none focus:ring-1 focus:ring-purple-500 max-w-[180px]"
+                          title="Text-to-speech voice"
+                        >
+                          {custom.length > 0 && (
+                            <optgroup label="My Voices">
+                              {custom.map(v => (
+                                <option key={v.id} value={v.id}>{v.name}</option>
+                              ))}
+                            </optgroup>
+                          )}
+                          {elevenlabs.length > 0 && (
+                            <optgroup label="ElevenLabs">
+                              {elevenlabs.map(v => (
+                                <option key={v.id} value={v.id}>{v.name}</option>
+                              ))}
+                            </optgroup>
+                          )}
+                          {browser.length > 0 && (
+                            <optgroup label="Browser">
+                              {browser.map(v => (
+                                <option key={v.id} value={v.id}>{v.name}</option>
+                              ))}
+                            </optgroup>
+                          )}
+                        </select>
+                      );
+                    })()}
                     {/* Invite button when no participants yet */}
                     {participants.length === 0 && (
                       <div className="relative">
