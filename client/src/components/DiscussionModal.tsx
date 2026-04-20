@@ -148,7 +148,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     voicePendingSendRef.current = true;
   }, [setMessage]);
 
-  const { isSupported: voiceSupported, isListening, startListening, stopListening } = useVoiceMode({
+  const { isSupported: voiceSupported, isListening, startListening, stopListening, debugStatus: voiceDebug } = useVoiceMode({
     onTranscript: handleVoiceTranscript,
     onSilenceTimeout: handleVoiceSilence,
   });
@@ -819,7 +819,9 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                   </div>
                   <div className="flex items-center gap-2">
                     {isListening && (
-                      <span className="text-xs text-purple-500 dark:text-purple-400 animate-pulse">Listening...</span>
+                      <span className="text-xs text-purple-500 dark:text-purple-400 animate-pulse truncate max-w-[200px]" title={voiceDebug}>
+                        {voiceDebug || 'Listening...'}
+                      </span>
                     )}
                     {voiceSupported && (
                       <button

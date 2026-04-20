@@ -27,6 +27,9 @@ interface SpeechRecognitionInstance extends EventTarget {
   onresult: ((event: SpeechRecognitionEvent) => void) | null;
   onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
   onend: (() => void) | null;
+  onstart: (() => void) | null;
+  onaudiostart: (() => void) | null;
+  onspeechstart: (() => void) | null;
   start(): void;
   stop(): void;
   abort(): void;
@@ -53,13 +56,13 @@ interface UseVoiceModeOptions {
 
 export function useVoiceMode({ onTranscript, onSilenceTimeout, silenceMs = 2000 }: UseVoiceModeOptions) {
   const [isListening, setIsListening] = useState(false);
+  const [debugStatus, setDebugStatus] = useState('');
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const accumulatedRef = useRef('');
   const wantListeningRef = useRef(false);
+  const restartCountRef = useRef(0);
 
-  // Callback refs — always point to the latest version, avoiding stale closures
-  // in long-lived SpeechRecognition event handlers
   const onTranscriptRef = useRef(onTranscript);
   onTranscriptRef.current = onTranscript;
   const onSilenceTimeoutRef = useRef(onSilenceTimeout);
@@ -98,6 +101,18 @@ export function useVoiceMode({ onTranscript, onSilenceTimeout, silenceMs = 2000 
     recognition.interimResults = true;
     recognition.lang = 'en-US';
 
+    recognition.onstart = () => {
+      setDebugStatus('Recognition started, waiting for audio...');
+    };
+
+    recognition.onaudiostart = () => {
+      setDebugStatus('Audio capture active, listening for speech...');
+    };
+
+    recognition.onspeechstart = () => {
+      setDebugStatus('Speech detected...');
+    };
+
     recognition.onresult = (event) => {
       clearSilenceTimer();
 
@@ -115,6 +130,8 @@ export function useVoiceMode({ onTranscript, onSilenceTimeout, silenceMs = 2000 
 
       accumulatedRef.current = finalTranscript;
       const displayText = (finalTranscript + interimTranscript).trim();
+      setDebugStatus(`Got: "${displayText.slice(0, 40)}${displayText.length > 40 ? '...' : ''}"${finalTranscript ? ' [final]' : ' [interim]'}`);
+
       if (displayText) {
         onTranscriptRef.current(displayText);
       }
@@ -128,6 +145,7 @@ export function useVoiceMode({ onTranscript, onSilenceTimeout, silenceMs = 2000 
           recognitionRef.current = null;
         }
         setIsListening(false);
+        setDebugStatus('Silence timeout — sending');
         if (text) {
           onSilenceTimeoutRef.current(text);
         }
@@ -136,18 +154,30 @@ export function useVoiceMode({ onTranscript, onSilenceTimeout, silenceMs = 2000 
 
     recognition.onerror = (event) => {
       if (FATAL_ERRORS.has(event.error)) {
+        setDebugStatus(`Fatal error: ${event.error}`);
         stopInternal();
+      } else {
+        setDebugStatus(`Non-fatal error: ${event.error}, will restart...`);
       }
     };
 
     recognition.onend = () => {
       recognitionRef.current = null;
       if (wantListeningRef.current) {
+        restartCountRef.current++;
+        if (restartCountRef.current > 50) {
+          setDebugStatus('Too many restarts, stopping');
+          clearSilenceTimer();
+          setIsListening(false);
+          wantListeningRef.current = false;
+          return;
+        }
+        setDebugStatus(`Restarting (${restartCountRef.current})...`);
         try {
           createAndStart();
           return;
         } catch {
-          // fall through to stop
+          // fall through
         }
       }
       clearSilenceTimer();
@@ -159,7 +189,8 @@ export function useVoiceMode({ onTranscript, onSilenceTimeout, silenceMs = 2000 
     try {
       recognition.start();
       return true;
-    } catch {
+    } catch (e) {
+      setDebugStatus(`Start failed: ${e}`);
       recognitionRef.current = null;
       return false;
     }
@@ -171,12 +202,15 @@ export function useVoiceMode({ onTranscript, onSilenceTimeout, silenceMs = 2000 
     if (!SpeechRecognitionClass || wantListeningRef.current) return;
 
     accumulatedRef.current = '';
+    restartCountRef.current = 0;
     wantListeningRef.current = true;
+    setDebugStatus('Starting...');
 
     if (createAndStart()) {
       setIsListening(true);
     } else {
       wantListeningRef.current = false;
+      setDebugStatus('Failed to start');
     }
   }, [SpeechRecognitionClass, createAndStart]);
 
@@ -190,5 +224,5 @@ export function useVoiceMode({ onTranscript, onSilenceTimeout, silenceMs = 2000 
     };
   }, [clearSilenceTimer]);
 
-  return { isSupported, isListening, startListening, stopListening };
+  return { isSupported, isListening, startListening, stopListening, debugStatus };
 }
