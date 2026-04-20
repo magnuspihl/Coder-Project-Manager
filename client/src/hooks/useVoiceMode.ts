@@ -16,15 +16,20 @@ interface SpeechRecognitionEvent extends Event {
   readonly resultIndex: number;
 }
 
+interface SpeechRecognitionErrorEvent extends Event {
+  readonly error: string;
+}
+
 interface SpeechRecognitionInstance extends EventTarget {
   continuous: boolean;
   interimResults: boolean;
   lang: string;
   onresult: ((event: SpeechRecognitionEvent) => void) | null;
-  onerror: ((event: Event) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
   onend: (() => void) | null;
   start(): void;
   stop(): void;
+  abort(): void;
 }
 
 interface SpeechRecognitionConstructor {
@@ -38,6 +43,8 @@ declare global {
   }
 }
 
+const FATAL_ERRORS = new Set(['not-allowed', 'service-not-allowed', 'language-not-supported']);
+
 interface UseVoiceModeOptions {
   onTranscript: (text: string) => void;
   onSilenceTimeout: (finalText: string) => void;
@@ -49,7 +56,7 @@ export function useVoiceMode({ onTranscript, onSilenceTimeout, silenceMs = 2000 
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const accumulatedRef = useRef('');
-  const stoppingRef = useRef(false);
+  const wantListeningRef = useRef(false);
 
   const SpeechRecognitionClass = typeof window !== 'undefined'
     ? (window.SpeechRecognition || window.webkitSpeechRecognition) || null
@@ -64,21 +71,8 @@ export function useVoiceMode({ onTranscript, onSilenceTimeout, silenceMs = 2000 
     }
   }, []);
 
-  const stopListening = useCallback(() => {
-    stoppingRef.current = true;
-    clearSilenceTimer();
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-      recognitionRef.current = null;
-    }
-    setIsListening(false);
-  }, [clearSilenceTimer]);
-
-  const startListening = useCallback(() => {
-    if (!SpeechRecognitionClass || isListening) return;
-
-    stoppingRef.current = false;
-    accumulatedRef.current = '';
+  const createRecognition = useCallback(() => {
+    if (!SpeechRecognitionClass) return null;
 
     const recognition = new SpeechRecognitionClass();
     recognition.continuous = true;
@@ -108,35 +102,90 @@ export function useVoiceMode({ onTranscript, onSilenceTimeout, silenceMs = 2000 
 
       silenceTimerRef.current = setTimeout(() => {
         const text = accumulatedRef.current.trim() || displayText;
-        if (text && !stoppingRef.current) {
+        wantListeningRef.current = false;
+        clearSilenceTimer();
+        if (recognitionRef.current) {
+          recognitionRef.current.stop();
+          recognitionRef.current = null;
+        }
+        setIsListening(false);
+        if (text) {
           onSilenceTimeout(text);
         }
-        stopListening();
       }, silenceMs);
     };
 
-    recognition.onerror = () => {
-      stopListening();
+    recognition.onerror = (event) => {
+      if (FATAL_ERRORS.has(event.error)) {
+        wantListeningRef.current = false;
+        clearSilenceTimer();
+        recognitionRef.current = null;
+        setIsListening(false);
+      }
+      // Non-fatal errors (no-speech, aborted, network) — let onend handle restart
     };
 
     recognition.onend = () => {
-      if (!stoppingRef.current) {
-        setIsListening(false);
-        recognitionRef.current = null;
-        clearSilenceTimer();
+      recognitionRef.current = null;
+      if (wantListeningRef.current && SpeechRecognitionClass) {
+        // Restart after transient end (no-speech timeout, network blip)
+        try {
+          const next = createRecognition();
+          if (next) {
+            recognitionRef.current = next;
+            next.start();
+            return;
+          }
+        } catch {
+          // fall through to stop
+        }
       }
+      clearSilenceTimer();
+      setIsListening(false);
+      wantListeningRef.current = false;
     };
 
+    return recognition;
+  }, [SpeechRecognitionClass, onTranscript, onSilenceTimeout, silenceMs, clearSilenceTimer]);
+
+  const stopListening = useCallback(() => {
+    wantListeningRef.current = false;
+    clearSilenceTimer();
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      recognitionRef.current = null;
+    }
+    setIsListening(false);
+  }, [clearSilenceTimer]);
+
+  const startListening = useCallback(() => {
+    if (!SpeechRecognitionClass || wantListeningRef.current) return;
+
+    accumulatedRef.current = '';
+    wantListeningRef.current = true;
+
+    const recognition = createRecognition();
+    if (!recognition) {
+      wantListeningRef.current = false;
+      return;
+    }
+
     recognitionRef.current = recognition;
-    recognition.start();
-    setIsListening(true);
-  }, [SpeechRecognitionClass, isListening, onTranscript, onSilenceTimeout, silenceMs, clearSilenceTimer, stopListening]);
+    try {
+      recognition.start();
+      setIsListening(true);
+    } catch {
+      wantListeningRef.current = false;
+      recognitionRef.current = null;
+    }
+  }, [SpeechRecognitionClass, createRecognition]);
 
   useEffect(() => {
     return () => {
+      wantListeningRef.current = false;
       clearSilenceTimer();
       if (recognitionRef.current) {
-        recognitionRef.current.stop();
+        recognitionRef.current.abort();
       }
     };
   }, [clearSilenceTimer]);
