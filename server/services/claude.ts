@@ -1,6 +1,6 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { createReadStream } from 'fs';
-import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, type Task, type TaskParticipant } from './tasks.js';
+import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, type Task, type TaskParticipant } from './tasks.js';
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit, handleStashAway } from './git.js';
@@ -442,6 +442,14 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   }
 
   let prompt = rawPrompt + branchNote + coderUrlNote;
+
+  // Host's Claude session does not contain participant messages — inject them
+  // as catch-up context so the host can see what invited agents have said.
+  const taskParticipants = getTaskParticipants(task.id);
+  if (taskParticipants.length > 0) {
+    const hostCatchUp = buildTaskParticipantContext(task.id, '__host__');
+    if (hostCatchUp) prompt = hostCatchUp + '\n' + prompt;
+  }
 
   // Auto-detect project directory if not already set
   if (!task.project_dir) {
