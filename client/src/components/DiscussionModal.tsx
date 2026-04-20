@@ -22,6 +22,7 @@ import {
 import { useDraft } from '../hooks/useDraft';
 import { useTTSVoice } from '../hooks/useTTSVoice';
 import { useVoiceMode } from '../hooks/useVoiceMode';
+import { useVoiceRecorder } from '../hooks/useVoiceRecorder';
 import { linkify } from '../utils/linkify';
 import { playListenChime } from '../utils/listenChime';
 import Markdown from './Markdown';
@@ -204,10 +205,44 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     voicePendingSendRef.current = true;
   }, [setMessage]);
 
-  const { isSupported: voiceSupported, isListening, startListening, stopListening, debugStatus: voiceDebug } = useVoiceMode({
+  // Whisper-based push-to-talk (preferred when available)
+  const handleRecorderTranscript = useCallback((text: string) => {
+    setMessage(text);
+    voicePendingSendRef.current = true;
+  }, [setMessage]);
+
+  const recorder = useVoiceRecorder({
+    onTranscript: handleRecorderTranscript,
+  });
+
+  // SpeechRecognition fallback (Chrome/Edge only)
+  const speechRec = useVoiceMode({
     onTranscript: handleVoiceTranscript,
     onSilenceTimeout: handleVoiceSilence,
   });
+
+  // Prefer Whisper recorder if available; fall back to SpeechRecognition
+  const useWhisper = recorder.isSupported;
+  const voiceSupported = useWhisper || speechRec.isSupported;
+  const isListening = useWhisper ? recorder.isRecording : speechRec.isListening;
+  const isTranscribing = useWhisper ? recorder.isTranscribing : false;
+  const voiceDebug = useWhisper ? recorder.debugStatus : speechRec.debugStatus;
+
+  const startListening = useCallback(() => {
+    if (useWhisper) {
+      recorder.startRecording();
+    } else {
+      speechRec.startListening();
+    }
+  }, [useWhisper, recorder.startRecording, speechRec.startListening]);
+
+  const stopListening = useCallback(() => {
+    if (useWhisper) {
+      recorder.stopRecording();
+    } else {
+      speechRec.stopListening();
+    }
+  }, [useWhisper, recorder.stopRecording, speechRec.stopListening]);
 
   const { voices: ttsVoices, selectedId: ttsSelectedId, selectVoice: ttsSelectVoice, speak: ttsSpeak, speakingId: ttsSpeakingId } = useTTSVoice();
 
@@ -913,7 +948,9 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                   <div className="flex items-center gap-2">
                     {voiceDebug && (
                       <span className={`text-xs truncate max-w-[220px] ${
-                        isListening
+                        isTranscribing
+                          ? 'text-amber-500 dark:text-amber-400 animate-pulse'
+                          : isListening
                           ? 'text-purple-500 dark:text-purple-400 animate-pulse'
                           : 'text-gray-400 dark:text-gray-500'
                       }`} title={voiceDebug}>
@@ -924,28 +961,35 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                       <button
                         type="button"
                         onClick={() => {
+                          if (isTranscribing) return;
                           if (isListening) {
                             stopListening();
-                            setVoiceModeActive(false);
+                            if (!useWhisper) setVoiceModeActive(false);
                           } else {
                             setVoiceModeActive(true);
                             playListenChime();
                             startListening();
                           }
                         }}
-                        disabled={sending || isAnyRunning}
+                        disabled={sending || isAnyRunning || isTranscribing}
                         className={`relative p-2 rounded-md transition-colors disabled:opacity-50 ${
-                          isListening
+                          isTranscribing
+                            ? 'text-amber-600 bg-amber-100 dark:bg-amber-900/30'
+                            : isListening
                             ? 'text-white bg-purple-600 voice-pulse-ring'
                             : voiceModeActive
                             ? 'text-purple-600 dark:text-purple-400 bg-purple-100 dark:bg-purple-900/30 hover:bg-purple-200 dark:hover:bg-purple-900/50'
                             : 'text-gray-400 dark:text-gray-500 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-900/20'
                         }`}
-                        title={isListening ? 'Stop listening' : voiceModeActive ? 'Resume listening' : 'Start voice mode'}
+                        title={isTranscribing ? 'Transcribing...' : isListening ? 'Stop recording' : useWhisper ? 'Push to talk' : voiceModeActive ? 'Resume listening' : 'Start voice mode'}
                       >
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                          <path fillRule="evenodd" d="M7 4a3 3 0 016 0v4a3 3 0 11-6 0V4zm4 10.93A7.001 7.001 0 0017 8a1 1 0 10-2 0A5 5 0 015 8a1 1 0 00-2 0 7.001 7.001 0 006 6.93V17H6a1 1 0 100 2h8a1 1 0 100-2h-3v-2.07z" clipRule="evenodd" />
-                        </svg>
+                        {isTranscribing ? (
+                          <div className="h-5 w-5 border-2 border-amber-600 border-t-transparent rounded-full animate-spin" />
+                        ) : (
+                          <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                            <path fillRule="evenodd" d="M7 4a3 3 0 016 0v4a3 3 0 11-6 0V4zm4 10.93A7.001 7.001 0 0017 8a1 1 0 10-2 0A5 5 0 015 8a1 1 0 00-2 0 7.001 7.001 0 006 6.93V17H6a1 1 0 100 2h8a1 1 0 100-2h-3v-2.07z" clipRule="evenodd" />
+                          </svg>
+                        )}
                       </button>
                     )}
                     <button
