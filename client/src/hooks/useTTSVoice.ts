@@ -14,8 +14,9 @@ export interface TTSVoice {
 interface ElevenLabsVoice {
   id: string;
   name: string;
-  category: string;
-  accent: string;
+  category?: string;
+  accent?: string;
+  style?: string;
 }
 
 interface ElevenLabsResponse {
@@ -50,9 +51,10 @@ export function useTTSVoice() {
           const data: ElevenLabsResponse = await resp.json();
           if (data.enabled && data.voices.length > 0) {
             for (const v of data.voices) {
+              const label = [v.name, v.accent, v.style].filter(Boolean).join(' — ');
               allVoices.push({
                 id: `el:${v.id}`,
-                name: v.name,
+                name: label,
                 provider: 'elevenlabs',
                 accent: v.accent,
                 category: v.category,
