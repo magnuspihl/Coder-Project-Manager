@@ -818,9 +818,13 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                     )}
                   </div>
                   <div className="flex items-center gap-2">
-                    {isListening && (
-                      <span className="text-xs text-purple-500 dark:text-purple-400 animate-pulse truncate max-w-[200px]" title={voiceDebug}>
-                        {voiceDebug || 'Listening...'}
+                    {voiceDebug && (
+                      <span className={`text-xs truncate max-w-[220px] ${
+                        isListening
+                          ? 'text-purple-500 dark:text-purple-400 animate-pulse'
+                          : 'text-gray-400 dark:text-gray-500'
+                      }`} title={voiceDebug}>
+                        {voiceDebug}
                       </span>
                     )}
                     {voiceSupported && (

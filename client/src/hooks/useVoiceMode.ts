@@ -48,7 +48,7 @@ declare global {
 
 const FATAL_ERRORS = new Set(['not-allowed', 'service-not-allowed', 'language-not-supported']);
 const RESTART_DELAY_MS = 500;
-const MAX_RESTARTS = 20;
+const MAX_RESTARTS = 3;
 
 interface UseVoiceModeOptions {
   onTranscript: (text: string) => void;
@@ -187,7 +187,10 @@ export function useVoiceMode({ onTranscript, onSilenceTimeout, silenceMs = 2000 
 
       restartCountRef.current++;
       if (restartCountRef.current > MAX_RESTARTS) {
-        setDebugStatus('Mic not responding — try again');
+        const msg = gotResultRef.current
+          ? 'Connection lost — click mic to retry'
+          : 'Speech service unavailable — try Chrome or Edge';
+        setDebugStatus(msg);
         clearSilenceTimer();
         setIsListening(false);
         wantListeningRef.current = false;
