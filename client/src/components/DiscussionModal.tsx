@@ -457,6 +457,56 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     return () => window.removeEventListener('keydown', handleKey);
   }, [onClose]);
 
+  // Hold-to-talk: hold ½ key (Danish keyboard) to record, release to stop & transcribe
+  const pttActiveRef = useRef(false);
+  const voiceSupportedRef = useRef(voiceSupported);
+  voiceSupportedRef.current = voiceSupported;
+  const isListeningRef = useRef(isListening);
+  isListeningRef.current = isListening;
+  const isTranscribingRef = useRef(isTranscribing);
+  isTranscribingRef.current = isTranscribing;
+  const sendingRef = useRef(sending);
+  sendingRef.current = sending;
+  const isAnyRunningRef = useRef(isAnyRunning);
+  isAnyRunningRef.current = isAnyRunning;
+  const startListeningRef = useRef(startListening);
+  startListeningRef.current = startListening;
+  const stopListeningRef = useRef(stopListening);
+  stopListeningRef.current = stopListening;
+
+  useEffect(() => {
+    const PTT_KEY = '½';
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== PTT_KEY || e.repeat) return;
+      if (!voiceSupportedRef.current || isTranscribingRef.current) return;
+      if (sendingRef.current || isAnyRunningRef.current) return;
+      e.preventDefault();
+      if (!pttActiveRef.current && !isListeningRef.current) {
+        pttActiveRef.current = true;
+        setVoiceModeActive(true);
+        playListenChime();
+        startListeningRef.current();
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key !== PTT_KEY) return;
+      e.preventDefault();
+      if (pttActiveRef.current && isListeningRef.current) {
+        pttActiveRef.current = false;
+        stopListeningRef.current();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, []);
+
   const handleSend = async (e?: FormEvent) => {
     if (e) e.preventDefault();
     if (isListening) stopListening();
@@ -981,7 +1031,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                             ? 'text-purple-600 dark:text-purple-400 bg-purple-100 dark:bg-purple-900/30 hover:bg-purple-200 dark:hover:bg-purple-900/50'
                             : 'text-gray-400 dark:text-gray-500 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-900/20'
                         }`}
-                        title={isTranscribing ? 'Transcribing...' : isListening ? 'Stop recording' : useWhisper ? 'Push to talk' : voiceModeActive ? 'Resume listening' : 'Start voice mode'}
+                        title={isTranscribing ? 'Transcribing...' : isListening ? 'Stop recording' : useWhisper ? 'Push to talk (hold ½)' : voiceModeActive ? 'Resume listening' : 'Start voice mode'}
                       >
                         {isTranscribing ? (
                           <div className="h-5 w-5 border-2 border-amber-600 border-t-transparent rounded-full animate-spin" />
