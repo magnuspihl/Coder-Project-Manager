@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo, memo, type FormEvent } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback, memo, type FormEvent, type MouseEvent as ReactMouseEvent } from 'react';
 import {
   getDiscussionDetail,
   getOlderDiscussionMessages,
@@ -20,17 +20,55 @@ import {
   type Workspace,
 } from '../api/client';
 import { useDraft } from '../hooks/useDraft';
+import { useTTSVoice } from '../hooks/useTTSVoice';
+import { useVoiceMode } from '../hooks/useVoiceMode';
+import { useVoiceRecorder } from '../hooks/useVoiceRecorder';
 import { linkify } from '../utils/linkify';
+import { playListenChime } from '../utils/listenChime';
 import Markdown from './Markdown';
 import RateLimitBanner from './RateLimitBanner';
 
 const TASK_REQUEST_RE = /\[TASK_REQUEST\]\s*[\s\S]*?\s*\[\/TASK_REQUEST\]/g;
 const MENTION_RE = /\[MENTION:[^\]]+\]/g;
 
-const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName, participants }: { msg: DiscussionMessage; hostWorkspaceName?: string; participants?: DiscussionParticipant[] }) {
+function stripMarkdownForSpeech(md: string): string {
+  return md
+    .replace(/```[\s\S]*?```/g, ' (code block) ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/#{1,6}\s+/g, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1')
+    .replace(/_([^_]+)_/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
+    .replace(/^\s*[-*+]\s+/gm, '')
+    .replace(/^\s*\d+\.\s+/gm, '')
+    .replace(/\n{2,}/g, '. ')
+    .replace(/\n/g, ' ')
+    .trim();
+}
+
+interface MessageRowProps {
+  msg: DiscussionMessage;
+  hostWorkspaceName?: string;
+  participants?: DiscussionParticipant[];
+  onSpeak?: (text: string, msgId: string) => void;
+  isSpeaking?: boolean;
+}
+
+const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName, participants, onSpeak, isSpeaking }: MessageRowProps) {
   const strippedContent = msg.role === 'assistant'
     ? msg.content.replace(TASK_REQUEST_RE, '').replace(MENTION_RE, '').trim()
     : msg.content;
+
+  const handleSpeak = (e: ReactMouseEvent) => {
+    e.stopPropagation();
+    if (!onSpeak) return;
+    const text = stripMarkdownForSpeech(strippedContent);
+    if (!text) return;
+    onSpeak(text, msg.id);
+  };
 
   // Determine the label for assistant messages
   const assistantLabel = msg.role === 'assistant'
@@ -69,6 +107,27 @@ const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName, participan
           )}
         </span>
         <div className="flex items-center gap-2">
+          {msg.role === 'assistant' && onSpeak && (
+            <button
+              onClick={handleSpeak}
+              className={`p-0.5 rounded transition-colors ${
+                isSpeaking
+                  ? 'text-purple-500 dark:text-purple-400'
+                  : 'text-gray-300 dark:text-gray-600 hover:text-gray-500 dark:hover:text-gray-400'
+              }`}
+              title={isSpeaking ? 'Stop speaking' : 'Read aloud'}
+            >
+              {isSpeaking ? (
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zM7 8a1 1 0 012 0v4a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" />
+                </svg>
+              ) : (
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M9.383 3.076A1 1 0 0110 4v12a1 1 0 01-1.707.707L4.586 13H2a1 1 0 01-1-1V8a1 1 0 011-1h2.586l3.707-3.707a1 1 0 011.09-.217zM14.657 2.929a1 1 0 011.414 0A9.972 9.972 0 0119 10a9.972 9.972 0 01-2.929 7.071 1 1 0 01-1.414-1.414A7.971 7.971 0 0017 10c0-2.21-.894-4.208-2.343-5.657a1 1 0 010-1.414zm-2.829 2.828a1 1 0 011.415 0A5.983 5.983 0 0115 10a5.984 5.984 0 01-1.757 4.243 1 1 0 01-1.415-1.415A3.984 3.984 0 0013 10a3.983 3.983 0 00-1.172-2.828 1 1 0 010-1.415z" clipRule="evenodd" />
+                </svg>
+              )}
+            </button>
+          )}
           {msg.cost && (
             <span className="text-xs text-gray-400 dark:text-gray-500">${msg.cost.toFixed(4)}</span>
           )}
@@ -131,6 +190,61 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const [availableWorkspaces, setAvailableWorkspaces] = useState<Workspace[]>([]);
   const [loadingWorkspaces, setLoadingWorkspaces] = useState(false);
   const lastParticipantsJsonRef = useRef('');
+
+  // Voice mode state
+  const [voiceModeActive, setVoiceModeActive] = useState(false);
+  const prevIsAnyRunningRef = useRef(false);
+  const voicePendingSendRef = useRef(false);
+
+  const handleVoiceTranscript = useCallback((text: string) => {
+    setMessage(text);
+  }, [setMessage]);
+
+  const handleVoiceSilence = useCallback((finalText: string) => {
+    setMessage(finalText);
+    voicePendingSendRef.current = true;
+  }, [setMessage]);
+
+  // Whisper-based push-to-talk (preferred when available)
+  const handleRecorderTranscript = useCallback((text: string) => {
+    setMessage(text);
+    voicePendingSendRef.current = true;
+  }, [setMessage]);
+
+  const recorder = useVoiceRecorder({
+    onTranscript: handleRecorderTranscript,
+  });
+
+  // SpeechRecognition fallback (Chrome/Edge only)
+  const speechRec = useVoiceMode({
+    onTranscript: handleVoiceTranscript,
+    onSilenceTimeout: handleVoiceSilence,
+  });
+
+  // Prefer Whisper recorder if available; fall back to SpeechRecognition
+  const useWhisper = recorder.isSupported;
+  const voiceSupported = useWhisper || speechRec.isSupported;
+  const isListening = useWhisper ? recorder.isRecording : speechRec.isListening;
+  const isTranscribing = useWhisper ? recorder.isTranscribing : false;
+  const voiceDebug = useWhisper ? recorder.debugStatus : speechRec.debugStatus;
+
+  const startListening = useCallback(() => {
+    if (useWhisper) {
+      recorder.startRecording();
+    } else {
+      speechRec.startListening();
+    }
+  }, [useWhisper, recorder.startRecording, speechRec.startListening]);
+
+  const stopListening = useCallback(() => {
+    if (useWhisper) {
+      recorder.stopRecording();
+    } else {
+      speechRec.stopListening();
+    }
+  }, [useWhisper, recorder.stopRecording, speechRec.stopListening]);
+
+  const { voices: ttsVoices, selectedId: ttsSelectedId, selectVoice: ttsSelectVoice, speak: ttsSpeak, speakingId: ttsSpeakingId } = useTTSVoice();
 
   // Initial load: fetch latest 50 messages
   // Subsequent polls: only fetch messages after the last known ID
@@ -270,6 +384,16 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const runningParticipant = participants.find(p => p.running);
   const runningAgentName = discussion?.running ? workspaceName : runningParticipant?.workspace_name || null;
 
+  // Voice mode: auto-re-listen when Claude finishes responding
+  useEffect(() => {
+    const wasRunning = prevIsAnyRunningRef.current;
+    prevIsAnyRunningRef.current = isAnyRunning;
+    if (wasRunning && !isAnyRunning && voiceModeActive && !isListening) {
+      playListenChime();
+      startListening();
+    }
+  }, [isAnyRunning, voiceModeActive, isListening, startListening]);
+
   // Target display name
   const targetName = targetId
     ? participants.find(p => p.id === targetId)?.workspace_name || 'participant'
@@ -333,23 +457,71 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     return () => window.removeEventListener('keydown', handleKey);
   }, [onClose]);
 
+  // Hold-to-talk: hold ½ key (Danish keyboard) to record, release to stop & transcribe
+  const pttActiveRef = useRef(false);
+  const voiceSupportedRef = useRef(voiceSupported);
+  voiceSupportedRef.current = voiceSupported;
+  const isListeningRef = useRef(isListening);
+  isListeningRef.current = isListening;
+  const isTranscribingRef = useRef(isTranscribing);
+  isTranscribingRef.current = isTranscribing;
+  const sendingRef = useRef(sending);
+  sendingRef.current = sending;
+  const isAnyRunningRef = useRef(isAnyRunning);
+  isAnyRunningRef.current = isAnyRunning;
+  const startListeningRef = useRef(startListening);
+  startListeningRef.current = startListening;
+  const stopListeningRef = useRef(stopListening);
+  stopListeningRef.current = stopListening;
+
+  useEffect(() => {
+    const PTT_KEY = '½';
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== PTT_KEY || e.repeat) return;
+      if (!voiceSupportedRef.current || isTranscribingRef.current) return;
+      if (sendingRef.current || isAnyRunningRef.current) return;
+      e.preventDefault();
+      if (!pttActiveRef.current && !isListeningRef.current) {
+        pttActiveRef.current = true;
+        setVoiceModeActive(true);
+        playListenChime();
+        startListeningRef.current();
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key !== PTT_KEY) return;
+      e.preventDefault();
+      if (pttActiveRef.current && isListeningRef.current) {
+        pttActiveRef.current = false;
+        stopListeningRef.current();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, []);
+
   const handleSend = async (e?: FormEvent) => {
     if (e) e.preventDefault();
+    if (isListening) stopListening();
     if (!message.trim() || sending) return;
     setSending(true);
     shouldForceScroll.current = true;
     try {
       if (targetId) {
-        // Send to participant
         await sendParticipantMessage(discussionId, targetId, message.trim());
       } else {
-        // Send to host
         await sendDiscussionMessage(discussionId, message.trim());
       }
       clearMessage();
       await loadData();
     } catch (err) {
-      // Show error inline
       if (err instanceof Error && err.message.includes('currently processing')) {
         // Don't clear message, let user retry
       }
@@ -357,6 +529,14 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
       setSending(false);
     }
   };
+
+  // Voice mode: auto-send when silence timeout sets the pending flag
+  useEffect(() => {
+    if (voicePendingSendRef.current && message.trim()) {
+      voicePendingSendRef.current = false;
+      handleSend();
+    }
+  }, [message]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
@@ -559,7 +739,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
               )}
 
               {visibleMessages.map((msg) => (
-                <MessageRow key={msg.id} msg={msg} hostWorkspaceName={workspaceName} participants={participants} />
+                <MessageRow key={msg.id} msg={msg} hostWorkspaceName={workspaceName} participants={participants} onSpeak={ttsVoices.length > 0 ? ttsSpeak : undefined} isSpeaking={ttsSpeakingId === msg.id} />
               ))}
 
               {/* Working indicator */}
@@ -743,6 +923,41 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                     >
                       End Discussion
                     </button>
+                    {ttsVoices.length > 0 && (() => {
+                      const custom = ttsVoices.filter(v => v.isCustom);
+                      const elevenlabs = ttsVoices.filter(v => v.provider === 'elevenlabs' && !v.isCustom);
+                      const browser = ttsVoices.filter(v => v.provider === 'browser');
+                      return (
+                        <select
+                          value={ttsSelectedId}
+                          onChange={(e) => ttsSelectVoice(e.target.value)}
+                          className="text-[10px] px-1.5 py-0.5 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-500 dark:text-gray-400 focus:outline-none focus:ring-1 focus:ring-purple-500 max-w-[180px]"
+                          title="Text-to-speech voice"
+                        >
+                          {custom.length > 0 && (
+                            <optgroup label="My Voices">
+                              {custom.map(v => (
+                                <option key={v.id} value={v.id}>{v.name}</option>
+                              ))}
+                            </optgroup>
+                          )}
+                          {elevenlabs.length > 0 && (
+                            <optgroup label="ElevenLabs">
+                              {elevenlabs.map(v => (
+                                <option key={v.id} value={v.id}>{v.name}</option>
+                              ))}
+                            </optgroup>
+                          )}
+                          {browser.length > 0 && (
+                            <optgroup label="Browser">
+                              {browser.map(v => (
+                                <option key={v.id} value={v.id}>{v.name}</option>
+                              ))}
+                            </optgroup>
+                          )}
+                        </select>
+                      );
+                    })()}
                     {/* Invite button when no participants yet */}
                     {participants.length === 0 && (
                       <div className="relative">
@@ -780,17 +995,65 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                       </div>
                     )}
                   </div>
-                  <button
-                    type="submit"
-                    disabled={sending || !message.trim() || isAnyRunning}
-                    className={`text-white text-sm px-4 py-2 rounded-md disabled:opacity-50 ${
-                      targetId
-                        ? 'bg-teal-600 hover:bg-teal-700'
-                        : 'bg-purple-600 hover:bg-purple-700'
-                    }`}
-                  >
-                    {sending ? 'Sending...' : `Send to ${targetName} (Ctrl+Enter)`}
-                  </button>
+                  <div className="flex items-center gap-2">
+                    {voiceDebug && (
+                      <span className={`text-xs truncate max-w-[220px] ${
+                        isTranscribing
+                          ? 'text-amber-500 dark:text-amber-400 animate-pulse'
+                          : isListening
+                          ? 'text-purple-500 dark:text-purple-400 animate-pulse'
+                          : 'text-gray-400 dark:text-gray-500'
+                      }`} title={voiceDebug}>
+                        {voiceDebug}
+                      </span>
+                    )}
+                    {voiceSupported && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (isTranscribing) return;
+                          if (isListening) {
+                            stopListening();
+                            if (!useWhisper) setVoiceModeActive(false);
+                          } else {
+                            setVoiceModeActive(true);
+                            playListenChime();
+                            startListening();
+                          }
+                        }}
+                        disabled={sending || isAnyRunning || isTranscribing}
+                        className={`relative p-2 rounded-md transition-colors disabled:opacity-50 ${
+                          isTranscribing
+                            ? 'text-amber-600 bg-amber-100 dark:bg-amber-900/30'
+                            : isListening
+                            ? 'text-white bg-purple-600 voice-pulse-ring'
+                            : voiceModeActive
+                            ? 'text-purple-600 dark:text-purple-400 bg-purple-100 dark:bg-purple-900/30 hover:bg-purple-200 dark:hover:bg-purple-900/50'
+                            : 'text-gray-400 dark:text-gray-500 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-900/20'
+                        }`}
+                        title={isTranscribing ? 'Transcribing...' : isListening ? 'Stop recording' : useWhisper ? 'Push to talk (hold ½)' : voiceModeActive ? 'Resume listening' : 'Start voice mode'}
+                      >
+                        {isTranscribing ? (
+                          <div className="h-5 w-5 border-2 border-amber-600 border-t-transparent rounded-full animate-spin" />
+                        ) : (
+                          <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                            <path fillRule="evenodd" d="M7 4a3 3 0 016 0v4a3 3 0 11-6 0V4zm4 10.93A7.001 7.001 0 0017 8a1 1 0 10-2 0A5 5 0 015 8a1 1 0 00-2 0 7.001 7.001 0 006 6.93V17H6a1 1 0 100 2h8a1 1 0 100-2h-3v-2.07z" clipRule="evenodd" />
+                          </svg>
+                        )}
+                      </button>
+                    )}
+                    <button
+                      type="submit"
+                      disabled={sending || !message.trim() || isAnyRunning}
+                      className={`text-white text-sm px-4 py-2 rounded-md disabled:opacity-50 ${
+                        targetId
+                          ? 'bg-teal-600 hover:bg-teal-700'
+                          : 'bg-purple-600 hover:bg-purple-700'
+                      }`}
+                    >
+                      {sending ? 'Sending...' : `Send to ${targetName} (Ctrl+Enter)`}
+                    </button>
+                  </div>
                 </div>
               </form>
             </div>

@@ -55,3 +55,14 @@
   border-color: #374151;
 }
 
+/* Voice mode pulsing ring animation */
+.voice-pulse-ring {
+  box-shadow: 0 0 0 0 rgba(147, 51, 234, 0.7);
+  animation: voice-pulse 1.5s ease-in-out infinite;
+}
+@keyframes voice-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(147, 51, 234, 0.7); }
+  70% { box-shadow: 0 0 0 8px rgba(147, 51, 234, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(147, 51, 234, 0); }
+}
+

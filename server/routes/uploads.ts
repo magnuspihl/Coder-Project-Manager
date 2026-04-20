@@ -79,6 +79,17 @@ router.get('/uploads/:id', requireAuth, (req: Request, res: Response) => {
   createReadStream(attachment.storage_path).pipe(res);
 });
 
+export interface Attachment {
+  id: string;
+  task_id: string | null;
+  filename: string;
+  original_name: string;
+  mime_type: string;
+  size: number;
+  storage_path: string;
+  created_at: string;
+}
+
 export function linkAttachmentsToTask(attachmentIds: string[], taskId: string) {
   const db = getDb();
   const stmt = db.prepare('UPDATE attachments SET task_id = ? WHERE id = ? AND task_id IS NULL');
