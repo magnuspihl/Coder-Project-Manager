@@ -20,6 +20,7 @@ import {
   type Workspace,
 } from '../api/client';
 import { useDraft } from '../hooks/useDraft';
+import { useTTSVoice } from '../hooks/useTTSVoice';
 import { useVoiceMode } from '../hooks/useVoiceMode';
 import { linkify } from '../utils/linkify';
 import { playListenChime } from '../utils/listenChime';
@@ -49,7 +50,7 @@ function stripMarkdownForSpeech(md: string): string {
 
 const hasTTS = typeof window !== 'undefined' && 'speechSynthesis' in window;
 
-const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName, participants }: { msg: DiscussionMessage; hostWorkspaceName?: string; participants?: DiscussionParticipant[] }) {
+const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName, participants, ttsVoice }: { msg: DiscussionMessage; hostWorkspaceName?: string; participants?: DiscussionParticipant[]; ttsVoice?: SpeechSynthesisVoice | null }) {
   const [speaking, setSpeaking] = useState(false);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
 
@@ -67,6 +68,7 @@ const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName, participan
     const text = stripMarkdownForSpeech(strippedContent);
     if (!text) return;
     const utter = new SpeechSynthesisUtterance(text);
+    if (ttsVoice) utter.voice = ttsVoice;
     utter.rate = 1.1;
     utter.onend = () => setSpeaking(false);
     utter.onerror = () => setSpeaking(false);
@@ -218,6 +220,8 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     onTranscript: handleVoiceTranscript,
     onSilenceTimeout: handleVoiceSilence,
   });
+
+  const { voices: ttsVoices, selectedURI: ttsSelectedURI, selectVoice: ttsSelectVoice, getVoice: ttsGetVoice } = useTTSVoice();
 
   // Initial load: fetch latest 50 messages
   // Subsequent polls: only fetch messages after the last known ID
@@ -662,7 +666,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
               )}
 
               {visibleMessages.map((msg) => (
-                <MessageRow key={msg.id} msg={msg} hostWorkspaceName={workspaceName} participants={participants} />
+                <MessageRow key={msg.id} msg={msg} hostWorkspaceName={workspaceName} participants={participants} ttsVoice={ttsGetVoice()} />
               ))}
 
               {/* Working indicator */}
@@ -846,6 +850,20 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                     >
                       End Discussion
                     </button>
+                    {hasTTS && ttsVoices.length > 0 && (
+                      <select
+                        value={ttsSelectedURI}
+                        onChange={(e) => ttsSelectVoice(e.target.value)}
+                        className="text-[10px] px-1.5 py-0.5 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-500 dark:text-gray-400 focus:outline-none focus:ring-1 focus:ring-purple-500 max-w-[160px]"
+                        title="Text-to-speech voice"
+                      >
+                        {ttsVoices.map(v => (
+                          <option key={v.voiceURI} value={v.voiceURI}>
+                            {v.name.replace(/^(Microsoft|Google)\s+/, '')}
+                          </option>
+                        ))}
+                      </select>
+                    )}
                     {/* Invite button when no participants yet */}
                     {participants.length === 0 && (
                       <div className="relative">
