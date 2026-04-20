@@ -1,66 +1,186 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 
-const STORAGE_KEY = 'tts:voiceURI';
+const STORAGE_KEY = 'tts:voiceId';
+const STORAGE_PROVIDER_KEY = 'tts:provider';
 
-const PREFERRED_PATTERNS = [
-  /\bnatural\b/i,
-  /\benhanced\b/i,
-  /\bpremium\b/i,
-  /\bgoogle\b.*\b(us|uk)\b/i,
-  /\bgoogle\b/i,
-  /\bmicrosoft\b.*\b(aria|jenny|guy)\b/i,
-  /\bsamantha\b/i,
-];
+export interface TTSVoice {
+  id: string;
+  name: string;
+  provider: 'elevenlabs' | 'browser';
+  accent?: string;
+  category?: string;
+}
 
-function pickDefaultVoice(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null {
-  const english = voices.filter(v => v.lang.startsWith('en'));
-  if (english.length === 0) return voices[0] || null;
+interface ElevenLabsVoice {
+  id: string;
+  name: string;
+  category: string;
+  accent: string;
+}
 
-  for (const pattern of PREFERRED_PATTERNS) {
-    const match = english.find(v => pattern.test(v.name));
-    if (match) return match;
-  }
-
-  return english.find(v => v.default) || english[0];
+interface ElevenLabsResponse {
+  voices: ElevenLabsVoice[];
+  enabled: boolean;
+  defaultVoiceId?: string;
 }
 
 export function useTTSVoice() {
-  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
-  const [selectedURI, setSelectedURI] = useState<string>(() => {
+  const [voices, setVoices] = useState<TTSVoice[]>([]);
+  const [selectedId, setSelectedId] = useState<string>(() => {
     try { return localStorage.getItem(STORAGE_KEY) || ''; }
     catch { return ''; }
   });
+  const [provider, setProvider] = useState<'elevenlabs' | 'browser'>(() => {
+    try { return (localStorage.getItem(STORAGE_PROVIDER_KEY) as 'elevenlabs' | 'browser') || 'browser'; }
+    catch { return 'browser'; }
+  });
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [speakingId, setSpeakingId] = useState<string | null>(null);
 
   useEffect(() => {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+    let cancelled = false;
 
-    const load = () => {
-      const available = speechSynthesis.getVoices();
-      if (available.length > 0) {
-        setVoices(available);
-        setSelectedURI(prev => {
-          if (prev && available.some(v => v.voiceURI === prev)) return prev;
-          const best = pickDefaultVoice(available);
-          const uri = best?.voiceURI || '';
-          try { localStorage.setItem(STORAGE_KEY, uri); } catch {}
-          return uri;
-        });
+    const loadVoices = async () => {
+      const allVoices: TTSVoice[] = [];
+
+      // Try ElevenLabs
+      try {
+        const resp = await fetch('/api/tts/voices', { credentials: 'include' });
+        if (resp.ok) {
+          const data: ElevenLabsResponse = await resp.json();
+          if (data.enabled && data.voices.length > 0) {
+            for (const v of data.voices) {
+              allVoices.push({
+                id: `el:${v.id}`,
+                name: v.name,
+                provider: 'elevenlabs',
+                accent: v.accent,
+                category: v.category,
+              });
+            }
+            // Auto-select ElevenLabs default if no selection yet
+            if (!cancelled) {
+              setSelectedId(prev => {
+                if (prev && allVoices.some(v => v.id === prev)) return prev;
+                const defaultId = `el:${data.defaultVoiceId || data.voices[0].id}`;
+                try { localStorage.setItem(STORAGE_KEY, defaultId); } catch {}
+                try { localStorage.setItem(STORAGE_PROVIDER_KEY, 'elevenlabs'); } catch {}
+                setProvider('elevenlabs');
+                return defaultId;
+              });
+            }
+          }
+        }
+      } catch {
+        // ElevenLabs unavailable, continue with browser voices
       }
+
+      // Add browser voices as fallback
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        const loadBrowser = () => {
+          const bv = speechSynthesis.getVoices();
+          const english = bv.filter(v => v.lang.startsWith('en'));
+          for (const v of english) {
+            allVoices.push({
+              id: `br:${v.voiceURI}`,
+              name: `${v.name} (browser)`,
+              provider: 'browser',
+            });
+          }
+          if (!cancelled) setVoices([...allVoices]);
+        };
+
+        const bv = speechSynthesis.getVoices();
+        if (bv.length > 0) {
+          loadBrowser();
+        } else {
+          speechSynthesis.addEventListener('voiceschanged', loadBrowser, { once: true });
+        }
+      }
+
+      if (!cancelled) setVoices(prev => prev.length > 0 ? prev : [...allVoices]);
     };
 
-    load();
-    speechSynthesis.addEventListener('voiceschanged', load);
-    return () => speechSynthesis.removeEventListener('voiceschanged', load);
+    loadVoices();
+    return () => { cancelled = true; };
   }, []);
 
-  const selectVoice = useCallback((uri: string) => {
-    setSelectedURI(uri);
-    try { localStorage.setItem(STORAGE_KEY, uri); } catch {}
+  const selectVoice = useCallback((id: string) => {
+    setSelectedId(id);
+    const prov = id.startsWith('el:') ? 'elevenlabs' : 'browser';
+    setProvider(prov);
+    try { localStorage.setItem(STORAGE_KEY, id); } catch {}
+    try { localStorage.setItem(STORAGE_PROVIDER_KEY, prov); } catch {}
   }, []);
 
-  const getVoice = useCallback((): SpeechSynthesisVoice | null => {
-    return voices.find(v => v.voiceURI === selectedURI) || null;
-  }, [voices, selectedURI]);
+  const speak = useCallback(async (text: string, msgId?: string): Promise<void> => {
+    // Stop any current playback
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+    speechSynthesis.cancel();
 
-  return { voices, selectedURI, selectVoice, getVoice };
+    if (speakingId === msgId) {
+      setSpeakingId(null);
+      return;
+    }
+
+    if (!text.trim()) return;
+
+    const voice = voices.find(v => v.id === selectedId);
+    const isElevenLabs = voice?.provider === 'elevenlabs' || selectedId.startsWith('el:');
+
+    if (isElevenLabs) {
+      const voiceId = selectedId.replace(/^el:/, '');
+      setSpeakingId(msgId || 'anon');
+      try {
+        const resp = await fetch('/api/tts/speak', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: text.slice(0, 5000), voiceId }),
+        });
+        if (!resp.ok) throw new Error('TTS failed');
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        audioRef.current = audio;
+        audio.onended = () => {
+          setSpeakingId(null);
+          URL.revokeObjectURL(url);
+          audioRef.current = null;
+        };
+        audio.onerror = () => {
+          setSpeakingId(null);
+          URL.revokeObjectURL(url);
+          audioRef.current = null;
+        };
+        await audio.play();
+      } catch {
+        setSpeakingId(null);
+      }
+    } else {
+      const uri = selectedId.replace(/^br:/, '');
+      const utter = new SpeechSynthesisUtterance(text);
+      const bv = speechSynthesis.getVoices().find(v => v.voiceURI === uri);
+      if (bv) utter.voice = bv;
+      utter.rate = 1.1;
+      setSpeakingId(msgId || 'anon');
+      utter.onend = () => setSpeakingId(null);
+      utter.onerror = () => setSpeakingId(null);
+      speechSynthesis.speak(utter);
+    }
+  }, [voices, selectedId, speakingId]);
+
+  const stopSpeaking = useCallback(() => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+    speechSynthesis.cancel();
+    setSpeakingId(null);
+  }, []);
+
+  return { voices, selectedId, selectVoice, speak, stopSpeaking, speakingId };
 }

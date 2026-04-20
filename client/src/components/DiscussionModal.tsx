@@ -48,38 +48,26 @@ function stripMarkdownForSpeech(md: string): string {
     .trim();
 }
 
-const hasTTS = typeof window !== 'undefined' && 'speechSynthesis' in window;
+interface MessageRowProps {
+  msg: DiscussionMessage;
+  hostWorkspaceName?: string;
+  participants?: DiscussionParticipant[];
+  onSpeak?: (text: string, msgId: string) => void;
+  isSpeaking?: boolean;
+}
 
-const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName, participants, ttsVoice }: { msg: DiscussionMessage; hostWorkspaceName?: string; participants?: DiscussionParticipant[]; ttsVoice?: SpeechSynthesisVoice | null }) {
-  const [speaking, setSpeaking] = useState(false);
-  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
-
+const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName, participants, onSpeak, isSpeaking }: MessageRowProps) {
   const strippedContent = msg.role === 'assistant'
     ? msg.content.replace(TASK_REQUEST_RE, '').replace(MENTION_RE, '').trim()
     : msg.content;
 
   const handleSpeak = (e: ReactMouseEvent) => {
     e.stopPropagation();
-    if (speaking) {
-      speechSynthesis.cancel();
-      setSpeaking(false);
-      return;
-    }
+    if (!onSpeak) return;
     const text = stripMarkdownForSpeech(strippedContent);
     if (!text) return;
-    const utter = new SpeechSynthesisUtterance(text);
-    if (ttsVoice) utter.voice = ttsVoice;
-    utter.rate = 1.1;
-    utter.onend = () => setSpeaking(false);
-    utter.onerror = () => setSpeaking(false);
-    utteranceRef.current = utter;
-    setSpeaking(true);
-    speechSynthesis.speak(utter);
+    onSpeak(text, msg.id);
   };
-
-  useEffect(() => {
-    return () => { speechSynthesis.cancel(); };
-  }, []);
 
   // Determine the label for assistant messages
   const assistantLabel = msg.role === 'assistant'
@@ -118,17 +106,17 @@ const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName, participan
           )}
         </span>
         <div className="flex items-center gap-2">
-          {msg.role === 'assistant' && hasTTS && (
+          {msg.role === 'assistant' && onSpeak && (
             <button
               onClick={handleSpeak}
               className={`p-0.5 rounded transition-colors ${
-                speaking
+                isSpeaking
                   ? 'text-purple-500 dark:text-purple-400'
                   : 'text-gray-300 dark:text-gray-600 hover:text-gray-500 dark:hover:text-gray-400'
               }`}
-              title={speaking ? 'Stop speaking' : 'Read aloud'}
+              title={isSpeaking ? 'Stop speaking' : 'Read aloud'}
             >
-              {speaking ? (
+              {isSpeaking ? (
                 <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
                   <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zM7 8a1 1 0 012 0v4a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" />
                 </svg>
@@ -221,7 +209,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     onSilenceTimeout: handleVoiceSilence,
   });
 
-  const { voices: ttsVoices, selectedURI: ttsSelectedURI, selectVoice: ttsSelectVoice, getVoice: ttsGetVoice } = useTTSVoice();
+  const { voices: ttsVoices, selectedId: ttsSelectedId, selectVoice: ttsSelectVoice, speak: ttsSpeak, speakingId: ttsSpeakingId } = useTTSVoice();
 
   // Initial load: fetch latest 50 messages
   // Subsequent polls: only fetch messages after the last known ID
@@ -666,7 +654,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
               )}
 
               {visibleMessages.map((msg) => (
-                <MessageRow key={msg.id} msg={msg} hostWorkspaceName={workspaceName} participants={participants} ttsVoice={ttsGetVoice()} />
+                <MessageRow key={msg.id} msg={msg} hostWorkspaceName={workspaceName} participants={participants} onSpeak={ttsVoices.length > 0 ? ttsSpeak : undefined} isSpeaking={ttsSpeakingId === msg.id} />
               ))}
 
               {/* Working indicator */}
@@ -850,16 +838,16 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                     >
                       End Discussion
                     </button>
-                    {hasTTS && ttsVoices.length > 0 && (
+                    {ttsVoices.length > 0 && (
                       <select
-                        value={ttsSelectedURI}
+                        value={ttsSelectedId}
                         onChange={(e) => ttsSelectVoice(e.target.value)}
                         className="text-[10px] px-1.5 py-0.5 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-500 dark:text-gray-400 focus:outline-none focus:ring-1 focus:ring-purple-500 max-w-[160px]"
                         title="Text-to-speech voice"
                       >
                         {ttsVoices.map(v => (
-                          <option key={v.voiceURI} value={v.voiceURI}>
-                            {v.name.replace(/^(Microsoft|Google)\s+/, '')}
+                          <option key={v.id} value={v.id}>
+                            {v.name}
                           </option>
                         ))}
                       </select>
