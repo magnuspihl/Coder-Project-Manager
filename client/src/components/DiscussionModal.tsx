@@ -267,6 +267,9 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const [wsVoiceSettings, setWsVoiceSettings] = useState<Record<string, string[]>>({});
   const wsVoiceSettingsRef = useRef(wsVoiceSettings);
   wsVoiceSettingsRef.current = wsVoiceSettings;
+  const [wsDefaultVoices, setWsDefaultVoices] = useState<Record<string, string | null>>({});
+  const wsDefaultVoicesRef = useRef(wsDefaultVoices);
+  wsDefaultVoicesRef.current = wsDefaultVoices;
 
   // Resolve workspace ID for a message (null participant_id = host workspace)
   const getMsgWorkspaceId = useCallback((msg: DiscussionMessage): string => {
@@ -419,7 +422,10 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     for (const id of wsIds) {
       if (id in wsVoiceSettings) continue;
       getWorkspaceVoiceSettings(id)
-        .then(({ voiceIds }) => setWsVoiceSettings(prev => ({ ...prev, [id]: voiceIds })))
+        .then(({ voiceIds, defaultVoiceId }) => {
+          setWsVoiceSettings(prev => ({ ...prev, [id]: voiceIds }));
+          setWsDefaultVoices(prev => ({ ...prev, [id]: defaultVoiceId }));
+        })
         .catch(() => setWsVoiceSettings(prev => ({ ...prev, [id]: [] })));
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -459,7 +465,10 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
           const stripped = stripMarkdownForSpeech(
             m.content.replace(TASK_REQUEST_RE, '').replace(MENTION_RE, '').trim()
           );
-          return { content: stripped, id: m.id, voiceIds: wsVoiceSettingsRef.current[wsId] ?? [] };
+          const explicit = wsVoiceSettingsRef.current[wsId] ?? [];
+          const def = wsDefaultVoicesRef.current[wsId];
+          const voiceIds = def && !explicit.includes(def) ? [...explicit, def] : explicit;
+          return { content: stripped, id: m.id, voiceIds };
         });
         ttsSpeakQueueRef.current = queue.slice(1);
         const first = queue[0];
@@ -834,7 +843,9 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                 let onSpeak: ((text: string, msgId: string) => void) | undefined;
                 if (ttsVoices.length > 0) {
                   const wsId = getMsgWorkspaceId(msg);
-                  const voiceIds = wsVoiceSettings[wsId] ?? [];
+                  const explicit = wsVoiceSettings[wsId] ?? [];
+                  const def = wsDefaultVoices[wsId];
+                  const voiceIds = def && !explicit.includes(def) ? [...explicit, def] : explicit;
                   onSpeak = (text, mid) => {
                     if (ttsSpeakingId === mid) { ttsStop(); return; }
                     ttsSpeakAs(text, mid, voiceIds);

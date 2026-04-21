@@ -122,6 +122,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [wsVoiceSettings, setWsVoiceSettings] = useState<Record<string, string[]>>({});
   const wsVoiceSettingsRef = useRef(wsVoiceSettings);
   wsVoiceSettingsRef.current = wsVoiceSettings;
+  const [wsDefaultVoices, setWsDefaultVoices] = useState<Record<string, string | null>>({});
+  const wsDefaultVoicesRef = useRef(wsDefaultVoices);
+  wsDefaultVoicesRef.current = wsDefaultVoices;
 
   const handleRecorderTranscript = useCallback((text: string) => {
     setReply(text);
@@ -497,7 +500,10 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     for (const id of wsIds) {
       if (id in wsVoiceSettings) continue;
       getWorkspaceVoiceSettings(id)
-        .then(({ voiceIds }) => setWsVoiceSettings(prev => ({ ...prev, [id]: voiceIds })))
+        .then(({ voiceIds, defaultVoiceId }) => {
+          setWsVoiceSettings(prev => ({ ...prev, [id]: voiceIds }));
+          setWsDefaultVoices(prev => ({ ...prev, [id]: defaultVoiceId }));
+        })
         .catch(() => setWsVoiceSettings(prev => ({ ...prev, [id]: [] })));
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -520,7 +526,10 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
         const wsId = lastAssistant.participant_id
           ? (participantsRef.current.find(p => p.id === lastAssistant.participant_id)?.workspace_id ?? task?.workspace_id ?? '')
           : (task?.workspace_id ?? '');
-        ttsSpeakAs(lastAssistant.content, lastAssistant.id, wsVoiceSettingsRef.current[wsId] ?? []);
+        const explicit = wsVoiceSettingsRef.current[wsId] ?? [];
+        const def = wsDefaultVoicesRef.current[wsId];
+        const voiceIds = def && !explicit.includes(def) ? [...explicit, def] : explicit;
+        ttsSpeakAs(lastAssistant.content, lastAssistant.id, voiceIds);
       }
     }
   }, [isAnyRunning, voiceModeActive, isListening, startListening, conversationMode, ttsVoices.length, ttsSpeakAs, task?.workspace_id]);
@@ -743,7 +752,10 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                                 ? (participants.find(p => p.id === msg.participant_id)?.workspace_id ?? task?.workspace_id ?? '')
                                 : (task?.workspace_id ?? '');
                               if (ttsSpeakingId === msg.id) { ttsStop(); return; }
-                              ttsSpeakAs(msg.content, msg.id, wsVoiceSettings[wsId] ?? []);
+                              const explicit = wsVoiceSettings[wsId] ?? [];
+                              const def = wsDefaultVoices[wsId];
+                              const voiceIds = def && !explicit.includes(def) ? [...explicit, def] : explicit;
+                              ttsSpeakAs(msg.content, msg.id, voiceIds);
                             }}
                             className={`p-0.5 rounded transition-colors ${ttsSpeakingId === msg.id ? 'text-purple-600 dark:text-purple-400' : 'text-gray-300 dark:text-gray-600 hover:text-purple-500 dark:hover:text-purple-400'}`}
                             title={ttsSpeakingId === msg.id ? 'Stop' : 'Read aloud'}

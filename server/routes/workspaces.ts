@@ -194,21 +194,21 @@ const KOKORO_VOICE_IDS = [
 function assignDefaultVoices(workspaceIds: string[]): void {
   const db = getDb();
   const { c: assignedCount } = db
-    .prepare('SELECT COUNT(*) as c FROM workspace_settings WHERE voice_ids IS NOT NULL')
+    .prepare('SELECT COUNT(*) as c FROM workspace_settings WHERE default_voice_id IS NOT NULL')
     .get() as { c: number };
   let nextIdx = assignedCount;
   const now = new Date().toISOString();
   for (const id of workspaceIds) {
     const row = db
-      .prepare('SELECT voice_ids FROM workspace_settings WHERE workspace_id = ?')
-      .get(id) as { voice_ids: string | null } | undefined;
-    if (!row || row.voice_ids === null) {
+      .prepare('SELECT default_voice_id FROM workspace_settings WHERE workspace_id = ?')
+      .get(id) as { default_voice_id: string | null } | undefined;
+    if (!row || row.default_voice_id === null) {
       const voiceId = KOKORO_VOICE_IDS[nextIdx % KOKORO_VOICE_IDS.length];
       db.prepare(
-        `INSERT INTO workspace_settings (workspace_id, voice_ids, updated_at)
+        `INSERT INTO workspace_settings (workspace_id, default_voice_id, updated_at)
          VALUES (?, ?, ?)
-         ON CONFLICT(workspace_id) DO UPDATE SET voice_ids = excluded.voice_ids, updated_at = excluded.updated_at`
-      ).run(id, JSON.stringify([voiceId]), now);
+         ON CONFLICT(workspace_id) DO UPDATE SET default_voice_id = excluded.default_voice_id, updated_at = excluded.updated_at`
+      ).run(id, voiceId, now);
       nextIdx++;
     }
   }
@@ -237,10 +237,11 @@ router.patch('/:workspaceId/git-settings', requireAuth, (req: Request, res: Resp
 
 // Voice settings
 router.get('/:workspaceId/voice-settings', requireAuth, (req: Request, res: Response) => {
-  const row = getDb().prepare('SELECT voice_ids FROM workspace_settings WHERE workspace_id = ?')
-    .get(req.params.workspaceId) as { voice_ids: string | null } | undefined;
+  const row = getDb().prepare('SELECT voice_ids, default_voice_id FROM workspace_settings WHERE workspace_id = ?')
+    .get(req.params.workspaceId) as { voice_ids: string | null; default_voice_id: string | null } | undefined;
   const voiceIds: string[] = row?.voice_ids ? JSON.parse(row.voice_ids) : [];
-  res.json({ voiceIds });
+  const defaultVoiceId: string | null = row?.default_voice_id ?? null;
+  res.json({ voiceIds, defaultVoiceId });
 });
 
 router.patch('/:workspaceId/voice-settings', requireAuth, (req: Request, res: Response) => {

@@ -364,7 +364,7 @@ export const updateGitSettings = (workspaceId: string, gitPushEnabled: boolean) 
   });
 
 export const getWorkspaceVoiceSettings = (workspaceId: string) =>
-  request<{ voiceIds: string[] }>(`/api/workspaces/${workspaceId}/voice-settings`);
+  request<{ voiceIds: string[]; defaultVoiceId: string | null }>(`/api/workspaces/${workspaceId}/voice-settings`);
 
 export const updateWorkspaceVoiceSettings = (workspaceId: string, voiceIds: string[]) =>
   request<{ ok: boolean; voiceIds: string[] }>(`/api/workspaces/${workspaceId}/voice-settings`, {

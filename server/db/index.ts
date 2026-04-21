@@ -133,6 +133,21 @@ export function getDb(): Database.Database {
       db.exec("ALTER TABLE workspace_settings ADD COLUMN voice_ids TEXT");
     }
 
+    if (!wsCols.some(c => c.name === 'default_voice_id')) {
+      db.exec("ALTER TABLE workspace_settings ADD COLUMN default_voice_id TEXT");
+      // Migrate: single-kokoro voice_ids entries were auto-assigned defaults —
+      // move them to default_voice_id and clear voice_ids so they don't show
+      // as user selections.
+      db.exec(`
+        UPDATE workspace_settings
+        SET default_voice_id = json_extract(voice_ids, '$[0]'),
+            voice_ids = NULL
+        WHERE voice_ids IS NOT NULL
+          AND json_array_length(voice_ids) = 1
+          AND json_extract(voice_ids, '$[0]') LIKE 'kokoro:%'
+      `);
+    }
+
     // Discussion messages migrations
     const dmCols = db.prepare("PRAGMA table_info(discussion_messages)").all() as Array<{ name: string }>;
     if (!dmCols.some(c => c.name === 'participant_id')) {

@@ -124,6 +124,7 @@ export default function WorkspacesPage() {
   const [settingsOpenWsId, setSettingsOpenWsId] = useState<string | null>(null);
   const [gitPushSettings, setGitPushSettings] = useState<Record<string, boolean>>({});
   const [wsVoiceSettings, setWsVoiceSettings] = useState<Record<string, string[]>>({});
+  const [wsDefaultVoices, setWsDefaultVoices] = useState<Record<string, string | null>>({});
   const [availableVoices, setAvailableVoices] = useState<Array<{ id: string; name: string }>>([]);
   const availableVoicesLoadedRef = useRef(false);
   const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -603,7 +604,10 @@ export default function WorkspacesPage() {
     // raced ahead of this fetch; don't clobber the already-updated state)
     if (!(workspaceId in wsVoiceSettings)) {
       getWorkspaceVoiceSettings(workspaceId)
-        .then(({ voiceIds }) => setWsVoiceSettings(prev => workspaceId in prev ? prev : { ...prev, [workspaceId]: voiceIds }))
+        .then(({ voiceIds, defaultVoiceId }) => {
+          setWsVoiceSettings(prev => workspaceId in prev ? prev : { ...prev, [workspaceId]: voiceIds });
+          setWsDefaultVoices(prev => ({ ...prev, [workspaceId]: defaultVoiceId }));
+        })
         .catch(() => setWsVoiceSettings(prev => workspaceId in prev ? prev : { ...prev, [workspaceId]: [] }));
     }
     // Load available voices once (Kokoro + ElevenLabs)
@@ -1035,11 +1039,14 @@ export default function WorkspacesPage() {
                   )}
                 </select>
                 {(() => {
-                  const fallbackId = (() => { try { return localStorage.getItem('tts:voiceId') ?? 'kokoro:af_sarah'; } catch { return 'kokoro:af_sarah'; } })();
-                  const fallbackName = availableVoices.find(v => v.id === fallbackId)?.name
-                    ?? KOKORO_VOICES.find(v => `kokoro:${v.id}` === fallbackId)?.name
-                    ?? fallbackId.replace(/^(kokoro:|el:|br:)/, '');
+                  const defaultId = wsDefaultVoices[ws.id] ?? null;
+                  const fallbackName = defaultId
+                    ? (availableVoices.find(v => v.id === defaultId)?.name
+                        ?? KOKORO_VOICES.find(v => `kokoro:${v.id}` === defaultId)?.name
+                        ?? defaultId.replace(/^(kokoro:|el:|br:)/, ''))
+                    : null;
                   const hasVoices = (wsVoiceSettings[ws.id] ?? []).length > 0;
+                  if (!fallbackName) return null;
                   return (
                     <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700/50 text-gray-400 dark:text-gray-500 rounded-full text-[10px] leading-tight italic">
                       {hasVoices ? '↩ ' : ''}{fallbackName}
