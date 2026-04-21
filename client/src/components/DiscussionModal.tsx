@@ -288,8 +288,12 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
         }
         initialLoadDone.current = true;
       } else if (data.messages.length > 0) {
-        // Incremental — append new messages
-        setMessages(prev => [...prev, ...data.messages]);
+        // Incremental — append only messages not already in state (guards against concurrent loadData calls)
+        setMessages(prev => {
+          const existingIds = new Set(prev.map(m => m.id));
+          const fresh = data.messages.filter(m => !existingIds.has(m.id));
+          return fresh.length > 0 ? [...prev, ...fresh] : prev;
+        });
         lastMessageIdRef.current = data.messages[data.messages.length - 1].id;
       }
     } catch {
