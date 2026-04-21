@@ -14,10 +14,10 @@ export interface KokoroVoice {
 }
 
 export const KOKORO_VOICES: KokoroVoice[] = [
-  { id: 'af_heart',    name: 'Heart',    accent: 'American', gender: 'Female' },
+  { id: 'af_sarah',    name: 'Sarah',    accent: 'American', gender: 'Female' },
+  { id: 'af_sky',      name: 'Sky',      accent: 'American', gender: 'Female' },
   { id: 'af_bella',    name: 'Bella',    accent: 'American', gender: 'Female' },
   { id: 'af_nicole',   name: 'Nicole',   accent: 'American', gender: 'Female' },
-  { id: 'af_sky',      name: 'Sky',      accent: 'American', gender: 'Female' },
   { id: 'am_adam',     name: 'Adam',     accent: 'American', gender: 'Male'   },
   { id: 'am_michael',  name: 'Michael',  accent: 'American', gender: 'Male'   },
   { id: 'bf_emma',     name: 'Emma',     accent: 'British',  gender: 'Female' },
@@ -52,7 +52,7 @@ export async function getKokoroPipeline(): Promise<Synthesizer> {
 
   initPromise = pipeline(
     'text-to-speech',
-    'onnx-community/Kokoro-82M-v1.0',
+    'onnx-community/Kokoro-82M-ONNX',
     {
       progress_callback: (info: Record<string, unknown>) => {
         const status = info.status as string;

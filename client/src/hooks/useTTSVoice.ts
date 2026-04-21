@@ -30,7 +30,7 @@ interface ElevenLabsResponse {
   defaultVoiceId?: string;
 }
 
-const DEFAULT_VOICE_ID = 'kokoro:af_heart';
+const DEFAULT_VOICE_ID = 'kokoro:af_sarah';
 
 export function useTTSVoice() {
   const [voices, setVoices] = useState<TTSVoice[]>(() =>
