@@ -203,7 +203,7 @@ export const getModels = (workspaceId: string) =>
 // Uploads
 // Tasks
 export const getTasks = (workspaceId: string) =>
-  request<{ tasks: Task[] }>(`/api/workspaces/${workspaceId}/tasks`);
+  request<{ tasks: Task[]; activeTaskId: string | null }>(`/api/workspaces/${workspaceId}/tasks`);
 
 export const createTask = (workspaceId: string, prompt: string, branch?: string, model?: string, caveman?: string, attachmentIds?: string[]) =>
   request<{ task: Task }>(`/api/workspaces/${workspaceId}/tasks`, {
@@ -222,7 +222,7 @@ export interface AttachmentInfo {
 }
 
 export const getTaskDetail = (taskId: string) =>
-  request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[] }>(`/api/tasks/${taskId}`);
+  request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[]; activeTaskId: string | null }>(`/api/tasks/${taskId}`);
 
 export const getStreamLog = (taskId: string, afterId?: number) =>
   request<{ streamLog: StreamLogEntry[] }>(`/api/tasks/${taskId}/stream-log${afterId ? `?after=${afterId}` : ''}`);
@@ -266,6 +266,9 @@ export const retryTask = (taskId: string) =>
 
 export const checkoutTaskBranch = (taskId: string) =>
   request<{ ok: boolean; message: string }>(`/api/tasks/${taskId}/checkout`, { method: 'POST' });
+
+export const setActiveTask = (taskId: string) =>
+  request<{ ok: boolean; message: string; activeTaskId: string }>(`/api/tasks/${taskId}/set-active`, { method: 'POST' });
 
 export const interruptTask = (taskId: string) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/interrupt`, { method: 'POST' });

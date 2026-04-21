@@ -10,6 +10,7 @@ import {
   cancelTask,
   deleteTask,
   checkoutTaskBranch,
+  setActiveTask,
   addTaskParticipant,
   removeTaskParticipant,
   sendTaskParticipantMessage,
@@ -73,6 +74,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [sending, setSending] = useState(false);
   const [idCopied, setIdCopied] = useState(false);
   const [checkingOut, setCheckingOut] = useState(false);
+  const [settingActive, setSettingActive] = useState(false);
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [completing, setCompleting] = useState(false);
   const [participants, setParticipants] = useState<TaskParticipant[]>([]);
   const [targetParticipantId, setTargetParticipantId] = useState<string | null>(null);
@@ -152,7 +155,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
   const loadData = async () => {
     try {
-      const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments } = await getTaskDetail(taskId);
+      const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments, activeTaskId: newActiveTaskId } = await getTaskDetail(taskId);
+      setActiveTaskId(newActiveTaskId);
       if (prevStatusRef.current && prevStatusRef.current !== 'awaiting_feedback' && newTask.status === 'awaiting_feedback') {
         playChime();
       }
@@ -401,6 +405,19 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     }
   };
 
+  const handleSetActive = async () => {
+    setSettingActive(true);
+    try {
+      const { activeTaskId: newActive } = await setActiveTask(taskId);
+      setActiveTaskId(newActive);
+      await loadData();
+    } catch (err: any) {
+      alert(err?.message || 'Failed to set active task');
+    } finally {
+      setSettingActive(false);
+    }
+  };
+
   const handleInterrupt = async () => {
     await interruptTask(taskId);
     if (onTaskChanged) onTaskChanged();
@@ -548,10 +565,33 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
             <div className="flex items-start justify-between gap-3 p-5 border-b border-gray-200 dark:border-gray-800">
               <div className="flex-1 min-w-0">
                 <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100 truncate">{task.title}</h2>
-                <div className="flex items-center gap-2 mt-1">
+                <div className="flex items-center gap-2 mt-1 flex-wrap">
                   <span className={`text-xs px-2 py-0.5 rounded-full ${STATUS_COLORS[task.status] || ''}`}>
                     {task.status.replace('_', ' ')}
                   </span>
+                  {activeTaskId === task.id ? (
+                    <span
+                      className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-900/20 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800"
+                      title="This task's changes are currently in the workspace"
+                    >
+                      <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" /></svg>
+                      active
+                    </span>
+                  ) : (task.status !== 'working' && task.status !== 'completed') && (
+                    <button
+                      onClick={handleSetActive}
+                      disabled={settingActive}
+                      className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:text-emerald-700 dark:hover:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 hover:border-emerald-200 dark:hover:border-emerald-800 transition-colors disabled:opacity-50"
+                      title="Restore this task's stash and make its changes visible in the workspace"
+                    >
+                      {settingActive ? (
+                        <div className="w-3 h-3 border border-current border-t-transparent rounded-full animate-spin" />
+                      ) : (
+                        <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M13 5l7 7-7 7M5 5l7 7-7 7" /></svg>
+                      )}
+                      set active
+                    </button>
+                  )}
                   <span className="text-xs text-gray-400 dark:text-gray-500">{task.workspace_name}</span>
                   {task.model && (
                     <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${

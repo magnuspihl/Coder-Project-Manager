@@ -148,7 +148,7 @@ async function findStashIndex(workspaceName: string, projectDir: string, taskId:
 /**
  * Get the last active task ID for a workspace.
  */
-function getLastActiveTaskId(workspaceId: string): string | null {
+export function getLastActiveTaskId(workspaceId: string): string | null {
   const row = getDb().prepare('SELECT last_active_task_id FROM workspace_settings WHERE workspace_id = ?')
     .get(workspaceId) as { last_active_task_id: string | null } | undefined;
   return row?.last_active_task_id || null;
@@ -255,6 +255,45 @@ export async function handleStashAway(task: Task): Promise<void> {
  */
 export async function handleTaskResumeGit(task: Task): Promise<void> {
   await handleSwitchToTask(task);
+}
+
+// ─── Manual stash activation ────────────────────────────────────────────
+
+/**
+ * Make a task the "active" one for its workspace: stash any other task's
+ * changes, restore this task's stash (if any), and mark it active.
+ * Returns a human-readable status message. Throws on failure.
+ */
+export async function switchActiveTask(task: Task): Promise<string> {
+  const dir = task.project_dir;
+  if (!dir) throw new Error('No project directory for this task');
+
+  const ws = task.workspace_name;
+  if (!await hasGitRepo(ws, dir)) {
+    throw new Error('Workspace has no git repository');
+  }
+
+  const lastActiveId = getLastActiveTaskId(task.workspace_id);
+  if (lastActiveId === task.id) {
+    return 'Already the active task';
+  }
+
+  if (lastActiveId && lastActiveId !== task.id) {
+    const status = await sshExec(ws, `cd ${dir} && git status --porcelain`);
+    if (status.trim()) {
+      await sshExec(ws, `cd ${dir} && git stash push --include-untracked -m "${stashTag(lastActiveId)}"`, 30000);
+    }
+  }
+
+  const idx = await findStashIndex(ws, dir, task.id);
+  let restored = false;
+  if (idx >= 0) {
+    await sshExec(ws, `cd ${dir} && git stash pop stash@{${idx}}`, 30000);
+    restored = true;
+  }
+
+  setLastActiveTaskId(task.workspace_id, task.id);
+  return restored ? 'Restored this task\'s changes to the workspace' : 'Workspace is now showing this task (no prior changes)';
 }
 
 // ─── Manual branch checkout ─────────────────────────────────────────────
