@@ -1,4 +1,4 @@
-import { KokoroTTS } from 'kokoro-js';
+import { KokoroTTS, TextSplitterStream } from 'kokoro-js';
 import { env } from '@huggingface/transformers';
 
 (env as Record<string, unknown>).useFS = false;
@@ -58,7 +58,14 @@ self.addEventListener('message', async (event: MessageEvent) => {
 
     if (type === 'stream') {
       if (!tts) throw new Error('Model not loaded');
-      for await (const chunk of tts.stream(text!, { voice: voice as never })) {
+      // tts.stream(string) passes text to a TextSplitterStream internally but never
+      // calls close() on it, so the async iterator hangs after the last sentence.
+      // Use TextSplitterStream directly and close it to flush remaining text.
+      const splitter = new TextSplitterStream();
+      const stream = tts.stream(splitter, { voice: voice as never });
+      splitter.push(text!);
+      splitter.close();
+      for await (const chunk of stream) {
         const audio = chunk.audio.audio as Float32Array;
         send(
           { id, type: 'audio-chunk', audio, sampling_rate: chunk.audio.sampling_rate },
