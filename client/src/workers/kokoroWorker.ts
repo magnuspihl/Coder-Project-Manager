@@ -85,25 +85,24 @@ self.addEventListener('message', async (event: MessageEvent) => {
       if (!loadPromise) {
         loadPromise = (async () => {
           const hasWebGPU = typeof navigator !== 'undefined' && 'gpu' in navigator;
-          // fp16 uses standard half-precision GPU ops; q4f16 custom dequant shaders
-          // produce NaN on some GPU/driver combinations.
-          const dtype = hasWebGPU ? 'fp16' : 'q4';
-          const device = hasWebGPU ? 'webgpu' : 'wasm';
           const progress = (info: Record<string, unknown>) => send({ type: 'progress', info });
 
-          try {
-            console.log(`[Kokoro Worker] Loading device=${device} dtype=${dtype}`);
-            tts = await KokoroTTS.from_pretrained(MODEL_ID, {
-              dtype, device, progress_callback: progress,
-            } as never);
-            currentDevice = device;
-          } catch (e) {
-            if (hasWebGPU) {
-              console.warn('[Kokoro Worker] WebGPU load failed, retrying with WASM q4:', e);
+          if (hasWebGPU) {
+            // Try fp32 first — fp16/q4f16 suffer NaN on some GPUs due to softmax
+            // overflow in half-precision arithmetic. fp32 avoids this entirely.
+            // Fall back to WASM if WebGPU load throws or runtime audio is bad.
+            try {
+              console.log('[Kokoro Worker] Loading device=webgpu dtype=fp32');
+              tts = await KokoroTTS.from_pretrained(MODEL_ID, {
+                dtype: 'fp32', device: 'webgpu', progress_callback: progress,
+              } as never);
+              currentDevice = 'webgpu';
+            } catch (e) {
+              console.warn('[Kokoro Worker] WebGPU fp32 load failed, falling back to WASM:', e);
               await loadWasm(progress);
-            } else {
-              throw e;
             }
+          } else {
+            await loadWasm(progress);
           }
         })();
       }
