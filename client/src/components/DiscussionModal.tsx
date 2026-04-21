@@ -203,6 +203,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   conversationModeRef.current = conversationMode;
   const lastAutoSpokenMsgIdRef = useRef<string | null>(null);
   const prevTtsSpeakingIdRef = useRef<string | null>(null);
+  const ttsSpeakQueueRef = useRef<Array<{ content: string; id: string; voiceIds: string[] }>>([]);
 
   const toggleConversationMode = useCallback(() => {
     setConversationMode(v => {
@@ -445,27 +446,40 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
 
     if (willAutoSpeak) {
       const msgs = visibleMessagesRef.current;
-      const lastAssistant = [...msgs].reverse().find(m => m.role === 'assistant');
-      if (lastAssistant && lastAssistant.id !== lastAutoSpokenMsgIdRef.current) {
-        lastAutoSpokenMsgIdRef.current = lastAssistant.id;
-        const wsId = lastAssistant.participant_id
-          ? (participants.find(p => p.id === lastAssistant.participant_id)?.workspace_id ?? workspaceId)
-          : workspaceId;
-        const voiceIds = wsVoiceSettingsRef.current[wsId] ?? [];
-        ttsSpeakAs(lastAssistant.content, lastAssistant.id, voiceIds);
+      const lastSpokenId = lastAutoSpokenMsgIdRef.current;
+      const lastSpokenIdx = lastSpokenId ? msgs.findIndex(m => m.id === lastSpokenId) : -1;
+      const unspoken = msgs
+        .slice(lastSpokenIdx + 1)
+        .filter(m => m.role === 'assistant');
+
+      if (unspoken.length > 0) {
+        lastAutoSpokenMsgIdRef.current = unspoken[unspoken.length - 1].id;
+        const queue = unspoken.map(m => {
+          const wsId = m.participant_id
+            ? (participants.find(p => p.id === m.participant_id)?.workspace_id ?? workspaceId)
+            : workspaceId;
+          return { content: m.content, id: m.id, voiceIds: wsVoiceSettingsRef.current[wsId] ?? [] };
+        });
+        ttsSpeakQueueRef.current = queue.slice(1);
+        const first = queue[0];
+        ttsSpeakAs(first.content, first.id, first.voiceIds);
       }
     }
   }, [isAnyRunning, voiceModeActive, isListening, startListening, conversationMode, ttsVoices.length, ttsSpeakAs, workspaceId, participants]);
 
-  // After TTS finishes in conversation mode, auto-re-listen so the loop continues
+  // After TTS finishes: play next queued message, or re-listen when queue is empty
   useEffect(() => {
     const prev = prevTtsSpeakingIdRef.current;
     prevTtsSpeakingIdRef.current = ttsSpeakingId;
-    if (prev !== null && ttsSpeakingId === null && conversationMode && voiceModeActive && !isListening) {
+    if (prev === null || ttsSpeakingId !== null || !conversationMode || !voiceModeActive) return;
+    const next = ttsSpeakQueueRef.current.shift();
+    if (next) {
+      ttsSpeakAs(next.content, next.id, next.voiceIds);
+    } else if (!isListening) {
       playListenChime();
       startListening();
     }
-  }, [ttsSpeakingId, conversationMode, voiceModeActive, isListening, startListening]);
+  }, [ttsSpeakingId, conversationMode, voiceModeActive, isListening, startListening, ttsSpeakAs]);
 
   // Target display name
   const targetName = targetId
