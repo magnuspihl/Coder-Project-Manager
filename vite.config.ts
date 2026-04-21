@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react()],
   root: 'client',
   optimizeDeps: {
-    exclude: ['@huggingface/transformers', 'kokoro-js'],
+    exclude: ['@huggingface/transformers', 'kokoro-js', 'onnxruntime-web'],
   },
   build: {
     outDir: '../dist/client',
