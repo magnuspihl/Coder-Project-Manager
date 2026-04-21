@@ -168,7 +168,7 @@ export function useTTSVoice() {
         unsub();
 
         console.log('[Kokoro] Synthesizing text, length:', text.length);
-        const out = await synth.generate(text.slice(0, 3000), { voice: voiceName as never });
+        const out = await synth.generate(text.slice(0, 3000), { voice: voiceName });
         console.log('[Kokoro] Got audio, samples:', out.audio?.length, 'rate:', out.sampling_rate);
 
         if (!out.audio?.length) throw new Error('Empty audio output');

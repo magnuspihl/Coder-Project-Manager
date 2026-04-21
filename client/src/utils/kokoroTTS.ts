@@ -1,4 +1,4 @@
-import { KokoroTTS } from 'kokoro-js';
+import KokoroWorkerConstructor from '../workers/kokoroWorker?worker';
 
 export interface KokoroVoice {
   id: string;
@@ -24,8 +24,6 @@ export const KOKORO_VOICES: KokoroVoice[] = [
   { id: 'bm_lewis',    name: 'Lewis',    accent: 'British',  gender: 'Male'   },
 ];
 
-const MODEL_ID = 'onnx-community/Kokoro-82M-v1.0-ONNX';
-
 type ProgressListener = (pct: number) => void;
 const progressListeners = new Set<ProgressListener>();
 
@@ -34,42 +32,91 @@ export function onKokoroProgress(cb: ProgressListener): () => void {
   return () => progressListeners.delete(cb);
 }
 
-let instance: KokoroTTS | null = null;
-let initPromise: Promise<KokoroTTS> | null = null;
+type Pending = { resolve: (data: unknown) => void; reject: (err: Error) => void };
 
-export function isKokoroLoaded(): boolean {
-  return instance !== null;
+let worker: Worker | null = null;
+let msgCounter = 0;
+const pending = new Map<number, Pending>();
+
+let loadPromise: Promise<void> | null = null;
+let loaded = false;
+
+function ensureWorker(): Worker {
+  if (worker) return worker;
+
+  const w = new KokoroWorkerConstructor();
+  worker = w;
+
+  w.onmessage = (evt: MessageEvent) => {
+    const { id, type, ...data } = evt.data as Record<string, unknown>;
+
+    if (type === 'progress') {
+      const info = data.info as Record<string, unknown>;
+      const pct = typeof info.progress === 'number' ? Math.round(info.progress) : null;
+      if (pct !== null) progressListeners.forEach(cb => cb(pct));
+      return;
+    }
+
+    const p = pending.get(id as number);
+    if (!p) return;
+    pending.delete(id as number);
+
+    if (type === 'error') {
+      p.reject(new Error(data.error as string));
+    } else {
+      p.resolve(data);
+    }
+  };
+
+  w.onerror = (err) => {
+    console.error('[Kokoro Worker] Uncaught error:', err.message);
+    for (const p of pending.values()) p.reject(new Error(err.message || 'Worker error'));
+    pending.clear();
+    worker = null;
+    loadPromise = null;
+    loaded = false;
+  };
+
+  return w;
 }
 
-export async function getKokoroPipeline(): Promise<KokoroTTS> {
-  if (instance) return instance;
-  if (initPromise) return initPromise;
-
-  console.log('[Kokoro] Loading pipeline...');
-
-  initPromise = KokoroTTS.from_pretrained(MODEL_ID, {
-    dtype: 'q4',
-    progress_callback: (info: Record<string, unknown>) => {
-      const status = info.status as string;
-      const file = info.file as string | undefined;
-      const pct = typeof info.progress === 'number' ? Math.round(info.progress) : null;
-      if (pct !== null) {
-        console.log(`[Kokoro] ${status} ${file || ''} ${pct}%`);
-        progressListeners.forEach(cb => cb(pct));
-      } else {
-        console.log(`[Kokoro] ${status} ${file || ''}`);
-      }
-    },
-  } as Parameters<typeof KokoroTTS.from_pretrained>[1]).then(tts => {
-    console.log('[Kokoro] Pipeline ready');
-    instance = tts;
-    progressListeners.forEach(cb => cb(100));
-    return instance;
-  }).catch(err => {
-    console.error('[Kokoro] Pipeline load failed:', err);
-    initPromise = null;
-    throw err;
+function workerCall<T>(type: string, data: Record<string, unknown> = {}): Promise<T> {
+  const id = ++msgCounter;
+  const w = ensureWorker();
+  return new Promise<T>((resolve, reject) => {
+    pending.set(id, { resolve: resolve as (d: unknown) => void, reject });
+    w.postMessage({ id, type, ...data });
   });
+}
 
-  return initPromise;
+export function isKokoroLoaded(): boolean {
+  return loaded;
+}
+
+export interface KokoroHandle {
+  generate(text: string, opts: { voice: string }): Promise<{ audio: Float32Array; sampling_rate: number }>;
+}
+
+export async function getKokoroPipeline(): Promise<KokoroHandle> {
+  if (!loadPromise) {
+    console.log('[Kokoro] Starting worker…');
+    loadPromise = workerCall<void>('load', { dtype: 'q4' }).then(() => {
+      loaded = true;
+      console.log('[Kokoro] Worker ready');
+      progressListeners.forEach(cb => cb(100));
+    }).catch(err => {
+      loadPromise = null;
+      throw err;
+    });
+  }
+
+  await loadPromise;
+
+  return {
+    generate(text: string, { voice }: { voice: string }) {
+      return workerCall<{ audio: Float32Array; sampling_rate: number }>(
+        'synthesize', { text, voice }
+      );
+    },
+  };
 }
