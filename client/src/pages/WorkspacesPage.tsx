@@ -973,9 +973,13 @@ export default function WorkspacesPage() {
                     </optgroup>
                   )}
                 </select>
-                {(wsVoiceSettings[ws.id] ?? []).length === 0 && (
-                  <span className="text-gray-400 dark:text-gray-500 text-[10px] italic">none (uses default)</span>
-                )}
+                {(wsVoiceSettings[ws.id] ?? []).length === 0 && (() => {
+                  const fallbackId = (() => { try { return localStorage.getItem('tts:voiceId') ?? 'kokoro:af_sarah'; } catch { return 'kokoro:af_sarah'; } })();
+                  const fallbackName = availableVoices.find(v => v.id === fallbackId)?.name
+                    ?? KOKORO_VOICES.find(v => `kokoro:${v.id}` === fallbackId)?.name
+                    ?? fallbackId.replace(/^(kokoro:|el:|br:)/, '');
+                  return <span className="text-gray-400 dark:text-gray-500 text-[10px] italic">none (uses default: {fallbackName})</span>;
+                })()}
               </div>
             </div>
           )}
