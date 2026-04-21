@@ -54,6 +54,7 @@ export async function getKokoroPipeline(): Promise<Synthesizer> {
     'text-to-speech',
     'onnx-community/Kokoro-82M-ONNX',
     {
+      dtype: 'q4' as never,
       progress_callback: (info: Record<string, unknown>) => {
         const status = info.status as string;
         const file = info.file as string | undefined;
