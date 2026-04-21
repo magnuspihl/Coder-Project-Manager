@@ -566,9 +566,9 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== PTT_KEY || e.repeat) return;
+      e.preventDefault();
       if (!voiceSupportedRef.current || isTranscribingRef.current) return;
       if (sendingRef.current || isAnyRunningRef.current) return;
-      e.preventDefault();
       if (!pttActiveRef.current && !isListeningRef.current) {
         pttActiveRef.current = true;
         setVoiceModeActive(true);
