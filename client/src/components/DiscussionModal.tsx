@@ -244,7 +244,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     }
   }, [useWhisper, recorder.stopRecording, speechRec.stopListening]);
 
-  const { voices: ttsVoices, selectedId: ttsSelectedId, selectVoice: ttsSelectVoice, speak: ttsSpeak, speakingId: ttsSpeakingId } = useTTSVoice();
+  const { voices: ttsVoices, selectedId: ttsSelectedId, selectVoice: ttsSelectVoice, speak: ttsSpeak, speakingId: ttsSpeakingId, kokoroLoading, kokoroProgress } = useTTSVoice();
 
   // Initial load: fetch latest 50 messages
   // Subsequent polls: only fetch messages after the last known ID
@@ -924,38 +924,53 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                       End Discussion
                     </button>
                     {ttsVoices.length > 0 && (() => {
+                      const kokoro = ttsVoices.filter(v => v.provider === 'kokoro');
                       const custom = ttsVoices.filter(v => v.isCustom);
                       const elevenlabs = ttsVoices.filter(v => v.provider === 'elevenlabs' && !v.isCustom);
                       const browser = ttsVoices.filter(v => v.provider === 'browser');
                       return (
-                        <select
-                          value={ttsSelectedId}
-                          onChange={(e) => ttsSelectVoice(e.target.value)}
-                          className="text-[10px] px-1.5 py-0.5 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-500 dark:text-gray-400 focus:outline-none focus:ring-1 focus:ring-purple-500 max-w-[180px]"
-                          title="Text-to-speech voice"
-                        >
-                          {custom.length > 0 && (
-                            <optgroup label="My Voices">
-                              {custom.map(v => (
-                                <option key={v.id} value={v.id}>{v.name}</option>
-                              ))}
-                            </optgroup>
+                        <div className="flex items-center gap-1">
+                          {kokoroLoading && (
+                            <span className="text-[10px] text-purple-500 dark:text-purple-400 whitespace-nowrap">
+                              {kokoroProgress > 0 && kokoroProgress < 100 ? `${kokoroProgress}%` : 'Loading…'}
+                            </span>
                           )}
-                          {elevenlabs.length > 0 && (
-                            <optgroup label="ElevenLabs">
-                              {elevenlabs.map(v => (
-                                <option key={v.id} value={v.id}>{v.name}</option>
-                              ))}
-                            </optgroup>
-                          )}
-                          {browser.length > 0 && (
-                            <optgroup label="Browser">
-                              {browser.map(v => (
-                                <option key={v.id} value={v.id}>{v.name}</option>
-                              ))}
-                            </optgroup>
-                          )}
-                        </select>
+                          <select
+                            value={ttsSelectedId}
+                            onChange={(e) => ttsSelectVoice(e.target.value)}
+                            className="text-[10px] px-1.5 py-0.5 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-500 dark:text-gray-400 focus:outline-none focus:ring-1 focus:ring-purple-500 max-w-[180px]"
+                            title="Text-to-speech voice"
+                          >
+                            {kokoro.length > 0 && (
+                              <optgroup label="Kokoro (local)">
+                                {kokoro.map(v => (
+                                  <option key={v.id} value={v.id}>{v.name}</option>
+                                ))}
+                              </optgroup>
+                            )}
+                            {custom.length > 0 && (
+                              <optgroup label="My Voices">
+                                {custom.map(v => (
+                                  <option key={v.id} value={v.id}>{v.name}</option>
+                                ))}
+                              </optgroup>
+                            )}
+                            {elevenlabs.length > 0 && (
+                              <optgroup label="ElevenLabs">
+                                {elevenlabs.map(v => (
+                                  <option key={v.id} value={v.id}>{v.name}</option>
+                                ))}
+                              </optgroup>
+                            )}
+                            {browser.length > 0 && (
+                              <optgroup label="Browser">
+                                {browser.map(v => (
+                                  <option key={v.id} value={v.id}>{v.name}</option>
+                                ))}
+                              </optgroup>
+                            )}
+                          </select>
+                        </div>
                       );
                     })()}
                     {/* Invite button when no participants yet */}
