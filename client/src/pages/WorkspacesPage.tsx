@@ -565,11 +565,12 @@ export default function WorkspacesPage() {
         setGitPushSettings(prev => ({ ...prev, [workspaceId]: gitPushEnabled }));
       } catch { /* default shown as true */ }
     }
-    // Fetch voice settings
+    // Fetch voice settings — skip if key already present (optimistic add may have
+    // raced ahead of this fetch; don't clobber the already-updated state)
     if (!(workspaceId in wsVoiceSettings)) {
       getWorkspaceVoiceSettings(workspaceId)
-        .then(({ voiceIds }) => setWsVoiceSettings(prev => ({ ...prev, [workspaceId]: voiceIds })))
-        .catch(() => setWsVoiceSettings(prev => ({ ...prev, [workspaceId]: [] })));
+        .then(({ voiceIds }) => setWsVoiceSettings(prev => workspaceId in prev ? prev : { ...prev, [workspaceId]: voiceIds }))
+        .catch(() => setWsVoiceSettings(prev => workspaceId in prev ? prev : { ...prev, [workspaceId]: [] }));
     }
     // Load available voices once (Kokoro + ElevenLabs)
     if (!availableVoicesLoadedRef.current) {
@@ -953,7 +954,7 @@ export default function WorkspacesPage() {
                 <select
                   value=""
                   onChange={e => { if (e.target.value) { handleAddVoice(ws.id, e.target.value); (e.target as HTMLSelectElement).value = ''; } }}
-                  className="text-[10px] px-1 py-0.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-500 dark:text-gray-400 cursor-pointer focus:outline-none"
+                  className="text-[10px] px-1 py-0.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-500 dark:text-gray-400 cursor-pointer focus:outline-none max-w-[10rem] min-w-0"
                   title="Add a voice to the priority list"
                 >
                   <option value="">+ Add voice</option>
