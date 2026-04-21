@@ -438,12 +438,6 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
 
     const willAutoSpeak = conversationMode && ttsVoices.length > 0;
 
-    // Re-listen immediately only if we won't auto-speak (auto-speak → re-listen happens after TTS ends)
-    if (voiceModeActive && !isListening && !willAutoSpeak) {
-      playListenChime();
-      startListening();
-    }
-
     if (willAutoSpeak) {
       const msgs = visibleMessagesRef.current;
       const lastSpokenId = lastAutoSpokenMsgIdRef.current;
@@ -462,28 +456,28 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
           const wsId = m.participant_id
             ? (participants.find(p => p.id === m.participant_id)?.workspace_id ?? workspaceId)
             : workspaceId;
-          return { content: m.content, id: m.id, voiceIds: wsVoiceSettingsRef.current[wsId] ?? [] };
+          const stripped = stripMarkdownForSpeech(
+            m.content.replace(TASK_REQUEST_RE, '').replace(MENTION_RE, '').trim()
+          );
+          return { content: stripped, id: m.id, voiceIds: wsVoiceSettingsRef.current[wsId] ?? [] };
         });
         ttsSpeakQueueRef.current = queue.slice(1);
         const first = queue[0];
         ttsSpeakAs(first.content, first.id, first.voiceIds);
       }
     }
-  }, [isAnyRunning, voiceModeActive, isListening, startListening, conversationMode, ttsVoices.length, ttsSpeakAs, workspaceId, participants]);
+  }, [isAnyRunning, conversationMode, ttsVoices.length, ttsSpeakAs, workspaceId, participants]);
 
-  // After TTS finishes: play next queued message, or re-listen when queue is empty
+  // After TTS finishes: play next queued message (PTT handles re-listen manually)
   useEffect(() => {
     const prev = prevTtsSpeakingIdRef.current;
     prevTtsSpeakingIdRef.current = ttsSpeakingId;
-    if (prev === null || ttsSpeakingId !== null || !conversationMode || !voiceModeActive) return;
+    if (prev === null || ttsSpeakingId !== null || !conversationMode) return;
     const next = ttsSpeakQueueRef.current.shift();
     if (next) {
       ttsSpeakAs(next.content, next.id, next.voiceIds);
-    } else if (!isListening) {
-      playListenChime();
-      startListening();
     }
-  }, [ttsSpeakingId, conversationMode, voiceModeActive, isListening, startListening, ttsSpeakAs]);
+  }, [ttsSpeakingId, conversationMode, ttsSpeakAs]);
 
   // Target display name
   const targetName = targetId
@@ -626,10 +620,14 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
 
   // Voice mode: auto-send when silence timeout sets the pending flag
   useEffect(() => {
-    if (voicePendingSendRef.current && message.trim()) {
-      voicePendingSendRef.current = false;
-      handleSend();
+    if (!voicePendingSendRef.current) return;
+    voicePendingSendRef.current = false;
+    const trimmed = message.trim();
+    if (!trimmed || trimmed === '[BLANK_AUDIO]') {
+      setMessage('');
+      return;
     }
+    handleSend();
   }, [message]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
