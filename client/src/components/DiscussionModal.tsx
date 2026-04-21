@@ -194,7 +194,9 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
 
   // Voice mode state
   const [voiceModeActive, setVoiceModeActive] = useState(false);
-  const prevIsAnyRunningRef = useRef(false);
+  const prevDiscRunningRef = useRef(false);
+  const prevParticipantRunningRef = useRef<Map<string, boolean>>(new Map());
+  const ttsSpeakingIdRef = useRef<string | null>(null);
   const voicePendingSendRef = useRef(false);
 
   // Conversation mode: auto-reads incoming messages + auto-sends on PTT release
@@ -262,6 +264,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   }, [useWhisper, recorder.stopRecording, speechRec.stopListening]);
 
   const { voices: ttsVoices, speak: ttsSpeak, speakAs: ttsSpeakAs, stopSpeaking: ttsStop, speakingId: ttsSpeakingId, kokoroLoading, kokoroProgress, kokoroError } = useTTSVoice();
+  ttsSpeakingIdRef.current = ttsSpeakingId;
 
   // Voice settings keyed by workspace ID — loaded lazily when participants join
   const [wsVoiceSettings, setWsVoiceSettings] = useState<Record<string, string[]>>({});
@@ -436,46 +439,68 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const runningParticipant = participants.find(p => p.running);
   const runningAgentName = discussion?.running ? workspaceName : runningParticipant?.workspace_name || null;
 
-  // When agent finishes: auto-speak last message (conversation mode) and/or auto-re-listen (voice mode)
+  // Speak each agent's message as soon as that agent finishes, without waiting for others.
   useEffect(() => {
-    const wasRunning = prevIsAnyRunningRef.current;
-    prevIsAnyRunningRef.current = isAnyRunning;
-    if (!wasRunning || isAnyRunning) return;
+    if (!conversationMode || ttsVoices.length === 0) return;
 
-    const willAutoSpeak = conversationMode && ttsVoices.length > 0;
-
-    if (willAutoSpeak) {
-      const msgs = visibleMessagesRef.current;
-      const lastSpokenId = lastAutoSpokenMsgIdRef.current;
-      const lastSpokenIdx = lastSpokenId ? msgs.findIndex(m => m.id === lastSpokenId) : -1;
-
-      // If nothing has been auto-spoken yet (or the ref ID is no longer in the
-      // message list), only speak the single latest assistant message rather than
-      // replaying the entire session history.
-      const unspoken = lastSpokenIdx >= 0
-        ? msgs.slice(lastSpokenIdx + 1).filter(m => m.role === 'assistant')
-        : (() => { const last = [...msgs].reverse().find(m => m.role === 'assistant'); return last ? [last] : []; })();
-
-      if (unspoken.length > 0) {
-        lastAutoSpokenMsgIdRef.current = unspoken[unspoken.length - 1].id;
-        const queue = unspoken.map(m => {
-          const wsId = m.participant_id
-            ? (participants.find(p => p.id === m.participant_id)?.workspace_id ?? workspaceId)
-            : workspaceId;
-          const stripped = stripMarkdownForSpeech(
-            m.content.replace(TASK_REQUEST_RE, '').replace(MENTION_RE, '').trim()
-          );
-          const explicit = wsVoiceSettingsRef.current[wsId] ?? [];
-          const def = wsDefaultVoicesRef.current[wsId];
-          const voiceIds = def && !explicit.includes(def) ? [...explicit, def] : explicit;
-          return { content: stripped, id: m.id, voiceIds };
-        });
-        ttsSpeakQueueRef.current = queue.slice(1);
-        const first = queue[0];
-        ttsSpeakAs(first.content, first.id, first.voiceIds);
-      }
+    const hostJustFinished = prevDiscRunningRef.current && !discussion?.running;
+    const justFinishedPIds = new Set<string>();
+    for (const p of participants) {
+      if (prevParticipantRunningRef.current.get(p.id) && !p.running) justFinishedPIds.add(p.id);
     }
-  }, [isAnyRunning, conversationMode, ttsVoices.length, ttsSpeakAs, workspaceId, participants]);
+
+    prevDiscRunningRef.current = !!discussion?.running;
+    prevParticipantRunningRef.current = new Map(participants.map(p => [p.id, p.running]));
+
+    if (!hostJustFinished && justFinishedPIds.size === 0) return;
+
+    const msgs = visibleMessagesRef.current;
+    const lastSpokenId = lastAutoSpokenMsgIdRef.current;
+    const lastSpokenIdx = lastSpokenId !== null ? msgs.findIndex(m => m.id === lastSpokenId) : -1;
+
+    // Candidate pool: messages after last spoken, or (bootstrap) most recent per agent
+    let candidates: DiscussionMessage[];
+    if (lastSpokenIdx >= 0) {
+      candidates = msgs.slice(lastSpokenIdx + 1).filter(m => m.role === 'assistant');
+    } else {
+      // Bootstrap: only the most-recent message from each just-finished agent
+      const byAgent = new Map<string | null, DiscussionMessage>();
+      for (const m of msgs) {
+        if (m.role !== 'assistant') continue;
+        const key = m.participant_id ?? null;
+        if (key === null ? hostJustFinished : justFinishedPIds.has(key)) byAgent.set(key, m);
+      }
+      candidates = [...byAgent.values()];
+    }
+
+    const readyToSpeak = candidates.filter(m =>
+      m.participant_id ? justFinishedPIds.has(m.participant_id) : hostJustFinished
+    );
+    if (readyToSpeak.length === 0) return;
+
+    lastAutoSpokenMsgIdRef.current = readyToSpeak[readyToSpeak.length - 1].id;
+
+    const newItems = readyToSpeak.map(m => {
+      const wsId = m.participant_id
+        ? (participants.find(p => p.id === m.participant_id)?.workspace_id ?? workspaceId)
+        : workspaceId;
+      const stripped = stripMarkdownForSpeech(
+        m.content.replace(TASK_REQUEST_RE, '').replace(MENTION_RE, '').trim()
+      );
+      const explicit = wsVoiceSettingsRef.current[wsId] ?? [];
+      const def = wsDefaultVoicesRef.current[wsId];
+      const voiceIds = def && !explicit.includes(def) ? [...explicit, def] : explicit;
+      return { content: stripped, id: m.id, voiceIds };
+    });
+
+    if (ttsSpeakQueueRef.current.length > 0 || ttsSpeakingIdRef.current !== null) {
+      // Already speaking — append so it plays after current item
+      ttsSpeakQueueRef.current.push(...newItems);
+    } else {
+      ttsSpeakQueueRef.current = newItems.slice(1);
+      ttsSpeakAs(newItems[0].content, newItems[0].id, newItems[0].voiceIds);
+    }
+  }, [discussion?.running, participants, conversationMode, ttsVoices.length, ttsSpeakAs, workspaceId]);
 
   // After TTS finishes: play next queued message (PTT handles re-listen manually)
   useEffect(() => {
