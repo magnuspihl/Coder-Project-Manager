@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, type FormEvent } from 'react';
+import { useState, useEffect, useRef, useCallback, type FormEvent } from 'react';
 import {
   getTaskDetail,
   getStreamLog,
@@ -15,6 +15,7 @@ import {
   sendTaskParticipantMessage,
   getWorkspaces,
   uploadFiles,
+  getWorkspaceVoiceSettings,
   type Task,
   type Message,
   type StreamLogEntry,
@@ -23,10 +24,14 @@ import {
   type AttachmentInfo,
 } from '../api/client';
 import { playChime } from '../utils/chime';
+import { playListenChime } from '../utils/listenChime';
 import RateLimitBanner from './RateLimitBanner';
 import { useDraft } from '../hooks/useDraft';
 import { linkify } from '../utils/linkify';
 import Markdown from './Markdown';
+import { useTTSVoice } from '../hooks/useTTSVoice';
+import { useVoiceRecorder } from '../hooks/useVoiceRecorder';
+import { useVoiceMode } from '../hooks/useVoiceMode';
 
 function timeAgo(iso: string): string {
   const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -89,6 +94,61 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
   const lastTaskJsonRef = useRef('');
   const lastMessagesJsonRef = useRef('');
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+
+  // Voice state
+  const [voiceModeActive, setVoiceModeActive] = useState(false);
+  const prevIsAnyRunningRef = useRef(false);
+  const voicePendingSendRef = useRef(false);
+  const [conversationMode, setConversationMode] = useState(() => localStorage.getItem('voice:conversation') === '1');
+  const conversationModeRef = useRef(conversationMode);
+  conversationModeRef.current = conversationMode;
+  const lastAutoSpokenMsgIdRef = useRef<string | null>(null);
+  const prevTtsSpeakingIdRef = useRef<string | null>(null);
+
+  const toggleConversationMode = useCallback(() => {
+    setConversationMode(v => {
+      const next = !v;
+      localStorage.setItem('voice:conversation', next ? '1' : '0');
+      return next;
+    });
+  }, []);
+
+  const { voices: ttsVoices, speakAs: ttsSpeakAs, stopSpeaking: ttsStop, speakingId: ttsSpeakingId, kokoroLoading, kokoroProgress } = useTTSVoice();
+  const [wsVoiceSettings, setWsVoiceSettings] = useState<Record<string, string[]>>({});
+  const wsVoiceSettingsRef = useRef(wsVoiceSettings);
+  wsVoiceSettingsRef.current = wsVoiceSettings;
+
+  const handleRecorderTranscript = useCallback((text: string) => {
+    setReply(text);
+    if (conversationModeRef.current) voicePendingSendRef.current = true;
+  }, [setReply]);
+
+  const recorder = useVoiceRecorder({ onTranscript: handleRecorderTranscript });
+  const speechRec = useVoiceMode({
+    onTranscript: useCallback((t: string) => setReply(t), [setReply]),
+    onSilenceTimeout: useCallback((t: string) => {
+      setReply(t);
+      if (conversationModeRef.current) voicePendingSendRef.current = true;
+    }, [setReply]),
+  });
+
+  const useWhisper = recorder.isSupported;
+  const voiceSupported = useWhisper || speechRec.isSupported;
+  const isListening = useWhisper ? recorder.isRecording : speechRec.isListening;
+  const isTranscribing = useWhisper ? recorder.isTranscribing : false;
+  const voiceDebug = useWhisper ? recorder.debugStatus : speechRec.debugStatus;
+
+  const startListening = useCallback(() => {
+    if (useWhisper) recorder.startRecording();
+    else speechRec.startListening();
+  }, [useWhisper, recorder.startRecording, speechRec.startListening]);
+
+  const stopListening = useCallback(() => {
+    if (useWhisper) recorder.stopRecording();
+    else speechRec.stopListening();
+  }, [useWhisper, recorder.stopRecording, speechRec.stopListening]);
 
   const loadData = async () => {
     try {
@@ -285,6 +345,23 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     }
   };
 
+  // Like handleReply but stays in the modal — used by voice auto-send so the
+  // conversation loop continues instead of closing the task detail view.
+  const replyAndStay = useCallback(async () => {
+    if (!reply.trim() && uploadedAttachmentIds.length === 0) return;
+    if (sending) return;
+    setSending(true);
+    try {
+      await replyToTask(taskId, reply.trim() || 'See attached files.', uploadedAttachmentIds.length > 0 ? uploadedAttachmentIds : undefined);
+      clearReply();
+      setPendingFiles([]);
+      setUploadedAttachmentIds([]);
+      onTaskChanged?.();
+      await loadData();
+    } catch { } finally { setSending(false); }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reply, uploadedAttachmentIds, sending, taskId]);
+
   const handleComplete = async () => {
     setCompleting(true);
     try {
@@ -394,6 +471,61 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   };
 
   const anyParticipantRunning = participants.some(p => p.running);
+  const isAnyRunning = task?.status === 'working' || anyParticipantRunning;
+
+  // Load workspace voice settings for task workspace and any advisor participants
+  useEffect(() => {
+    if (!task?.workspace_id) return;
+    const wsIds = [task.workspace_id, ...participants.map(p => p.workspace_id)];
+    for (const id of wsIds) {
+      if (id in wsVoiceSettings) continue;
+      getWorkspaceVoiceSettings(id)
+        .then(({ voiceIds }) => setWsVoiceSettings(prev => ({ ...prev, [id]: voiceIds })))
+        .catch(() => setWsVoiceSettings(prev => ({ ...prev, [id]: [] })));
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [task?.workspace_id, participants.length]);
+
+  // Auto-speak last assistant message and/or auto-re-listen when agent finishes
+  useEffect(() => {
+    const wasRunning = prevIsAnyRunningRef.current;
+    prevIsAnyRunningRef.current = isAnyRunning;
+    if (!wasRunning || isAnyRunning) return;
+    const willAutoSpeak = conversationMode && ttsVoices.length > 0;
+    if (voiceModeActive && !isListening && !willAutoSpeak) {
+      playListenChime();
+      startListening();
+    }
+    if (willAutoSpeak) {
+      const lastAssistant = [...messagesRef.current].reverse().find(m => m.role === 'assistant');
+      if (lastAssistant && lastAssistant.id !== lastAutoSpokenMsgIdRef.current) {
+        lastAutoSpokenMsgIdRef.current = lastAssistant.id;
+        const wsId = lastAssistant.participant_id
+          ? (participantsRef.current.find(p => p.id === lastAssistant.participant_id)?.workspace_id ?? task?.workspace_id ?? '')
+          : (task?.workspace_id ?? '');
+        ttsSpeakAs(lastAssistant.content, lastAssistant.id, wsVoiceSettingsRef.current[wsId] ?? []);
+      }
+    }
+  }, [isAnyRunning, voiceModeActive, isListening, startListening, conversationMode, ttsVoices.length, ttsSpeakAs, task?.workspace_id]);
+
+  // After TTS finishes in conversation mode, resume listening for next user input
+  useEffect(() => {
+    const prev = prevTtsSpeakingIdRef.current;
+    prevTtsSpeakingIdRef.current = ttsSpeakingId;
+    if (prev !== null && ttsSpeakingId === null && conversationMode && voiceModeActive && !isListening) {
+      playListenChime();
+      startListening();
+    }
+  }, [ttsSpeakingId, conversationMode, voiceModeActive, isListening, startListening]);
+
+  // Auto-send transcribed text when in conversation mode (stays in modal)
+  useEffect(() => {
+    if (voicePendingSendRef.current && reply.trim() && task?.status === 'awaiting_feedback') {
+      voicePendingSendRef.current = false;
+      replyAndStay();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reply, task?.status]);
 
   const handleOverlayClick = (e: React.MouseEvent) => {
     if (e.target === overlayRef.current) closeModal();
@@ -564,6 +696,23 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         <span className="text-xs text-gray-400 dark:text-gray-500">
                           {new Date(msg.created_at).toLocaleTimeString()}
                         </span>
+                        {msg.role === 'assistant' && ttsVoices.length > 0 && (
+                          <button
+                            onClick={() => {
+                              const wsId = msg.participant_id
+                                ? (participants.find(p => p.id === msg.participant_id)?.workspace_id ?? task?.workspace_id ?? '')
+                                : (task?.workspace_id ?? '');
+                              if (ttsSpeakingId === msg.id) { ttsStop(); return; }
+                              ttsSpeakAs(msg.content, msg.id, wsVoiceSettings[wsId] ?? []);
+                            }}
+                            className={`p-0.5 rounded transition-colors ${ttsSpeakingId === msg.id ? 'text-purple-600 dark:text-purple-400' : 'text-gray-300 dark:text-gray-600 hover:text-purple-500 dark:hover:text-purple-400'}`}
+                            title={ttsSpeakingId === msg.id ? 'Stop' : 'Read aloud'}
+                          >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
+                              <path fillRule="evenodd" d="M9.383 3.076A1 1 0 0110 4v12a1 1 0 01-1.707.707L4.586 13H2a1 1 0 01-1-1V8a1 1 0 011-1h2.586l3.707-3.707a1 1 0 011.09-.217zM14.657 2.929a1 1 0 011.414 0A9.972 9.972 0 0119 10a9.972 9.972 0 01-2.929 7.071 1 1 0 01-1.414-1.414A7.971 7.971 0 0017 10c0-2.21-.894-4.208-2.343-5.657a1 1 0 010-1.414zm-2.829 2.828a1 1 0 011.415 0A5.983 5.983 0 0115 10a5.984 5.984 0 01-1.757 4.243 1 1 0 01-1.415-1.415A3.984 3.984 0 0013 10a3.983 3.983 0 00-1.172-2.828 1 1 0 010-1.415z" clipRule="evenodd" />
+                            </svg>
+                          </button>
+                        )}
                       </div>
                     </div>
                     <Markdown content={msg.content} />
@@ -818,6 +967,63 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                           )}
                         </button>
                         <div className="flex-1" />
+                        {/* Voice controls */}
+                        {kokoroLoading && (
+                          <span className="text-[10px] text-purple-500 dark:text-purple-400 whitespace-nowrap animate-pulse">
+                            {kokoroProgress > 0 && kokoroProgress < 100 ? `Kokoro ${kokoroProgress}%` : 'Loading Kokoro…'}
+                          </span>
+                        )}
+                        {voiceDebug && (
+                          <span className={`text-xs truncate max-w-[180px] ${
+                            isTranscribing ? 'text-amber-500 dark:text-amber-400 animate-pulse'
+                            : isListening ? 'text-purple-500 dark:text-purple-400 animate-pulse'
+                            : 'text-gray-400 dark:text-gray-500'
+                          }`} title={voiceDebug}>{voiceDebug}</span>
+                        )}
+                        {voiceSupported && ttsVoices.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={toggleConversationMode}
+                            className={`p-2 rounded-md transition-colors ${conversationMode ? 'text-white bg-purple-600 hover:bg-purple-700' : 'text-gray-400 dark:text-gray-500 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-900/20'}`}
+                            title={conversationMode ? 'Conversation mode on — auto-reads replies, auto-sends speech' : 'Enable conversation mode'}
+                          >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                              <path fillRule="evenodd" d="M18 10c0 3.866-3.582 7-8 7a8.841 8.841 0 01-4.083-.98L2 17l1.338-3.123C2.493 12.767 2 11.434 2 10c0-3.866 3.582-7 8-7s8 3.134 8 7zM7 9H5v2h2V9zm8 0h-2v2h2V9zM9 9h2v2H9V9z" clipRule="evenodd" />
+                            </svg>
+                          </button>
+                        )}
+                        {voiceSupported && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (isTranscribing) return;
+                              if (isListening) {
+                                stopListening();
+                                if (!useWhisper) setVoiceModeActive(false);
+                              } else {
+                                setVoiceModeActive(true);
+                                playListenChime();
+                                startListening();
+                              }
+                            }}
+                            disabled={sending || isAnyRunning || isTranscribing}
+                            className={`relative p-2 rounded-md transition-colors disabled:opacity-50 ${
+                              isTranscribing ? 'text-amber-600 bg-amber-100 dark:bg-amber-900/30'
+                              : isListening ? 'text-white bg-purple-600 voice-pulse-ring'
+                              : voiceModeActive ? 'text-purple-600 dark:text-purple-400 bg-purple-100 dark:bg-purple-900/30 hover:bg-purple-200 dark:hover:bg-purple-900/50'
+                              : 'text-gray-400 dark:text-gray-500 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-900/20'
+                            }`}
+                            title={isTranscribing ? 'Transcribing...' : isListening ? 'Stop recording' : useWhisper ? 'Push to talk' : voiceModeActive ? 'Resume listening' : 'Start voice mode'}
+                          >
+                            {isTranscribing ? (
+                              <div className="h-5 w-5 border-2 border-amber-600 border-t-transparent rounded-full animate-spin" />
+                            ) : (
+                              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                <path fillRule="evenodd" d="M7 4a3 3 0 016 0v4a3 3 0 11-6 0V4zm4 10.93A7.001 7.001 0 0017 8a1 1 0 10-2 0A5 5 0 015 8a1 1 0 00-2 0 7.001 7.001 0 006 6.93V17H6a1 1 0 100 2h8a1 1 0 100-2h-3v-2.07z" clipRule="evenodd" />
+                              </svg>
+                            )}
+                          </button>
+                        )}
                         <button
                           type="submit"
                           disabled={sending || (!reply.trim() && uploadedAttachmentIds.length === 0) || anyParticipantRunning}
