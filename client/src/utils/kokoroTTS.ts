@@ -1,4 +1,10 @@
-import { pipeline } from '@huggingface/transformers';
+import { pipeline, env } from '@huggingface/transformers';
+
+// Force browser mode — Vite's process polyfill makes Transformers.js think
+// it's running in Node.js and try to read local files instead of fetching.
+env.useFS = false;
+env.allowLocalModels = false;
+env.allowRemoteModels = true;
 
 export interface KokoroVoice {
   id: string;
