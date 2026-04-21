@@ -15,9 +15,12 @@ import {
   getOrCreateDiscussion,
   getDiscussionStatus,
   checkoutTaskBranch,
+  setActiveTask,
   getModels,
   getGitSettings,
   updateGitSettings,
+  getWorkspaceVoiceSettings,
+  updateWorkspaceVoiceSettings,
   uploadFiles,
   type Workspace,
   type ModelInfo,
@@ -27,6 +30,7 @@ import {
   type ClaudeUsage,
   type RateLimitUsage,
 } from '../api/client';
+import { KOKORO_VOICES } from '../utils/kokoroTTS';
 import { playChime } from '../utils/chime';
 import { useDraft, useSessionState } from '../hooks/useDraft';
 import TaskDetailModal from '../components/TaskDetailModal';
@@ -93,6 +97,7 @@ export default function WorkspacesPage() {
   const [claudeUsage, setClaudeUsage] = useState<Record<string, ClaudeUsage>>({});
   const [globalRateLimits, setGlobalRateLimits] = useState<Record<string, RateLimitUsage>>({});
   const [tasksByWorkspace, setTasksByWorkspace] = useState<Record<string, Task[]>>({});
+  const [activeTaskByWorkspace, setActiveTaskByWorkspace] = useState<Record<string, string | null>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [showStopped, setShowStopped] = useState(false);
@@ -118,6 +123,9 @@ export default function WorkspacesPage() {
   const [chatCreating, setChatCreating] = useState(false);
   const [settingsOpenWsId, setSettingsOpenWsId] = useState<string | null>(null);
   const [gitPushSettings, setGitPushSettings] = useState<Record<string, boolean>>({});
+  const [wsVoiceSettings, setWsVoiceSettings] = useState<Record<string, string[]>>({});
+  const [availableVoices, setAvailableVoices] = useState<Array<{ id: string; name: string }>>([]);
+  const availableVoicesLoadedRef = useRef(false);
   const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevTaskStatusesRef = useRef<Map<string, string>>(new Map());
   const lastTaskWorkspaceIdRef = useRef<string | null>(null);
@@ -150,12 +158,16 @@ export default function WorkspacesPage() {
       // Fetch tasks for running workspaces in parallel
       const runningWs = ws.filter((w) => w.latest_build.status === 'running');
       const taskResults = await Promise.all(
-        runningWs.map((w) => getTasks(w.id).then((r) => ({ id: w.id, tasks: r.tasks })).catch(() => ({ id: w.id, tasks: [] as Task[] })))
+        runningWs.map((w) => getTasks(w.id)
+          .then((r) => ({ id: w.id, tasks: r.tasks, activeTaskId: r.activeTaskId }))
+          .catch(() => ({ id: w.id, tasks: [] as Task[], activeTaskId: null as string | null })))
       );
 
       const tasksMap: Record<string, Task[]> = {};
-      for (const { id, tasks } of taskResults) {
+      const activeMap: Record<string, string | null> = {};
+      for (const { id, tasks, activeTaskId } of taskResults) {
         tasksMap[id] = tasks;
+        activeMap[id] = activeTaskId;
       }
 
       // Chime detection
@@ -181,6 +193,7 @@ export default function WorkspacesPage() {
       prevTaskStatusesRef.current = next;
 
       setIfChanged('tasksByWorkspace', setTasksByWorkspace, tasksMap);
+      setIfChanged('activeTaskByWorkspace', setActiveTaskByWorkspace, activeMap);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to load');
     } finally {
@@ -476,6 +489,21 @@ export default function WorkspacesPage() {
     }
   };
 
+  const [activatingTaskId, setActivatingTaskId] = useState<string | null>(null);
+  const handleSetActive = async (e: React.MouseEvent, taskId: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setActivatingTaskId(taskId);
+    try {
+      await setActiveTask(taskId);
+      await loadData();
+    } catch (err: any) {
+      alert(err.message || 'Failed to set active task');
+    } finally {
+      setActivatingTaskId(null);
+    }
+  };
+
   const handleUndo = async () => {
     if (!deletedTaskId) return;
     if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
@@ -559,6 +587,56 @@ export default function WorkspacesPage() {
         setGitPushSettings(prev => ({ ...prev, [workspaceId]: gitPushEnabled }));
       } catch { /* default shown as true */ }
     }
+    // Fetch voice settings — skip if key already present (optimistic add may have
+    // raced ahead of this fetch; don't clobber the already-updated state)
+    if (!(workspaceId in wsVoiceSettings)) {
+      getWorkspaceVoiceSettings(workspaceId)
+        .then(({ voiceIds }) => setWsVoiceSettings(prev => workspaceId in prev ? prev : { ...prev, [workspaceId]: voiceIds }))
+        .catch(() => setWsVoiceSettings(prev => workspaceId in prev ? prev : { ...prev, [workspaceId]: [] }));
+    }
+    // Load available voices once (Kokoro + ElevenLabs)
+    if (!availableVoicesLoadedRef.current) {
+      availableVoicesLoadedRef.current = true;
+      const voices: Array<{ id: string; name: string }> = KOKORO_VOICES.map(v => ({
+        id: `kokoro:${v.id}`,
+        name: `${v.name} — ${v.accent} ${v.gender}`,
+      }));
+      try {
+        const resp = await fetch('/api/tts/voices', { credentials: 'include' });
+        if (resp.ok) {
+          const data = await resp.json() as { enabled: boolean; voices: Array<{ id: string; name: string; description?: string }> };
+          if (data.enabled) {
+            for (const v of data.voices) {
+              voices.push({ id: `el:${v.id}`, name: v.description ? `${v.name} — ${v.description}` : v.name });
+            }
+          }
+        }
+      } catch { /* ElevenLabs unavailable */ }
+      setAvailableVoices(voices);
+    }
+  };
+
+  const handleAddVoice = async (workspaceId: string, voiceId: string) => {
+    const current = wsVoiceSettings[workspaceId] ?? [];
+    if (current.includes(voiceId)) return;
+    const next = [...current, voiceId];
+    setWsVoiceSettings(prev => ({ ...prev, [workspaceId]: next }));
+    try {
+      await updateWorkspaceVoiceSettings(workspaceId, next);
+    } catch {
+      setWsVoiceSettings(prev => ({ ...prev, [workspaceId]: current }));
+    }
+  };
+
+  const handleRemoveVoice = async (workspaceId: string, voiceId: string) => {
+    const current = wsVoiceSettings[workspaceId] ?? [];
+    const next = current.filter(v => v !== voiceId);
+    setWsVoiceSettings(prev => ({ ...prev, [workspaceId]: next }));
+    try {
+      await updateWorkspaceVoiceSettings(workspaceId, next);
+    } catch {
+      setWsVoiceSettings(prev => ({ ...prev, [workspaceId]: current }));
+    }
   };
 
   const handleToggleGitPush = async (workspaceId: string) => {
@@ -635,9 +713,36 @@ export default function WorkspacesPage() {
     >
       <div className="flex items-start justify-between gap-2">
         <h4 className="text-sm font-medium text-gray-900 dark:text-gray-100 line-clamp-2 flex-1">{task.title}</h4>
-        <span className={`text-xs px-2 py-0.5 rounded-full whitespace-nowrap shrink-0 ${STATUS_COLORS[task.status] || ''}`}>
-          {task.status.replace('_', ' ')}
-        </span>
+        <div className="flex items-center gap-1 shrink-0">
+          {activeTaskByWorkspace[task.workspace_id] === task.id ? (
+            <span
+              className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full whitespace-nowrap bg-emerald-50 dark:bg-emerald-900/20 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800"
+              title="This task's changes are currently in the workspace"
+            >
+              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" /></svg>
+              active
+            </span>
+          ) : (
+            task.status !== 'working' && task.status !== 'completed' && (
+              <button
+                onClick={(e) => handleSetActive(e, task.id)}
+                disabled={activatingTaskId === task.id}
+                className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full whitespace-nowrap border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:text-emerald-700 dark:hover:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 hover:border-emerald-200 dark:hover:border-emerald-800 transition-colors disabled:opacity-50"
+                title="Restore this task's stash and make its changes visible in the workspace"
+              >
+                {activatingTaskId === task.id ? (
+                  <div className="animate-spin h-3 w-3 border border-current border-t-transparent rounded-full" />
+                ) : (
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M13 5l7 7-7 7M5 5l7 7-7 7" /></svg>
+                )}
+                set active
+              </button>
+            )
+          )}
+          <span className={`text-xs px-2 py-0.5 rounded-full whitespace-nowrap ${STATUS_COLORS[task.status] || ''}`}>
+            {task.status.replace('_', ' ')}
+          </span>
+        </div>
       </div>
       <div className="flex items-center gap-2 text-xs text-gray-400 dark:text-gray-500 mt-1">
         <span>{new Date(task.created_at).toLocaleString()}</span>
@@ -869,7 +974,7 @@ export default function WorkspacesPage() {
             </div>
           </div>
           {settingsOpenWsId === ws.id && (
-            <div className="flex items-center gap-2 px-2 py-1.5 bg-gray-100 dark:bg-gray-800 rounded text-xs mb-1">
+            <div className="flex flex-col gap-2 px-2 py-2 bg-gray-100 dark:bg-gray-800 rounded text-xs mb-1">
               <label className="flex items-center gap-1.5 cursor-pointer select-none">
                 <input
                   type="checkbox"
@@ -879,6 +984,57 @@ export default function WorkspacesPage() {
                 />
                 <span className="text-gray-600 dark:text-gray-300">Allow git remote operations</span>
               </label>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-gray-500 dark:text-gray-400 shrink-0">Voice:</span>
+                {(wsVoiceSettings[ws.id] ?? []).map((vid, idx) => {
+                  const voiceName = availableVoices.find(v => v.id === vid)?.name ?? vid;
+                  return (
+                    <span key={vid} className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 rounded-full text-[10px] leading-tight">
+                      <span className="text-purple-400 dark:text-purple-500 mr-0.5">{idx + 1}.</span>
+                      {voiceName.slice(0, 24)}{voiceName.length > 24 ? '…' : ''}
+                      <button
+                        onClick={() => handleRemoveVoice(ws.id, vid)}
+                        className="ml-0.5 opacity-50 hover:opacity-100 hover:text-red-500 leading-none"
+                        title="Remove"
+                      >×</button>
+                    </span>
+                  );
+                })}
+                <select
+                  value=""
+                  onChange={e => { if (e.target.value) { handleAddVoice(ws.id, e.target.value); (e.target as HTMLSelectElement).value = ''; } }}
+                  className="text-[10px] px-1 py-0.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-500 dark:text-gray-400 cursor-pointer focus:outline-none max-w-[10rem] min-w-0"
+                  title="Add a voice to the priority list"
+                >
+                  <option value="">+ Add voice</option>
+                  {availableVoices.filter(v => v.id.startsWith('kokoro:') && !(wsVoiceSettings[ws.id] ?? []).includes(v.id)).length > 0 && (
+                    <optgroup label="Kokoro (local)">
+                      {availableVoices
+                        .filter(v => v.id.startsWith('kokoro:') && !(wsVoiceSettings[ws.id] ?? []).includes(v.id))
+                        .map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                    </optgroup>
+                  )}
+                  {availableVoices.filter(v => v.id.startsWith('el:') && !(wsVoiceSettings[ws.id] ?? []).includes(v.id)).length > 0 && (
+                    <optgroup label="ElevenLabs">
+                      {availableVoices
+                        .filter(v => v.id.startsWith('el:') && !(wsVoiceSettings[ws.id] ?? []).includes(v.id))
+                        .map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                    </optgroup>
+                  )}
+                </select>
+                {(() => {
+                  const fallbackId = (() => { try { return localStorage.getItem('tts:voiceId') ?? 'kokoro:af_sarah'; } catch { return 'kokoro:af_sarah'; } })();
+                  const fallbackName = availableVoices.find(v => v.id === fallbackId)?.name
+                    ?? KOKORO_VOICES.find(v => `kokoro:${v.id}` === fallbackId)?.name
+                    ?? fallbackId.replace(/^(kokoro:|el:|br:)/, '');
+                  const hasVoices = (wsVoiceSettings[ws.id] ?? []).length > 0;
+                  return (
+                    <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700/50 text-gray-400 dark:text-gray-500 rounded-full text-[10px] leading-tight italic">
+                      {hasVoices ? '↩ ' : ''}{fallbackName}
+                    </span>
+                  );
+                })()}
+              </div>
             </div>
           )}
           {(apps.length > 0 || openPorts.length > 0 || githubRepoUrl) && (

@@ -13,6 +13,7 @@ import {
   removeDiscussionParticipant,
   sendParticipantMessage,
   getWorkspaces,
+  getWorkspaceVoiceSettings,
   type Discussion,
   type DiscussionMessage,
   type DiscussionParticipant,
@@ -196,19 +197,35 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const prevIsAnyRunningRef = useRef(false);
   const voicePendingSendRef = useRef(false);
 
+  // Conversation mode: auto-reads incoming messages + auto-sends on PTT release
+  const [conversationMode, setConversationMode] = useState(() => localStorage.getItem('voice:conversation') === '1');
+  const conversationModeRef = useRef(conversationMode);
+  conversationModeRef.current = conversationMode;
+  const lastAutoSpokenMsgIdRef = useRef<string | null>(null);
+  const prevTtsSpeakingIdRef = useRef<string | null>(null);
+  const ttsSpeakQueueRef = useRef<Array<{ content: string; id: string; voiceIds: string[] }>>([]);
+
+  const toggleConversationMode = useCallback(() => {
+    setConversationMode(v => {
+      const next = !v;
+      localStorage.setItem('voice:conversation', next ? '1' : '0');
+      return next;
+    });
+  }, []);
+
   const handleVoiceTranscript = useCallback((text: string) => {
     setMessage(text);
   }, [setMessage]);
 
   const handleVoiceSilence = useCallback((finalText: string) => {
     setMessage(finalText);
-    voicePendingSendRef.current = true;
+    if (conversationModeRef.current) voicePendingSendRef.current = true;
   }, [setMessage]);
 
   // Whisper-based push-to-talk (preferred when available)
   const handleRecorderTranscript = useCallback((text: string) => {
     setMessage(text);
-    voicePendingSendRef.current = true;
+    if (conversationModeRef.current) voicePendingSendRef.current = true;
   }, [setMessage]);
 
   const recorder = useVoiceRecorder({
@@ -244,7 +261,18 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     }
   }, [useWhisper, recorder.stopRecording, speechRec.stopListening]);
 
-  const { voices: ttsVoices, selectedId: ttsSelectedId, selectVoice: ttsSelectVoice, speak: ttsSpeak, speakingId: ttsSpeakingId } = useTTSVoice();
+  const { voices: ttsVoices, speak: ttsSpeak, speakAs: ttsSpeakAs, stopSpeaking: ttsStop, speakingId: ttsSpeakingId, kokoroLoading, kokoroProgress, kokoroError } = useTTSVoice();
+
+  // Voice settings keyed by workspace ID — loaded lazily when participants join
+  const [wsVoiceSettings, setWsVoiceSettings] = useState<Record<string, string[]>>({});
+  const wsVoiceSettingsRef = useRef(wsVoiceSettings);
+  wsVoiceSettingsRef.current = wsVoiceSettings;
+
+  // Resolve workspace ID for a message (null participant_id = host workspace)
+  const getMsgWorkspaceId = useCallback((msg: DiscussionMessage): string => {
+    if (!msg.participant_id) return workspaceId;
+    return participants.find(p => p.id === msg.participant_id)?.workspace_id ?? workspaceId;
+  }, [workspaceId, participants]);
 
   // Initial load: fetch latest 50 messages
   // Subsequent polls: only fetch messages after the last known ID
@@ -288,8 +316,12 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
         }
         initialLoadDone.current = true;
       } else if (data.messages.length > 0) {
-        // Incremental — append new messages
-        setMessages(prev => [...prev, ...data.messages]);
+        // Incremental — append only messages not already in state (guards against concurrent loadData calls)
+        setMessages(prev => {
+          const existingIds = new Set(prev.map(m => m.id));
+          const fresh = data.messages.filter(m => !existingIds.has(m.id));
+          return fresh.length > 0 ? [...prev, ...fresh] : prev;
+        });
         lastMessageIdRef.current = data.messages[data.messages.length - 1].id;
       }
     } catch {
@@ -378,21 +410,76 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     }),
     [messages]
   );
+  const visibleMessagesRef = useRef(visibleMessages);
+  visibleMessagesRef.current = visibleMessages;
+
+  // Load voice settings for any workspace we haven't fetched yet (host + participants)
+  useEffect(() => {
+    const wsIds = [workspaceId, ...participants.map(p => p.workspace_id)];
+    for (const id of wsIds) {
+      if (id in wsVoiceSettings) continue;
+      getWorkspaceVoiceSettings(id)
+        .then(({ voiceIds }) => setWsVoiceSettings(prev => ({ ...prev, [id]: voiceIds })))
+        .catch(() => setWsVoiceSettings(prev => ({ ...prev, [id]: [] })));
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspaceId, participants.length]);
 
   // Computed: is any agent (host or participant) running?
   const isAnyRunning = !!(discussion?.running) || participants.some(p => p.running);
   const runningParticipant = participants.find(p => p.running);
   const runningAgentName = discussion?.running ? workspaceName : runningParticipant?.workspace_name || null;
 
-  // Voice mode: auto-re-listen when Claude finishes responding
+  // When agent finishes: auto-speak last message (conversation mode) and/or auto-re-listen (voice mode)
   useEffect(() => {
     const wasRunning = prevIsAnyRunningRef.current;
     prevIsAnyRunningRef.current = isAnyRunning;
-    if (wasRunning && !isAnyRunning && voiceModeActive && !isListening) {
+    if (!wasRunning || isAnyRunning) return;
+
+    const willAutoSpeak = conversationMode && ttsVoices.length > 0;
+
+    // Re-listen immediately only if we won't auto-speak (auto-speak → re-listen happens after TTS ends)
+    if (voiceModeActive && !isListening && !willAutoSpeak) {
       playListenChime();
       startListening();
     }
-  }, [isAnyRunning, voiceModeActive, isListening, startListening]);
+
+    if (willAutoSpeak) {
+      const msgs = visibleMessagesRef.current;
+      const lastSpokenId = lastAutoSpokenMsgIdRef.current;
+      const lastSpokenIdx = lastSpokenId ? msgs.findIndex(m => m.id === lastSpokenId) : -1;
+      const unspoken = msgs
+        .slice(lastSpokenIdx + 1)
+        .filter(m => m.role === 'assistant');
+
+      if (unspoken.length > 0) {
+        lastAutoSpokenMsgIdRef.current = unspoken[unspoken.length - 1].id;
+        const queue = unspoken.map(m => {
+          const wsId = m.participant_id
+            ? (participants.find(p => p.id === m.participant_id)?.workspace_id ?? workspaceId)
+            : workspaceId;
+          return { content: m.content, id: m.id, voiceIds: wsVoiceSettingsRef.current[wsId] ?? [] };
+        });
+        ttsSpeakQueueRef.current = queue.slice(1);
+        const first = queue[0];
+        ttsSpeakAs(first.content, first.id, first.voiceIds);
+      }
+    }
+  }, [isAnyRunning, voiceModeActive, isListening, startListening, conversationMode, ttsVoices.length, ttsSpeakAs, workspaceId, participants]);
+
+  // After TTS finishes: play next queued message, or re-listen when queue is empty
+  useEffect(() => {
+    const prev = prevTtsSpeakingIdRef.current;
+    prevTtsSpeakingIdRef.current = ttsSpeakingId;
+    if (prev === null || ttsSpeakingId !== null || !conversationMode || !voiceModeActive) return;
+    const next = ttsSpeakQueueRef.current.shift();
+    if (next) {
+      ttsSpeakAs(next.content, next.id, next.voiceIds);
+    } else if (!isListening) {
+      playListenChime();
+      startListening();
+    }
+  }, [ttsSpeakingId, conversationMode, voiceModeActive, isListening, startListening, ttsSpeakAs]);
 
   // Target display name
   const targetName = targetId
@@ -499,11 +586,11 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('keydown', handleKeyDown, { capture: true });
+    window.addEventListener('keyup', handleKeyUp, { capture: true });
     return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('keydown', handleKeyDown, { capture: true });
+      window.removeEventListener('keyup', handleKeyUp, { capture: true });
     };
   }, []);
 
@@ -738,9 +825,18 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                 </div>
               )}
 
-              {visibleMessages.map((msg) => (
-                <MessageRow key={msg.id} msg={msg} hostWorkspaceName={workspaceName} participants={participants} onSpeak={ttsVoices.length > 0 ? ttsSpeak : undefined} isSpeaking={ttsSpeakingId === msg.id} />
-              ))}
+              {visibleMessages.map((msg) => {
+                let onSpeak: ((text: string, msgId: string) => void) | undefined;
+                if (ttsVoices.length > 0) {
+                  const wsId = getMsgWorkspaceId(msg);
+                  const voiceIds = wsVoiceSettings[wsId] ?? [];
+                  onSpeak = (text, mid) => {
+                    if (ttsSpeakingId === mid) { ttsStop(); return; }
+                    ttsSpeakAs(text, mid, voiceIds);
+                  };
+                }
+                return <MessageRow key={msg.id} msg={msg} hostWorkspaceName={workspaceName} participants={participants} onSpeak={onSpeak} isSpeaking={ttsSpeakingId === msg.id} />;
+              })}
 
               {/* Working indicator */}
               {isAnyRunning && (
@@ -923,41 +1019,16 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                     >
                       End Discussion
                     </button>
-                    {ttsVoices.length > 0 && (() => {
-                      const custom = ttsVoices.filter(v => v.isCustom);
-                      const elevenlabs = ttsVoices.filter(v => v.provider === 'elevenlabs' && !v.isCustom);
-                      const browser = ttsVoices.filter(v => v.provider === 'browser');
-                      return (
-                        <select
-                          value={ttsSelectedId}
-                          onChange={(e) => ttsSelectVoice(e.target.value)}
-                          className="text-[10px] px-1.5 py-0.5 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-500 dark:text-gray-400 focus:outline-none focus:ring-1 focus:ring-purple-500 max-w-[180px]"
-                          title="Text-to-speech voice"
-                        >
-                          {custom.length > 0 && (
-                            <optgroup label="My Voices">
-                              {custom.map(v => (
-                                <option key={v.id} value={v.id}>{v.name}</option>
-                              ))}
-                            </optgroup>
-                          )}
-                          {elevenlabs.length > 0 && (
-                            <optgroup label="ElevenLabs">
-                              {elevenlabs.map(v => (
-                                <option key={v.id} value={v.id}>{v.name}</option>
-                              ))}
-                            </optgroup>
-                          )}
-                          {browser.length > 0 && (
-                            <optgroup label="Browser">
-                              {browser.map(v => (
-                                <option key={v.id} value={v.id}>{v.name}</option>
-                              ))}
-                            </optgroup>
-                          )}
-                        </select>
-                      );
-                    })()}
+                    {kokoroLoading && (
+                      <span className="text-[10px] text-purple-500 dark:text-purple-400 whitespace-nowrap animate-pulse">
+                        {kokoroProgress > 0 && kokoroProgress < 100 ? `Kokoro ${kokoroProgress}%` : 'Loading Kokoro…'}
+                      </span>
+                    )}
+                    {kokoroError && !kokoroLoading && (
+                      <span className="text-[10px] text-red-500 dark:text-red-400 whitespace-nowrap truncate max-w-[140px]" title={kokoroError}>
+                        Kokoro error
+                      </span>
+                    )}
                     {/* Invite button when no participants yet */}
                     {participants.length === 0 && (
                       <div className="relative">
@@ -1006,6 +1077,22 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                       }`} title={voiceDebug}>
                         {voiceDebug}
                       </span>
+                    )}
+                    {voiceSupported && ttsVoices.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={toggleConversationMode}
+                        className={`p-2 rounded-md transition-colors ${
+                          conversationMode
+                            ? 'text-white bg-purple-600 hover:bg-purple-700'
+                            : 'text-gray-400 dark:text-gray-500 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-900/20'
+                        }`}
+                        title={conversationMode ? 'Conversation mode on — auto-reads replies, auto-sends speech' : 'Enable conversation mode'}
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                          <path fillRule="evenodd" d="M18 10c0 3.866-3.582 7-8 7a8.841 8.841 0 01-4.083-.98L2 17l1.338-3.123C2.493 12.767 2 11.434 2 10c0-3.866 3.582-7 8-7s8 3.134 8 7zM7 9H5v2h2V9zm8 0h-2v2h2V9zM9 9h2v2H9V9z" clipRule="evenodd" />
+                        </svg>
+                      </button>
                     )}
                     {voiceSupported && (
                       <button

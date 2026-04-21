@@ -22,7 +22,7 @@ import {
 import { processQueue, resumeTask, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
-import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch } from '../services/git.js';
+import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, switchActiveTask, getLastActiveTaskId } from '../services/git.js';
 import { linkAttachmentsToTask, getAttachmentsByTask } from './uploads.js';
 
 const router = Router();
@@ -36,7 +36,8 @@ router.get('/workspaces/:workspaceId/tasks', requireAuth, (req: Request, res: Re
     total_cost_usd: costs[t.id] || 0,
     rate_limit: getRateLimitInfo(t.id) || null,
   }));
-  res.json({ tasks });
+  const activeTaskId = getLastActiveTaskId(req.params.workspaceId);
+  res.json({ tasks, activeTaskId });
 });
 
 // Create a new task
@@ -121,7 +122,8 @@ router.get('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
     activity: getTaskParticipantActivity(p.id) || null,
   }));
   const attachments = getAttachmentsByTask(task.id);
-  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages, participants, attachments });
+  const activeTaskId = getLastActiveTaskId(task.workspace_id);
+  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages, participants, attachments, activeTaskId });
 });
 
 // Get stream log for a task (loaded on demand)
@@ -233,6 +235,31 @@ router.post('/tasks/:taskId/reopen', requireAuth, async (req: Request, res: Resp
   handleTaskReopenGit(task).catch(() => {});
 
   res.json({ task: getTask(task.id) });
+});
+
+// Make this task the active one on its workspace (stash swap)
+router.post('/tasks/:taskId/set-active', requireAuth, async (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  if (task.status === 'working' || task.status === 'completed') {
+    res.status(400).json({ error: 'Cannot activate a working or completed task' });
+    return;
+  }
+  const working = getWorkingTask(task.workspace_id);
+  if (working) {
+    res.status(409).json({ error: 'Cannot switch active task while a task is running on this workspace' });
+    return;
+  }
+  try {
+    const message = await switchActiveTask(task);
+    addMessage(task.id, 'system', message);
+    res.json({ ok: true, message, activeTaskId: task.id });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to set active task' });
+  }
 });
 
 // Switch workspace to a task's branch

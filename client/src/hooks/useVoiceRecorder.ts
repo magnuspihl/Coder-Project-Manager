@@ -1,4 +1,5 @@
 import { useRef, useState, useCallback, useEffect } from 'react';
+import { transcribeAudio, ensureWhisperLoaded, onWhisperProgress } from '../utils/whisperSTT';
 
 interface UseVoiceRecorderOptions {
   onTranscript: (text: string) => void;
@@ -8,7 +9,6 @@ interface UseVoiceRecorderOptions {
 export function useVoiceRecorder({ onTranscript, onError }: UseVoiceRecorderOptions) {
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
-  const [sttEnabled, setSttEnabled] = useState(false);
   const [debugStatus, setDebugStatus] = useState('');
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -19,11 +19,20 @@ export function useVoiceRecorder({ onTranscript, onError }: UseVoiceRecorderOpti
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
 
+  // Preload the Whisper model in the background as soon as the hook mounts.
+  // By the time the user clicks the mic, the model is typically already ready.
   useEffect(() => {
-    fetch('/api/stt/status', { credentials: 'include' })
-      .then(r => r.json())
-      .then((data: { enabled: boolean }) => setSttEnabled(data.enabled))
-      .catch(() => setSttEnabled(false));
+    const unsub = onWhisperProgress((pct) => {
+      if (pct < 100) setDebugStatus(`Loading model (${pct}%)`);
+      else setDebugStatus('');
+    });
+
+    ensureWhisperLoaded().catch((err) => {
+      console.error('[Whisper] Preload failed:', err);
+      setDebugStatus('Model unavailable');
+    });
+
+    return unsub;
   }, []);
 
   const stopRecording = useCallback(async () => {
@@ -56,32 +65,18 @@ export function useVoiceRecorder({ onTranscript, onError }: UseVoiceRecorderOpti
         setDebugStatus('Transcribing...');
 
         try {
-          const formData = new FormData();
-          formData.append('audio', blob, 'recording.webm');
-
-          const resp = await fetch('/api/stt/transcribe', {
-            method: 'POST',
-            credentials: 'include',
-            body: formData,
-          });
-
-          if (!resp.ok) {
-            const err = await resp.json().catch(() => ({ error: 'Transcription failed' }));
-            const msg = (err as { error?: string }).error || 'Transcription failed';
-            setDebugStatus(msg);
-            onErrorRef.current?.(msg);
+          const text = await transcribeAudio(blob);
+          if (text) {
+            setDebugStatus(`"${text.slice(0, 40)}${text.length > 40 ? '…' : ''}"`);
+            onTranscriptRef.current(text);
           } else {
-            const data = await resp.json() as { text: string };
-            if (data.text?.trim()) {
-              setDebugStatus(`"${data.text.trim().slice(0, 40)}..."`);
-              onTranscriptRef.current(data.text.trim());
-            } else {
-              setDebugStatus('No speech detected');
-            }
+            setDebugStatus('No speech detected');
           }
-        } catch {
-          setDebugStatus('Whisper server unreachable');
-          onErrorRef.current?.('Whisper server unreachable');
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : 'Transcription failed';
+          console.error('[Whisper]', msg);
+          setDebugStatus(msg);
+          onErrorRef.current?.(msg);
         } finally {
           setIsTranscribing(false);
         }
@@ -114,7 +109,7 @@ export function useVoiceRecorder({ onTranscript, onError }: UseVoiceRecorderOpti
       mediaRecorderRef.current = recorder;
       recorder.start(250);
       setIsRecording(true);
-      setDebugStatus('Recording... click to stop');
+      setDebugStatus('Recording… click to stop');
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Mic access denied';
       setDebugStatus(msg);
@@ -132,7 +127,7 @@ export function useVoiceRecorder({ onTranscript, onError }: UseVoiceRecorderOpti
   }, []);
 
   return {
-    isSupported: sttEnabled && !!navigator.mediaDevices?.getUserMedia,
+    isSupported: !!navigator.mediaDevices?.getUserMedia,
     isRecording,
     isTranscribing,
     startRecording,

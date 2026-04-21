@@ -58,6 +58,7 @@ async function withTokenRefresh<T>(
 router.get('/', requireAuth, async (req: Request, res: Response) => {
   const workspaces = await withTokenRefresh(req, res, (token) => listWorkspaces(token), 'Failed to fetch workspaces from Coder');
   if (workspaces === undefined) return;
+  assignDefaultVoices(workspaces.map(w => w.id));
   const taskCounts = getTaskCountsByWorkspace();
   const tokenTotals = getTokenTotalsByWorkspace();
   const githubRepoUrls = getGithubRepoUrlsByWorkspace();
@@ -182,6 +183,37 @@ router.get('/:workspaceId/models', requireAuth, async (req: Request, res: Respon
 // Git settings
 import { getDb } from '../db/index.js';
 
+// Kokoro voice IDs in round-robin assignment order
+const KOKORO_VOICE_IDS = [
+  'kokoro:af_heart', 'kokoro:af_bella', 'kokoro:af_sarah', 'kokoro:af_sky',
+  'kokoro:af_nicole', 'kokoro:am_fenrir', 'kokoro:am_michael', 'kokoro:am_puck',
+  'kokoro:am_adam', 'kokoro:bf_emma', 'kokoro:bf_isabella', 'kokoro:bm_george',
+  'kokoro:bm_fable', 'kokoro:bm_lewis',
+];
+
+function assignDefaultVoices(workspaceIds: string[]): void {
+  const db = getDb();
+  const { c: assignedCount } = db
+    .prepare('SELECT COUNT(*) as c FROM workspace_settings WHERE voice_ids IS NOT NULL')
+    .get() as { c: number };
+  let nextIdx = assignedCount;
+  const now = new Date().toISOString();
+  for (const id of workspaceIds) {
+    const row = db
+      .prepare('SELECT voice_ids FROM workspace_settings WHERE workspace_id = ?')
+      .get(id) as { voice_ids: string | null } | undefined;
+    if (!row || row.voice_ids === null) {
+      const voiceId = KOKORO_VOICE_IDS[nextIdx % KOKORO_VOICE_IDS.length];
+      db.prepare(
+        `INSERT INTO workspace_settings (workspace_id, voice_ids, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(workspace_id) DO UPDATE SET voice_ids = excluded.voice_ids, updated_at = excluded.updated_at`
+      ).run(id, JSON.stringify([voiceId]), now);
+      nextIdx++;
+    }
+  }
+}
+
 router.get('/:workspaceId/git-settings', requireAuth, (req: Request, res: Response) => {
   const row = getDb().prepare('SELECT git_push_enabled FROM workspace_settings WHERE workspace_id = ?')
     .get(req.params.workspaceId) as { git_push_enabled: number } | undefined;
@@ -201,6 +233,29 @@ router.patch('/:workspaceId/git-settings', requireAuth, (req: Request, res: Resp
      ON CONFLICT(workspace_id) DO UPDATE SET git_push_enabled = ?, updated_at = ?`
   ).run(req.params.workspaceId, gitPushEnabled ? 1 : 0, new Date().toISOString(), gitPushEnabled ? 1 : 0, new Date().toISOString());
   res.json({ ok: true, gitPushEnabled });
+});
+
+// Voice settings
+router.get('/:workspaceId/voice-settings', requireAuth, (req: Request, res: Response) => {
+  const row = getDb().prepare('SELECT voice_ids FROM workspace_settings WHERE workspace_id = ?')
+    .get(req.params.workspaceId) as { voice_ids: string | null } | undefined;
+  const voiceIds: string[] = row?.voice_ids ? JSON.parse(row.voice_ids) : [];
+  res.json({ voiceIds });
+});
+
+router.patch('/:workspaceId/voice-settings', requireAuth, (req: Request, res: Response) => {
+  const { voiceIds } = req.body as { voiceIds: unknown };
+  if (!Array.isArray(voiceIds) || !voiceIds.every(v => typeof v === 'string')) {
+    res.status(400).json({ error: 'voiceIds must be an array of strings' });
+    return;
+  }
+  const now = new Date().toISOString();
+  getDb().prepare(
+    `INSERT INTO workspace_settings (workspace_id, voice_ids, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(workspace_id) DO UPDATE SET voice_ids = excluded.voice_ids, updated_at = excluded.updated_at`
+  ).run(req.params.workspaceId, JSON.stringify(voiceIds), now);
+  res.json({ ok: true, voiceIds });
 });
 
 export default router;

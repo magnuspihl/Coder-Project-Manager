@@ -129,6 +129,10 @@ export function getDb(): Database.Database {
       db.exec("ALTER TABLE workspace_settings ADD COLUMN last_active_task_id TEXT");
     }
 
+    if (!wsCols.some(c => c.name === 'voice_ids')) {
+      db.exec("ALTER TABLE workspace_settings ADD COLUMN voice_ids TEXT");
+    }
+
     // Discussion messages migrations
     const dmCols = db.prepare("PRAGMA table_info(discussion_messages)").all() as Array<{ name: string }>;
     if (!dmCols.some(c => c.name === 'participant_id')) {
