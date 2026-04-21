@@ -448,9 +448,13 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
       const msgs = visibleMessagesRef.current;
       const lastSpokenId = lastAutoSpokenMsgIdRef.current;
       const lastSpokenIdx = lastSpokenId ? msgs.findIndex(m => m.id === lastSpokenId) : -1;
-      const unspoken = msgs
-        .slice(lastSpokenIdx + 1)
-        .filter(m => m.role === 'assistant');
+
+      // If nothing has been auto-spoken yet (or the ref ID is no longer in the
+      // message list), only speak the single latest assistant message rather than
+      // replaying the entire session history.
+      const unspoken = lastSpokenIdx >= 0
+        ? msgs.slice(lastSpokenIdx + 1).filter(m => m.role === 'assistant')
+        : (() => { const last = [...msgs].reverse().find(m => m.role === 'assistant'); return last ? [last] : []; })();
 
       if (unspoken.length > 0) {
         lastAutoSpokenMsgIdRef.current = unspoken[unspoken.length - 1].id;
