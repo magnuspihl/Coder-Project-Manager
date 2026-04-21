@@ -153,6 +153,17 @@ export function getDb(): Database.Database {
     if (!dmCols.some(c => c.name === 'participant_id')) {
       db.exec("ALTER TABLE discussion_messages ADD COLUMN participant_id TEXT");
     }
+
+    // Play-on-open: track last time each discussion/task was opened
+    if (!discCols.some(c => c.name === 'last_opened_at')) {
+      db.exec("ALTER TABLE discussions ADD COLUMN last_opened_at TEXT");
+    }
+
+    // Re-read tasks cols in case they were modified above
+    const tasksCols2 = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+    if (!tasksCols2.some(c => c.name === 'last_opened_at')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN last_opened_at TEXT");
+    }
   }
   return db;
 }

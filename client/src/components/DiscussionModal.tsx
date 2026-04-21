@@ -14,6 +14,7 @@ import {
   sendParticipantMessage,
   getWorkspaces,
   getWorkspaceVoiceSettings,
+  touchDiscussion,
   type Discussion,
   type DiscussionMessage,
   type DiscussionParticipant,
@@ -206,6 +207,10 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const lastAutoSpokenMsgIdRef = useRef<string | null>(null);
   const prevTtsSpeakingIdRef = useRef<string | null>(null);
   const ttsSpeakQueueRef = useRef<Array<{ content: string; id: string; voiceIds: string[] }>>([]);
+
+  // Play-on-open: speak new messages when modal is opened in conversation mode
+  const [touchResult, setTouchResult] = useState<{ previousOpenedAt: string | null } | null>(null);
+  const playOnOpenDoneRef = useRef(false);
 
   const toggleConversationMode = useCallback(() => {
     setConversationMode(v => {
@@ -404,6 +409,52 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     window.addEventListener('popstate', handlePopState);
     return () => { window.removeEventListener('popstate', handlePopState); };
   }, []);
+
+  // Touch the discussion on mount to record open time and get previous open time
+  useEffect(() => {
+    touchDiscussion(discussionId)
+      .then(setTouchResult)
+      .catch(() => setTouchResult({ previousOpenedAt: null }));
+  }, [discussionId]);
+
+  // Play-on-open: once initial load is done, speak assistant messages newer than previousOpenedAt
+  // Uses visibleMessagesRef (not state) to avoid declaring this effect after the useMemo below
+  useEffect(() => {
+    if (playOnOpenDoneRef.current) return;
+    if (!touchResult || loading || !conversationMode || ttsVoices.length === 0) return;
+    playOnOpenDoneRef.current = true;
+    if (touchResult.previousOpenedAt === null) return; // first ever open — nothing to speak
+
+    const threshold = touchResult.previousOpenedAt;
+    const newMsgs = visibleMessagesRef.current.filter(
+      m => m.role === 'assistant' && m.created_at > threshold
+    );
+    if (newMsgs.length === 0) return;
+
+    // Mark all as spoken so the regular auto-speak effect doesn't re-queue them
+    lastAutoSpokenMsgIdRef.current = newMsgs[newMsgs.length - 1].id;
+
+    const items = newMsgs.map(m => {
+      const wsId = m.participant_id
+        ? (participants.find(p => p.id === m.participant_id)?.workspace_id ?? workspaceId)
+        : workspaceId;
+      const stripped = stripMarkdownForSpeech(
+        m.content.replace(TASK_REQUEST_RE, '').replace(MENTION_RE, '').trim()
+      );
+      const explicit = wsVoiceSettingsRef.current[wsId] ?? [];
+      const def = wsDefaultVoicesRef.current[wsId];
+      const voiceIds = def && !explicit.includes(def) ? [...explicit, def] : explicit;
+      return { content: stripped, id: m.id, voiceIds };
+    });
+
+    if (ttsSpeakQueueRef.current.length > 0 || ttsSpeakingIdRef.current !== null) {
+      ttsSpeakQueueRef.current.push(...items);
+    } else {
+      ttsSpeakQueueRef.current = items.slice(1);
+      ttsSpeakAs(items[0].content, items[0].id, items[0].voiceIds);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [touchResult, loading, conversationMode, ttsVoices.length]);
 
   // Memoize filtered message list so we don't re-filter/re-render on every poll
   const visibleMessages = useMemo(() =>

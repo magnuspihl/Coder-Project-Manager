@@ -24,6 +24,7 @@ import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, switchActiveTask, getLastActiveTaskId } from '../services/git.js';
 import { linkAttachmentsToTask, getAttachmentsByTask } from './uploads.js';
+import { getDb } from '../db/index.js';
 
 const router = Router();
 
@@ -192,6 +193,21 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
   // No other task working — resume immediately
   await resumeTask(task, message);
   res.json({ task: getTask(task.id) });
+});
+
+// Touch a task: atomically record open time, return previous value
+router.post('/tasks/:taskId/touch', requireAuth, (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  const db = getDb();
+  const now = new Date().toISOString();
+  const row = db.prepare('SELECT last_opened_at FROM tasks WHERE id = ?').get(task.id) as { last_opened_at: string | null } | undefined;
+  const previousOpenedAt = row?.last_opened_at ?? null;
+  db.prepare('UPDATE tasks SET last_opened_at = ? WHERE id = ?').run(now, task.id);
+  res.json({ previousOpenedAt, openedAt: now });
 });
 
 // Mark task as completed

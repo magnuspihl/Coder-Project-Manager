@@ -448,3 +448,9 @@ export const restartCpm = () =>
 
 export const sendParticipantCatchUp = (discussionId: string, participantId: string) =>
   request<{ ok: boolean; skipped: boolean }>(`/api/discussions/${discussionId}/participants/${participantId}/catchup`, { method: 'POST' });
+
+export const touchDiscussion = (discussionId: string) =>
+  request<{ previousOpenedAt: string | null; openedAt: string }>(`/api/discussions/${discussionId}/touch`, { method: 'POST' });
+
+export const touchTask = (taskId: string) =>
+  request<{ previousOpenedAt: string | null; openedAt: string }>(`/api/tasks/${taskId}/touch`, { method: 'POST' });

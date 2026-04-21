@@ -17,6 +17,7 @@ import {
   getWorkspaces,
   uploadFiles,
   getWorkspaceVoiceSettings,
+  touchTask,
   type Task,
   type Message,
   type StreamLogEntry,
@@ -109,6 +110,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   conversationModeRef.current = conversationMode;
   const lastAutoSpokenMsgIdRef = useRef<string | null>(null);
   const prevTtsSpeakingIdRef = useRef<string | null>(null);
+  const [touchResult, setTouchResult] = useState<{ previousOpenedAt: string | null } | null>(null);
+  const playOnOpenDoneRef = useRef(false);
 
   const toggleConversationMode = useCallback(() => {
     setConversationMode(v => {
@@ -278,6 +281,39 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       window.removeEventListener('popstate', handlePopState);
     };
   }, []);
+
+  // Touch the task on mount to record open time and get previous open time
+  useEffect(() => {
+    touchTask(taskId)
+      .then(setTouchResult)
+      .catch(() => setTouchResult({ previousOpenedAt: null }));
+  }, [taskId]);
+
+  // Play-on-open: once initial load is done, speak assistant messages newer than previousOpenedAt
+  useEffect(() => {
+    if (playOnOpenDoneRef.current) return;
+    if (!touchResult || loading || !conversationMode || ttsVoices.length === 0) return;
+    playOnOpenDoneRef.current = true;
+    if (touchResult.previousOpenedAt === null) return; // first ever open — nothing to speak
+
+    const threshold = touchResult.previousOpenedAt;
+    const newMsgs = messages.filter(
+      m => m.role === 'assistant' && m.created_at > threshold
+    );
+    if (newMsgs.length === 0) return;
+
+    // Speak just the most recent new message (consistent with normal auto-speak behavior)
+    const m = newMsgs[newMsgs.length - 1];
+    lastAutoSpokenMsgIdRef.current = m.id;
+    const wsId = m.participant_id
+      ? (participantsRef.current.find(p => p.id === m.participant_id)?.workspace_id ?? task?.workspace_id ?? '')
+      : (task?.workspace_id ?? '');
+    const explicit = wsVoiceSettingsRef.current[wsId] ?? [];
+    const def = wsDefaultVoicesRef.current[wsId];
+    const voiceIds = def && !explicit.includes(def) ? [...explicit, def] : explicit;
+    ttsSpeakAs(m.content, m.id, voiceIds);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [touchResult, loading, conversationMode, ttsVoices.length, messages]);
 
   // When closing via non-back-button means (Escape, X, etc.), pop the history entry we pushed
   const closeModal = () => {

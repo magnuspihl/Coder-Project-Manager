@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth.js';
+import { getDb } from '../db/index.js';
 import {
   getActiveDiscussion,
   getDiscussion,
@@ -220,6 +221,21 @@ router.post('/discussions/:discussionId/message', requireAuth, async (req: Reque
   await launchDiscussion(discussion, message, isResume, req.user!.username);
 
   res.json({ ok: true });
+});
+
+// Touch a discussion: atomically record open time, return previous value
+router.post('/discussions/:discussionId/touch', requireAuth, (req: Request, res: Response) => {
+  const discussion = getDiscussion(req.params.discussionId);
+  if (!discussion) {
+    res.status(404).json({ error: 'Discussion not found' });
+    return;
+  }
+  const db = getDb();
+  const now = new Date().toISOString();
+  const row = db.prepare('SELECT last_opened_at FROM discussions WHERE id = ?').get(discussion.id) as { last_opened_at: string | null } | undefined;
+  const previousOpenedAt = row?.last_opened_at ?? null;
+  db.prepare('UPDATE discussions SET last_opened_at = ? WHERE id = ?').run(now, discussion.id);
+  res.json({ previousOpenedAt, openedAt: now });
 });
 
 // Close a discussion
