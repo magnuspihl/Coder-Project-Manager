@@ -234,8 +234,20 @@ export default function WorkspacesPage() {
       const aHasAny = aCounts ? (aCounts.working + aCounts.queued + aCounts.awaiting_feedback + aCounts.failed + aCounts.completed + aCounts.cancelled) > 0 : false;
       const bHasAny = bCounts ? (bCounts.working + bCounts.queued + bCounts.awaiting_feedback + bCounts.failed + bCounts.completed + bCounts.cancelled) > 0 : false;
       if (aHasAny !== bHasAny) return aHasAny ? -1 : 1;
+      // Lanes without any tasks: sort by latest chat message desc (lanes without chats go last, alphabetical fallback)
+      if (!aHasAny && !bHasAny) {
+        const aMsg = latestDiscussionMessages[a.id];
+        const bMsg = latestDiscussionMessages[b.id];
+        if (aMsg && bMsg) {
+          if (aMsg !== bMsg) return aMsg > bMsg ? -1 : 1;
+        } else if (aMsg) {
+          return -1;
+        } else if (bMsg) {
+          return 1;
+        }
+      }
       return a.name.localeCompare(b.name);
-    }), [workspaces, taskCounts]);
+    }), [workspaces, taskCounts, latestDiscussionMessages]);
 
   // Pre-sort tasks per workspace so we don't re-sort on every render/keypress
   const sortedTasksByWorkspace = useMemo(() => {
