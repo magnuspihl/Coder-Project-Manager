@@ -1,7 +1,6 @@
 import { KokoroTTS } from 'kokoro-js';
 import { env } from '@huggingface/transformers';
 
-// Force browser fetch mode — same as main thread
 (env as Record<string, unknown>).useFS = false;
 (env as Record<string, unknown>).allowLocalModels = false;
 (env as Record<string, unknown>).allowRemoteModels = true;
@@ -16,24 +15,40 @@ function send(msg: unknown, transfer?: Transferable[]) {
 }
 
 self.addEventListener('message', async (event: MessageEvent) => {
-  const { id, type, text, voice, dtype } = event.data as {
+  const { id, type, text, voice } = event.data as {
     id: number;
-    type: 'load' | 'synthesize';
+    type: 'load' | 'stream';
     text?: string;
     voice?: string;
-    dtype?: string;
   };
 
   try {
     if (type === 'load') {
       if (!loadPromise) {
         loadPromise = (async () => {
-          tts = await KokoroTTS.from_pretrained(MODEL_ID, {
-            dtype: (dtype || 'q4') as never,
-            progress_callback: (info: Record<string, unknown>) => {
-              send({ type: 'progress', info });
-            },
-          } as never);
+          // Prefer WebGPU (much faster); fall back to WASM if unavailable or broken.
+          const hasWebGPU =
+            typeof navigator !== 'undefined' && 'gpu' in navigator;
+          const dtype = hasWebGPU ? 'q4f16' : 'q4';
+          const device = hasWebGPU ? 'webgpu' : 'wasm';
+
+          const progress = (info: Record<string, unknown>) => send({ type: 'progress', info });
+
+          try {
+            console.log(`[Kokoro Worker] Loading device=${device} dtype=${dtype}`);
+            tts = await KokoroTTS.from_pretrained(MODEL_ID, {
+              dtype, device, progress_callback: progress,
+            } as never);
+          } catch (e) {
+            if (hasWebGPU) {
+              console.warn('[Kokoro Worker] WebGPU failed, retrying with WASM q4:', e);
+              tts = await KokoroTTS.from_pretrained(MODEL_ID, {
+                dtype: 'q4', device: 'wasm', progress_callback: progress,
+              } as never);
+            } else {
+              throw e;
+            }
+          }
         })();
       }
       await loadPromise;
@@ -41,11 +56,16 @@ self.addEventListener('message', async (event: MessageEvent) => {
       return;
     }
 
-    if (type === 'synthesize') {
+    if (type === 'stream') {
       if (!tts) throw new Error('Model not loaded');
-      const out = await tts.generate(text!, { voice: voice as never });
-      const audio = out.audio as Float32Array;
-      send({ id, type: 'audio', audio, sampling_rate: out.sampling_rate }, [audio.buffer]);
+      for await (const chunk of tts.stream(text!, { voice: voice as never })) {
+        const audio = chunk.audio.audio as Float32Array;
+        send(
+          { id, type: 'audio-chunk', audio, sampling_rate: chunk.audio.sampling_rate },
+          [audio.buffer],
+        );
+      }
+      send({ id, type: 'audio-done' });
       return;
     }
   } catch (err) {

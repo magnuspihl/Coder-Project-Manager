@@ -33,10 +33,16 @@ export function onKokoroProgress(cb: ProgressListener): () => void {
 }
 
 type Pending = { resolve: (data: unknown) => void; reject: (err: Error) => void };
+type StreamCbs = {
+  onChunk: (audio: Float32Array, samplingRate: number) => void;
+  onDone: () => void;
+  onError: (err: Error) => void;
+};
 
 let worker: Worker | null = null;
 let msgCounter = 0;
 const pending = new Map<number, Pending>();
+const streams = new Map<number, StreamCbs>();
 
 let loadPromise: Promise<void> | null = null;
 let loaded = false;
@@ -49,6 +55,7 @@ function ensureWorker(): Worker {
 
   w.onmessage = (evt: MessageEvent) => {
     const { id, type, ...data } = evt.data as Record<string, unknown>;
+    const numId = id as number;
 
     if (type === 'progress') {
       const info = data.info as Record<string, unknown>;
@@ -57,21 +64,36 @@ function ensureWorker(): Worker {
       return;
     }
 
-    const p = pending.get(id as number);
-    if (!p) return;
-    pending.delete(id as number);
+    if (type === 'audio-chunk') {
+      streams.get(numId)?.onChunk(data.audio as Float32Array, data.sampling_rate as number);
+      return;
+    }
+
+    if (type === 'audio-done') {
+      const cb = streams.get(numId);
+      streams.delete(numId);
+      cb?.onDone();
+      return;
+    }
 
     if (type === 'error') {
-      p.reject(new Error(data.error as string));
-    } else {
-      p.resolve(data);
+      const scb = streams.get(numId);
+      if (scb) { streams.delete(numId); scb.onError(new Error(data.error as string)); return; }
+      const p = pending.get(numId);
+      if (p) { pending.delete(numId); p.reject(new Error(data.error as string)); }
+      return;
     }
+
+    const p = pending.get(numId);
+    if (p) { pending.delete(numId); p.resolve(data); }
   };
 
   w.onerror = (err) => {
     console.error('[Kokoro Worker] Uncaught error:', err.message);
     for (const p of pending.values()) p.reject(new Error(err.message || 'Worker error'));
+    for (const cb of streams.values()) cb.onError(new Error(err.message || 'Worker error'));
     pending.clear();
+    streams.clear();
     worker = null;
     loadPromise = null;
     loaded = false;
@@ -94,13 +116,19 @@ export function isKokoroLoaded(): boolean {
 }
 
 export interface KokoroHandle {
-  generate(text: string, opts: { voice: string }): Promise<{ audio: Float32Array; sampling_rate: number }>;
+  stream(
+    text: string,
+    voice: string,
+    onChunk: (audio: Float32Array, samplingRate: number) => void,
+    onDone: () => void,
+    onError: (err: string) => void,
+  ): void;
 }
 
 export async function getKokoroPipeline(): Promise<KokoroHandle> {
   if (!loadPromise) {
     console.log('[Kokoro] Starting worker…');
-    loadPromise = workerCall<void>('load', { dtype: 'q4' }).then(() => {
+    loadPromise = workerCall<void>('load').then(() => {
       loaded = true;
       console.log('[Kokoro] Worker ready');
       progressListeners.forEach(cb => cb(100));
@@ -113,10 +141,11 @@ export async function getKokoroPipeline(): Promise<KokoroHandle> {
   await loadPromise;
 
   return {
-    generate(text: string, { voice }: { voice: string }) {
-      return workerCall<{ audio: Float32Array; sampling_rate: number }>(
-        'synthesize', { text, voice }
-      );
+    stream(text, voice, onChunk, onDone, onError) {
+      const id = ++msgCounter;
+      const w = ensureWorker();
+      streams.set(id, { onChunk, onDone, onError: (e) => onError(e.message) });
+      w.postMessage({ id, type: 'stream', text, voice });
     },
   };
 }

@@ -156,39 +156,57 @@ export function useTTSVoice() {
       const voiceName = id.replace(/^kokoro:/, '');
       setSpeakingId(msgId || 'anon');
 
-      const unsub = onKokoroProgress((pct) => {
-        setKokoroProgress(pct);
-      });
+      const unsub = onKokoroProgress((pct) => setKokoroProgress(pct));
 
       try {
         setKokoroLoading(true);
-        console.log('[Kokoro] Loading pipeline for voice:', voiceName);
         const synth = await getKokoroPipeline();
         setKokoroLoading(false);
         unsub();
 
-        console.log('[Kokoro] Synthesizing text, length:', text.length);
-        const out = await synth.generate(text.slice(0, 3000), { voice: voiceName });
-        console.log('[Kokoro] Got audio, samples:', out.audio?.length, 'rate:', out.sampling_rate);
-
-        if (!out.audio?.length) throw new Error('Empty audio output');
-
-        const ctx = new AudioContext({ sampleRate: out.sampling_rate });
-        const buffer = ctx.createBuffer(1, out.audio.length, out.sampling_rate);
-        buffer.getChannelData(0).set(out.audio);
-        const source = ctx.createBufferSource();
-        source.buffer = buffer;
-        source.connect(ctx.destination);
-        kokoroSourceRef.current = source;
+        // Create AudioContext once for the whole utterance so we can schedule
+        // each sentence chunk to play immediately after the previous one.
+        const ctx = new AudioContext({ sampleRate: 24000 });
         kokoroContextRef.current = ctx;
-        source.onended = () => {
-          setSpeakingId(null);
-          ctx.close().catch(() => {});
-          kokoroSourceRef.current = null;
-          kokoroContextRef.current = null;
-        };
-        source.start();
-        console.log('[Kokoro] Playback started');
+        kokoroSourceRef.current = null;
+        let nextStart = ctx.currentTime;
+        let lastSource: AudioBufferSourceNode | null = null;
+
+        synth.stream(
+          text.slice(0, 3000),
+          voiceName,
+          (audio, samplingRate) => {
+            if (kokoroContextRef.current !== ctx) return; // stopped mid-stream
+            const buf = ctx.createBuffer(1, audio.length, samplingRate);
+            buf.getChannelData(0).set(audio);
+            const src = ctx.createBufferSource();
+            src.buffer = buf;
+            src.connect(ctx.destination);
+            // Small lookahead buffer so scheduling is gapless even under load
+            const startAt = Math.max(ctx.currentTime + 0.05, nextStart);
+            src.start(startAt);
+            nextStart = startAt + buf.duration;
+            lastSource = src;
+          },
+          () => {
+            // All sentences synthesised — wait for last source to finish
+            if (kokoroContextRef.current !== ctx) return;
+            const finish = () => {
+              setSpeakingId(null);
+              ctx.close().catch(() => {});
+              if (kokoroContextRef.current === ctx) kokoroContextRef.current = null;
+            };
+            if (lastSource) lastSource.onended = finish;
+            else finish();
+          },
+          (errMsg) => {
+            console.error('[Kokoro] Stream error:', errMsg);
+            setKokoroError(errMsg);
+            setSpeakingId(null);
+            ctx.close().catch(() => {});
+            if (kokoroContextRef.current === ctx) kokoroContextRef.current = null;
+          },
+        );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error('[Kokoro] Error:', msg);
