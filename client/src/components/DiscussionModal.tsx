@@ -565,9 +565,10 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     const PTT_KEY = '½';
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== PTT_KEY || e.repeat) return;
+      if (e.key !== PTT_KEY) return;
       e.preventDefault();
       e.stopPropagation();
+      if (e.repeat) return;
       if (!voiceSupportedRef.current || isTranscribingRef.current) return;
       if (sendingRef.current || isAnyRunningRef.current) return;
       if (!pttActiveRef.current && !isListeningRef.current) {
