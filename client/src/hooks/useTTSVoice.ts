@@ -167,37 +167,42 @@ export function useTTSVoice() {
         // Create AudioContext once for the whole utterance so we can schedule
         // each sentence chunk to play immediately after the previous one.
         const ctx = new AudioContext({ sampleRate: 24000 });
+        // Chrome may create AudioContext in suspended state after an async gap;
+        // resume() ensures scheduled buffers actually play.
+        await ctx.resume();
         kokoroContextRef.current = ctx;
         kokoroSourceRef.current = null;
         let nextStart = ctx.currentTime;
-        let lastSource: AudioBufferSourceNode | null = null;
+
+        console.log('[Kokoro] Starting stream, voice:', voiceName, 'ctx state:', ctx.state);
 
         synth.stream(
           text.slice(0, 3000),
           voiceName,
           (audio, samplingRate) => {
+            console.log('[Kokoro] Chunk received, samples:', audio.length, 'ctx state:', ctx.state);
             if (kokoroContextRef.current !== ctx) return; // stopped mid-stream
             const buf = ctx.createBuffer(1, audio.length, samplingRate);
             buf.getChannelData(0).set(audio);
             const src = ctx.createBufferSource();
             src.buffer = buf;
             src.connect(ctx.destination);
-            // Small lookahead buffer so scheduling is gapless even under load
             const startAt = Math.max(ctx.currentTime + 0.05, nextStart);
             src.start(startAt);
             nextStart = startAt + buf.duration;
-            lastSource = src;
           },
           () => {
-            // All sentences synthesised — wait for last source to finish
+            // All sentences synthesised — schedule cleanup after last chunk ends.
+            // Using setTimeout instead of onended avoids a race where the last
+            // chunk finishes playing before onDone is called.
             if (kokoroContextRef.current !== ctx) return;
-            const finish = () => {
+            const timeLeft = Math.max(0, nextStart - ctx.currentTime);
+            console.log('[Kokoro] Synthesis done, audio ends in', timeLeft.toFixed(2), 's');
+            setTimeout(() => {
               setSpeakingId(null);
               ctx.close().catch(() => {});
               if (kokoroContextRef.current === ctx) kokoroContextRef.current = null;
-            };
-            if (lastSource) lastSource.onended = finish;
-            else finish();
+            }, timeLeft * 1000 + 150);
           },
           (errMsg) => {
             console.error('[Kokoro] Stream error:', errMsg);

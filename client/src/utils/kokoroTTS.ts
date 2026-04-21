@@ -65,6 +65,7 @@ function ensureWorker(): Worker {
     }
 
     if (type === 'audio-chunk') {
+      console.log('[Kokoro] audio-chunk id=', numId, 'samples=', (data.audio as Float32Array)?.length);
       streams.get(numId)?.onChunk(data.audio as Float32Array, data.sampling_rate as number);
       return;
     }
@@ -144,6 +145,7 @@ export async function getKokoroPipeline(): Promise<KokoroHandle> {
     stream(text, voice, onChunk, onDone, onError) {
       const id = ++msgCounter;
       const w = ensureWorker();
+      console.log('[Kokoro] Sending stream id=', id, 'voice:', voice, 'text length:', text.length);
       streams.set(id, { onChunk, onDone, onError: (e) => onError(e.message) });
       w.postMessage({ id, type: 'stream', text, voice });
     },

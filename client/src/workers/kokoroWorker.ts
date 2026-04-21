@@ -58,6 +58,7 @@ self.addEventListener('message', async (event: MessageEvent) => {
 
     if (type === 'stream') {
       if (!tts) throw new Error('Model not loaded');
+      console.log('[Kokoro Worker] stream id=', id, 'text length:', text!.length);
       // tts.stream(string) passes text to a TextSplitterStream internally but never
       // calls close() on it, so the async iterator hangs after the last sentence.
       // Use TextSplitterStream directly and close it to flush remaining text.
@@ -65,13 +66,16 @@ self.addEventListener('message', async (event: MessageEvent) => {
       const stream = tts.stream(splitter, { voice: voice as never });
       splitter.push(text!);
       splitter.close();
+      let chunkCount = 0;
       for await (const chunk of stream) {
         const audio = chunk.audio.audio as Float32Array;
+        console.log('[Kokoro Worker] chunk', ++chunkCount, 'samples:', audio.length);
         send(
           { id, type: 'audio-chunk', audio, sampling_rate: chunk.audio.sampling_rate },
           [audio.buffer],
         );
       }
+      console.log('[Kokoro Worker] stream done, chunks:', chunkCount);
       send({ id, type: 'audio-done' });
       return;
     }
