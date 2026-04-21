@@ -131,8 +131,7 @@ export function useTTSVoice() {
     try { localStorage.setItem(STORAGE_PROVIDER_KEY, prov); } catch {}
   }, []);
 
-  const speak = useCallback(async (text: string, msgId?: string): Promise<void> => {
-    // Stop any current playback
+  const stopCurrent = useCallback(() => {
     if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
     speechSynthesis.cancel();
     if (kokoroSourceRef.current) {
@@ -143,36 +142,29 @@ export function useTTSVoice() {
       kokoroContextRef.current.close().catch(() => {});
       kokoroContextRef.current = null;
     }
+  }, []);
 
-    if (speakingId === msgId) {
-      setSpeakingId(null);
-      return;
-    }
+  // Core speaking logic for a specific voice. Does NOT stop current playback or
+  // check toggle — callers are responsible for that. Throws on synthesis error so
+  // speakAs() can fall through to the next voice in the priority list.
+  const speakWithVoiceId = useCallback(async (text: string, msgId: string | undefined, id: string): Promise<void> => {
     if (!text.trim()) return;
-
-    const id = selectedId;
 
     if (id.startsWith('kokoro:')) {
       const voiceName = id.replace(/^kokoro:/, '');
       setSpeakingId(msgId || 'anon');
-
       const unsub = onKokoroProgress((pct) => setKokoroProgress(pct));
-
       try {
         setKokoroLoading(true);
         const synth = await getKokoroPipeline();
         setKokoroLoading(false);
         unsub();
 
-        // Create AudioContext before synthesis so stopSpeaking() can cancel via
-        // the ref even while we're still waiting for chunks to arrive.
         const ctx = new AudioContext({ sampleRate: 24000 });
         await ctx.resume();
         kokoroContextRef.current = ctx;
         kokoroSourceRef.current = null;
 
-        // Buffer all chunks before scheduling: synthesis (WASM) may be slower than
-        // real-time playback, causing silence gaps if we schedule eagerly per-chunk.
         const chunks: Array<{ audio: Float32Array; samplingRate: number }> = [];
         console.log('[Kokoro] Buffering synthesis, voice:', voiceName);
 
@@ -181,7 +173,7 @@ export function useTTSVoice() {
             text.slice(0, 3000),
             voiceName,
             (audio, samplingRate) => {
-              if (kokoroContextRef.current !== ctx) { resolve(); return; } // stopped
+              if (kokoroContextRef.current !== ctx) { resolve(); return; }
               console.log('[Kokoro] Chunk buffered, samples:', audio.length);
               chunks.push({ audio, samplingRate });
             },
@@ -190,7 +182,7 @@ export function useTTSVoice() {
           );
         });
 
-        if (kokoroContextRef.current !== ctx) return; // stopped during synthesis
+        if (kokoroContextRef.current !== ctx) return;
 
         let nextStart = ctx.currentTime + 0.05;
         for (const { audio, samplingRate } of chunks) {
@@ -217,6 +209,7 @@ export function useTTSVoice() {
         setSpeakingId(null);
         setKokoroLoading(false);
         unsub();
+        throw err;
       }
       return;
     }
@@ -231,21 +224,24 @@ export function useTTSVoice() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text: text.slice(0, 5000), voiceId }),
         });
-        if (!resp.ok) throw new Error('TTS failed');
+        if (!resp.ok) throw new Error(`TTS failed: ${resp.status}`);
         const blob = await resp.blob();
         const url = URL.createObjectURL(blob);
         const audio = new Audio(url);
         audioRef.current = audio;
-        audio.onended = () => { setSpeakingId(null); URL.revokeObjectURL(url); audioRef.current = null; };
-        audio.onerror = () => { setSpeakingId(null); URL.revokeObjectURL(url); audioRef.current = null; };
-        await audio.play();
-      } catch {
+        await new Promise<void>((resolve, reject) => {
+          audio.onended = () => { setSpeakingId(null); URL.revokeObjectURL(url); audioRef.current = null; resolve(); };
+          audio.onerror = () => { setSpeakingId(null); URL.revokeObjectURL(url); audioRef.current = null; reject(new Error('Audio playback error')); };
+          audio.play().catch(reject);
+        });
+      } catch (err) {
         setSpeakingId(null);
+        throw err;
       }
       return;
     }
 
-    // Browser TTS
+    // Browser TTS — best-effort, no error propagation (can't reliably detect voice absence)
     const uri = id.replace(/^br:/, '');
     const utter = new SpeechSynthesisUtterance(text);
     const bv = speechSynthesis.getVoices().find(v => v.voiceURI === uri);
@@ -255,22 +251,41 @@ export function useTTSVoice() {
     utter.onend = () => setSpeakingId(null);
     utter.onerror = () => setSpeakingId(null);
     speechSynthesis.speak(utter);
-  }, [selectedId, speakingId]);
+  }, [stopCurrent]);
+
+  // Manual speak: stops current, toggles off if same message, uses selectedId
+  const speak = useCallback(async (text: string, msgId?: string): Promise<void> => {
+    stopCurrent();
+    if (speakingId === msgId) { setSpeakingId(null); return; }
+    try {
+      await speakWithVoiceId(text, msgId, selectedId);
+    } catch {
+      // swallow — error already logged inside speakWithVoiceId
+    }
+  }, [selectedId, speakingId, stopCurrent, speakWithVoiceId]);
+
+  // Speaks using a priority-ordered list of voice IDs, falling back on error.
+  // Caller is responsible for toggle behavior (stop if same msgId is already speaking).
+  const speakAs = useCallback(async (text: string, msgId: string | undefined, voiceIds: string[]): Promise<void> => {
+    stopCurrent();
+    setSpeakingId(null);
+    const ids = voiceIds.length > 0 ? voiceIds : [selectedId];
+    for (const vid of ids) {
+      try {
+        await speakWithVoiceId(text, msgId, vid);
+        return;
+      } catch (err) {
+        console.warn('[TTS] Voice', vid, 'failed, trying next:', err instanceof Error ? err.message : err);
+        setSpeakingId(null);
+      }
+    }
+  }, [selectedId, stopCurrent, speakWithVoiceId]);
 
   const stopSpeaking = useCallback(() => {
-    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
-    speechSynthesis.cancel();
-    if (kokoroSourceRef.current) {
-      try { kokoroSourceRef.current.stop(); } catch {}
-      kokoroSourceRef.current = null;
-    }
-    if (kokoroContextRef.current) {
-      kokoroContextRef.current.close().catch(() => {});
-      kokoroContextRef.current = null;
-    }
+    stopCurrent();
     setSpeakingId(null);
     setKokoroLoading(false);
-  }, []);
+  }, [stopCurrent]);
 
-  return { voices, selectedId, provider, selectVoice, speak, stopSpeaking, speakingId, kokoroLoading, kokoroProgress, kokoroError };
+  return { voices, selectedId, provider, selectVoice, speak, speakAs, stopSpeaking, speakingId, kokoroLoading, kokoroProgress, kokoroError };
 }

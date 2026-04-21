@@ -203,4 +203,27 @@ router.patch('/:workspaceId/git-settings', requireAuth, (req: Request, res: Resp
   res.json({ ok: true, gitPushEnabled });
 });
 
+// Voice settings
+router.get('/:workspaceId/voice-settings', requireAuth, (req: Request, res: Response) => {
+  const row = getDb().prepare('SELECT voice_ids FROM workspace_settings WHERE workspace_id = ?')
+    .get(req.params.workspaceId) as { voice_ids: string | null } | undefined;
+  const voiceIds: string[] = row?.voice_ids ? JSON.parse(row.voice_ids) : [];
+  res.json({ voiceIds });
+});
+
+router.patch('/:workspaceId/voice-settings', requireAuth, (req: Request, res: Response) => {
+  const { voiceIds } = req.body as { voiceIds: unknown };
+  if (!Array.isArray(voiceIds) || !voiceIds.every(v => typeof v === 'string')) {
+    res.status(400).json({ error: 'voiceIds must be an array of strings' });
+    return;
+  }
+  const now = new Date().toISOString();
+  getDb().prepare(
+    `INSERT INTO workspace_settings (workspace_id, voice_ids, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(workspace_id) DO UPDATE SET voice_ids = excluded.voice_ids, updated_at = excluded.updated_at`
+  ).run(req.params.workspaceId, JSON.stringify(voiceIds), now);
+  res.json({ ok: true, voiceIds });
+});
+
 export default router;

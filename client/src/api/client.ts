@@ -360,6 +360,15 @@ export const updateGitSettings = (workspaceId: string, gitPushEnabled: boolean) 
     body: JSON.stringify({ gitPushEnabled }),
   });
 
+export const getWorkspaceVoiceSettings = (workspaceId: string) =>
+  request<{ voiceIds: string[] }>(`/api/workspaces/${workspaceId}/voice-settings`);
+
+export const updateWorkspaceVoiceSettings = (workspaceId: string, voiceIds: string[]) =>
+  request<{ ok: boolean; voiceIds: string[] }>(`/api/workspaces/${workspaceId}/voice-settings`, {
+    method: 'PATCH',
+    body: JSON.stringify({ voiceIds }),
+  });
+
 export const getDiscussionSettings = (workspaceId: string) =>
   request<{ fullAccess: boolean }>(`/api/workspaces/${workspaceId}/discussion-settings`);
 

@@ -18,6 +18,8 @@ import {
   getModels,
   getGitSettings,
   updateGitSettings,
+  getWorkspaceVoiceSettings,
+  updateWorkspaceVoiceSettings,
   uploadFiles,
   type Workspace,
   type ModelInfo,
@@ -27,6 +29,7 @@ import {
   type ClaudeUsage,
   type RateLimitUsage,
 } from '../api/client';
+import { KOKORO_VOICES } from '../utils/kokoroTTS';
 import { playChime } from '../utils/chime';
 import { useDraft, useSessionState } from '../hooks/useDraft';
 import TaskDetailModal from '../components/TaskDetailModal';
@@ -118,6 +121,9 @@ export default function WorkspacesPage() {
   const [chatCreating, setChatCreating] = useState(false);
   const [settingsOpenWsId, setSettingsOpenWsId] = useState<string | null>(null);
   const [gitPushSettings, setGitPushSettings] = useState<Record<string, boolean>>({});
+  const [wsVoiceSettings, setWsVoiceSettings] = useState<Record<string, string[]>>({});
+  const [availableVoices, setAvailableVoices] = useState<Array<{ id: string; name: string }>>([]);
+  const availableVoicesLoadedRef = useRef(false);
   const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevTaskStatusesRef = useRef<Map<string, string>>(new Map());
   const lastTaskWorkspaceIdRef = useRef<string | null>(null);
@@ -559,6 +565,55 @@ export default function WorkspacesPage() {
         setGitPushSettings(prev => ({ ...prev, [workspaceId]: gitPushEnabled }));
       } catch { /* default shown as true */ }
     }
+    // Fetch voice settings
+    if (!(workspaceId in wsVoiceSettings)) {
+      getWorkspaceVoiceSettings(workspaceId)
+        .then(({ voiceIds }) => setWsVoiceSettings(prev => ({ ...prev, [workspaceId]: voiceIds })))
+        .catch(() => setWsVoiceSettings(prev => ({ ...prev, [workspaceId]: [] })));
+    }
+    // Load available voices once (Kokoro + ElevenLabs)
+    if (!availableVoicesLoadedRef.current) {
+      availableVoicesLoadedRef.current = true;
+      const voices: Array<{ id: string; name: string }> = KOKORO_VOICES.map(v => ({
+        id: `kokoro:${v.id}`,
+        name: `${v.name} — ${v.accent} ${v.gender}`,
+      }));
+      try {
+        const resp = await fetch('/api/tts/voices', { credentials: 'include' });
+        if (resp.ok) {
+          const data = await resp.json() as { enabled: boolean; voices: Array<{ id: string; name: string; description?: string }> };
+          if (data.enabled) {
+            for (const v of data.voices) {
+              voices.push({ id: `el:${v.id}`, name: v.description ? `${v.name} — ${v.description}` : v.name });
+            }
+          }
+        }
+      } catch { /* ElevenLabs unavailable */ }
+      setAvailableVoices(voices);
+    }
+  };
+
+  const handleAddVoice = async (workspaceId: string, voiceId: string) => {
+    const current = wsVoiceSettings[workspaceId] ?? [];
+    if (current.includes(voiceId)) return;
+    const next = [...current, voiceId];
+    setWsVoiceSettings(prev => ({ ...prev, [workspaceId]: next }));
+    try {
+      await updateWorkspaceVoiceSettings(workspaceId, next);
+    } catch {
+      setWsVoiceSettings(prev => ({ ...prev, [workspaceId]: current }));
+    }
+  };
+
+  const handleRemoveVoice = async (workspaceId: string, voiceId: string) => {
+    const current = wsVoiceSettings[workspaceId] ?? [];
+    const next = current.filter(v => v !== voiceId);
+    setWsVoiceSettings(prev => ({ ...prev, [workspaceId]: next }));
+    try {
+      await updateWorkspaceVoiceSettings(workspaceId, next);
+    } catch {
+      setWsVoiceSettings(prev => ({ ...prev, [workspaceId]: current }));
+    }
   };
 
   const handleToggleGitPush = async (workspaceId: string) => {
@@ -869,7 +924,7 @@ export default function WorkspacesPage() {
             </div>
           </div>
           {settingsOpenWsId === ws.id && (
-            <div className="flex items-center gap-2 px-2 py-1.5 bg-gray-100 dark:bg-gray-800 rounded text-xs mb-1">
+            <div className="flex flex-col gap-2 px-2 py-2 bg-gray-100 dark:bg-gray-800 rounded text-xs mb-1">
               <label className="flex items-center gap-1.5 cursor-pointer select-none">
                 <input
                   type="checkbox"
@@ -879,6 +934,48 @@ export default function WorkspacesPage() {
                 />
                 <span className="text-gray-600 dark:text-gray-300">Allow git remote operations</span>
               </label>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-gray-500 dark:text-gray-400 shrink-0">Voice:</span>
+                {(wsVoiceSettings[ws.id] ?? []).map((vid, idx) => {
+                  const voiceName = availableVoices.find(v => v.id === vid)?.name ?? vid;
+                  return (
+                    <span key={vid} className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 rounded-full text-[10px] leading-tight">
+                      <span className="text-purple-400 dark:text-purple-500 mr-0.5">{idx + 1}.</span>
+                      {voiceName.slice(0, 24)}{voiceName.length > 24 ? '…' : ''}
+                      <button
+                        onClick={() => handleRemoveVoice(ws.id, vid)}
+                        className="ml-0.5 opacity-50 hover:opacity-100 hover:text-red-500 leading-none"
+                        title="Remove"
+                      >×</button>
+                    </span>
+                  );
+                })}
+                <select
+                  value=""
+                  onChange={e => { if (e.target.value) { handleAddVoice(ws.id, e.target.value); (e.target as HTMLSelectElement).value = ''; } }}
+                  className="text-[10px] px-1 py-0.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-500 dark:text-gray-400 cursor-pointer focus:outline-none"
+                  title="Add a voice to the priority list"
+                >
+                  <option value="">+ Add voice</option>
+                  {availableVoices.filter(v => v.id.startsWith('kokoro:') && !(wsVoiceSettings[ws.id] ?? []).includes(v.id)).length > 0 && (
+                    <optgroup label="Kokoro (local)">
+                      {availableVoices
+                        .filter(v => v.id.startsWith('kokoro:') && !(wsVoiceSettings[ws.id] ?? []).includes(v.id))
+                        .map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                    </optgroup>
+                  )}
+                  {availableVoices.filter(v => v.id.startsWith('el:') && !(wsVoiceSettings[ws.id] ?? []).includes(v.id)).length > 0 && (
+                    <optgroup label="ElevenLabs">
+                      {availableVoices
+                        .filter(v => v.id.startsWith('el:') && !(wsVoiceSettings[ws.id] ?? []).includes(v.id))
+                        .map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                    </optgroup>
+                  )}
+                </select>
+                {(wsVoiceSettings[ws.id] ?? []).length === 0 && (
+                  <span className="text-gray-400 dark:text-gray-500 text-[10px] italic">none (uses default)</span>
+                )}
+              </div>
             </div>
           )}
           {(apps.length > 0 || openPorts.length > 0 || githubRepoUrl) && (

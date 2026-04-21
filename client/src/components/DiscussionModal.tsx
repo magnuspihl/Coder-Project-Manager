@@ -13,6 +13,7 @@ import {
   removeDiscussionParticipant,
   sendParticipantMessage,
   getWorkspaces,
+  getWorkspaceVoiceSettings,
   type Discussion,
   type DiscussionMessage,
   type DiscussionParticipant,
@@ -196,19 +197,34 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const prevIsAnyRunningRef = useRef(false);
   const voicePendingSendRef = useRef(false);
 
+  // Conversation mode: auto-reads incoming messages + auto-sends on PTT release
+  const [conversationMode, setConversationMode] = useState(() => localStorage.getItem('voice:conversation') === '1');
+  const conversationModeRef = useRef(conversationMode);
+  conversationModeRef.current = conversationMode;
+  const lastAutoSpokenMsgIdRef = useRef<string | null>(null);
+  const prevTtsSpeakingIdRef = useRef<string | null>(null);
+
+  const toggleConversationMode = useCallback(() => {
+    setConversationMode(v => {
+      const next = !v;
+      localStorage.setItem('voice:conversation', next ? '1' : '0');
+      return next;
+    });
+  }, []);
+
   const handleVoiceTranscript = useCallback((text: string) => {
     setMessage(text);
   }, [setMessage]);
 
   const handleVoiceSilence = useCallback((finalText: string) => {
     setMessage(finalText);
-    voicePendingSendRef.current = true;
+    if (conversationModeRef.current) voicePendingSendRef.current = true;
   }, [setMessage]);
 
   // Whisper-based push-to-talk (preferred when available)
   const handleRecorderTranscript = useCallback((text: string) => {
     setMessage(text);
-    voicePendingSendRef.current = true;
+    if (conversationModeRef.current) voicePendingSendRef.current = true;
   }, [setMessage]);
 
   const recorder = useVoiceRecorder({
@@ -244,7 +260,18 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     }
   }, [useWhisper, recorder.stopRecording, speechRec.stopListening]);
 
-  const { voices: ttsVoices, selectedId: ttsSelectedId, selectVoice: ttsSelectVoice, speak: ttsSpeak, speakingId: ttsSpeakingId, kokoroLoading, kokoroProgress, kokoroError } = useTTSVoice();
+  const { voices: ttsVoices, speak: ttsSpeak, speakAs: ttsSpeakAs, stopSpeaking: ttsStop, speakingId: ttsSpeakingId, kokoroLoading, kokoroProgress, kokoroError } = useTTSVoice();
+
+  // Voice settings keyed by workspace ID — loaded lazily when participants join
+  const [wsVoiceSettings, setWsVoiceSettings] = useState<Record<string, string[]>>({});
+  const wsVoiceSettingsRef = useRef(wsVoiceSettings);
+  wsVoiceSettingsRef.current = wsVoiceSettings;
+
+  // Resolve workspace ID for a message (null participant_id = host workspace)
+  const getMsgWorkspaceId = useCallback((msg: DiscussionMessage): string => {
+    if (!msg.participant_id) return workspaceId;
+    return participants.find(p => p.id === msg.participant_id)?.workspace_id ?? workspaceId;
+  }, [workspaceId, participants]);
 
   // Initial load: fetch latest 50 messages
   // Subsequent polls: only fetch messages after the last known ID
@@ -382,21 +409,63 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     }),
     [messages]
   );
+  const visibleMessagesRef = useRef(visibleMessages);
+  visibleMessagesRef.current = visibleMessages;
+
+  // Load voice settings for any workspace we haven't fetched yet (host + participants)
+  useEffect(() => {
+    const wsIds = [workspaceId, ...participants.map(p => p.workspace_id)];
+    for (const id of wsIds) {
+      if (id in wsVoiceSettings) continue;
+      getWorkspaceVoiceSettings(id)
+        .then(({ voiceIds }) => setWsVoiceSettings(prev => ({ ...prev, [id]: voiceIds })))
+        .catch(() => setWsVoiceSettings(prev => ({ ...prev, [id]: [] })));
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspaceId, participants.length]);
 
   // Computed: is any agent (host or participant) running?
   const isAnyRunning = !!(discussion?.running) || participants.some(p => p.running);
   const runningParticipant = participants.find(p => p.running);
   const runningAgentName = discussion?.running ? workspaceName : runningParticipant?.workspace_name || null;
 
-  // Voice mode: auto-re-listen when Claude finishes responding
+  // When agent finishes: auto-speak last message (conversation mode) and/or auto-re-listen (voice mode)
   useEffect(() => {
     const wasRunning = prevIsAnyRunningRef.current;
     prevIsAnyRunningRef.current = isAnyRunning;
-    if (wasRunning && !isAnyRunning && voiceModeActive && !isListening) {
+    if (!wasRunning || isAnyRunning) return;
+
+    const willAutoSpeak = conversationMode && ttsVoices.length > 0;
+
+    // Re-listen immediately only if we won't auto-speak (auto-speak → re-listen happens after TTS ends)
+    if (voiceModeActive && !isListening && !willAutoSpeak) {
       playListenChime();
       startListening();
     }
-  }, [isAnyRunning, voiceModeActive, isListening, startListening]);
+
+    if (willAutoSpeak) {
+      const msgs = visibleMessagesRef.current;
+      const lastAssistant = [...msgs].reverse().find(m => m.role === 'assistant');
+      if (lastAssistant && lastAssistant.id !== lastAutoSpokenMsgIdRef.current) {
+        lastAutoSpokenMsgIdRef.current = lastAssistant.id;
+        const wsId = lastAssistant.participant_id
+          ? (participants.find(p => p.id === lastAssistant.participant_id)?.workspace_id ?? workspaceId)
+          : workspaceId;
+        const voiceIds = wsVoiceSettingsRef.current[wsId] ?? [];
+        ttsSpeakAs(lastAssistant.content, lastAssistant.id, voiceIds);
+      }
+    }
+  }, [isAnyRunning, voiceModeActive, isListening, startListening, conversationMode, ttsVoices.length, ttsSpeakAs, workspaceId, participants]);
+
+  // After TTS finishes in conversation mode, auto-re-listen so the loop continues
+  useEffect(() => {
+    const prev = prevTtsSpeakingIdRef.current;
+    prevTtsSpeakingIdRef.current = ttsSpeakingId;
+    if (prev !== null && ttsSpeakingId === null && conversationMode && voiceModeActive && !isListening) {
+      playListenChime();
+      startListening();
+    }
+  }, [ttsSpeakingId, conversationMode, voiceModeActive, isListening, startListening]);
 
   // Target display name
   const targetName = targetId
@@ -742,9 +811,18 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                 </div>
               )}
 
-              {visibleMessages.map((msg) => (
-                <MessageRow key={msg.id} msg={msg} hostWorkspaceName={workspaceName} participants={participants} onSpeak={ttsVoices.length > 0 ? ttsSpeak : undefined} isSpeaking={ttsSpeakingId === msg.id} />
-              ))}
+              {visibleMessages.map((msg) => {
+                let onSpeak: ((text: string, msgId: string) => void) | undefined;
+                if (ttsVoices.length > 0) {
+                  const wsId = getMsgWorkspaceId(msg);
+                  const voiceIds = wsVoiceSettings[wsId] ?? [];
+                  onSpeak = (text, mid) => {
+                    if (ttsSpeakingId === mid) { ttsStop(); return; }
+                    ttsSpeakAs(text, mid, voiceIds);
+                  };
+                }
+                return <MessageRow key={msg.id} msg={msg} hostWorkspaceName={workspaceName} participants={participants} onSpeak={onSpeak} isSpeaking={ttsSpeakingId === msg.id} />;
+              })}
 
               {/* Working indicator */}
               {isAnyRunning && (
@@ -927,61 +1005,16 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                     >
                       End Discussion
                     </button>
-                    {ttsVoices.length > 0 && (() => {
-                      const kokoro = ttsVoices.filter(v => v.provider === 'kokoro');
-                      const custom = ttsVoices.filter(v => v.isCustom);
-                      const elevenlabs = ttsVoices.filter(v => v.provider === 'elevenlabs' && !v.isCustom);
-                      const browser = ttsVoices.filter(v => v.provider === 'browser');
-                      return (
-                        <div className="flex items-center gap-1">
-                          {kokoroLoading && (
-                            <span className="text-[10px] text-purple-500 dark:text-purple-400 whitespace-nowrap">
-                              {kokoroProgress > 0 && kokoroProgress < 100 ? `Kokoro ${kokoroProgress}%` : 'Loading Kokoro…'}
-                            </span>
-                          )}
-                          {kokoroError && !kokoroLoading && (
-                            <span className="text-[10px] text-red-500 dark:text-red-400 whitespace-nowrap truncate max-w-[140px]" title={kokoroError}>
-                              Kokoro error
-                            </span>
-                          )}
-                          <select
-                            value={ttsSelectedId}
-                            onChange={(e) => ttsSelectVoice(e.target.value)}
-                            className="text-[10px] px-1.5 py-0.5 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-500 dark:text-gray-400 focus:outline-none focus:ring-1 focus:ring-purple-500 max-w-[180px]"
-                            title="Text-to-speech voice"
-                          >
-                            {kokoro.length > 0 && (
-                              <optgroup label="Kokoro (local)">
-                                {kokoro.map(v => (
-                                  <option key={v.id} value={v.id}>{v.name}</option>
-                                ))}
-                              </optgroup>
-                            )}
-                            {custom.length > 0 && (
-                              <optgroup label="My Voices">
-                                {custom.map(v => (
-                                  <option key={v.id} value={v.id}>{v.name}</option>
-                                ))}
-                              </optgroup>
-                            )}
-                            {elevenlabs.length > 0 && (
-                              <optgroup label="ElevenLabs">
-                                {elevenlabs.map(v => (
-                                  <option key={v.id} value={v.id}>{v.name}</option>
-                                ))}
-                              </optgroup>
-                            )}
-                            {browser.length > 0 && (
-                              <optgroup label="Browser">
-                                {browser.map(v => (
-                                  <option key={v.id} value={v.id}>{v.name}</option>
-                                ))}
-                              </optgroup>
-                            )}
-                          </select>
-                        </div>
-                      );
-                    })()}
+                    {kokoroLoading && (
+                      <span className="text-[10px] text-purple-500 dark:text-purple-400 whitespace-nowrap animate-pulse">
+                        {kokoroProgress > 0 && kokoroProgress < 100 ? `Kokoro ${kokoroProgress}%` : 'Loading Kokoro…'}
+                      </span>
+                    )}
+                    {kokoroError && !kokoroLoading && (
+                      <span className="text-[10px] text-red-500 dark:text-red-400 whitespace-nowrap truncate max-w-[140px]" title={kokoroError}>
+                        Kokoro error
+                      </span>
+                    )}
                     {/* Invite button when no participants yet */}
                     {participants.length === 0 && (
                       <div className="relative">
@@ -1030,6 +1063,22 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                       }`} title={voiceDebug}>
                         {voiceDebug}
                       </span>
+                    )}
+                    {voiceSupported && ttsVoices.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={toggleConversationMode}
+                        className={`p-2 rounded-md transition-colors ${
+                          conversationMode
+                            ? 'text-white bg-purple-600 hover:bg-purple-700'
+                            : 'text-gray-400 dark:text-gray-500 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-900/20'
+                        }`}
+                        title={conversationMode ? 'Conversation mode on — auto-reads replies, auto-sends speech' : 'Enable conversation mode'}
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                          <path fillRule="evenodd" d="M18 10c0 3.866-3.582 7-8 7a8.841 8.841 0 01-4.083-.98L2 17l1.338-3.123C2.493 12.767 2 11.434 2 10c0-3.866 3.582-7 8-7s8 3.134 8 7zM7 9H5v2h2V9zm8 0h-2v2h2V9zM9 9h2v2H9V9z" clipRule="evenodd" />
+                        </svg>
+                      </button>
                     )}
                     {voiceSupported && (
                       <button
