@@ -269,7 +269,10 @@ export function useTTSVoice() {
   const speakAs = useCallback(async (text: string, msgId: string | undefined, voiceIds: string[]): Promise<void> => {
     stopCurrent();
     setSpeakingId(null);
-    const ids = voiceIds.length > 0 ? voiceIds : [selectedId];
+    // Always append selectedId as the final fallback so workspace voices
+    // (e.g. ElevenLabs) can fall through to the global default on failure.
+    const seen = new Set<string>();
+    const ids = [...voiceIds, selectedId].filter(id => seen.has(id) ? false : (seen.add(id), true));
     for (const vid of ids) {
       try {
         await speakWithVoiceId(text, msgId, vid);

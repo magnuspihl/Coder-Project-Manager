@@ -973,12 +973,17 @@ export default function WorkspacesPage() {
                     </optgroup>
                   )}
                 </select>
-                {(wsVoiceSettings[ws.id] ?? []).length === 0 && (() => {
+                {(() => {
                   const fallbackId = (() => { try { return localStorage.getItem('tts:voiceId') ?? 'kokoro:af_sarah'; } catch { return 'kokoro:af_sarah'; } })();
                   const fallbackName = availableVoices.find(v => v.id === fallbackId)?.name
                     ?? KOKORO_VOICES.find(v => `kokoro:${v.id}` === fallbackId)?.name
                     ?? fallbackId.replace(/^(kokoro:|el:|br:)/, '');
-                  return <span className="text-gray-400 dark:text-gray-500 text-[10px] italic">none (uses default: {fallbackName})</span>;
+                  const hasVoices = (wsVoiceSettings[ws.id] ?? []).length > 0;
+                  return (
+                    <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700/50 text-gray-400 dark:text-gray-500 rounded-full text-[10px] leading-tight italic">
+                      {hasVoices ? '↩ ' : ''}{fallbackName}
+                    </span>
+                  );
                 })()}
               </div>
             </div>
