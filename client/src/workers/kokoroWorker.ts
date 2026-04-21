@@ -28,9 +28,48 @@ const MODEL_ID = 'onnx-community/Kokoro-82M-v1.0-ONNX';
 
 let tts: KokoroTTS | null = null;
 let loadPromise: Promise<void> | null = null;
+let currentDevice: 'webgpu' | 'wasm' = 'wasm';
 
 function send(msg: unknown, transfer?: Transferable[]) {
   (self as unknown as { postMessage(m: unknown, t?: Transferable[]): void }).postMessage(msg, transfer);
+}
+
+async function loadWasm(progress: (info: Record<string, unknown>) => void) {
+  console.log('[Kokoro Worker] Loading device=wasm dtype=q4');
+  tts = await KokoroTTS.from_pretrained(MODEL_ID, {
+    dtype: 'q4', device: 'wasm', progress_callback: progress,
+  } as never);
+  currentDevice = 'wasm';
+}
+
+async function runStream(id: number, text: string, voice: string) {
+  if (!tts) throw new Error('Model not loaded');
+  const splitter = new TextSplitterStream();
+  const stream = tts.stream(splitter, { voice: voice as never });
+  splitter.push(text);
+  splitter.close();
+
+  let chunkCount = 0;
+  for await (const chunk of stream) {
+    const raw = chunk.audio.audio as Float32Array;
+    const audio = new Float32Array(raw);
+    const maxAmp = audio.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+    console.log('[Kokoro Worker] chunk', ++chunkCount, 'samples:', audio.length, 'maxAmp:', maxAmp.toFixed(4));
+
+    // If first chunk has invalid data from WebGPU, reload with WASM and retry.
+    if (chunkCount === 1 && (isNaN(maxAmp) || maxAmp === 0) && currentDevice === 'webgpu') {
+      console.warn('[Kokoro Worker] WebGPU produced bad audio — reloading with WASM');
+      tts = null;
+      loadPromise = null;
+      await loadWasm(() => {});
+      await runStream(id, text, voice);
+      return;
+    }
+
+    send({ id, type: 'audio-chunk', audio, sampling_rate: chunk.audio.sampling_rate }, [audio.buffer]);
+  }
+  console.log('[Kokoro Worker] stream done, chunks:', chunkCount);
+  send({ id, type: 'audio-done' });
 }
 
 self.addEventListener('message', async (event: MessageEvent) => {
@@ -46,7 +85,9 @@ self.addEventListener('message', async (event: MessageEvent) => {
       if (!loadPromise) {
         loadPromise = (async () => {
           const hasWebGPU = typeof navigator !== 'undefined' && 'gpu' in navigator;
-          const dtype = hasWebGPU ? 'q4f16' : 'q4';
+          // fp16 uses standard half-precision GPU ops; q4f16 custom dequant shaders
+          // produce NaN on some GPU/driver combinations.
+          const dtype = hasWebGPU ? 'fp16' : 'q4';
           const device = hasWebGPU ? 'webgpu' : 'wasm';
           const progress = (info: Record<string, unknown>) => send({ type: 'progress', info });
 
@@ -55,12 +96,11 @@ self.addEventListener('message', async (event: MessageEvent) => {
             tts = await KokoroTTS.from_pretrained(MODEL_ID, {
               dtype, device, progress_callback: progress,
             } as never);
+            currentDevice = device;
           } catch (e) {
             if (hasWebGPU) {
-              console.warn('[Kokoro Worker] WebGPU failed, retrying with WASM q4:', e);
-              tts = await KokoroTTS.from_pretrained(MODEL_ID, {
-                dtype: 'q4', device: 'wasm', progress_callback: progress,
-              } as never);
+              console.warn('[Kokoro Worker] WebGPU load failed, retrying with WASM q4:', e);
+              await loadWasm(progress);
             } else {
               throw e;
             }
@@ -73,29 +113,8 @@ self.addEventListener('message', async (event: MessageEvent) => {
     }
 
     if (type === 'stream') {
-      if (!tts) throw new Error('Model not loaded');
       console.log('[Kokoro Worker] stream id=', id, 'text length:', text!.length);
-      // tts.stream(string) passes text to a TextSplitterStream internally but never
-      // calls close() on it, so the async iterator hangs after the last sentence.
-      // Use TextSplitterStream directly and close it to flush remaining text.
-      const splitter = new TextSplitterStream();
-      const stream = tts.stream(splitter, { voice: voice as never });
-      splitter.push(text!);
-      splitter.close();
-      let chunkCount = 0;
-      for await (const chunk of stream) {
-        const raw = chunk.audio.audio as Float32Array;
-        // Copy into a fresh ArrayBuffer — avoids aliasing with ONNX internal buffers.
-        const audio = new Float32Array(raw);
-        const maxAmp = audio.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
-        console.log('[Kokoro Worker] chunk', ++chunkCount, 'samples:', audio.length, 'maxAmp:', maxAmp.toFixed(4));
-        send(
-          { id, type: 'audio-chunk', audio, sampling_rate: chunk.audio.sampling_rate },
-          [audio.buffer],
-        );
-      }
-      console.log('[Kokoro Worker] stream done, chunks:', chunkCount);
-      send({ id, type: 'audio-done' });
+      await runStream(id, text!, voice!);
       return;
     }
   } catch (err) {
