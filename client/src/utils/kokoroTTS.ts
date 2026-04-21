@@ -1,7 +1,4 @@
-import { pipeline, env } from '@huggingface/transformers';
-
-// Don't use a local model cache — always fetch from HuggingFace CDN
-env.allowLocalModels = false;
+import { pipeline } from '@huggingface/transformers';
 
 export interface KokoroVoice {
   id: string;
@@ -45,17 +42,33 @@ export async function getKokoroPipeline(): Promise<Synthesizer> {
   if (instance) return instance;
   if (initPromise) return initPromise;
 
-  initPromise = pipeline('text-to-speech', 'onnx-community/Kokoro-82M-v1.0', {
-    dtype: 'q8' as never,
-    progress_callback: (info: Record<string, unknown>) => {
-      if (info.status === 'progress' && typeof info.progress === 'number') {
-        progressListeners.forEach(cb => cb(Math.round(info.progress as number)));
-      }
-    },
-  }).then(p => {
+  console.log('[Kokoro] Loading pipeline...');
+
+  initPromise = pipeline(
+    'text-to-speech',
+    'onnx-community/Kokoro-82M-v1.0',
+    {
+      progress_callback: (info: Record<string, unknown>) => {
+        const status = info.status as string;
+        const file = info.file as string | undefined;
+        const pct = typeof info.progress === 'number' ? Math.round(info.progress) : null;
+        if (pct !== null) {
+          console.log(`[Kokoro] ${status} ${file || ''} ${pct}%`);
+          progressListeners.forEach(cb => cb(pct));
+        } else {
+          console.log(`[Kokoro] ${status} ${file || ''}`);
+        }
+      },
+    }
+  ).then(p => {
+    console.log('[Kokoro] Pipeline ready');
     instance = p as unknown as Synthesizer;
     progressListeners.forEach(cb => cb(100));
     return instance;
+  }).catch(err => {
+    console.error('[Kokoro] Pipeline load failed:', err);
+    initPromise = null; // allow retry
+    throw err;
   });
 
   return initPromise;

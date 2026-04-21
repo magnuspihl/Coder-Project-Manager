@@ -55,6 +55,7 @@ export function useTTSVoice() {
 
   const [kokoroLoading, setKokoroLoading] = useState(false);
   const [kokoroProgress, setKokoroProgress] = useState(0);
+  const [kokoroError, setKokoroError] = useState<string | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const kokoroSourceRef = useRef<AudioBufferSourceNode | null>(null);
@@ -161,11 +162,16 @@ export function useTTSVoice() {
 
       try {
         setKokoroLoading(true);
+        console.log('[Kokoro] Loading pipeline for voice:', voiceName);
         const synth = await getKokoroPipeline();
         setKokoroLoading(false);
         unsub();
 
+        console.log('[Kokoro] Synthesizing text, length:', text.length);
         const out = await synth(text.slice(0, 3000), { voice: voiceName });
+        console.log('[Kokoro] Got audio, samples:', out.audio?.length, 'rate:', out.sampling_rate);
+
+        if (!out.audio?.length) throw new Error('Empty audio output');
 
         const ctx = new AudioContext({ sampleRate: out.sampling_rate });
         const buffer = ctx.createBuffer(1, out.audio.length, out.sampling_rate);
@@ -182,7 +188,11 @@ export function useTTSVoice() {
           kokoroContextRef.current = null;
         };
         source.start();
-      } catch {
+        console.log('[Kokoro] Playback started');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error('[Kokoro] Error:', msg);
+        setKokoroError(msg);
         setSpeakingId(null);
         setKokoroLoading(false);
         unsub();
@@ -241,5 +251,5 @@ export function useTTSVoice() {
     setKokoroLoading(false);
   }, []);
 
-  return { voices, selectedId, provider, selectVoice, speak, stopSpeaking, speakingId, kokoroLoading, kokoroProgress };
+  return { voices, selectedId, provider, selectVoice, speak, stopSpeaking, speakingId, kokoroLoading, kokoroProgress, kokoroError };
 }

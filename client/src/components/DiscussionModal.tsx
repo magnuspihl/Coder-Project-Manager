@@ -244,7 +244,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     }
   }, [useWhisper, recorder.stopRecording, speechRec.stopListening]);
 
-  const { voices: ttsVoices, selectedId: ttsSelectedId, selectVoice: ttsSelectVoice, speak: ttsSpeak, speakingId: ttsSpeakingId, kokoroLoading, kokoroProgress } = useTTSVoice();
+  const { voices: ttsVoices, selectedId: ttsSelectedId, selectVoice: ttsSelectVoice, speak: ttsSpeak, speakingId: ttsSpeakingId, kokoroLoading, kokoroProgress, kokoroError } = useTTSVoice();
 
   // Initial load: fetch latest 50 messages
   // Subsequent polls: only fetch messages after the last known ID
@@ -936,7 +936,12 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                         <div className="flex items-center gap-1">
                           {kokoroLoading && (
                             <span className="text-[10px] text-purple-500 dark:text-purple-400 whitespace-nowrap">
-                              {kokoroProgress > 0 && kokoroProgress < 100 ? `${kokoroProgress}%` : 'Loading…'}
+                              {kokoroProgress > 0 && kokoroProgress < 100 ? `Kokoro ${kokoroProgress}%` : 'Loading Kokoro…'}
+                            </span>
+                          )}
+                          {kokoroError && !kokoroLoading && (
+                            <span className="text-[10px] text-red-500 dark:text-red-400 whitespace-nowrap truncate max-w-[140px]" title={kokoroError}>
+                              Kokoro error
                             </span>
                           )}
                           <select
