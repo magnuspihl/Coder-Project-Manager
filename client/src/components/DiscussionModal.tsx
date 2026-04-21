@@ -567,6 +567,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== PTT_KEY || e.repeat) return;
       e.preventDefault();
+      e.stopPropagation();
       if (!voiceSupportedRef.current || isTranscribingRef.current) return;
       if (sendingRef.current || isAnyRunningRef.current) return;
       if (!pttActiveRef.current && !isListeningRef.current) {
@@ -580,6 +581,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     const handleKeyUp = (e: KeyboardEvent) => {
       if (e.key !== PTT_KEY) return;
       e.preventDefault();
+      e.stopPropagation();
       if (pttActiveRef.current && isListeningRef.current) {
         pttActiveRef.current = false;
         stopListeningRef.current();
