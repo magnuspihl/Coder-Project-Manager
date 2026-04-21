@@ -138,7 +138,7 @@ const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName, participan
           </span>
         </div>
       </div>
-      <Markdown content={msg.role === 'assistant' ? strippedContent : msg.content} />
+      <Markdown content={msg.role === 'assistant' ? strippedContent : msg.content} breaks={msg.role === 'user'} />
     </div>
   );
 });

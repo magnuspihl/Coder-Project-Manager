@@ -1,6 +1,7 @@
 import { useState, memo, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkBreaks from 'remark-breaks';
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -18,11 +19,11 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-export default memo(function Markdown({ content }: { content: string }) {
+export default memo(function Markdown({ content, breaks = false }: { content: string; breaks?: boolean }) {
   return (
     <div className="markdown-body text-sm">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={breaks ? [remarkGfm, remarkBreaks] : [remarkGfm]}
         children={content}
         components={{
           code(props) {
