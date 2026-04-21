@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react()],
   root: 'client',
   optimizeDeps: {
-    exclude: ['@huggingface/transformers'],
+    exclude: ['@huggingface/transformers', 'kokoro-js'],
   },
   build: {
     outDir: '../dist/client',
