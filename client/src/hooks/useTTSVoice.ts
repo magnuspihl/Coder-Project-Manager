@@ -164,54 +164,52 @@ export function useTTSVoice() {
         setKokoroLoading(false);
         unsub();
 
-        // Create AudioContext once for the whole utterance so we can schedule
-        // each sentence chunk to play immediately after the previous one.
+        // Create AudioContext before synthesis so stopSpeaking() can cancel via
+        // the ref even while we're still waiting for chunks to arrive.
         const ctx = new AudioContext({ sampleRate: 24000 });
-        // Chrome may create AudioContext in suspended state after an async gap;
-        // resume() ensures scheduled buffers actually play.
         await ctx.resume();
         kokoroContextRef.current = ctx;
         kokoroSourceRef.current = null;
-        let nextStart = ctx.currentTime;
 
-        console.log('[Kokoro] Starting stream, voice:', voiceName, 'ctx state:', ctx.state);
+        // Buffer all chunks before scheduling: synthesis (WASM) may be slower than
+        // real-time playback, causing silence gaps if we schedule eagerly per-chunk.
+        const chunks: Array<{ audio: Float32Array; samplingRate: number }> = [];
+        console.log('[Kokoro] Buffering synthesis, voice:', voiceName);
 
-        synth.stream(
-          text.slice(0, 3000),
-          voiceName,
-          (audio, samplingRate) => {
-            console.log('[Kokoro] Chunk received, samples:', audio.length, 'ctx state:', ctx.state);
-            if (kokoroContextRef.current !== ctx) return; // stopped mid-stream
-            const buf = ctx.createBuffer(1, audio.length, samplingRate);
-            buf.getChannelData(0).set(audio);
-            const src = ctx.createBufferSource();
-            src.buffer = buf;
-            src.connect(ctx.destination);
-            const startAt = Math.max(ctx.currentTime + 0.05, nextStart);
-            src.start(startAt);
-            nextStart = startAt + buf.duration;
-          },
-          () => {
-            // All sentences synthesised — schedule cleanup after last chunk ends.
-            // Using setTimeout instead of onended avoids a race where the last
-            // chunk finishes playing before onDone is called.
-            if (kokoroContextRef.current !== ctx) return;
-            const timeLeft = Math.max(0, nextStart - ctx.currentTime);
-            console.log('[Kokoro] Synthesis done, audio ends in', timeLeft.toFixed(2), 's');
-            setTimeout(() => {
-              setSpeakingId(null);
-              ctx.close().catch(() => {});
-              if (kokoroContextRef.current === ctx) kokoroContextRef.current = null;
-            }, timeLeft * 1000 + 150);
-          },
-          (errMsg) => {
-            console.error('[Kokoro] Stream error:', errMsg);
-            setKokoroError(errMsg);
-            setSpeakingId(null);
-            ctx.close().catch(() => {});
-            if (kokoroContextRef.current === ctx) kokoroContextRef.current = null;
-          },
-        );
+        await new Promise<void>((resolve, reject) => {
+          synth.stream(
+            text.slice(0, 3000),
+            voiceName,
+            (audio, samplingRate) => {
+              if (kokoroContextRef.current !== ctx) { resolve(); return; } // stopped
+              console.log('[Kokoro] Chunk buffered, samples:', audio.length);
+              chunks.push({ audio, samplingRate });
+            },
+            () => resolve(),
+            (errMsg) => reject(new Error(errMsg)),
+          );
+        });
+
+        if (kokoroContextRef.current !== ctx) return; // stopped during synthesis
+
+        let nextStart = ctx.currentTime + 0.05;
+        for (const { audio, samplingRate } of chunks) {
+          const buf = ctx.createBuffer(1, audio.length, samplingRate);
+          buf.getChannelData(0).set(audio);
+          const src = ctx.createBufferSource();
+          src.buffer = buf;
+          src.connect(ctx.destination);
+          src.start(nextStart);
+          nextStart += buf.duration;
+        }
+
+        const timeLeft = Math.max(0, nextStart - ctx.currentTime);
+        console.log('[Kokoro] Playing', chunks.length, 'chunks, ends in', timeLeft.toFixed(2), 's');
+        setTimeout(() => {
+          setSpeakingId(null);
+          ctx.close().catch(() => {});
+          if (kokoroContextRef.current === ctx) kokoroContextRef.current = null;
+        }, timeLeft * 1000 + 150);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error('[Kokoro] Error:', msg);
