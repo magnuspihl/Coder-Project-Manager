@@ -1,5 +1,5 @@
 import { sshExec, detectProjectDir } from './claude.js';
-import { addMessage, getTask, type Task } from './tasks.js';
+import { addMessage, getTask, getWorkingTask, type Task } from './tasks.js';
 import { getDb } from '../db/index.js';
 import { execFile } from 'child_process';
 
@@ -237,17 +237,6 @@ export async function handleSwitchToTask(task: Task): Promise<void> {
   }
 }
 
-/**
- * Called when a task leaves working state (pause/complete).
- * Does NOT stash — changes stay in the working tree for review.
- * Only updates tracking so we know whose changes are there.
- */
-export async function handleStashAway(task: Task): Promise<void> {
-  // No-op: lazy stashing means we leave changes in the working tree.
-  // They'll be stashed later if/when another task needs the working tree.
-  // We keep last_active_task_id pointing at this task so we know whose changes are there.
-}
-
 // ─── Task Resume: switch to task (lazy stash + restore) ─────────────────
 
 /**
@@ -333,6 +322,15 @@ export async function checkoutTaskBranch(task: Task): Promise<string> {
  * Returns true if completion is allowed, false if blocked.
  */
 export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
+  // Defense-in-depth: refuse if another task is actively working on this
+  // workspace. Running git ops (stash/checkout/commit) concurrently with a
+  // Claude agent would corrupt its working tree. The /complete endpoint
+  // should already queue instead of calling this, but guard anyway.
+  const conflicting = getWorkingTask(task.workspace_id);
+  if (conflicting && conflicting.id !== task.id) {
+    throw new Error(`Cannot run git completion: task ${conflicting.id} is currently working on this workspace.`);
+  }
+
   const dir = await resolveProjectDir(task);
   if (!dir) return true; // no project dir — nothing to do
 
@@ -382,12 +380,24 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
 
     // Re-read task for latest title
     const freshTask = getTask(task.id) || task;
-    const branchName = generateBranchName(freshTask);
+    // If the user explicitly set a branch when creating the task, commit on
+    // that branch — don't generate a new one or auto-create. Just ensure we
+    // are on it.
+    const userBranch = freshTask.branch?.trim();
+    const branchName = userBranch || generateBranchName(freshTask);
 
-    // Create branch (or switch to it if it already exists), commit, push
+    // Ensure we are on the target branch, creating it only when auto-generated.
     const currentBranch = (await sshExec(ws, `cd ${dir} && git rev-parse --abbrev-ref HEAD`)).trim();
     if (currentBranch === branchName) {
-      // Already on the right branch (e.g. reopen → complete retry)
+      // Already on the right branch (e.g. reopen → complete retry, or user-picked branch)
+    } else if (userBranch) {
+      // User-specified branch: switch to it but do not create.
+      try {
+        await sshExec(ws, `cd ${dir} && git checkout ${branchName}`, 15000);
+      } catch (err: any) {
+        addMessage(task.id, 'system', `Error: could not switch to user-specified branch \`${branchName}\`: ${err.message}`);
+        return false;
+      }
     } else {
       try {
         await sshExec(ws, `cd ${dir} && git checkout -b ${branchName}`, 15000);
@@ -457,7 +467,9 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
   } catch (err: any) {
     const reason = `Git completion failed: ${err.message || err}`;
     addMessage(task.id, 'system', `Error: ${reason}`);
-    return true; // Don't block completion on git errors
+    // Block completion on git errors — leave the task in awaiting_feedback
+    // so the user can inspect, resolve manually, and retry completion.
+    return false;
   }
 }
 

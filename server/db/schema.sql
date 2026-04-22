@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   verification_url TEXT,
   branch TEXT,
   model TEXT,
+  pending_complete INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT,
@@ -33,6 +34,12 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_workspace_status ON tasks(workspace_id, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_workspace_position ON tasks(workspace_id, position);
+-- Invariant: at most one working task per workspace.
+-- Enforced at the DB level so any race past the in-process lock surfaces as
+-- a constraint violation rather than silently corrupting state.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_one_working_per_workspace
+  ON tasks(workspace_id)
+  WHERE status = 'working' AND deleted_at IS NULL;
 
 -- Messages table: conversation history per task
 CREATE TABLE IF NOT EXISTS messages (

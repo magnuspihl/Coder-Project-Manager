@@ -21,6 +21,7 @@ export interface Task {
   git_branch: string | null;
   github_repo_url: string | null;
   caveman: string | null;
+  pending_complete: number;
   total_input_tokens: number;
   total_output_tokens: number;
   created_at: string;
@@ -263,8 +264,8 @@ export function updateTaskStatus(taskId: string, status: string, failedReason?: 
     db.prepare('UPDATE tasks SET status = ?, updated_at = ?, completed_at = ? WHERE id = ?').run(
       status, now, now, taskId
     );
-    // Clean up stream_log to prevent unbounded table growth
-    db.prepare('DELETE FROM stream_log WHERE task_id = ?').run(taskId);
+    // Keep stream_log around — users may want to inspect what Claude did
+    // after completion. Hard-delete (via the task DELETE route) still purges it.
   } else if (status === 'failed' && failedReason) {
     db.prepare('UPDATE tasks SET status = ?, failed_reason = ?, updated_at = ? WHERE id = ?').run(
       status, failedReason, now, taskId
@@ -302,6 +303,16 @@ export function getWorkingTask(workspaceId: string): Task | undefined {
   const db = getDb();
   return db
     .prepare("SELECT * FROM tasks WHERE workspace_id = ? AND status = 'working' AND deleted_at IS NULL LIMIT 1")
+    .get(workspaceId) as Task | undefined;
+}
+
+export function setPendingComplete(taskId: string, value: boolean): void {
+  getDb().prepare('UPDATE tasks SET pending_complete = ? WHERE id = ?').run(value ? 1 : 0, taskId);
+}
+
+export function getPendingCompletionTask(workspaceId: string): Task | undefined {
+  return getDb()
+    .prepare("SELECT * FROM tasks WHERE workspace_id = ? AND pending_complete = 1 AND deleted_at IS NULL ORDER BY position ASC LIMIT 1")
     .get(workspaceId) as Task | undefined;
 }
 
