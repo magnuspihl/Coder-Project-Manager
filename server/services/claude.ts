@@ -7,6 +7,7 @@ import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
 import { getAttachmentsByTask, type Attachment } from '../routes/uploads.js';
+import { writeCpmGuidelines } from './workspace-memory.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
@@ -1513,16 +1514,15 @@ export async function launchDiscussion(
       .run(new Date().toISOString(), discussion.id);
     taskActivity.set(`disc:${discussion.id}`, { timestamp: new Date().toISOString(), summary: 'Starting discussion session' });
 
-    // Archive stale files to .prev (keep for forensic recovery if the next
-    // turn fails to parse and wipes in-memory state).
-    try {
-      await sshExec(discussion.workspace_name,
+    // Pre-launch prep: archive stale output files + write the CPM guidelines
+    // memory file. Both are independent SSH calls and both are non-fatal.
+    await Promise.all([
+      sshExec(discussion.workspace_name,
         `mv -f ${shellEscape(outputFile)} ${shellEscape(outputFile + '.prev')} 2>/dev/null; ` +
         `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`
-      );
-    } catch {
-      // Non-fatal
-    }
+      ).catch(() => { /* Non-fatal */ }),
+      writeCpmGuidelines(discussion.workspace_name),
+    ]);
 
     // Spawn SSH
     const sshProcess = spawn('coder', ['ssh', discussion.workspace_name, '--', remoteCmd], {
@@ -1852,12 +1852,15 @@ export async function launchParticipantDiscussion(
     const pollKey = `disc-p:${participant.id}`;
     taskActivity.set(pollKey, { timestamp: new Date().toISOString(), summary: 'Starting participant session' });
 
-    // Archive stale files to .prev for forensic recovery
-    try {
-      await sshExec(participant.workspace_name,
+    // Pre-launch prep: archive stale output files + write the CPM guidelines
+    // memory file. Both are independent SSH calls and both are non-fatal.
+    await Promise.all([
+      sshExec(participant.workspace_name,
         `mv -f ${shellEscape(outputFile)} ${shellEscape(outputFile + '.prev')} 2>/dev/null; ` +
-        `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`);
-    } catch { /* Non-fatal */ }
+        `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`
+      ).catch(() => { /* Non-fatal */ }),
+      writeCpmGuidelines(participant.workspace_name),
+    ]);
 
     // Spawn SSH
     const sshProcess = spawn('coder', ['ssh', participant.workspace_name, '--', remoteCmd], {
