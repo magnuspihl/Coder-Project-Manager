@@ -14,6 +14,7 @@ import {
   getTaskCostUsd,
   getTaskCostsByWorkspace,
   getWorkingTask,
+  setPendingComplete,
   addTaskParticipant,
   removeTaskParticipant,
   getTaskParticipants,
@@ -177,6 +178,12 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
 
   addMessage(task.id, 'user', message, undefined, req.user!.username);
 
+  // User replied → cancel any pending completion: they're asking to continue.
+  if (task.pending_complete) {
+    setPendingComplete(task.id, false);
+    addMessage(task.id, 'system', 'Pending completion cancelled — reply received.');
+  }
+
   if (Array.isArray(attachmentIds) && attachmentIds.length > 0) {
     linkAttachmentsToTask(attachmentIds.filter((a: unknown) => typeof a === 'string'), task.id);
   }
@@ -218,13 +225,39 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
     return;
   }
 
-  // Handle git operations before marking complete — may block completion if remote is disabled and changes exist
-  const allowed = await handleTaskCompletionGit(task);
-  if (!allowed) {
-    res.status(409).json({ error: 'Cannot complete: uncommitted git changes exist. Please handle git operations manually first.', task: getTask(task.id) });
+  // Only awaiting_feedback tasks can be completed. Running git ops on a
+  // working task would corrupt Claude's tree; completing queued/failed/
+  // cancelled tasks is semantically meaningless.
+  if (task.status !== 'awaiting_feedback') {
+    res.status(400).json({ error: `Only tasks awaiting feedback can be completed (current status: ${task.status}).` });
     return;
   }
 
+  // If another task is actively working on this workspace, defer completion
+  // until the queue is idle. Otherwise concurrent git ops (stash/checkout/
+  // commit) would corrupt the working agent's tree.
+  const working = getWorkingTask(task.workspace_id);
+  if (working && working.id !== task.id) {
+    if (!task.pending_complete) {
+      setPendingComplete(task.id, true);
+      addMessage(task.id, 'system', `Completion queued — will finalize after task "${working.title}" finishes on this workspace.`);
+    }
+    res.status(202).json({ task: getTask(task.id), queued: true });
+    return;
+  }
+
+  // Handle git operations before marking complete — may block completion on
+  // uncommitted changes (remote disabled) or on any git failure.
+  const allowed = await handleTaskCompletionGit(task);
+  if (!allowed) {
+    res.status(409).json({
+      error: 'Cannot complete: git operation blocked. See task messages for the exact reason.',
+      task: getTask(task.id),
+    });
+    return;
+  }
+
+  setPendingComplete(task.id, false);
   updateTaskStatus(task.id, 'completed');
 
   // Let the queue processor start the next task
@@ -315,6 +348,12 @@ router.post('/tasks/:taskId/retry', requireAuth, async (req: Request, res: Respo
   const continuationPrompt = 'Continue where you left off.';
   addMessage(task.id, 'user', continuationPrompt, undefined, req.user!.username);
 
+  // Retry → cancel pending completion; user is re-engaging.
+  if (task.pending_complete) {
+    setPendingComplete(task.id, false);
+    addMessage(task.id, 'system', 'Pending completion cancelled — retry requested.');
+  }
+
   // If another task is working on this workspace, queue instead of resuming immediately
   const working = getWorkingTask(task.workspace_id);
   if (working) {
@@ -379,6 +418,14 @@ router.delete('/tasks/:taskId', requireAuth, async (req: Request, res: Response)
 
   if (task.status === 'working') {
     cancelTask(task.workspace_id);
+  }
+
+  // Stop any running advisor participants so they don't keep polling / writing
+  // to a deleted task's conversation log.
+  for (const p of getTaskParticipants(task.id)) {
+    if (isTaskParticipantRunning(p.id)) {
+      try { stopTaskParticipant(p.id); } catch { /* ignore */ }
+    }
   }
 
   deleteTask(task.id);

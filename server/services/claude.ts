@@ -1,9 +1,10 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { createReadStream } from 'fs';
-import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, type Task, type TaskParticipant } from './tasks.js';
+import { randomUUID } from 'crypto';
+import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, getPendingCompletionTask, setPendingComplete, type Task, type TaskParticipant } from './tasks.js';
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { getDb } from '../db/index.js';
-import { handleTaskLaunchGit, handleTaskResumeGit, handleStashAway } from './git.js';
+import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
 import { getAttachmentsByTask, type Attachment } from '../routes/uploads.js';
 
@@ -261,6 +262,42 @@ export function sshExec(workspaceName: string, command: string, timeout = 15000)
 }
 
 /**
+ * Read new lines from a remote output file and the remote exit-code file in a
+ * single SSH round trip, separated by a nonce marker so Claude's output can
+ * never be mistaken for the marker.
+ *
+ * A previous implementation used a fixed marker ("---CPM_EXIT_CHECK---"); when
+ * Claude read CPM's own source code, the marker appeared in a tool_result
+ * block, and the first indexOf matched the fake marker — corrupting exitPart
+ * and triggering a premature task completion with exitCode=NaN.
+ */
+async function pollOutputAndExit(
+  workspaceName: string,
+  outputFile: string,
+  exitFile: string,
+  linesRead: number,
+  timeout = 20000,
+): Promise<{ jsonPart: string; exitPart: string }> {
+  const marker = `---CPM-EXIT-${randomUUID()}---`;
+  const command =
+    `tail -n +${linesRead + 1} ${shellEscape(outputFile)} 2>/dev/null; ` +
+    `echo ${shellEscape(marker)}; ` +
+    `cat ${shellEscape(exitFile)} 2>/dev/null || echo 'RUNNING'`;
+  const output = await sshExec(workspaceName, command, timeout);
+  // Use lastIndexOf as a belt-and-suspenders guard: even in the pathological
+  // case where Claude's output echoed the exact nonce, the real marker is
+  // always appended after the tail, so the last occurrence wins.
+  const markerIdx = output.lastIndexOf(marker);
+  if (markerIdx < 0) {
+    return { jsonPart: output, exitPart: 'RUNNING' };
+  }
+  return {
+    jsonPart: output.slice(0, markerIdx),
+    exitPart: output.slice(markerIdx + marker.length).trim(),
+  };
+}
+
+/**
  * Copy local files to a remote workspace via coder ssh stdin piping.
  * Returns array of remote paths where files were placed.
  */
@@ -351,23 +388,60 @@ export async function detectProjectDir(workspaceName: string): Promise<string | 
   }
 }
 
-// Per-workspace lock to prevent concurrent processQueue calls from
-// double-launching the same task (TOCTOU race between check and launch).
-const queueLocks = new Map<string, Promise<void>>();
+// Per-workspace lock covering any mutation that could spawn a task, kill a
+// task, or run git ops on the workspace. All three must serialize to keep
+// the "one working task per workspace" invariant honest and avoid racing
+// launch vs cancel vs complete.
+const workspaceLocks = new Map<string, Promise<unknown>>();
+
+export async function withWorkspaceLock<T>(workspaceId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = workspaceLocks.get(workspaceId);
+  const run = async (): Promise<T> => {
+    if (prev) await prev.catch(() => {});
+    return fn();
+  };
+  const promise = run();
+  workspaceLocks.set(workspaceId, promise);
+  try {
+    return await promise;
+  } finally {
+    if (workspaceLocks.get(workspaceId) === promise) {
+      workspaceLocks.delete(workspaceId);
+    }
+  }
+}
 
 /**
  * Central queue processor. This is the ONLY way tasks get started.
  * Call this whenever the queue state might have changed for a workspace.
  */
 export async function processQueue(workspaceId: string): Promise<void> {
-  // Serialize per workspace — wait for any in-flight processQueue to finish
-  const existing = queueLocks.get(workspaceId);
-  const run = async () => {
-    if (existing) await existing.catch(() => {});
-
+  await withWorkspaceLock(workspaceId, async () => {
     const working = getWorkingTask(workspaceId);
     if (working) {
       return;
+    }
+
+    // Flush any tasks whose completion was deferred while a task was working.
+    // Running git completion now (with no working agent) is safe.
+    let pending = getPendingCompletionTask(workspaceId);
+    while (pending) {
+      try {
+        const allowed = await handleTaskCompletionGit(pending);
+        if (allowed) {
+          setPendingComplete(pending.id, false);
+          updateTaskStatus(pending.id, 'completed');
+        } else {
+          // Blocked by uncommitted changes + remote disabled — clear the flag
+          // and leave the user a message so they can handle it and retry.
+          setPendingComplete(pending.id, false);
+          addMessage(pending.id, 'system', 'Queued completion could not proceed — uncommitted changes and remote pushes are disabled. Resolve manually and try again.');
+        }
+      } catch (err: any) {
+        setPendingComplete(pending.id, false);
+        addMessage(pending.id, 'system', `Queued completion failed: ${err?.message || err}. Please retry.`);
+      }
+      pending = getPendingCompletionTask(workspaceId);
     }
 
     const next = getNextQueuedTask(workspaceId);
@@ -389,18 +463,7 @@ export async function processQueue(workspaceId: string): Promise<void> {
     }
 
     await launchTask(next);
-  };
-
-  const promise = run();
-  queueLocks.set(workspaceId, promise);
-  try {
-    await promise;
-  } finally {
-    // Only clear if we're still the latest lock holder
-    if (queueLocks.get(workspaceId) === promise) {
-      queueLocks.delete(workspaceId);
-    }
-  }
+  });
 }
 
 /**
@@ -461,29 +524,36 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   }
 
   // Git branch management
-  if (task.branch && task.project_dir && !isResume) {
-    // User specified a branch override — check it out directly
+  if (task.branch && task.project_dir) {
+    // User specified a branch override — ensure the workspace is on that
+    // branch before each run (launch *and* resume), since another task on
+    // this workspace may have switched branches between runs.
     const ws = task.workspace_name;
     const dir = shellEscape(task.project_dir);
     const branch = task.branch;
     try {
-      console.log(`[claude-executor] Checking out branch '${branch}' on workspace ${ws}`);
+      console.log(`[claude-executor] Ensuring branch '${branch}' on workspace ${ws} (isResume=${isResume})`);
       await sshExec(ws, `cd ${dir} && git fetch origin`, 30000);
 
-      const remoteRef = await sshExec(ws,
-        `cd ${dir} && git ls-remote --heads origin ${shellEscape(branch)}`,
-        15000
-      );
-
-      if (remoteRef && remoteRef.includes(branch)) {
-        await sshExec(ws,
-          `cd ${dir} && git checkout ${shellEscape(branch)} && git pull origin ${shellEscape(branch)}`,
-          30000
+      const currentBranch = (await sshExec(ws, `cd ${dir} && git rev-parse --abbrev-ref HEAD`)).trim();
+      if (currentBranch !== branch) {
+        const remoteRef = await sshExec(ws,
+          `cd ${dir} && git ls-remote --heads origin ${shellEscape(branch)}`,
+          15000
         );
-      } else {
-        await sshExec(ws, `cd ${dir} && git checkout -b ${shellEscape(branch)}`, 15000);
+
+        if (remoteRef && remoteRef.includes(branch)) {
+          await sshExec(ws,
+            `cd ${dir} && git checkout ${shellEscape(branch)} && git pull origin ${shellEscape(branch)}`,
+            30000
+          );
+        } else {
+          // Only create the branch on first launch — on resume, a missing
+          // branch is unexpected but we still create it rather than fail.
+          await sshExec(ws, `cd ${dir} && git checkout -b ${shellEscape(branch)}`, 15000);
+        }
+        addMessage(task.id, 'system', `Checked out branch \`${branch}\`.`);
       }
-      addMessage(task.id, 'system', `Checked out branch \`${branch}\`.`);
     } catch (err) {
       const errorMsg = `Failed to checkout branch '${branch}': ${(err as Error).message || err}`;
       console.error(`[claude-executor] ${errorMsg}`);
@@ -563,7 +633,8 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   if (task.project_dir) {
     remoteCmd += `cd ${shellEscape(task.project_dir)} && `;
   }
-  // Exit file is pre-cleaned above, but rm again in case the pre-clean SSH failed
+  // Exit file was archived to .prev above; rm -f is idempotent as a second
+  // layer in case the archive SSH failed.
   remoteCmd += `rm -f ${shellEscape(exitFile)} && `;
   remoteCmd += `${claudeCmd} > ${shellEscape(outputFile)} 2>&1; `;
   remoteCmd += `echo $? > ${shellEscape(exitFile)}`;
@@ -574,18 +645,37 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   console.log('[claude-executor] Remote cmd:', remoteCmd.slice(0, 300));
 
   try {
+    // Re-read status immediately before we commit to spawning. If the task
+    // was cancelled/deleted between the caller's check and here, bail out
+    // instead of creating an orphan working row + SSH process.
+    const current = getTask(task.id);
+    if (!current || current.status === 'cancelled' || current.status === 'completed') {
+      console.log(`[claude-executor] Task ${task.id} no longer launchable (status=${current?.status ?? 'deleted'}); aborting`);
+      return;
+    }
+    // Also fail fast if another task has somehow entered 'working' on this
+    // workspace. The workspace lock should prevent this, but the DB is the
+    // source of truth.
+    const existingWorking = getWorkingTask(task.workspace_id);
+    if (existingWorking && existingWorking.id !== task.id) {
+      console.log(`[claude-executor] Refusing to launch ${task.id}: task ${existingWorking.id} is already working on workspace ${task.workspace_id}`);
+      return;
+    }
+
     updateTaskStatus(task.id, 'working');
     taskActivity.set(task.id, { timestamp: new Date().toISOString(), summary: 'Starting Claude session' });
 
-    // Delete stale output/exit files BEFORE spawning SSH.
-    // Without this, the poller can read old files from a previous run
-    // before the new SSH process connects and deletes them itself.
+    // Archive the previous run's output/exit to .prev before spawning SSH.
+    // Archiving (not deleting) preserves the prior turn's content for forensic
+    // recovery if parsing failed the first time — e.g. a marker-collision bug
+    // that drops the final turn from the DB but leaves it on disk.
     try {
       await sshExec(task.workspace_name,
-        `rm -f ${shellEscape(outputFile)} ${shellEscape(exitFile)}`,
+        `mv -f ${shellEscape(outputFile)} ${shellEscape(outputFile + '.prev')} 2>/dev/null; ` +
+        `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`,
       );
     } catch {
-      // Non-fatal — the remote rm -f in the command will also clean up
+      // Non-fatal — the remote command will also overwrite
     }
 
     // Spawn SSH fully detached with no pipes.
@@ -618,11 +708,22 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
 }
 
 /**
- * Resume a task that is awaiting feedback. This bypasses the queue
- * because the task is already "active" — it just needs to continue.
+ * Resume a task that is awaiting feedback. Must hold the workspace lock
+ * so it can't race against processQueue spawning a different task on the
+ * same workspace.
  */
 export async function resumeTask(task: Task, feedback: string): Promise<void> {
-  await launchTask(task, true, feedback);
+  await withWorkspaceLock(task.workspace_id, async () => {
+    // Under the lock, re-check that no other task has started working.
+    const working = getWorkingTask(task.workspace_id);
+    if (working && working.id !== task.id) {
+      // Another task beat us to it — re-queue this one so processQueue picks
+      // it up when the workspace is idle.
+      updateTaskStatus(task.id, 'queued');
+      return;
+    }
+    await launchTask(task, true, feedback);
+  });
 }
 
 function processEvent(taskId: string, event: { type: string; [key: string]: unknown }): void {
@@ -676,11 +777,11 @@ function processEvent(taskId: string, event: { type: string; [key: string]: unkn
 
 export function cancelTask(workspaceId: string): void {
   const db = getDb();
-  const task = db.prepare("SELECT id, workspace_name, ssh_pid FROM tasks WHERE workspace_id = ? AND status = 'working' LIMIT 1")
-    .get(workspaceId) as { id: string; workspace_name: string; ssh_pid: number | null } | undefined;
+  const task = db.prepare("SELECT id, workspace_name, ssh_pid, claude_session_id FROM tasks WHERE workspace_id = ? AND status = 'working' LIMIT 1")
+    .get(workspaceId) as { id: string; workspace_name: string; ssh_pid: number | null; claude_session_id: string | null } | undefined;
 
   if (task) {
-    killTaskProcess(task.id, task.ssh_pid);
+    killTaskProcess(task.id, task.ssh_pid, task.workspace_name, task.claude_session_id);
   }
 }
 
@@ -690,23 +791,25 @@ export function cancelTask(workspaceId: string): void {
  */
 export function interruptTask(taskId: string): void {
   const db = getDb();
-  const partial = db.prepare("SELECT id, workspace_name, ssh_pid FROM tasks WHERE id = ? AND status = 'working'")
-    .get(taskId) as { id: string; workspace_name: string; ssh_pid: number | null } | undefined;
+  const partial = db.prepare("SELECT id, workspace_name, ssh_pid, claude_session_id FROM tasks WHERE id = ? AND status = 'working'")
+    .get(taskId) as { id: string; workspace_name: string; ssh_pid: number | null; claude_session_id: string | null } | undefined;
 
   if (partial) {
-    killTaskProcess(partial.id, partial.ssh_pid);
-    addMessage(partial.id, 'system', 'Task was interrupted by user.');
+    killTaskProcess(partial.id, partial.ssh_pid, partial.workspace_name, partial.claude_session_id);
+    addMessage(partial.id, 'system',
+      'Task was interrupted by user. Note: token usage and cost for the in-flight turn may not be fully reflected — Claude only reports final totals at the end of a turn.'
+    );
     updateTaskStatus(partial.id, 'awaiting_feedback');
-    // Fetch full task for git operations
-    const fullTask = getTask(partial.id);
-    if (fullTask) {
-      handleStashAway(fullTask).catch(err => console.error('[git] Pause commit failed:', (err as Error).message?.slice(0, 100)));
-    }
   }
 }
 
 /** Kill the SSH process for a task and clean up tracking state. */
-function killTaskProcess(taskId: string, sshPid: number | null): void {
+function killTaskProcess(
+  taskId: string,
+  sshPid: number | null,
+  workspaceName?: string,
+  claudeSessionId?: string | null,
+): void {
   const db = getDb();
   const proc = activeProcesses.get(taskId);
   if (proc) {
@@ -718,6 +821,17 @@ function killTaskProcess(taskId: string, sshPid: number | null): void {
   stopPolling(taskId);
   taskActivity.delete(taskId);
   db.prepare('UPDATE tasks SET ssh_pid = NULL WHERE id = ?').run(taskId);
+
+  // Remote fallback: killing the local SSH client doesn't guarantee the
+  // remote `claude` process dies (detached/background). Pkill on the
+  // workspace using the unique session-id to scope precisely to this task.
+  if (workspaceName && claudeSessionId) {
+    const pattern = claudeSessionId.replace(/[^a-zA-Z0-9-]/g, '');
+    if (pattern.length >= 8) {
+      sshExec(workspaceName, `pkill -f ${pattern} || true`, 10000)
+        .catch(err => console.error(`[kill] Remote pkill failed for task ${taskId}:`, (err as Error).message?.slice(0, 120)));
+    }
+  }
 }
 
 function stopPolling(taskId: string): void {
@@ -756,6 +870,7 @@ export async function reconnectWorkingTasks(): Promise<void> {
 
       if (processAlive) {
         console.log(`[recovery] Task "${task.title}" SSH process (PID ${sshPid}) still alive, reconnecting via file polling`);
+        addMessage(task.id, 'system', 'Server restarted while task was running — reconnecting to remote session. Any assistant output produced during the restart will be reloaded from the remote output file.');
         // Don't set a fake activity — startFilePolling will immediately poll
         // the remote file and derive real activity from Claude's output
         startFilePolling(task);
@@ -777,7 +892,6 @@ export async function reconnectWorkingTasks(): Promise<void> {
               const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
               if (hasResponse) {
                 updateTaskStatus(task.id, 'awaiting_feedback');
-                await handleStashAway(task).catch(err => console.error('[git] Pause commit failed:', (err as Error).message?.slice(0, 100)));
               } else {
                 // No response captured — task was likely interrupted. Re-queue for retry.
                 console.log(`[recovery] Task "${task.title}" exited with no response — re-queuing`);
@@ -823,11 +937,11 @@ export async function reconnectWorkingTasks(): Promise<void> {
 function startFilePolling(task: Task): void {
   stopPolling(task.id);
 
-  // Clear stream log and current-session assistant messages — the remote output file
-  // contains the complete history, so we'll re-process from scratch.
-  // This prevents duplicates on reconnect while preserving previous session messages.
-  getDb().prepare('DELETE FROM stream_log WHERE task_id = ?').run(task.id);
-  deleteCurrentSessionAssistantMessages(task.id);
+  const db = getDb();
+  // Deferred wipe: stream_log + current-session messages are cleared only
+  // after the first poll confirms ≥1 parseable event, and the wipe + reparse
+  // happen in a single transaction so a crash mid-way rolls back to prior state.
+  let wiped = false;
 
   let linesRead = 0;
   let lastSavedMessageId: string | null = null;
@@ -837,6 +951,75 @@ function startFilePolling(task: Task): void {
   let partialLine = '';  // Buffer for incomplete last line from previous poll
   let polling = false;   // Guard against overlapping polls
 
+  // Per-line processor — extracted so the first poll can run it inside the
+  // wipe+reparse transaction without duplicating logic.
+  const processLine = (line: string): void => {
+    linesRead++;
+    if (!line.trim()) return;
+
+    let event: { type: string; [key: string]: unknown };
+    try {
+      event = JSON.parse(line);
+    } catch {
+      // Not valid JSON (e.g. stderr output), skip
+      return;
+    }
+
+    try {
+      processEvent(task.id, event);
+
+      // Track rate limit events
+      if (event.type === 'rate_limit_event') {
+        const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string; status?: string; utilization?: number } | undefined;
+        if (info) {
+          updateWorkspaceUsage(task.workspace_name, info);
+          if (info.status === 'rate_limited' && info.resetsAt && info.resetsAt * 1000 > Date.now()) {
+            rateLimitInfo.set(task.id, { resetsAt: info.resetsAt, rateLimitType: info.rateLimitType || 'unknown' });
+          }
+        }
+      }
+
+      // Save each assistant turn's text as a message immediately,
+      // so it appears in the chat UI while the task is still working.
+      if (event.type === 'assistant' && (event.message as { content?: unknown })?.content) {
+        let turnText = '';
+        for (const block of (event.message as { content: Array<{ type: string; text?: string }> }).content) {
+          if (block.type === 'text' && block.text) {
+            turnText += block.text;
+          }
+        }
+        if (turnText) {
+          const msg = addMessage(task.id, 'assistant', turnText);
+          lastSavedMessageId = msg.id;
+          lastSavedMessageText = turnText;
+        }
+      }
+
+      if (event.type === 'result') {
+        const resultText = extractResultText(event);
+        // Save result text as a message if it has content distinct from the last assistant message
+        if (resultText && resultText !== lastSavedMessageText) {
+          const msg = addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined);
+          lastSavedMessageId = msg.id;
+          lastSavedMessageText = resultText;
+        } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
+          // Attach session cost to the last assistant message
+          updateMessageCost(lastSavedMessageId, event.total_cost_usd);
+        }
+        // Accumulate token usage
+        const { inputTokens: inTok, outputTokens: outTok } = extractTokenUsage(event);
+        if (inTok > 0 || outTok > 0) {
+          addTokenUsage(task.id, inTok, outTok);
+        }
+        if (event.is_error && Array.isArray(event.errors) && (event.errors as string[]).length > 0) {
+          resultError = (event.errors as string[]).join('; ');
+        }
+      }
+    } catch (eventErr) {
+      console.error(`[claude-poller] Error processing event for task ${task.id}:`, (eventErr as Error).message?.slice(0, 200));
+    }
+  };
+
   const poll = async () => {
     if (polling) return;  // Previous poll still in flight — skip
     polling = true;
@@ -844,16 +1027,11 @@ function startFilePolling(task: Task): void {
       const outputFile = remoteOutputPath(task.id);
       const exitFile = remoteExitCodePath(task.id);
 
-      const output = await sshExec(task.workspace_name,
-        `tail -n +${linesRead + 1} ${shellEscape(outputFile)} 2>/dev/null; echo '---CPM_EXIT_CHECK---'; cat ${shellEscape(exitFile)} 2>/dev/null || echo 'RUNNING'`,
-        20000,
+      const { jsonPart, exitPart } = await pollOutputAndExit(
+        task.workspace_name, outputFile, exitFile, linesRead,
       );
 
       consecutiveErrors = 0;
-
-      const markerIdx = output.indexOf('---CPM_EXIT_CHECK---');
-      const jsonPart = markerIdx >= 0 ? output.slice(0, markerIdx) : output;
-      const exitPart = markerIdx >= 0 ? output.slice(markerIdx + '---CPM_EXIT_CHECK---'.length).trim() : 'RUNNING';
 
       if (jsonPart.trim() || partialLine) {
         // Prepend any buffered partial line from the previous poll
@@ -871,77 +1049,43 @@ function startFilePolling(task: Task): void {
           partialLine = allLines.pop()!;
         }
 
-        // Count ALL lines (including blank) to stay in sync with tail -n
-        for (const line of allLines) {
-          linesRead++;
-          if (!line.trim()) continue;
-
-          let event: { type: string; [key: string]: unknown };
-          try {
-            event = JSON.parse(line);
-          } catch {
-            // Not valid JSON (e.g. stderr output), skip
-            continue;
+        if (!wiped) {
+          // Staging check: don't wipe existing DB state until we have ≥1
+          // parseable event to replace it with. If the remote file is empty,
+          // stderr-only, or the SSH call returned garbage, keep prior state
+          // and retry next poll.
+          let hasValidEvent = false;
+          for (const line of allLines) {
+            if (!line.trim()) continue;
+            try { JSON.parse(line); hasValidEvent = true; break; } catch { continue; }
           }
-
-          try {
-            processEvent(task.id, event);
-
-            // Track rate limit events
-            if (event.type === 'rate_limit_event') {
-              const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string; status?: string; utilization?: number } | undefined;
-              if (info) {
-                updateWorkspaceUsage(task.workspace_name, info);
-                if (info.status === 'rate_limited' && info.resetsAt && info.resetsAt * 1000 > Date.now()) {
-                  rateLimitInfo.set(task.id, { resetsAt: info.resetsAt, rateLimitType: info.rateLimitType || 'unknown' });
-                }
-              }
-            }
-
-            // Save each assistant turn's text as a message immediately,
-            // so it appears in the chat UI while the task is still working.
-            if (event.type === 'assistant' && (event.message as { content?: unknown })?.content) {
-              let turnText = '';
-              for (const block of (event.message as { content: Array<{ type: string; text?: string }> }).content) {
-                if (block.type === 'text' && block.text) {
-                  turnText += block.text;
-                }
-              }
-              if (turnText) {
-                const msg = addMessage(task.id, 'assistant', turnText);
-                lastSavedMessageId = msg.id;
-                lastSavedMessageText = turnText;
-              }
-            }
-
-            if (event.type === 'result') {
-              const resultText = extractResultText(event);
-              // Save result text as a message if it has content distinct from the last assistant message
-              if (resultText && resultText !== lastSavedMessageText) {
-                const msg = addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined);
-                lastSavedMessageId = msg.id;
-                lastSavedMessageText = resultText;
-              } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
-                // Attach session cost to the last assistant message
-                updateMessageCost(lastSavedMessageId, event.total_cost_usd);
-              }
-              // Accumulate token usage
-              const { inputTokens: inTok, outputTokens: outTok } = extractTokenUsage(event);
-              if (inTok > 0 || outTok > 0) {
-                addTokenUsage(task.id, inTok, outTok);
-              }
-              if (event.is_error && Array.isArray(event.errors) && (event.errors as string[]).length > 0) {
-                resultError = (event.errors as string[]).join('; ');
-              }
-            }
-          } catch (eventErr) {
-            console.error(`[claude-poller] Error processing event for task ${task.id}:`, (eventErr as Error).message?.slice(0, 200));
+          if (!hasValidEvent) {
+            // Restore buffer; do NOT advance linesRead; do NOT wipe.
+            partialLine = fullData;
+          } else {
+            // Atomic wipe + reparse: rolls back if any insert throws.
+            db.transaction(() => {
+              db.prepare('DELETE FROM stream_log WHERE task_id = ?').run(task.id);
+              deleteCurrentSessionAssistantMessages(task.id);
+              for (const line of allLines) processLine(line);
+            })();
+            wiped = true;
           }
+        } else {
+          // Normal incremental path after first successful wipe.
+          for (const line of allLines) processLine(line);
         }
       }
 
       if (exitPart !== 'RUNNING' && exitPart !== '') {
         const exitCode = parseInt(exitPart, 10);
+        if (isNaN(exitCode)) {
+          // Non-numeric exit content means something went wrong reading the
+          // exit file (corruption, partial write, or — historically — a
+          // marker collision). Treat as still running; a later poll resolves.
+          console.warn(`[claude-poller] Task ${task.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
+          return;
+        }
         console.log(`[claude-poller] Task ${task.id} finished with exit code ${exitCode}`);
         stopPolling(task.id);
         taskActivity.delete(task.id);
@@ -959,12 +1103,11 @@ function startFilePolling(task: Task): void {
         } else if (resultError) {
           addMessage(task.id, 'system', `Error: ${resultError}`);
           updateTaskStatus(task.id, 'failed', resultError);
-        } else if (exitCode === 0 || isNaN(exitCode)) {
+        } else if (exitCode === 0) {
           // Only transition to awaiting_feedback if we actually captured a response
           const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
           if (hasResponse) {
             updateTaskStatus(task.id, 'awaiting_feedback');
-            handleStashAway(task).catch(err => console.error('[git] Pause commit failed:', (err as Error).message?.slice(0, 100)));
           } else {
             // No response captured — re-queue for automatic retry
             console.log(`[claude-poller] Task ${task.id} exited with no response — re-queuing`);
@@ -1059,19 +1202,23 @@ async function processRemainingOutput(task: Task): Promise<void> {
 
     if (!output) return;
 
-    // Clear current session messages to avoid duplicates on recovery re-processing
-    deleteCurrentSessionAssistantMessages(task.id);
+    // Stage 1: parse all events into staging arrays WITHOUT touching the DB.
+    // Only if we successfully extract ≥1 message do we wipe existing
+    // messages and insert staged ones. Prevents a wipe-without-replacement
+    // if parsing yields nothing (empty/corrupt output file).
+    type Staged = { text: string; cost?: number };
+    const stagedMessages: Staged[] = [];
+    const stagedStreamEvents: Array<{ type: string; [k: string]: unknown }> = [];
+    let stagedInputTokens = 0;
+    let stagedOutputTokens = 0;
+    let lastStagedText: string | null = null;
 
-    let lastSavedMessageId: string | null = null;
-    let lastSavedMessageText: string | null = null;
     for (const line of output.split('\n')) {
       if (!line.trim()) continue;
       try {
         const event = JSON.parse(line);
-        // Populate stream log for recovered events
-        processEvent(task.id, event);
+        stagedStreamEvents.push(event);
 
-        // Save each assistant turn's text as a message immediately
         if (event.type === 'assistant' && event.message?.content) {
           let turnText = '';
           for (const block of event.message.content) {
@@ -1080,29 +1227,53 @@ async function processRemainingOutput(task: Task): Promise<void> {
             }
           }
           if (turnText) {
-            const msg = addMessage(task.id, 'assistant', turnText);
-            lastSavedMessageId = msg.id;
-            lastSavedMessageText = turnText;
+            stagedMessages.push({ text: turnText });
+            lastStagedText = turnText;
           }
         }
         if (event.type === 'result') {
           const resultText = extractResultText(event);
-          // Save result text as a message if it has content distinct from the last assistant message
-          if (resultText && resultText !== lastSavedMessageText) {
-            const msg = addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined);
-            lastSavedMessageId = msg.id;
-            lastSavedMessageText = resultText;
-          } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
-            updateMessageCost(lastSavedMessageId, event.total_cost_usd);
+          const cost = typeof event.total_cost_usd === 'number' ? event.total_cost_usd as number : undefined;
+          if (resultText && resultText !== lastStagedText) {
+            stagedMessages.push({ text: resultText, cost });
+            lastStagedText = resultText;
+          } else if (cost !== undefined && stagedMessages.length > 0) {
+            stagedMessages[stagedMessages.length - 1].cost = cost;
           }
           const { inputTokens: inTok, outputTokens: outTok } = extractTokenUsage(event);
-          if (inTok > 0 || outTok > 0) {
-            addTokenUsage(task.id, inTok, outTok);
-          }
+          stagedInputTokens += inTok;
+          stagedOutputTokens += outTok;
         }
       } catch {
         // Skip invalid JSON
       }
+    }
+
+    // Stage 2: if nothing parsed, do NOT wipe existing messages.
+    if (stagedMessages.length === 0) {
+      console.log(`[recovery] Task ${task.id}: parsed 0 messages from ${stagedStreamEvents.length} events — preserving existing messages`);
+      for (const event of stagedStreamEvents) {
+        processEvent(task.id, event);
+      }
+      return;
+    }
+
+    // Stage 3: atomically wipe current-session messages and insert staged ones.
+    const db = getDb();
+    db.transaction(() => {
+      deleteCurrentSessionAssistantMessages(task.id);
+      for (const m of stagedMessages) {
+        addMessage(task.id, 'assistant', m.text, m.cost);
+      }
+      if (stagedInputTokens > 0 || stagedOutputTokens > 0) {
+        addTokenUsage(task.id, stagedInputTokens, stagedOutputTokens);
+      }
+    })();
+
+    // Populate stream_log outside the message transaction — it's regenerable
+    // diagnostic data and shouldn't block the critical message insert.
+    for (const event of stagedStreamEvents) {
+      processEvent(task.id, event);
     }
 
     // Don't clean up remote files — they're the source of truth for recovery.
@@ -1342,10 +1513,12 @@ export async function launchDiscussion(
       .run(new Date().toISOString(), discussion.id);
     taskActivity.set(`disc:${discussion.id}`, { timestamp: new Date().toISOString(), summary: 'Starting discussion session' });
 
-    // Clean stale files
+    // Archive stale files to .prev (keep for forensic recovery if the next
+    // turn fails to parse and wipes in-memory state).
     try {
       await sshExec(discussion.workspace_name,
-        `rm -f ${shellEscape(outputFile)} ${shellEscape(exitFile)}`
+        `mv -f ${shellEscape(outputFile)} ${shellEscape(outputFile + '.prev')} 2>/dev/null; ` +
+        `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`
       );
     } catch {
       // Non-fatal
@@ -1410,13 +1583,16 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
   const pollKey = `disc:${discussion.id}`;
   stopPolling(pollKey);
 
-  // Clear stream log and current-session assistant messages (for reconnect dedup).
-  // Skip cleanup for catch-up launches — there's no prior output to de-duplicate,
+  // Wipe stream_log and (optionally) current-session messages atomically.
+  // Skip cleanup for catch-up launches — there's no prior output to dedupe,
   // and cleaning up would delete the host's previous legitimate responses.
-  getDb().prepare('DELETE FROM stream_log WHERE task_id = ?').run(pollKey);
-  if (!skipMessageCleanup) {
-    deleteCurrentDiscussionAssistantMessages(discussion.id);
-  }
+  const db = getDb();
+  db.transaction(() => {
+    db.prepare('DELETE FROM stream_log WHERE task_id = ?').run(pollKey);
+    if (!skipMessageCleanup) {
+      deleteCurrentDiscussionAssistantMessages(discussion.id);
+    }
+  })();
 
   let linesRead = 0;
   let lastSavedMessageId: string | null = null;
@@ -1432,16 +1608,11 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
       const outputFile = remoteDiscussionOutputPath(discussion.id);
       const exitFile = remoteDiscussionExitCodePath(discussion.id);
 
-      const output = await sshExec(discussion.workspace_name,
-        `tail -n +${linesRead + 1} ${shellEscape(outputFile)} 2>/dev/null; echo '---CPM_EXIT_CHECK---'; cat ${shellEscape(exitFile)} 2>/dev/null || echo 'RUNNING'`,
-        20000,
+      const { jsonPart, exitPart } = await pollOutputAndExit(
+        discussion.workspace_name, outputFile, exitFile, linesRead,
       );
 
       consecutiveErrors = 0;
-
-      const markerIdx = output.indexOf('---CPM_EXIT_CHECK---');
-      const jsonPart = markerIdx >= 0 ? output.slice(0, markerIdx) : output;
-      const exitPart = markerIdx >= 0 ? output.slice(markerIdx + '---CPM_EXIT_CHECK---'.length).trim() : 'RUNNING';
 
       if (jsonPart.trim() || partialLine) {
         const fullData = partialLine + jsonPart;
@@ -1514,6 +1685,10 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
 
       if (exitPart !== 'RUNNING' && exitPart !== '') {
         const exitCode = parseInt(exitPart, 10);
+        if (isNaN(exitCode)) {
+          console.warn(`[discussion-poller] Discussion ${discussion.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
+          return;
+        }
         console.log(`[discussion-poller] Discussion ${discussion.id} finished (exit: ${exitPart})`);
         stopPolling(pollKey);
         taskActivity.delete(`disc:${discussion.id}`);
@@ -1677,9 +1852,11 @@ export async function launchParticipantDiscussion(
     const pollKey = `disc-p:${participant.id}`;
     taskActivity.set(pollKey, { timestamp: new Date().toISOString(), summary: 'Starting participant session' });
 
-    // Clean stale files
+    // Archive stale files to .prev for forensic recovery
     try {
-      await sshExec(participant.workspace_name, `rm -f ${shellEscape(outputFile)} ${shellEscape(exitFile)}`);
+      await sshExec(participant.workspace_name,
+        `mv -f ${shellEscape(outputFile)} ${shellEscape(outputFile + '.prev')} 2>/dev/null; ` +
+        `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`);
     } catch { /* Non-fatal */ }
 
     // Spawn SSH
@@ -1760,16 +1937,11 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
       const outputFile = remoteParticipantOutputPath(participant.id);
       const exitFile = remoteParticipantExitCodePath(participant.id);
 
-      const output = await sshExec(participant.workspace_name,
-        `tail -n +${linesRead + 1} ${shellEscape(outputFile)} 2>/dev/null; echo '---CPM_EXIT_CHECK---'; cat ${shellEscape(exitFile)} 2>/dev/null || echo 'RUNNING'`,
-        20000,
+      const { jsonPart, exitPart } = await pollOutputAndExit(
+        participant.workspace_name, outputFile, exitFile, linesRead,
       );
 
       consecutiveErrors = 0;
-
-      const markerIdx = output.indexOf('---CPM_EXIT_CHECK---');
-      const jsonPart = markerIdx >= 0 ? output.slice(0, markerIdx) : output;
-      const exitPart = markerIdx >= 0 ? output.slice(markerIdx + '---CPM_EXIT_CHECK---'.length).trim() : 'RUNNING';
 
       if (jsonPart.trim() || partialLine) {
         const fullData = partialLine + jsonPart;
@@ -1835,6 +2007,10 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
 
       if (exitPart !== 'RUNNING' && exitPart !== '') {
         const exitCode = parseInt(exitPart, 10);
+        if (isNaN(exitCode)) {
+          console.warn(`[participant-poller] Participant ${participant.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
+          return;
+        }
         console.log(`[participant-poller] Participant ${participant.id} finished (exit: ${exitPart})`);
         stopPolling(pollKey);
         taskActivity.delete(pollKey);
@@ -1946,7 +2122,11 @@ export async function launchTaskParticipant(
   try {
     const pollKey = `task-p:${participant.id}`;
     taskActivity.set(pollKey, { timestamp: new Date().toISOString(), summary: 'Starting advisory session' });
-    try { await sshExec(participant.workspace_name, `rm -f ${shellEscape(outputFile)} ${shellEscape(exitFile)}`); } catch { /* */ }
+    try {
+      await sshExec(participant.workspace_name,
+        `mv -f ${shellEscape(outputFile)} ${shellEscape(outputFile + '.prev')} 2>/dev/null; ` +
+        `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`);
+    } catch { /* */ }
 
     const sshProcess = spawn('coder', ['ssh', participant.workspace_name, '--', remoteCmd], {
       env: { ...process.env, CODER_URL }, stdio: 'ignore', detached: true,
@@ -1988,12 +2168,10 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
     try {
       const outputFile = remoteTaskParticipantOutputPath(participant.id);
       const exitFile = remoteTaskParticipantExitCodePath(participant.id);
-      const output = await sshExec(participant.workspace_name,
-        `tail -n +${linesRead + 1} ${shellEscape(outputFile)} 2>/dev/null; echo '---CPM_EXIT_CHECK---'; cat ${shellEscape(exitFile)} 2>/dev/null || echo 'RUNNING'`, 20000);
+      const { jsonPart, exitPart } = await pollOutputAndExit(
+        participant.workspace_name, outputFile, exitFile, linesRead,
+      );
       consecutiveErrors = 0;
-      const markerIdx = output.indexOf('---CPM_EXIT_CHECK---');
-      const jsonPart = markerIdx >= 0 ? output.slice(0, markerIdx) : output;
-      const exitPart = markerIdx >= 0 ? output.slice(markerIdx + '---CPM_EXIT_CHECK---'.length).trim() : 'RUNNING';
 
       if (jsonPart.trim() || partialLine) {
         const fullData = partialLine + jsonPart;
@@ -2035,9 +2213,13 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
         }
       }
       if (exitPart !== 'RUNNING' && exitPart !== '') {
-        stopPolling(pollKey); taskActivity.delete(pollKey); activeProcesses.delete(pollKey);
         const exitCode = parseInt(exitPart, 10);
-        if (exitCode !== 0 && !isNaN(exitCode)) addMessage(task.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`);
+        if (isNaN(exitCode)) {
+          console.warn(`[task-participant-poller] Participant ${participant.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
+          return;
+        }
+        stopPolling(pollKey); taskActivity.delete(pollKey); activeProcesses.delete(pollKey);
+        if (exitCode !== 0) addMessage(task.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`);
       }
     } catch {
       consecutiveErrors++;

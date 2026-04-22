@@ -910,6 +910,11 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
             <div className="border-t border-gray-200 dark:border-gray-800 p-5">
               {task.status === 'awaiting_feedback' && (
                 <div className="space-y-3">
+                  {!!task.pending_complete && (
+                    <div className="text-xs px-3 py-2 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-300">
+                      Completion is queued — will finalize once the working task on this workspace finishes. Replying below will cancel the pending completion.
+                    </div>
+                  )}
                   {/* Participant target selector */}
                   {participants.length > 0 && (
                     <div className="flex items-center gap-1.5 flex-wrap">
@@ -1125,10 +1130,11 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   <div className="flex items-center gap-2">
                     <button
                       onClick={handleComplete}
-                      disabled={completing}
+                      disabled={completing || !!task.pending_complete}
                       className="bg-green-600 text-white text-sm px-4 py-2 rounded-md hover:bg-green-700 disabled:opacity-50"
+                      title={task.pending_complete ? 'Completion queued — will finalize once the working task finishes' : undefined}
                     >
-                      {completing ? 'Completing...' : 'Mark Complete (Alt+C)'}
+                      {task.pending_complete ? 'Completion queued…' : completing ? 'Completing...' : 'Mark Complete (Alt+C)'}
                     </button>
                     <button
                       onClick={handleRetry}
@@ -1232,12 +1238,17 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
               )}
 
               {task.status === 'queued' && (
-                <button
-                  onClick={handleCancel}
-                  className="text-sm text-red-500 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 mt-2"
-                >
-                  Cancel Task
-                </button>
+                <div className="space-y-2">
+                  <div className="text-xs px-3 py-2 rounded-md bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400">
+                    Queued — waiting for the active task on this workspace to finish.
+                  </div>
+                  <button
+                    onClick={handleCancel}
+                    className="text-sm text-red-500 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300"
+                  >
+                    Cancel Task
+                  </button>
+                </div>
               )}
 
               {(task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled' || task.status === 'awaiting_feedback') && (

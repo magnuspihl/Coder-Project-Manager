@@ -164,6 +164,40 @@ export function getDb(): Database.Database {
     if (!tasksCols2.some(c => c.name === 'last_opened_at')) {
       db.exec("ALTER TABLE tasks ADD COLUMN last_opened_at TEXT");
     }
+    if (!tasksCols2.some(c => c.name === 'pending_complete')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN pending_complete INTEGER NOT NULL DEFAULT 0");
+    }
+
+    // Enforce one-working-task-per-workspace at the DB level. If the DB is
+    // inconsistent (leftover working tasks from a crash), mark all but the
+    // most recent as failed so the unique index can apply cleanly.
+    try {
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_one_working_per_workspace
+          ON tasks(workspace_id)
+          WHERE status = 'working' AND deleted_at IS NULL
+      `);
+    } catch {
+      console.warn('[db] Duplicate working tasks detected — demoting older ones to failed.');
+      db.exec(`
+        UPDATE tasks SET status = 'failed', failed_reason = 'Orphaned: multiple working tasks on same workspace detected at startup.'
+        WHERE id IN (
+          SELECT id FROM tasks t1
+          WHERE status = 'working' AND deleted_at IS NULL
+            AND EXISTS (
+              SELECT 1 FROM tasks t2
+              WHERE t2.workspace_id = t1.workspace_id
+                AND t2.status = 'working' AND t2.deleted_at IS NULL
+                AND t2.updated_at > t1.updated_at
+            )
+        )
+      `);
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_one_working_per_workspace
+          ON tasks(workspace_id)
+          WHERE status = 'working' AND deleted_at IS NULL
+      `);
+    }
   }
   return db;
 }
