@@ -729,50 +729,9 @@ export default function WorkspacesPage() {
     >
       <div className="flex items-start justify-between gap-2">
         <h4 className="text-sm font-medium text-gray-900 dark:text-gray-100 line-clamp-2 flex-1">{task.title}</h4>
-        <div className="flex items-center gap-1 shrink-0">
-          {activeTaskByWorkspace[task.workspace_id] === task.id ? (
-            <span
-              className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full whitespace-nowrap bg-emerald-50 dark:bg-emerald-900/20 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800"
-              title="This task's changes are currently in the workspace"
-            >
-              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" /></svg>
-              active
-            </span>
-          ) : (
-            task.status !== 'working' && task.status !== 'completed' && (
-              <button
-                onClick={(e) => handleSetActive(e, task.id)}
-                disabled={activatingTaskId === task.id}
-                className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full whitespace-nowrap border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:text-emerald-700 dark:hover:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 hover:border-emerald-200 dark:hover:border-emerald-800 transition-colors disabled:opacity-50"
-                title="Restore this task's stash and make its changes visible in the workspace"
-              >
-                {activatingTaskId === task.id ? (
-                  <div className="animate-spin h-3 w-3 border border-current border-t-transparent rounded-full" />
-                ) : (
-                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M13 5l7 7-7 7M5 5l7 7-7 7" /></svg>
-                )}
-                set active
-              </button>
-            )
-          )}
-          <span className={`text-xs px-2 py-0.5 rounded-full whitespace-nowrap ${STATUS_COLORS[task.status] || ''}`}>
-            {task.status.replace('_', ' ')}
-          </span>
-        </div>
-      </div>
-      <div className="flex items-center gap-2 text-xs text-gray-400 dark:text-gray-500 mt-1">
-        <span>{new Date(task.created_at).toLocaleString()}</span>
-        {task.model && (
-          <span className={`px-1.5 py-0.5 rounded font-medium ${
-            task.model.startsWith('ollama/')
-              ? 'bg-green-50 dark:bg-green-900/20 text-green-600 dark:text-green-400'
-              : 'bg-purple-50 dark:bg-purple-900/20 text-purple-600 dark:text-purple-400'
-          }`}>
-            {task.model.startsWith('ollama/')
-              ? task.model.slice('ollama/'.length).replace(/:latest$/, '')
-              : task.model.replace(/^claude-/, '')}
-          </span>
-        )}
+        <span className={`text-xs px-2 py-0.5 rounded-full whitespace-nowrap shrink-0 ${STATUS_COLORS[task.status] || ''}`}>
+          {task.status.replace('_', ' ')}
+        </span>
       </div>
       {task.git_branch && (
         <div className="mt-1 flex items-center gap-1">
@@ -906,23 +865,40 @@ export default function WorkspacesPage() {
           )}
         </div>
         <div className="flex items-center gap-2">
-          {task.caveman && (
-            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 font-medium" title={`Caveman mode: ${task.caveman}`}>
-              {task.caveman === 'ultra' ? '🦴 ultra' : task.caveman === 'full' ? '🦴 full' : '🦴 lite'}
-            </span>
-          )}
           {(task.total_input_tokens > 0 || task.total_output_tokens > 0) && (
             <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono" title={`In: ${task.total_input_tokens.toLocaleString()} | Out: ${task.total_output_tokens.toLocaleString()}`}>
               {formatTokens(task.total_input_tokens + task.total_output_tokens)}t
             </span>
           )}
-          {typeof task.total_cost_usd === 'number' && task.total_cost_usd > 0 && (
-            <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono">${task.total_cost_usd.toFixed(2)}</span>
-          )}
           {task.id === spaceTargetTaskId && !selectedTaskId && !newTaskWorkspaceId && (
             <span className="text-[10px] text-gray-400 dark:text-gray-600">
               <kbd className="px-1 py-0.5 rounded border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 text-gray-400 dark:text-gray-500 font-mono text-[10px]">Space</kbd> to open
             </span>
+          )}
+          {activeTaskByWorkspace[task.workspace_id] === task.id ? (
+            <span
+              className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full whitespace-nowrap bg-emerald-50 dark:bg-emerald-900/20 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800"
+              title="This task's changes are currently in the workspace"
+            >
+              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" /></svg>
+              active
+            </span>
+          ) : (
+            task.status !== 'working' && task.status !== 'completed' && (
+              <button
+                onClick={(e) => handleSetActive(e, task.id)}
+                disabled={activatingTaskId === task.id}
+                className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full whitespace-nowrap border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:text-emerald-700 dark:hover:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 hover:border-emerald-200 dark:hover:border-emerald-800 transition-colors disabled:opacity-50"
+                title="Restore this task's stash and make its changes visible in the workspace"
+              >
+                {activatingTaskId === task.id ? (
+                  <div className="animate-spin h-3 w-3 border border-current border-t-transparent rounded-full" />
+                ) : (
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M13 5l7 7-7 7M5 5l7 7-7 7" /></svg>
+                )}
+                set active
+              </button>
+            )
           )}
         </div>
       </div>
