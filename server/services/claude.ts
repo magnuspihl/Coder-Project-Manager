@@ -951,6 +951,13 @@ function startFilePolling(task: Task): void {
   let consecutiveErrors = 0;
   let partialLine = '';  // Buffer for incomplete last line from previous poll
   let polling = false;   // Guard against overlapping polls
+  // Track when a terminal `result` event arrives. `claude -p` sometimes hangs
+  // after emitting its terminal result (background subagent Tasks not
+  // releasing the process), so the exit-code file is never written and the
+  // task gets stuck in 'working'. If the exit file doesn't appear within the
+  // grace window after a result event, we force-finalize from the result.
+  let resultSeenAt = 0;
+  const RESULT_EXIT_GRACE_MS = 15000;
 
   // Per-line processor — extracted so the first poll can run it inside the
   // wipe+reparse transaction without duplicating logic.
@@ -1015,6 +1022,9 @@ function startFilePolling(task: Task): void {
         if (event.is_error && Array.isArray(event.errors) && (event.errors as string[]).length > 0) {
           resultError = (event.errors as string[]).join('; ');
         }
+        if (resultSeenAt === 0) {
+          resultSeenAt = Date.now();
+        }
       }
     } catch (eventErr) {
       console.error(`[claude-poller] Error processing event for task ${task.id}:`, (eventErr as Error).message?.slice(0, 200));
@@ -1078,21 +1088,15 @@ function startFilePolling(task: Task): void {
         }
       }
 
-      if (exitPart !== 'RUNNING' && exitPart !== '') {
-        const exitCode = parseInt(exitPart, 10);
-        if (isNaN(exitCode)) {
-          // Non-numeric exit content means something went wrong reading the
-          // exit file (corruption, partial write, or — historically — a
-          // marker collision). Treat as still running; a later poll resolves.
-          console.warn(`[claude-poller] Task ${task.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
-          return;
-        }
-        console.log(`[claude-poller] Task ${task.id} finished with exit code ${exitCode}`);
+      // Shared completion path — invoked either when the remote exit file
+      // appears, or when we saw a terminal result event but the process
+      // never exited (grace fallback). exitCode === null means "result
+      // event only; treat as success unless resultError is set".
+      const finalize = (exitCode: number | null): void => {
         stopPolling(task.id);
         taskActivity.delete(task.id);
         getDb().prepare('UPDATE tasks SET ssh_pid = NULL WHERE id = ?').run(task.id);
 
-        // Check if this was a rate limit failure
         const rlInfo = rateLimitInfo.get(task.id);
         rateLimitInfo.delete(task.id);
         const isRateLimited = rlInfo && rlInfo.resetsAt * 1000 > Date.now();
@@ -1104,14 +1108,12 @@ function startFilePolling(task: Task): void {
         } else if (resultError) {
           addMessage(task.id, 'system', `Error: ${resultError}`);
           updateTaskStatus(task.id, 'failed', resultError);
-        } else if (exitCode === 0) {
-          // Only transition to awaiting_feedback if we actually captured a response
+        } else if (exitCode === null || exitCode === 0) {
           const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
           if (hasResponse) {
             updateTaskStatus(task.id, 'awaiting_feedback');
           } else {
-            // No response captured — re-queue for automatic retry
-            console.log(`[claude-poller] Task ${task.id} exited with no response — re-queuing`);
+            console.log(`[claude-poller] Task ${task.id} finished with no response — re-queuing`);
             addMessage(task.id, 'system', 'Claude exited without producing a response. Re-queued for automatic retry.');
             updateTaskStatus(task.id, 'queued');
           }
@@ -1121,10 +1123,41 @@ function startFilePolling(task: Task): void {
           updateTaskStatus(task.id, 'failed', errorMsg);
         }
 
+        processQueue(task.workspace_id).catch(() => {});
+      };
+
+      if (exitPart !== 'RUNNING' && exitPart !== '') {
+        const exitCode = parseInt(exitPart, 10);
+        if (isNaN(exitCode)) {
+          // Non-numeric exit content means something went wrong reading the
+          // exit file (corruption, partial write, or — historically — a
+          // marker collision). Treat as still running; a later poll resolves.
+          console.warn(`[claude-poller] Task ${task.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
+          return;
+        }
+        console.log(`[claude-poller] Task ${task.id} finished with exit code ${exitCode}`);
+        finalize(exitCode);
         // Don't clean up remote files — they're the source of truth for recovery.
         // They'll be cleaned up when the next task launches (rm -f exitFile).
-
-        processQueue(task.workspace_id).catch(() => {});
+      } else if (resultSeenAt > 0 && Date.now() - resultSeenAt > RESULT_EXIT_GRACE_MS) {
+        // Terminal `result` event arrived but `claude -p` didn't exit within
+        // the grace window (known hang: background subagent Tasks pin the
+        // process). Force-kill remotely and finalize from the result.
+        const waited = Date.now() - resultSeenAt;
+        console.warn(`[claude-poller] Task ${task.id} emitted result ${waited}ms ago but process hasn't exited — force-closing`);
+        if (task.claude_session_id) {
+          const pattern = task.claude_session_id.replace(/[^a-zA-Z0-9-]/g, '');
+          if (pattern.length >= 8) {
+            sshExec(task.workspace_name, `pkill -f ${pattern} || true`, 10000)
+              .catch(err => console.error(`[claude-poller] Force-close pkill failed for ${task.id}:`, (err as Error).message?.slice(0, 120)));
+          }
+        }
+        const localProc = activeProcesses.get(task.id);
+        if (localProc) {
+          try { localProc.kill(); } catch {}
+          activeProcesses.delete(task.id);
+        }
+        finalize(null);
       }
     } catch (err) {
       consecutiveErrors++;
@@ -1600,6 +1633,11 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
   let consecutiveErrors = 0;
   let partialLine = '';
   let polling = false;
+  // See note in startFilePolling: `claude -p` sometimes emits a terminal
+  // `result` event but hangs instead of exiting, so the exit file never
+  // gets written. Grace-fallback forces completion from the result event.
+  let resultSeenAt = 0;
+  const RESULT_EXIT_GRACE_MS = 15000;
 
   const poll = async () => {
     if (polling) return;
@@ -1676,6 +1714,9 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
                 // Update cost on last message
                 getDb().prepare('UPDATE discussion_messages SET cost = ? WHERE id = ?').run(event.total_cost_usd, lastSavedMessageId);
               }
+              if (resultSeenAt === 0) {
+                resultSeenAt = Date.now();
+              }
             }
           } catch (eventErr) {
             console.error(`[discussion-poller] Error processing event:`, (eventErr as Error).message?.slice(0, 200));
@@ -1683,13 +1724,7 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
         }
       }
 
-      if (exitPart !== 'RUNNING' && exitPart !== '') {
-        const exitCode = parseInt(exitPart, 10);
-        if (isNaN(exitCode)) {
-          console.warn(`[discussion-poller] Discussion ${discussion.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
-          return;
-        }
-        console.log(`[discussion-poller] Discussion ${discussion.id} finished (exit: ${exitPart})`);
+      const finalize = async (exitCode: number | null): Promise<void> => {
         stopPolling(pollKey);
         taskActivity.delete(`disc:${discussion.id}`);
         activeProcesses.delete(`disc:${discussion.id}`);
@@ -1697,13 +1732,13 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
         getDb().prepare('UPDATE discussions SET ssh_pid = NULL WHERE id = ?').run(discussion.id);
 
         // Check for agent mentions in the last response (host = null source)
-        if (exitCode === 0 && lastSavedMessageText) {
+        if ((exitCode === 0 || exitCode === null) && lastSavedMessageText) {
           parseMentions(discussion, lastSavedMessageText, null);
         }
 
-        // Surface errors to the user
-        if (exitCode !== 0 && !isNaN(exitCode)) {
-          // Try to extract error details from the output file (stderr is mixed in)
+        // Surface errors to the user (non-null non-zero exit only — result-event
+        // fallback is treated as success unless we want to parse errors from it).
+        if (exitCode !== null && exitCode !== 0 && !isNaN(exitCode)) {
           let errorDetail = '';
           try {
             const lastLines = await sshExec(discussion.workspace_name,
@@ -1723,6 +1758,27 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
           const msg = errorMessages[exitCode] || `Claude exited with code ${exitCode}${errorDetail}`;
           addDiscussionMessage(discussion.id, 'system', `Error: ${msg}`);
         }
+      };
+
+      if (exitPart !== 'RUNNING' && exitPart !== '') {
+        const exitCode = parseInt(exitPart, 10);
+        if (isNaN(exitCode)) {
+          console.warn(`[discussion-poller] Discussion ${discussion.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
+          return;
+        }
+        console.log(`[discussion-poller] Discussion ${discussion.id} finished (exit: ${exitPart})`);
+        await finalize(exitCode);
+      } else if (resultSeenAt > 0 && Date.now() - resultSeenAt > RESULT_EXIT_GRACE_MS) {
+        const waited = Date.now() - resultSeenAt;
+        console.warn(`[discussion-poller] Discussion ${discussion.id} emitted result ${waited}ms ago but process hasn't exited — force-closing`);
+        // Discussion launch doesn't track a session-id locally; kill the
+        // SSH client and let the remote bash exit when the pipe closes.
+        const localProc = activeProcesses.get(`disc:${discussion.id}`);
+        if (localProc) {
+          try { localProc.kill(); } catch {}
+          activeProcesses.delete(`disc:${discussion.id}`);
+        }
+        await finalize(null);
       }
     } catch (err) {
       consecutiveErrors++;
@@ -1932,6 +1988,8 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
   let consecutiveErrors = 0;
   let partialLine = '';
   let polling = false;
+  let resultSeenAt = 0;
+  const RESULT_EXIT_GRACE_MS = 15000;
 
   const poll = async () => {
     if (polling) return;
@@ -2001,12 +2059,29 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
               } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
                 getDb().prepare('UPDATE discussion_messages SET cost = ? WHERE id = ?').run(event.total_cost_usd, lastSavedMessageId);
               }
+              if (resultSeenAt === 0) {
+                resultSeenAt = Date.now();
+              }
             }
           } catch (eventErr) {
             console.error(`[participant-poller] Error processing event:`, (eventErr as Error).message?.slice(0, 200));
           }
         }
       }
+
+      const finalize = (exitCode: number | null): void => {
+        stopPolling(pollKey);
+        taskActivity.delete(pollKey);
+        activeProcesses.delete(pollKey);
+
+        if ((exitCode === 0 || exitCode === null) && lastSavedMessageText) {
+          parseMentions(discussion, lastSavedMessageText, participant.id);
+        }
+
+        if (exitCode !== null && exitCode !== 0 && !isNaN(exitCode)) {
+          addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`);
+        }
+      };
 
       if (exitPart !== 'RUNNING' && exitPart !== '') {
         const exitCode = parseInt(exitPart, 10);
@@ -2015,18 +2090,15 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
           return;
         }
         console.log(`[participant-poller] Participant ${participant.id} finished (exit: ${exitPart})`);
-        stopPolling(pollKey);
-        taskActivity.delete(pollKey);
-        activeProcesses.delete(pollKey);
-
-        // Check for agent mentions in the last response
-        if (exitCode === 0 && lastSavedMessageText) {
-          parseMentions(discussion, lastSavedMessageText, participant.id);
+        finalize(exitCode);
+      } else if (resultSeenAt > 0 && Date.now() - resultSeenAt > RESULT_EXIT_GRACE_MS) {
+        const waited = Date.now() - resultSeenAt;
+        console.warn(`[participant-poller] Participant ${participant.id} emitted result ${waited}ms ago but process hasn't exited — force-closing`);
+        const localProc = activeProcesses.get(pollKey);
+        if (localProc) {
+          try { localProc.kill(); } catch {}
         }
-
-        if (exitCode !== 0 && !isNaN(exitCode)) {
-          addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`);
-        }
+        finalize(null);
       }
     } catch (err) {
       consecutiveErrors++;
@@ -2164,6 +2236,8 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
   stopPolling(pollKey);
   let linesRead = 0, lastSavedMessageId: string | null = null, lastSavedMessageText: string | null = null;
   let consecutiveErrors = 0, partialLine = '', polling = false;
+  let resultSeenAt = 0;
+  const RESULT_EXIT_GRACE_MS = 15000;
 
   const poll = async () => {
     if (polling) return;
@@ -2211,18 +2285,33 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
               } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
                 updateMessageCost(lastSavedMessageId, event.total_cost_usd as number);
               }
+              if (resultSeenAt === 0) resultSeenAt = Date.now();
             }
           } catch { /* skip */ }
         }
       }
+      const finalize = (exitCode: number | null): void => {
+        stopPolling(pollKey); taskActivity.delete(pollKey); activeProcesses.delete(pollKey);
+        if (exitCode !== null && exitCode !== 0) {
+          addMessage(task.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`);
+        }
+      };
+
       if (exitPart !== 'RUNNING' && exitPart !== '') {
         const exitCode = parseInt(exitPart, 10);
         if (isNaN(exitCode)) {
           console.warn(`[task-participant-poller] Participant ${participant.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
           return;
         }
-        stopPolling(pollKey); taskActivity.delete(pollKey); activeProcesses.delete(pollKey);
-        if (exitCode !== 0) addMessage(task.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`);
+        finalize(exitCode);
+      } else if (resultSeenAt > 0 && Date.now() - resultSeenAt > RESULT_EXIT_GRACE_MS) {
+        const waited = Date.now() - resultSeenAt;
+        console.warn(`[task-participant-poller] Participant ${participant.id} emitted result ${waited}ms ago but process hasn't exited — force-closing`);
+        const localProc = activeProcesses.get(pollKey);
+        if (localProc) {
+          try { localProc.kill(); } catch {}
+        }
+        finalize(null);
       }
     } catch {
       consecutiveErrors++;
