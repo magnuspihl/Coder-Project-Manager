@@ -11,7 +11,7 @@ const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
 const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || '50';
 const ALLOWED_TOOLS = process.env.CLAUDE_ALLOWED_TOOLS || 'Read,Edit,Write,Bash,Glob,Grep';
-const DISCUSSION_ALLOWED_TOOLS = 'Read,Bash,Glob,Grep,mcp__coder__coder_report_task';
+const DISCUSSION_ALLOWED_TOOLS = 'Read,Edit,Write,MultiEdit,Bash,Glob,Grep,mcp__coder__coder_report_task';
 
 // Track active SSH processes per task so we can kill them
 const activeProcesses = new Map<string, ChildProcess>();
@@ -1113,9 +1113,14 @@ async function processRemainingOutput(task: Task): Promise<void> {
 
 // ─── Discussion (workspace chat) support ───────────────────────────────────
 
-const DISCUSSION_PROMPT_PREFIX = `You are in a read-only discussion session for this workspace. You can explore and read code, run read-only shell commands (git log, ls, find, cat, etc.), but you MUST NOT modify, create, or delete any files, make commits, push to git, or change system state. Your tools are limited to Read, Glob, Grep, and Bash.
+function getDiscussionPromptPrefix(projectDir: string | null): string {
+  const boundary = projectDir
+    ? `You MUST NOT modify, create, or delete any files within \`${projectDir}\` (the git-tracked project directory) — treat it as read-only. If work needs to be done inside the project, output a [TASK_REQUEST] instead and the user will approve it as a task.\n\nYou MAY freely read, explore, and write to files outside this path — global config files like \`~/.claude/CLAUDE.md\`, workspace memory files, temp files, etc.`
+    : `You MUST NOT modify, create, or delete files in the project repository — treat it as read-only. If work needs to be done in the project, output a [TASK_REQUEST] instead and the user will approve it as a task.`;
 
-If the discussion leads to work that should be done, output a task request in this EXACT format (on its own, not inside a code block):
+  return `You are a discussion agent for this workspace. ${boundary}
+
+If the discussion leads to work that should be done inside the project, output a task request in this EXACT format (on its own, not inside a code block):
 
 [TASK_REQUEST]
 {"prompt": "detailed task description here", "branch": "optional-branch-name"}
@@ -1126,6 +1131,14 @@ The "branch" field is optional — omit it or set it to null if no specific bran
 ---
 
 `;
+}
+
+function getReadOnlyOverride(projectDir: string | null): string {
+  const boundary = projectDir
+    ? `You MUST NOT modify, create, or delete any files within \`${projectDir}\` (the git-tracked project directory). You MAY write to files outside this path (global config, memory files, temp files, etc.).`
+    : `You MUST NOT modify, create, or delete files in the project repository.`;
+  return `[SYSTEM OVERRIDE] Your access mode has been changed to READ-ONLY. You are now in a discussion session. ${boundary}\n\n`;
+}
 
 /** Remote path for discussion output files */
 function remoteDiscussionOutputPath(discussionId: string): string {
@@ -1225,9 +1238,6 @@ export async function launchDiscussion(
   const FULL_ACCESS_OVERRIDE = '[SYSTEM OVERRIDE] Your access mode has been changed to FULL ACCESS. ' +
     'You are NO LONGER in a read-only session. Disregard any earlier instructions about being read-only or having limited tools. ' +
     'You now have full access to all tools and can modify files, make commits, run any commands, and perform all actions.\n\n';
-  const READ_ONLY_OVERRIDE = '[SYSTEM OVERRIDE] Your access mode has been changed to READ-ONLY. ' +
-    'You are now in a read-only discussion session. You MUST NOT modify, create, or delete any files, make commits, push to git, or change system state. ' +
-    'Your tools are limited to Read, Glob, Grep, and Bash (read-only commands only).\n\n';
 
   // Build catch-up context for the host if there are participants —
   // the host's own session doesn't contain messages from other agents.
@@ -1240,7 +1250,7 @@ export async function launchDiscussion(
   let prompt: string;
   if (!isResume) {
     // First message — use prefix or not based on mode
-    prompt = isFullAccess ? message : DISCUSSION_PROMPT_PREFIX + message;
+    prompt = isFullAccess ? message : getDiscussionPromptPrefix(discussion.project_dir ?? null) + message;
   } else if (participants.length > 0) {
     // Resuming with participants — prepend catch-up if available, skip access override.
     // Always include mention instruction so the agent knows how to reach other agents.
@@ -1252,7 +1262,7 @@ export async function launchDiscussion(
     prompt = FULL_ACCESS_OVERRIDE + message;
   } else {
     // Resuming in read-only, no participants — send override in case mode changed
-    prompt = READ_ONLY_OVERRIDE + message;
+    prompt = getReadOnlyOverride(discussion.project_dir ?? null) + message;
   }
 
   // Auto-detect project directory if not already set
@@ -1600,7 +1610,7 @@ export async function launchParticipantDiscussion(
 
   let prompt: string;
   if (!isResume) {
-    const prefix = isFullAccess ? '' : DISCUSSION_PROMPT_PREFIX;
+    const prefix = isFullAccess ? '' : getDiscussionPromptPrefix(participant.project_dir ?? null);
     const context = [mentionInstr].filter(Boolean).join('\n');
     prompt = prefix + (context ? context + '\n' : '') + message;
   } else {
@@ -1889,7 +1899,7 @@ export async function launchTaskParticipant(
 
   let prompt: string;
   if (!isResume) {
-    prompt = DISCUSSION_PROMPT_PREFIX + (catchUp ? catchUp + '\n' : '') + message;
+    prompt = getDiscussionPromptPrefix(participant.project_dir ?? null) + (catchUp ? catchUp + '\n' : '') + message;
   } else {
     prompt = catchUp ? catchUp + '\n' + message : message;
   }

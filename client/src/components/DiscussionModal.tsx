@@ -873,14 +873,14 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                     className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
                       discussion.full_access ? 'bg-amber-500' : 'bg-gray-300 dark:bg-gray-600'
                     } ${discussion.running ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
-                    title={discussion.full_access ? 'Full access — Claude can modify files' : 'Read-only — Claude can only read and explore'}
+                    title={discussion.full_access ? 'Full Access — Claude can modify project files directly' : 'Project files are read-only — Claude proposes tasks for project changes'}
                   >
                     <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${
                       discussion.full_access ? 'translate-x-3.5' : 'translate-x-0.5'
                     }`} />
                   </button>
                   <span className={`text-[10px] ${discussion.full_access ? 'text-amber-600 dark:text-amber-400' : 'text-gray-400 dark:text-gray-500'}`}>
-                    {discussion.full_access ? 'Full Access' : 'Read-Only'}
+                    {discussion.full_access ? 'Full Access' : 'Project read-only'}
                   </span>
                 </div>
               </div>
