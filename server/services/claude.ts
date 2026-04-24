@@ -3,7 +3,7 @@ import { createReadStream } from 'fs';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, type Task, type TaskParticipant } from './tasks.js';
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { getDb } from '../db/index.js';
-import { handleTaskLaunchGit, handleTaskResumeGit, handleStashAway } from './git.js';
+import { handleTaskLaunchGit, handleTaskResumeGit, handleStashAway, fetchGitHubToken } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
 import { getAttachmentsByTask, type Attachment } from '../routes/uploads.js';
 
@@ -1362,8 +1362,9 @@ export async function launchDiscussion(
     }
 
     // Spawn SSH
+    const ghToken = await fetchGitHubToken().catch(() => null);
     const sshProcess = spawn('coder', ['ssh', discussion.workspace_name, '--', remoteCmd], {
-      env: { ...process.env, CODER_URL },
+      env: { ...process.env, CODER_URL, ...(ghToken ? { GH_TOKEN: ghToken } : {}) },
       stdio: 'ignore',
       detached: true,
     });
@@ -1693,8 +1694,9 @@ export async function launchParticipantDiscussion(
     } catch { /* Non-fatal */ }
 
     // Spawn SSH
+    const ghToken = await fetchGitHubToken().catch(() => null);
     const sshProcess = spawn('coder', ['ssh', participant.workspace_name, '--', remoteCmd], {
-      env: { ...process.env, CODER_URL },
+      env: { ...process.env, CODER_URL, ...(ghToken ? { GH_TOKEN: ghToken } : {}) },
       stdio: 'ignore',
       detached: true,
     });
@@ -1958,8 +1960,11 @@ export async function launchTaskParticipant(
     taskActivity.set(pollKey, { timestamp: new Date().toISOString(), summary: 'Starting advisory session' });
     try { await sshExec(participant.workspace_name, `rm -f ${shellEscape(outputFile)} ${shellEscape(exitFile)}`); } catch { /* */ }
 
+    const ghToken = await fetchGitHubToken().catch(() => null);
     const sshProcess = spawn('coder', ['ssh', participant.workspace_name, '--', remoteCmd], {
-      env: { ...process.env, CODER_URL }, stdio: 'ignore', detached: true,
+      env: { ...process.env, CODER_URL, ...(ghToken ? { GH_TOKEN: ghToken } : {}) },
+      stdio: 'ignore',
+      detached: true,
     });
     activeProcesses.set(pollKey, sshProcess);
     sshProcess.unref();

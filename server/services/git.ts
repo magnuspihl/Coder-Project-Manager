@@ -7,7 +7,7 @@ import { execFile } from 'child_process';
  * Fetch a GitHub token from Coder's external auth provider.
  * Returns the token string or null if unavailable.
  */
-function fetchGitHubToken(): Promise<string | null> {
+export function fetchGitHubToken(): Promise<string | null> {
   return new Promise((resolve) => {
     execFile('coder', ['external-auth', 'access-token', 'magnuspihl'], {
       timeout: 10000,
