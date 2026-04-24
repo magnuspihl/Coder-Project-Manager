@@ -549,9 +549,12 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
             30000
           );
         } else {
-          // Only create the branch on first launch — on resume, a missing
-          // branch is unexpected but we still create it rather than fail.
-          await sshExec(ws, `cd ${dir} && git checkout -b ${shellEscape(branch)}`, 15000);
+          try {
+            await sshExec(ws, `cd ${dir} && git checkout -b ${shellEscape(branch)}`, 15000);
+          } catch {
+            // Branch exists locally but not on origin — switch to it
+            await sshExec(ws, `cd ${dir} && git checkout ${shellEscape(branch)}`, 15000);
+          }
         }
         addMessage(task.id, 'system', `Checked out branch \`${branch}\`.`);
       }

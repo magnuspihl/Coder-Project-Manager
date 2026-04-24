@@ -683,21 +683,20 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const handleSend = async (e?: FormEvent) => {
     if (e) e.preventDefault();
     if (isListening) stopListening();
-    if (!message.trim() || sending) return;
+    const trimmed = message.trim();
+    if (!trimmed || sending) return;
     setSending(true);
+    clearMessage();
     shouldForceScroll.current = true;
     try {
       if (targetId) {
-        await sendParticipantMessage(discussionId, targetId, message.trim());
+        await sendParticipantMessage(discussionId, targetId, trimmed);
       } else {
-        await sendDiscussionMessage(discussionId, message.trim());
+        await sendDiscussionMessage(discussionId, trimmed);
       }
-      clearMessage();
       await loadData();
-    } catch (err) {
-      if (err instanceof Error && err.message.includes('currently processing')) {
-        // Don't clear message, let user retry
-      }
+    } catch {
+      setMessage(trimmed);
     } finally {
       setSending(false);
     }
