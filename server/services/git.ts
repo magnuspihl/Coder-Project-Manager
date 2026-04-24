@@ -372,39 +372,45 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       return true;
     }
 
-    // Remote allowed: create branch, commit, push, PR, merge
-    if (!hasChanges) {
-      // Nothing to commit — task is done
-      return true;
-    }
+    // Remote allowed: determine branch, commit if needed, push/PR/merge if ahead
 
     const defaultBranch = await getDefaultBranch(ws, dir);
 
     // Re-read task for latest title
     const freshTask = getTask(task.id) || task;
-    const branchName = generateBranchName(freshTask);
 
-    // Create branch (or switch to it if it already exists), commit, push
+    // Determine working branch: if Claude already branched, use that branch;
+    // otherwise create/switch to the generated task branch.
     const currentBranch = (await sshExec(ws, `cd ${dir} && git rev-parse --abbrev-ref HEAD`)).trim();
-    if (currentBranch === branchName) {
-      // Already on the right branch (e.g. reopen → complete retry)
-    } else {
+    let workingBranch: string;
+    if (currentBranch === defaultBranch) {
+      workingBranch = generateBranchName(freshTask);
       try {
-        await sshExec(ws, `cd ${dir} && git checkout -b ${branchName}`, 15000);
+        await sshExec(ws, `cd ${dir} && git checkout -b ${workingBranch}`, 15000);
       } catch {
-        // Branch already exists — switch to it
-        await sshExec(ws, `cd ${dir} && git checkout ${branchName}`, 15000);
+        await sshExec(ws, `cd ${dir} && git checkout ${workingBranch}`, 15000);
+      }
+    } else {
+      workingBranch = currentBranch;
+    }
+
+    // Commit any uncommitted changes (skip if the tree is clean)
+    if (hasChanges) {
+      await sshExec(ws, `cd ${dir} && git add -A`);
+      const staged = await sshExec(ws, `cd ${dir} && git diff --cached --name-only`);
+      if (staged.trim()) {
+        await sshExec(ws, `cd ${dir} && git commit -m ${shellEscape(freshTask.title || 'Task changes')}`, 30000);
       }
     }
-    // Stage and commit (skip if nothing actually staged — worktrees/submodules can show as modified but not stageable)
-    await sshExec(ws, `cd ${dir} && git add -A`);
-    const staged = await sshExec(ws, `cd ${dir} && git diff --cached --name-only`);
-    if (!staged.trim()) {
-      // Nothing actually committable — bail out cleanly
+
+    // Gate push/PR/merge on whether there are commits ahead of the default branch
+    const aheadStr = await sshExec(ws, `cd ${dir} && git rev-list --count origin/${defaultBranch}..HEAD`);
+    const commitsAhead = parseInt(aheadStr.trim(), 10) || 0;
+    if (commitsAhead === 0) {
       return true;
     }
-    await sshExec(ws, `cd ${dir} && git commit -m ${shellEscape(freshTask.title || 'Task changes')}`, 30000);
-    storeTaskBranch(task.id, branchName);
+
+    storeTaskBranch(task.id, workingBranch);
 
     // Detect and store the GitHub repo URL
     const repoUrl = await detectGitHubRepoUrl(ws, dir);
@@ -413,12 +419,12 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
     }
 
     try {
-      await sshExec(ws, `cd ${dir} && git push -u origin ${branchName}`, 30000);
+      await sshExec(ws, `cd ${dir} && git push -u origin ${workingBranch}`, 30000);
     } catch {
       try {
-        await sshExec(ws, `cd ${dir} && git push origin ${branchName}`, 30000);
+        await sshExec(ws, `cd ${dir} && git push origin ${workingBranch}`, 30000);
       } catch (pushErr: any) {
-        addMessage(task.id, 'system', `Changes committed on branch \`${branchName}\` but push failed: ${pushErr.message}`);
+        addMessage(task.id, 'system', `Changes committed on branch \`${workingBranch}\` but push failed: ${pushErr.message}`);
         return true;
       }
     }
@@ -428,7 +434,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
     const prBody = `Automated PR for completed task.\n\n**Task:** ${freshTask.title}\n**Task ID:** ${freshTask.id}`;
     let prUrl: string;
     try {
-      const existingPr = await sshGh(ws, `cd ${dir} && gh pr view ${branchName} --json url --jq .url 2>/dev/null`);
+      const existingPr = await sshGh(ws, `cd ${dir} && gh pr view ${workingBranch} --json url --jq .url 2>/dev/null`);
       if (existingPr.trim()) {
         prUrl = existingPr.trim();
         addMessage(task.id, 'system', `Existing pull request found: ${prUrl}`);
@@ -437,15 +443,15 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       }
     } catch {
       prUrl = await sshGh(ws,
-        `cd ${dir} && gh pr create --base ${defaultBranch} --head ${branchName} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`
+        `cd ${dir} && gh pr create --base ${defaultBranch} --head ${workingBranch} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`
       );
       addMessage(task.id, 'system', `Pull request created: ${prUrl}`);
     }
 
     // Merge
     try {
-      await sshGh(ws, `cd ${dir} && gh pr merge ${branchName} --merge --delete-branch`);
-      addMessage(task.id, 'system', `PR merged and branch \`${branchName}\` deleted.`);
+      await sshGh(ws, `cd ${dir} && gh pr merge ${workingBranch} --merge --delete-branch`);
+      addMessage(task.id, 'system', `PR merged and branch \`${workingBranch}\` deleted.`);
       await sshExec(ws, `cd ${dir} && git checkout ${defaultBranch} && git pull origin ${defaultBranch}`, 30000);
     } catch (mergeErr: any) {
       addMessage(task.id, 'system', `PR created but merge failed: ${mergeErr.message}. Manual merge may be needed.`);
