@@ -366,16 +366,18 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
   const handleReply = async (e?: FormEvent) => {
     if (e) e.preventDefault();
-    if (!reply.trim() && uploadedAttachmentIds.length === 0) return;
+    const trimmed = reply.trim();
+    if (!trimmed && uploadedAttachmentIds.length === 0) return;
     setSending(true);
+    const attIds = uploadedAttachmentIds.length > 0 ? uploadedAttachmentIds : undefined;
+    clearReply();
+    setPendingFiles([]);
+    setUploadedAttachmentIds([]);
     try {
-      await replyToTask(taskId, reply.trim() || 'See attached files.', uploadedAttachmentIds.length > 0 ? uploadedAttachmentIds : undefined);
-      clearReply();
-      setPendingFiles([]);
-      setUploadedAttachmentIds([]);
+      await replyToTask(taskId, trimmed || 'See attached files.', attIds);
       closeAndNotify();
     } catch {
-      // ignore
+      setReply(trimmed);
     } finally {
       setSending(false);
     }
@@ -391,17 +393,21 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   // Like handleReply but stays in the modal — used by voice auto-send so the
   // conversation loop continues instead of closing the task detail view.
   const replyAndStay = useCallback(async () => {
-    if (!reply.trim() && uploadedAttachmentIds.length === 0) return;
+    const trimmed = reply.trim();
+    if (!trimmed && uploadedAttachmentIds.length === 0) return;
     if (sending) return;
     setSending(true);
+    const attIds = uploadedAttachmentIds.length > 0 ? uploadedAttachmentIds : undefined;
+    clearReply();
+    setPendingFiles([]);
+    setUploadedAttachmentIds([]);
     try {
-      await replyToTask(taskId, reply.trim() || 'See attached files.', uploadedAttachmentIds.length > 0 ? uploadedAttachmentIds : undefined);
-      clearReply();
-      setPendingFiles([]);
-      setUploadedAttachmentIds([]);
+      await replyToTask(taskId, trimmed || 'See attached files.', attIds);
       onTaskChanged?.();
       await loadData();
-    } catch { } finally { setSending(false); }
+    } catch {
+      setReply(trimmed);
+    } finally { setSending(false); }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reply, uploadedAttachmentIds, sending, taskId]);
 
@@ -511,16 +517,15 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
   const handleSendToParticipant = async (e?: FormEvent) => {
     if (e) e.preventDefault();
-    if (!reply.trim() || !targetParticipantId) return;
+    const trimmed = reply.trim();
+    if (!trimmed || !targetParticipantId) return;
     setSending(true);
+    clearReply();
     try {
-      await sendTaskParticipantMessage(taskId, targetParticipantId, reply.trim());
-      clearReply();
+      await sendTaskParticipantMessage(taskId, targetParticipantId, trimmed);
       await loadData();
-    } catch (err) {
-      if (err instanceof Error && err.message.includes('currently processing')) {
-        // Don't clear, let user retry
-      }
+    } catch {
+      setReply(trimmed);
     } finally {
       setSending(false);
     }
