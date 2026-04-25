@@ -1,5 +1,5 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
-import { createReadStream } from 'fs';
+import { createReadStream, createWriteStream } from 'fs';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, type Task, type TaskParticipant } from './tasks.js';
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { getDb } from '../db/index.js';
@@ -245,10 +245,36 @@ function shellEscape(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
+// Name of the workspace this server is running in (set by Coder)
+const LOCAL_WORKSPACE_NAME = process.env.CODER_WORKSPACE_NAME || '';
+
+function isLocalWorkspace(workspaceName: string): boolean {
+  return !!LOCAL_WORKSPACE_NAME && workspaceName === LOCAL_WORKSPACE_NAME;
+}
+
+/**
+ * Run a shell command locally, returning stdout.
+ */
+function localExec(command: string, timeout = 15000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile('bash', ['-c', command], {
+      timeout,
+      env: { ...process.env },
+    }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout?.trim() || '');
+    });
+  });
+}
+
 /**
  * Run a command via coder ssh, returning stdout.
+ * When the target workspace is the local workspace, runs the command locally instead.
  */
 export function sshExec(workspaceName: string, command: string, timeout = 15000): Promise<string> {
+  if (isLocalWorkspace(workspaceName)) {
+    return localExec(command, timeout);
+  }
   return new Promise((resolve, reject) => {
     execFile('coder', ['ssh', workspaceName, '--', command], {
       timeout,
@@ -278,23 +304,34 @@ async function transferFilesToWorkspace(
   for (const att of attachments) {
     const remotePath = `${remoteDir}/${att.original_name}`;
     try {
-      await new Promise<void>((resolve, reject) => {
-        const proc = spawn('coder', [
-          'ssh', workspaceName, '--',
-          `cat > ${shellEscape(remotePath)}`,
-        ], {
-          env: { ...process.env, CODER_URL },
-          stdio: ['pipe', 'ignore', 'pipe'],
+      if (isLocalWorkspace(workspaceName)) {
+        await new Promise<void>((resolve, reject) => {
+          const src = createReadStream(att.storage_path);
+          const dst = createWriteStream(remotePath);
+          src.pipe(dst);
+          dst.on('finish', resolve);
+          dst.on('error', reject);
+          src.on('error', (err) => { dst.destroy(); reject(err); });
         });
-        const fileStream = createReadStream(att.storage_path);
-        fileStream.pipe(proc.stdin);
-        fileStream.on('error', (err) => { proc.kill(); reject(err); });
-        proc.on('close', (code) => {
-          if (code === 0) resolve();
-          else reject(new Error(`SCP failed for ${att.original_name} (exit ${code})`));
+      } else {
+        await new Promise<void>((resolve, reject) => {
+          const proc = spawn('coder', [
+            'ssh', workspaceName, '--',
+            `cat > ${shellEscape(remotePath)}`,
+          ], {
+            env: { ...process.env, CODER_URL },
+            stdio: ['pipe', 'ignore', 'pipe'],
+          });
+          const fileStream = createReadStream(att.storage_path);
+          fileStream.pipe(proc.stdin);
+          fileStream.on('error', (err) => { proc.kill(); reject(err); });
+          proc.on('close', (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`SCP failed for ${att.original_name} (exit ${code})`));
+          });
+          proc.on('error', reject);
         });
-        proc.on('error', reject);
-      });
+      }
       pathMap.set(att.id, remotePath);
     } catch (err) {
       console.error(`[file-transfer] Failed to transfer ${att.original_name}:`, (err as Error).message?.slice(0, 100));
@@ -588,14 +625,19 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
       // Non-fatal — the remote rm -f in the command will also clean up
     }
 
-    // Spawn SSH fully detached with no pipes.
-    // No stdout/stderr pipe means no SIGPIPE when the server restarts.
-    // The process writes to a file on the remote workspace which we poll.
-    const sshProcess = spawn('coder', ['ssh', task.workspace_name, '--', remoteCmd], {
-      env: { ...process.env, CODER_URL },
-      stdio: 'ignore',
-      detached: true,
-    });
+    // Spawn the claude process — locally if the task targets this workspace,
+    // otherwise via coder ssh so it runs inside the remote workspace.
+    const sshProcess = isLocalWorkspace(task.workspace_name)
+      ? spawn('bash', ['-c', remoteCmd], {
+          env: { ...process.env },
+          stdio: 'ignore',
+          detached: true,
+        })
+      : spawn('coder', ['ssh', task.workspace_name, '--', remoteCmd], {
+          env: { ...process.env, CODER_URL },
+          stdio: 'ignore',
+          detached: true,
+        });
 
     // Store PID in DB so we can find orphaned processes after restart
     getDb().prepare('UPDATE tasks SET ssh_pid = ? WHERE id = ?').run(sshProcess.pid ?? null, task.id);
