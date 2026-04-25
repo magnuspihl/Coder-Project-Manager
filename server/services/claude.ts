@@ -812,9 +812,12 @@ export async function reconnectWorkingTasks(): Promise<void> {
           if (exitCheck !== 'NO_EXIT') {
             console.log(`[recovery] Task "${task.title}" finished while server was down (exit: ${exitCheck})`);
             // Read the output file and process it
-            await processRemainingOutput(task);
+            const { resultError } = await processRemainingOutput(task);
             const exitCode = parseInt(exitCheck, 10);
-            if (exitCode === 0 || isNaN(exitCode)) {
+            if (resultError) {
+              addMessage(task.id, 'system', `Error: ${resultError}`);
+              updateTaskStatus(task.id, 'failed', resultError);
+            } else if (exitCode === 0 || isNaN(exitCode)) {
               // Only transition to awaiting_feedback if we actually captured a response
               const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
               if (hasResponse) {
@@ -830,11 +833,26 @@ export async function reconnectWorkingTasks(): Promise<void> {
               updateTaskStatus(task.id, 'failed', `Claude exited with code ${exitCode}`);
             }
           } else {
-            // SSH process gone with no exit code — task was interrupted mid-execution.
-            // Re-queue it so it retries automatically instead of requiring manual retry.
-            console.log(`[recovery] Task "${task.title}" SSH process gone, no exit code — re-queuing for automatic retry`);
-            addMessage(task.id, 'system', 'Server restarted while this task was running. Re-queued for automatic retry.');
-            updateTaskStatus(task.id, 'queued');
+            // SSH process gone with no exit code. The CLI may have hung post-result
+            // (Claude finished, but a child held stdout open). Read whatever output
+            // is on disk — if a `result` event is present, finalize like a normal
+            // completion. Only re-queue if Claude truly produced nothing.
+            const { resultSeen, resultError } = await processRemainingOutput(task);
+            if (resultSeen) {
+              if (resultError) {
+                console.log(`[recovery] Task "${task.title}" result event has error — failing`);
+                addMessage(task.id, 'system', `Error: ${resultError}`);
+                updateTaskStatus(task.id, 'failed', resultError);
+              } else {
+                console.log(`[recovery] Task "${task.title}" produced a result before SSH died — finalizing as awaiting_feedback`);
+                updateTaskStatus(task.id, 'awaiting_feedback');
+                await handleStashAway(task).catch(err => console.error('[git] Pause commit failed:', (err as Error).message?.slice(0, 100)));
+              }
+            } else {
+              console.log(`[recovery] Task "${task.title}" SSH process gone, no exit code, no result — re-queuing for automatic retry`);
+              addMessage(task.id, 'system', 'Server restarted while this task was running. Re-queued for automatic retry.');
+              updateTaskStatus(task.id, 'queued');
+            }
           }
         } catch (err) {
           console.log(`[recovery] Cannot reach workspace for task "${task.title}":`, (err as Error).message?.slice(0, 80));
@@ -878,6 +896,8 @@ function startFilePolling(task: Task): void {
   let consecutiveErrors = 0;
   let partialLine = '';  // Buffer for incomplete last line from previous poll
   let polling = false;   // Guard against overlapping polls
+  let finalized = false; // Set once we've transitioned status (via result event or exit code)
+  let resultSeen = false; // Set when we observe Claude's terminal `result` event
 
   const poll = async () => {
     if (polling) return;  // Previous poll still in flight — skip
@@ -975,6 +995,7 @@ function startFilePolling(task: Task): void {
               if (event.is_error && Array.isArray(event.errors) && (event.errors as string[]).length > 0) {
                 resultError = (event.errors as string[]).join('; ');
               }
+              resultSeen = true;
             }
           } catch (eventErr) {
             console.error(`[claude-poller] Error processing event for task ${task.id}:`, (eventErr as Error).message?.slice(0, 200));
@@ -982,9 +1003,17 @@ function startFilePolling(task: Task): void {
         }
       }
 
-      if (exitPart !== 'RUNNING' && exitPart !== '') {
+      // Finalize on `result` event arrival — Claude has logically finished even
+      // if the OS process hasn't exited yet (e.g. lingering subprocess holds the
+      // stdout pipe open, blocking exit). Don't wait for the exit code.
+      if (resultSeen && !finalized) {
+        finalized = true;
+        console.log(`[claude-poller] Task ${task.id} finalized via result event`);
+        finalizeTask(task, resultError);
+      } else if (exitPart !== 'RUNNING' && exitPart !== '' && !finalized) {
+        finalized = true;
         const exitCode = parseInt(exitPart, 10);
-        console.log(`[claude-poller] Task ${task.id} finished with exit code ${exitCode}`);
+        console.log(`[claude-poller] Task ${task.id} finished with exit code ${exitCode} (no result event)`);
         stopPolling(task.id);
         taskActivity.delete(task.id);
         getDb().prepare('UPDATE tasks SET ssh_pid = NULL WHERE id = ?').run(task.id);
@@ -1045,6 +1074,46 @@ function startFilePolling(task: Task): void {
   poll();
 }
 
+/**
+ * Transition a task to its terminal state and kick the queue.
+ *
+ * Called when Claude emits a `result` event — at that point Claude has
+ * logically finished even if the OS process hasn't exited yet (e.g. a child
+ * shell holds the stdout pipe open). We kill the lingering SSH process so the
+ * remote command isn't stranded, then move the task forward.
+ */
+function finalizeTask(task: Task, resultError: string | null): void {
+  const db = getDb();
+  // Read the latest ssh_pid before we clear it, so killTaskProcess can target it.
+  const row = db.prepare('SELECT ssh_pid FROM tasks WHERE id = ?').get(task.id) as { ssh_pid: number | null } | undefined;
+  killTaskProcess(task.id, row?.ssh_pid ?? null);
+
+  const rlInfo = rateLimitInfo.get(task.id);
+  rateLimitInfo.delete(task.id);
+  const isRateLimited = rlInfo && rlInfo.resetsAt * 1000 > Date.now();
+
+  if (isRateLimited) {
+    const resetTime = new Date(rlInfo!.resetsAt * 1000).toISOString();
+    addMessage(task.id, 'system', `Rate limited — resets at ${resetTime}`);
+    updateTaskStatus(task.id, 'failed', `rate_limited:${rlInfo!.resetsAt}`);
+  } else if (resultError) {
+    addMessage(task.id, 'system', `Error: ${resultError}`);
+    updateTaskStatus(task.id, 'failed', resultError);
+  } else {
+    const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
+    if (hasResponse) {
+      updateTaskStatus(task.id, 'awaiting_feedback');
+      handleStashAway(task).catch(err => console.error('[git] Pause commit failed:', (err as Error).message?.slice(0, 100)));
+    } else {
+      console.log(`[claude-poller] Task ${task.id} finalized with no response — re-queuing`);
+      addMessage(task.id, 'system', 'Claude exited without producing a response. Re-queued for automatic retry.');
+      updateTaskStatus(task.id, 'queued');
+    }
+  }
+
+  processQueue(task.workspace_id).catch(() => {});
+}
+
 /** Extract text from a result event's result field (string or content blocks array). */
 function extractResultText(event: { [key: string]: unknown }): string {
   if (typeof event.result === 'string') {
@@ -1090,8 +1159,11 @@ function extractTokenUsage(event: { [key: string]: unknown }): { inputTokens: nu
 
 /**
  * Read remaining output from a task that finished while the server was down.
+ * Returns whether a terminal `result` event was observed and any error from it.
  */
-async function processRemainingOutput(task: Task): Promise<void> {
+async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean; resultError: string | null }> {
+  let resultSeen = false;
+  let resultError: string | null = null;
   try {
     const outputFile = remoteOutputPath(task.id);
     const output = await sshExec(task.workspace_name,
@@ -1099,7 +1171,7 @@ async function processRemainingOutput(task: Task): Promise<void> {
       30000,
     );
 
-    if (!output) return;
+    if (!output) return { resultSeen, resultError };
 
     // Clear current session messages to avoid duplicates on recovery re-processing
     deleteCurrentSessionAssistantMessages(task.id);
@@ -1141,6 +1213,10 @@ async function processRemainingOutput(task: Task): Promise<void> {
           if (inTok > 0 || outTok > 0) {
             addTokenUsage(task.id, inTok, outTok);
           }
+          resultSeen = true;
+          if (event.is_error && Array.isArray(event.errors) && event.errors.length > 0) {
+            resultError = event.errors.join('; ');
+          }
         }
       } catch {
         // Skip invalid JSON
@@ -1151,6 +1227,7 @@ async function processRemainingOutput(task: Task): Promise<void> {
   } catch (err) {
     console.log(`[recovery] Failed to read remaining output:`, (err as Error).message?.slice(0, 100));
   }
+  return { resultSeen, resultError };
 }
 
 // ─── Discussion (workspace chat) support ───────────────────────────────────
