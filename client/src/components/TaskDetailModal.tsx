@@ -803,7 +803,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         )}
                       </div>
                     </div>
-                    <Markdown content={msg.content} />
+                    <Markdown content={msg.content} breaks={msg.role === 'user'} />
                   </div>
                 );
               })}
