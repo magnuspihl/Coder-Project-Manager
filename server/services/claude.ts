@@ -1554,6 +1554,9 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
   let consecutiveErrors = 0;
   let partialLine = '';
   let polling = false;
+  let finalized = false;
+  let resultSeen = false;
+  let resultError: string | null = null;
 
   const poll = async () => {
     if (polling) return;
@@ -1635,6 +1638,10 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
                 // Update cost on last message
                 getDb().prepare('UPDATE discussion_messages SET cost = ? WHERE id = ?').run(event.total_cost_usd, lastSavedMessageId);
               }
+              if (event.is_error && Array.isArray(event.errors) && (event.errors as string[]).length > 0) {
+                resultError = (event.errors as string[]).join('; ');
+              }
+              resultSeen = true;
             }
           } catch (eventErr) {
             console.error(`[discussion-poller] Error processing event:`, (eventErr as Error).message?.slice(0, 200));
@@ -1642,7 +1649,27 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
         }
       }
 
-      if (exitPart !== 'RUNNING' && exitPart !== '') {
+      // Finalize on `result` event arrival — Claude has logically finished even
+      // if the OS process hasn't exited yet (e.g. lingering subprocess holds the
+      // stdout pipe open, blocking exit). Don't wait for the exit code.
+      if (resultSeen && !finalized) {
+        finalized = true;
+        console.log(`[discussion-poller] Discussion ${discussion.id} finalized via result event`);
+        const proc = activeProcesses.get(`disc:${discussion.id}`);
+        if (proc) proc.kill();
+        stopPolling(pollKey);
+        taskActivity.delete(`disc:${discussion.id}`);
+        activeProcesses.delete(`disc:${discussion.id}`);
+        rateLimitInfo.delete(`disc:${discussion.id}`);
+        getDb().prepare('UPDATE discussions SET ssh_pid = NULL WHERE id = ?').run(discussion.id);
+
+        if (resultError) {
+          addDiscussionMessage(discussion.id, 'system', `Error: ${resultError}`);
+        } else if (lastSavedMessageText) {
+          parseMentions(discussion, lastSavedMessageText, null);
+        }
+      } else if (exitPart !== 'RUNNING' && exitPart !== '' && !finalized) {
+        finalized = true;
         const exitCode = parseInt(exitPart, 10);
         console.log(`[discussion-poller] Discussion ${discussion.id} finished (exit: ${exitPart})`);
         stopPolling(pollKey);
@@ -1883,6 +1910,9 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
   let consecutiveErrors = 0;
   let partialLine = '';
   let polling = false;
+  let finalized = false;
+  let resultSeen = false;
+  let resultError: string | null = null;
 
   const poll = async () => {
     if (polling) return;
@@ -1957,6 +1987,10 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
               } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
                 getDb().prepare('UPDATE discussion_messages SET cost = ? WHERE id = ?').run(event.total_cost_usd, lastSavedMessageId);
               }
+              if (event.is_error && Array.isArray(event.errors) && (event.errors as string[]).length > 0) {
+                resultError = (event.errors as string[]).join('; ');
+              }
+              resultSeen = true;
             }
           } catch (eventErr) {
             console.error(`[participant-poller] Error processing event:`, (eventErr as Error).message?.slice(0, 200));
@@ -1964,7 +1998,25 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
         }
       }
 
-      if (exitPart !== 'RUNNING' && exitPart !== '') {
+      // Finalize on `result` event arrival — Claude has logically finished even
+      // if the OS process hasn't exited yet (e.g. lingering subprocess holds the
+      // stdout pipe open, blocking exit). Don't wait for the exit code.
+      if (resultSeen && !finalized) {
+        finalized = true;
+        console.log(`[participant-poller] Participant ${participant.id} finalized via result event`);
+        const proc = activeProcesses.get(pollKey);
+        if (proc) proc.kill();
+        stopPolling(pollKey);
+        taskActivity.delete(pollKey);
+        activeProcesses.delete(pollKey);
+
+        if (resultError) {
+          addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} session ended with error: ${resultError}`);
+        } else if (lastSavedMessageText) {
+          parseMentions(discussion, lastSavedMessageText, participant.id);
+        }
+      } else if (exitPart !== 'RUNNING' && exitPart !== '' && !finalized) {
+        finalized = true;
         const exitCode = parseInt(exitPart, 10);
         console.log(`[participant-poller] Participant ${participant.id} finished (exit: ${exitPart})`);
         stopPolling(pollKey);
@@ -2115,6 +2167,7 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
   stopPolling(pollKey);
   let linesRead = 0, lastSavedMessageId: string | null = null, lastSavedMessageText: string | null = null;
   let consecutiveErrors = 0, partialLine = '', polling = false;
+  let finalized = false, resultSeen = false;
 
   const poll = async () => {
     if (polling) return;
@@ -2164,11 +2217,21 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
               } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
                 updateMessageCost(lastSavedMessageId, event.total_cost_usd as number);
               }
+              resultSeen = true;
             }
           } catch { /* skip */ }
         }
       }
-      if (exitPart !== 'RUNNING' && exitPart !== '') {
+      // Finalize on `result` event arrival — Claude has logically finished even
+      // if the OS process hasn't exited yet (e.g. lingering subprocess holds the
+      // stdout pipe open, blocking exit). Don't wait for the exit code.
+      if (resultSeen && !finalized) {
+        finalized = true;
+        const proc = activeProcesses.get(pollKey);
+        if (proc) proc.kill();
+        stopPolling(pollKey); taskActivity.delete(pollKey); activeProcesses.delete(pollKey);
+      } else if (exitPart !== 'RUNNING' && exitPart !== '' && !finalized) {
+        finalized = true;
         stopPolling(pollKey); taskActivity.delete(pollKey); activeProcesses.delete(pollKey);
         const exitCode = parseInt(exitPart, 10);
         if (exitCode !== 0 && !isNaN(exitCode)) addMessage(task.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`);
