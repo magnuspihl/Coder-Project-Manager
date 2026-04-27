@@ -198,9 +198,16 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
 
 /**
  * Called when switching TO a task (launch or resume).
- * If a different task's changes are in the working tree, stash them first,
- * then restore this task's stash if one exists.
- * Finally, marks this task as the active one for the workspace.
+ *
+ * Behavior depends on whether git remote operations are allowed:
+ *
+ *   Remote allowed: stash any other task's changes, force-checkout the
+ *   default branch (with pull), then pop this task's stash. Every task
+ *   starts on a clean default branch — this prevents stale branches from
+ *   prior tasks (or mid-task drift) from polluting future work.
+ *
+ *   Remote disabled: stash/pop only, never touch branches. The user is
+ *   driving git manually in this mode.
  */
 export async function handleSwitchToTask(task: Task): Promise<void> {
   const dir = task.project_dir;
@@ -211,14 +218,35 @@ export async function handleSwitchToTask(task: Task): Promise<void> {
   try {
     if (!await hasGitRepo(ws, dir)) return;
 
-    // Check if another task's changes are in the working tree
+    const remoteAllowed = isRemoteAllowed(task.workspace_id);
+
+    // Stash the previous task's changes if the working tree currently belongs
+    // to a different task.
     const lastActiveId = getLastActiveTaskId(task.workspace_id);
     if (lastActiveId && lastActiveId !== task.id) {
-      // Stash the previous task's changes
       const status = await sshExec(ws, `cd ${dir} && git status --porcelain`);
       if (status.trim()) {
         await sshExec(ws, `cd ${dir} && git stash push --include-untracked -m "${stashTag(lastActiveId)}"`, 30000);
         console.log(`[git] Stashed changes for previous task ${lastActiveId}`);
+      }
+    }
+
+    // Force HEAD onto the default branch so every task starts from a known state.
+    // Only when remote ops are allowed — otherwise the user is driving branches manually.
+    if (remoteAllowed) {
+      try {
+        const defaultBranch = await getDefaultBranch(ws, dir);
+        const currentBranch = (await sshExec(ws, `cd ${dir} && git rev-parse --abbrev-ref HEAD`)).trim();
+        if (currentBranch !== defaultBranch) {
+          await sshExec(ws, `cd ${dir} && git checkout ${defaultBranch}`, 15000);
+          console.log(`[git] Switched workspace ${ws} from '${currentBranch}' to '${defaultBranch}' for task ${task.id}`);
+        }
+        await sshExec(ws, `cd ${dir} && git pull --ff-only origin ${defaultBranch}`, 30000).catch((err: any) => {
+          console.warn(`[git] Pull on ${defaultBranch} failed (continuing): ${err.message}`);
+        });
+      } catch (err: any) {
+        console.warn(`[git] Could not normalize to default branch: ${err.message}`);
+        addMessage(task.id, 'system', `Warning: could not switch to default branch: ${err.message}`);
       }
     }
 
@@ -326,8 +354,11 @@ export async function checkoutTaskBranch(task: Task): Promise<string> {
 
 /**
  * After a task is marked complete:
- * - If remote allowed: create branch, commit, push, PR, merge
- * - If remote disabled: refuse if there are uncommitted changes
+ * - Remote allowed: create a fresh task branch off default, commit, push,
+ *   open PR, merge, and clean up. Any failure blocks completion so the
+ *   user can investigate.
+ * - Remote disabled: refuse if there are uncommitted changes; otherwise
+ *   pass through. The user is driving branches/pushes manually.
  *
  * Returns true if completion is allowed, false if blocked.
  */
@@ -372,7 +403,8 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
     const hasChanges = !!status.trim();
 
     if (!remoteAllowed) {
-      // Remote disabled: refuse completion if there are uncommitted changes
+      // Remote disabled: refuse completion if there are uncommitted changes —
+      // user must resolve manually before completing.
       if (hasChanges) {
         addMessage(task.id, 'system', 'Cannot complete: there are uncommitted changes. Please handle git operations manually before completing this task.');
         return false;
@@ -380,56 +412,55 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       return true;
     }
 
-    // Remote allowed: determine branch, commit if needed, push/PR/merge if ahead
+    // Remote allowed: always create a fresh task branch off the default branch.
 
     const defaultBranch = await getDefaultBranch(ws, dir);
 
-    // Re-read task for latest title
-    const freshTask = getTask(task.id) || task;
-
-    // Determine working branch:
-    //   1. If the user explicitly set a branch on the task, commit on that branch
-    //      (switch to it but never create — must already exist).
-    //   2. Otherwise, if Claude already branched off default, use Claude's branch.
-    //   3. Otherwise (still on default), generate a new task branch.
+    // Refuse if HEAD has drifted off the default branch — Claude (or someone)
+    // switched branches mid-task. We don't try to be clever about cherry-picking;
+    // surface the drift so the user can reconcile manually.
     const currentBranch = (await sshExec(ws, `cd ${dir} && git rev-parse --abbrev-ref HEAD`)).trim();
-    const userBranch = freshTask.branch?.trim();
-    let workingBranch: string;
-    if (userBranch) {
-      workingBranch = userBranch;
-      if (currentBranch !== userBranch) {
-        try {
-          await sshExec(ws, `cd ${dir} && git checkout ${userBranch}`, 15000);
-        } catch (err: any) {
-          addMessage(task.id, 'system', `Error: could not switch to user-specified branch \`${userBranch}\`: ${err.message}`);
-          return false;
-        }
-      }
-    } else if (currentBranch === defaultBranch) {
-      workingBranch = generateBranchName(freshTask);
-      try {
-        await sshExec(ws, `cd ${dir} && git checkout -b ${workingBranch}`, 15000);
-      } catch {
-        await sshExec(ws, `cd ${dir} && git checkout ${workingBranch}`, 15000);
-      }
-    } else {
-      workingBranch = currentBranch;
+    if (currentBranch !== defaultBranch) {
+      addMessage(task.id, 'system',
+        `Cannot complete: workspace is on branch \`${currentBranch}\` instead of \`${defaultBranch}\`. ` +
+        `The agent appears to have switched branches mid-task. Please reconcile manually ` +
+        `(merge or move the work onto \`${defaultBranch}\`) before completing.`
+      );
+      return false;
     }
 
-    // Commit any uncommitted changes (skip if the tree is clean)
-    if (hasChanges) {
+    // If there are no changes at all, nothing to do — just complete.
+    if (!hasChanges) {
+      // No commits to push either (we're sitting on default with a clean tree).
+      setLastActiveTaskId(task.workspace_id, null);
+      return true;
+    }
+
+    const freshTask = getTask(task.id) || task;
+    const workingBranch = generateBranchName(freshTask);
+
+    // Create the task branch off default. If a same-named branch somehow exists,
+    // refuse rather than overwrite — this keeps the rule "always a fresh branch".
+    try {
+      await sshExec(ws, `cd ${dir} && git checkout -b ${workingBranch}`, 15000);
+    } catch (err: any) {
+      addMessage(task.id, 'system',
+        `Cannot complete: could not create branch \`${workingBranch}\`: ${err.message}. ` +
+        `It may already exist locally — delete it and retry, or rename the task.`
+      );
+      return false;
+    }
+
+    // Commit
+    try {
       await sshExec(ws, `cd ${dir} && git add -A`);
       const staged = await sshExec(ws, `cd ${dir} && git diff --cached --name-only`);
       if (staged.trim()) {
         await sshExec(ws, `cd ${dir} && git commit -m ${shellEscape(freshTask.title || 'Task changes')}`, 30000);
       }
-    }
-
-    // Gate push/PR/merge on whether there are commits ahead of the default branch
-    const aheadStr = await sshExec(ws, `cd ${dir} && git rev-list --count origin/${defaultBranch}..HEAD`);
-    const commitsAhead = parseInt(aheadStr.trim(), 10) || 0;
-    if (commitsAhead === 0) {
-      return true;
+    } catch (err: any) {
+      addMessage(task.id, 'system', `Cannot complete: git commit failed: ${err.message}`);
+      return false;
     }
 
     storeTaskBranch(task.id, workingBranch);
@@ -440,18 +471,19 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       storeTaskRepoUrl(task.id, repoUrl);
     }
 
+    // Push — hard-fail on error, leaving the task in awaiting_feedback so the
+    // user can inspect (the branch is committed locally but not pushed).
     try {
       await sshExec(ws, `cd ${dir} && git push -u origin ${workingBranch}`, 30000);
-    } catch {
-      try {
-        await sshExec(ws, `cd ${dir} && git push origin ${workingBranch}`, 30000);
-      } catch (pushErr: any) {
-        addMessage(task.id, 'system', `Changes committed on branch \`${workingBranch}\` but push failed: ${pushErr.message}`);
-        return true;
-      }
+    } catch (pushErr: any) {
+      addMessage(task.id, 'system',
+        `Cannot complete: changes committed on branch \`${workingBranch}\` but push failed: ${pushErr.message}. ` +
+        `Resolve the push issue and retry completion.`
+      );
+      return false;
     }
 
-    // Create PR (check if one already exists for this branch)
+    // Create PR (or reuse existing for this branch)
     const prTitle = freshTask.title || `Task: ${freshTask.prompt.slice(0, 60)}`;
     const prBody = `Automated PR for completed task.\n\n**Task:** ${freshTask.title}\n**Task ID:** ${freshTask.id}`;
     let prUrl: string;
@@ -464,19 +496,38 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
         throw new Error('no existing PR');
       }
     } catch {
-      prUrl = await sshGh(ws,
-        `cd ${dir} && gh pr create --base ${defaultBranch} --head ${workingBranch} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`
-      );
-      addMessage(task.id, 'system', `Pull request created: ${prUrl}`);
+      try {
+        prUrl = await sshGh(ws,
+          `cd ${dir} && gh pr create --base ${defaultBranch} --head ${workingBranch} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`
+        );
+        addMessage(task.id, 'system', `Pull request created: ${prUrl}`);
+      } catch (prErr: any) {
+        addMessage(task.id, 'system',
+          `Cannot complete: PR creation failed for branch \`${workingBranch}\`: ${prErr.message}. ` +
+          `Resolve the issue and retry completion.`
+        );
+        return false;
+      }
     }
 
-    // Merge
+    // Merge — hard-fail. Don't auto-clean if merge fails; the user needs the branch to investigate.
     try {
       await sshGh(ws, `cd ${dir} && gh pr merge ${workingBranch} --merge --delete-branch`);
       addMessage(task.id, 'system', `PR merged and branch \`${workingBranch}\` deleted.`);
-      await sshExec(ws, `cd ${dir} && git checkout ${defaultBranch} && git pull origin ${defaultBranch}`, 30000);
     } catch (mergeErr: any) {
-      addMessage(task.id, 'system', `PR created but merge failed: ${mergeErr.message}. Manual merge may be needed.`);
+      addMessage(task.id, 'system',
+        `Cannot complete: PR merge failed for \`${workingBranch}\`: ${mergeErr.message}. ` +
+        `Resolve any conflicts on the PR and retry completion.`
+      );
+      return false;
+    }
+
+    // Clean up: switch back to default and pull the merged commit.
+    try {
+      await sshExec(ws, `cd ${dir} && git checkout ${defaultBranch} && git pull --ff-only origin ${defaultBranch}`, 30000);
+    } catch (cleanupErr: any) {
+      // Cleanup failure is non-fatal — the merge already happened; just warn.
+      addMessage(task.id, 'system', `Warning: post-merge cleanup failed: ${cleanupErr.message}. Workspace may need a manual \`git checkout ${defaultBranch} && git pull\`.`);
     }
 
     // Clear active task tracking — this task is done

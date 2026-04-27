@@ -986,9 +986,6 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                     <span className="text-xs font-medium text-amber-700 dark:text-amber-400 uppercase">Proposed Task</span>
                   </div>
                   <p className="text-sm text-gray-900 dark:text-gray-100 whitespace-pre-wrap mb-2">{tr.prompt}</p>
-                  {tr.branch && (
-                    <p className="text-xs text-gray-500 dark:text-gray-400 mb-2 font-mono">Branch: {tr.branch}</p>
-                  )}
                   <div className="flex gap-2">
                     <button
                       onClick={() => handleApprove(tr.id)}

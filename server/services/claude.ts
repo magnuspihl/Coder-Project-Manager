@@ -533,16 +533,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
       `This project runs inside a Coder workspace, so use Coder-routed URLs (not localhost). ` +
       `The Coder access URL is: ${CODER_URL}. The workspace name is: ${task.workspace_name}.`;
   }
-  // If a branch was specified, override the agent's default branching behavior
-  let branchNote = '';
-  if (task.branch) {
-    branchNote = `\n\nIMPORTANT: You are already on the git branch \`${task.branch}\`. ` +
-      `Do NOT create a new branch or switch to a different branch. ` +
-      `Commit and push all your work directly to \`${task.branch}\`. ` +
-      `This overrides any branching instructions in your system prompt or CLAUDE.md.`;
-  }
-
-  let prompt = rawPrompt + branchNote + coderUrlNote;
+  let prompt = rawPrompt + coderUrlNote;
 
   // Host's Claude session does not contain participant messages — inject them
   // as catch-up context so the host can see what invited agents have said.
@@ -561,49 +552,8 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     }
   }
 
-  // Git branch management
-  if (task.branch && task.project_dir) {
-    // User specified a branch override — ensure the workspace is on that
-    // branch before each run (launch *and* resume), since another task on
-    // this workspace may have switched branches between runs.
-    const ws = task.workspace_name;
-    const dir = shellEscape(task.project_dir);
-    const branch = task.branch;
-    try {
-      console.log(`[claude-executor] Ensuring branch '${branch}' on workspace ${ws} (isResume=${isResume})`);
-      await sshExec(ws, `cd ${dir} && git fetch origin`, 30000);
-
-      const currentBranch = (await sshExec(ws, `cd ${dir} && git rev-parse --abbrev-ref HEAD`)).trim();
-      if (currentBranch !== branch) {
-        const remoteRef = await sshExec(ws,
-          `cd ${dir} && git ls-remote --heads origin ${shellEscape(branch)}`,
-          15000
-        );
-
-        if (remoteRef && remoteRef.includes(branch)) {
-          await sshExec(ws,
-            `cd ${dir} && git checkout ${shellEscape(branch)} && git pull origin ${shellEscape(branch)}`,
-            30000
-          );
-        } else {
-          try {
-            await sshExec(ws, `cd ${dir} && git checkout -b ${shellEscape(branch)}`, 15000);
-          } catch {
-            // Branch exists locally but not on origin — switch to it
-            await sshExec(ws, `cd ${dir} && git checkout ${shellEscape(branch)}`, 15000);
-          }
-        }
-        addMessage(task.id, 'system', `Checked out branch \`${branch}\`.`);
-      }
-    } catch (err) {
-      const errorMsg = `Failed to checkout branch '${branch}': ${(err as Error).message || err}`;
-      console.error(`[claude-executor] ${errorMsg}`);
-      addMessage(task.id, 'system', `Error: ${errorMsg}`);
-      updateTaskStatus(task.id, 'failed', errorMsg);
-      processQueue(task.workspace_id).catch(() => {});
-      return;
-    }
-  } else if (isResume) {
+  // Git: stash-based task switching + force-checkout default (when remote allowed)
+  if (isResume) {
     await handleTaskResumeGit(task);
   } else {
     await handleTaskLaunchGit(task);
@@ -1412,10 +1362,10 @@ function getDiscussionPromptPrefix(projectDir: string | null): string {
 If the discussion leads to work that should be done inside the project, output a task request in this EXACT format (on its own, not inside a code block):
 
 [TASK_REQUEST]
-{"prompt": "detailed task description here", "branch": "optional-branch-name"}
+{"prompt": "detailed task description here"}
 [/TASK_REQUEST]
 
-The "branch" field is optional — omit it or set it to null if no specific branch is needed. The user will be prompted to approve the task before it runs.
+The user will be prompted to approve the task before it runs.
 
 ---
 
@@ -1449,8 +1399,7 @@ function parseTaskRequests(discussionId: string, text: string): void {
     try {
       const data = JSON.parse(match[1]);
       if (data.prompt && typeof data.prompt === 'string') {
-        const branch = typeof data.branch === 'string' ? data.branch : undefined;
-        createTaskRequest(discussionId, data.prompt, branch);
+        createTaskRequest(discussionId, data.prompt);
         console.log(`[discussion] Task request created for discussion ${discussionId}`);
       }
     } catch {

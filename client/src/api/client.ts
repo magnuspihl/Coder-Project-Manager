@@ -85,7 +85,6 @@ export interface Task {
   claude_session_id: string | null;
   failed_reason: string | null;
   verification_url: string | null;
-  branch: string | null;
   git_branch: string | null;
   github_repo_url: string | null;
   model: string | null;
@@ -206,10 +205,10 @@ export const getModels = (workspaceId: string) =>
 export const getTasks = (workspaceId: string) =>
   request<{ tasks: Task[]; activeTaskId: string | null }>(`/api/workspaces/${workspaceId}/tasks`);
 
-export const createTask = (workspaceId: string, prompt: string, branch?: string, model?: string, caveman?: string, attachmentIds?: string[]) =>
+export const createTask = (workspaceId: string, prompt: string, model?: string, caveman?: string, attachmentIds?: string[]) =>
   request<{ task: Task }>(`/api/workspaces/${workspaceId}/tasks`, {
     method: 'POST',
-    body: JSON.stringify({ prompt, ...(branch ? { branch } : {}), ...(model ? { model } : {}), ...(caveman ? { caveman } : {}), ...(attachmentIds?.length ? { attachmentIds } : {}) }),
+    body: JSON.stringify({ prompt, ...(model ? { model } : {}), ...(caveman ? { caveman } : {}), ...(attachmentIds?.length ? { attachmentIds } : {}) }),
   });
 
 export interface AttachmentInfo {
@@ -349,7 +348,6 @@ export interface TaskRequestItem {
   id: string;
   discussion_id: string;
   prompt: string;
-  branch: string | null;
   status: string;
   created_task_id: string | null;
   created_at: string;
