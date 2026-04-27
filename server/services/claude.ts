@@ -1,10 +1,10 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
-import { createReadStream } from 'fs';
+import { createReadStream, createWriteStream } from 'fs';
 import { randomUUID } from 'crypto';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, getPendingCompletionTask, setPendingComplete, type Task, type TaskParticipant } from './tasks.js';
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { getDb } from '../db/index.js';
-import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit } from './git.js';
+import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, handleStashAway, fetchGitHubToken } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
 import { getAttachmentsByTask, type Attachment } from '../routes/uploads.js';
 import { writeCpmGuidelines } from './workspace-memory.js';
@@ -13,7 +13,7 @@ const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
 const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || '50';
 const ALLOWED_TOOLS = process.env.CLAUDE_ALLOWED_TOOLS || 'Read,Edit,Write,Bash,Glob,Grep';
-const DISCUSSION_ALLOWED_TOOLS = 'Read,Bash,Glob,Grep,mcp__coder__coder_report_task';
+const DISCUSSION_ALLOWED_TOOLS = 'Read,Edit,Write,MultiEdit,Bash,Glob,Grep,mcp__coder__coder_report_task';
 
 // Track active SSH processes per task so we can kill them
 const activeProcesses = new Map<string, ChildProcess>();
@@ -247,10 +247,36 @@ function shellEscape(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
+// Name of the workspace this server is running in (set by Coder)
+const LOCAL_WORKSPACE_NAME = process.env.CODER_WORKSPACE_NAME || '';
+
+function isLocalWorkspace(workspaceName: string): boolean {
+  return !!LOCAL_WORKSPACE_NAME && workspaceName === LOCAL_WORKSPACE_NAME;
+}
+
+/**
+ * Run a shell command locally, returning stdout.
+ */
+function localExec(command: string, timeout = 15000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile('bash', ['-c', command], {
+      timeout,
+      env: { ...process.env },
+    }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout?.trim() || '');
+    });
+  });
+}
+
 /**
  * Run a command via coder ssh, returning stdout.
+ * When the target workspace is the local workspace, runs the command locally instead.
  */
 export function sshExec(workspaceName: string, command: string, timeout = 15000): Promise<string> {
+  if (isLocalWorkspace(workspaceName)) {
+    return localExec(command, timeout);
+  }
   return new Promise((resolve, reject) => {
     execFile('coder', ['ssh', workspaceName, '--', command], {
       timeout,
@@ -316,23 +342,34 @@ async function transferFilesToWorkspace(
   for (const att of attachments) {
     const remotePath = `${remoteDir}/${att.original_name}`;
     try {
-      await new Promise<void>((resolve, reject) => {
-        const proc = spawn('coder', [
-          'ssh', workspaceName, '--',
-          `cat > ${shellEscape(remotePath)}`,
-        ], {
-          env: { ...process.env, CODER_URL },
-          stdio: ['pipe', 'ignore', 'pipe'],
+      if (isLocalWorkspace(workspaceName)) {
+        await new Promise<void>((resolve, reject) => {
+          const src = createReadStream(att.storage_path);
+          const dst = createWriteStream(remotePath);
+          src.pipe(dst);
+          dst.on('finish', resolve);
+          dst.on('error', reject);
+          src.on('error', (err) => { dst.destroy(); reject(err); });
         });
-        const fileStream = createReadStream(att.storage_path);
-        fileStream.pipe(proc.stdin);
-        fileStream.on('error', (err) => { proc.kill(); reject(err); });
-        proc.on('close', (code) => {
-          if (code === 0) resolve();
-          else reject(new Error(`SCP failed for ${att.original_name} (exit ${code})`));
+      } else {
+        await new Promise<void>((resolve, reject) => {
+          const proc = spawn('coder', [
+            'ssh', workspaceName, '--',
+            `cat > ${shellEscape(remotePath)}`,
+          ], {
+            env: { ...process.env, CODER_URL },
+            stdio: ['pipe', 'ignore', 'pipe'],
+          });
+          const fileStream = createReadStream(att.storage_path);
+          fileStream.pipe(proc.stdin);
+          fileStream.on('error', (err) => { proc.kill(); reject(err); });
+          proc.on('close', (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`SCP failed for ${att.original_name} (exit ${code})`));
+          });
+          proc.on('error', reject);
         });
-        proc.on('error', reject);
-      });
+      }
       pathMap.set(att.id, remotePath);
     } catch (err) {
       console.error(`[file-transfer] Failed to transfer ${att.original_name}:`, (err as Error).message?.slice(0, 100));
@@ -682,14 +719,19 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
       // Non-fatal — the remote command will also overwrite
     }
 
-    // Spawn SSH fully detached with no pipes.
-    // No stdout/stderr pipe means no SIGPIPE when the server restarts.
-    // The process writes to a file on the remote workspace which we poll.
-    const sshProcess = spawn('coder', ['ssh', task.workspace_name, '--', remoteCmd], {
-      env: { ...process.env, CODER_URL },
-      stdio: 'ignore',
-      detached: true,
-    });
+    // Spawn the claude process — locally if the task targets this workspace,
+    // otherwise via coder ssh so it runs inside the remote workspace.
+    const sshProcess = isLocalWorkspace(task.workspace_name)
+      ? spawn('bash', ['-c', remoteCmd], {
+          env: { ...process.env },
+          stdio: 'ignore',
+          detached: true,
+        })
+      : spawn('coder', ['ssh', task.workspace_name, '--', remoteCmd], {
+          env: { ...process.env, CODER_URL },
+          stdio: 'ignore',
+          detached: true,
+        });
 
     // Store PID in DB so we can find orphaned processes after restart
     getDb().prepare('UPDATE tasks SET ssh_pid = ? WHERE id = ?').run(sshProcess.pid ?? null, task.id);
@@ -889,9 +931,12 @@ export async function reconnectWorkingTasks(): Promise<void> {
           if (exitCheck !== 'NO_EXIT') {
             console.log(`[recovery] Task "${task.title}" finished while server was down (exit: ${exitCheck})`);
             // Read the output file and process it
-            await processRemainingOutput(task);
+            const { resultError } = await processRemainingOutput(task);
             const exitCode = parseInt(exitCheck, 10);
-            if (exitCode === 0 || isNaN(exitCode)) {
+            if (resultError) {
+              addMessage(task.id, 'system', `Error: ${resultError}`);
+              updateTaskStatus(task.id, 'failed', resultError);
+            } else if (exitCode === 0 || isNaN(exitCode)) {
               // Only transition to awaiting_feedback if we actually captured a response
               const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
               if (hasResponse) {
@@ -906,11 +951,26 @@ export async function reconnectWorkingTasks(): Promise<void> {
               updateTaskStatus(task.id, 'failed', `Claude exited with code ${exitCode}`);
             }
           } else {
-            // SSH process gone with no exit code — task was interrupted mid-execution.
-            // Re-queue it so it retries automatically instead of requiring manual retry.
-            console.log(`[recovery] Task "${task.title}" SSH process gone, no exit code — re-queuing for automatic retry`);
-            addMessage(task.id, 'system', 'Server restarted while this task was running. Re-queued for automatic retry.');
-            updateTaskStatus(task.id, 'queued');
+            // SSH process gone with no exit code. The CLI may have hung post-result
+            // (Claude finished, but a child held stdout open). Read whatever output
+            // is on disk — if a `result` event is present, finalize like a normal
+            // completion. Only re-queue if Claude truly produced nothing.
+            const { resultSeen, resultError } = await processRemainingOutput(task);
+            if (resultSeen) {
+              if (resultError) {
+                console.log(`[recovery] Task "${task.title}" result event has error — failing`);
+                addMessage(task.id, 'system', `Error: ${resultError}`);
+                updateTaskStatus(task.id, 'failed', resultError);
+              } else {
+                console.log(`[recovery] Task "${task.title}" produced a result before SSH died — finalizing as awaiting_feedback`);
+                updateTaskStatus(task.id, 'awaiting_feedback');
+                await handleStashAway(task).catch((err: unknown) => console.error('[git] Pause commit failed:', (err as Error).message?.slice(0, 100)));
+              }
+            } else {
+              console.log(`[recovery] Task "${task.title}" SSH process gone, no exit code, no result — re-queuing for automatic retry`);
+              addMessage(task.id, 'system', 'Server restarted while this task was running. Re-queued for automatic retry.');
+              updateTaskStatus(task.id, 'queued');
+            }
           }
         } catch (err) {
           console.log(`[recovery] Cannot reach workspace for task "${task.title}":`, (err as Error).message?.slice(0, 80));
@@ -954,13 +1014,8 @@ function startFilePolling(task: Task): void {
   let consecutiveErrors = 0;
   let partialLine = '';  // Buffer for incomplete last line from previous poll
   let polling = false;   // Guard against overlapping polls
-  // Track when a terminal `result` event arrives. `claude -p` sometimes hangs
-  // after emitting its terminal result (background subagent Tasks not
-  // releasing the process), so the exit-code file is never written and the
-  // task gets stuck in 'working'. If the exit file doesn't appear within the
-  // grace window after a result event, we force-finalize from the result.
-  let resultSeenAt = 0;
-  const RESULT_EXIT_GRACE_MS = 15000;
+  let finalized = false; // Set once we've transitioned status (via result event or exit code)
+  let resultSeen = false; // Set when we observe Claude's terminal `result` event
 
   // Per-line processor — extracted so the first poll can run it inside the
   // wipe+reparse transaction without duplicating logic.
@@ -1025,9 +1080,7 @@ function startFilePolling(task: Task): void {
         if (event.is_error && Array.isArray(event.errors) && (event.errors as string[]).length > 0) {
           resultError = (event.errors as string[]).join('; ');
         }
-        if (resultSeenAt === 0) {
-          resultSeenAt = Date.now();
-        }
+        resultSeen = true;
       }
     } catch (eventErr) {
       console.error(`[claude-poller] Error processing event for task ${task.id}:`, (eventErr as Error).message?.slice(0, 200));
@@ -1091,11 +1144,24 @@ function startFilePolling(task: Task): void {
         }
       }
 
-      // Shared completion path — invoked either when the remote exit file
-      // appears, or when we saw a terminal result event but the process
-      // never exited (grace fallback). exitCode === null means "result
-      // event only; treat as success unless resultError is set".
-      const finalize = (exitCode: number | null): void => {
+      // Finalize on `result` event arrival — Claude has logically finished even
+      // if the OS process hasn't exited yet (e.g. lingering subprocess holds the
+      // stdout pipe open, blocking exit). Don't wait for the exit code.
+      if (resultSeen && !finalized) {
+        finalized = true;
+        console.log(`[claude-poller] Task ${task.id} finalized via result event`);
+        finalizeTask(task, resultError);
+      } else if (exitPart !== 'RUNNING' && exitPart !== '' && !finalized) {
+        const exitCode = parseInt(exitPart, 10);
+        if (isNaN(exitCode)) {
+          // Non-numeric exit content means something went wrong reading the
+          // exit file (corruption, partial write, or — historically — a
+          // marker collision). Treat as still running; a later poll resolves.
+          console.warn(`[claude-poller] Task ${task.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
+          return;
+        }
+        finalized = true;
+        console.log(`[claude-poller] Task ${task.id} finished with exit code ${exitCode} (no result event)`);
         stopPolling(task.id);
         taskActivity.delete(task.id);
         getDb().prepare('UPDATE tasks SET ssh_pid = NULL WHERE id = ?').run(task.id);
@@ -1111,10 +1177,11 @@ function startFilePolling(task: Task): void {
         } else if (resultError) {
           addMessage(task.id, 'system', `Error: ${resultError}`);
           updateTaskStatus(task.id, 'failed', resultError);
-        } else if (exitCode === null || exitCode === 0) {
+        } else if (exitCode === 0) {
           const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
           if (hasResponse) {
             updateTaskStatus(task.id, 'awaiting_feedback');
+            handleStashAway(task).catch((err: unknown) => console.error('[git] Pause commit failed:', (err as Error).message?.slice(0, 100)));
           } else {
             console.log(`[claude-poller] Task ${task.id} finished with no response — re-queuing`);
             addMessage(task.id, 'system', 'Claude exited without producing a response. Re-queued for automatic retry.');
@@ -1127,40 +1194,6 @@ function startFilePolling(task: Task): void {
         }
 
         processQueue(task.workspace_id).catch(() => {});
-      };
-
-      if (exitPart !== 'RUNNING' && exitPart !== '') {
-        const exitCode = parseInt(exitPart, 10);
-        if (isNaN(exitCode)) {
-          // Non-numeric exit content means something went wrong reading the
-          // exit file (corruption, partial write, or — historically — a
-          // marker collision). Treat as still running; a later poll resolves.
-          console.warn(`[claude-poller] Task ${task.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
-          return;
-        }
-        console.log(`[claude-poller] Task ${task.id} finished with exit code ${exitCode}`);
-        finalize(exitCode);
-        // Don't clean up remote files — they're the source of truth for recovery.
-        // They'll be cleaned up when the next task launches (rm -f exitFile).
-      } else if (resultSeenAt > 0 && Date.now() - resultSeenAt > RESULT_EXIT_GRACE_MS) {
-        // Terminal `result` event arrived but `claude -p` didn't exit within
-        // the grace window (known hang: background subagent Tasks pin the
-        // process). Force-kill remotely and finalize from the result.
-        const waited = Date.now() - resultSeenAt;
-        console.warn(`[claude-poller] Task ${task.id} emitted result ${waited}ms ago but process hasn't exited — force-closing`);
-        if (task.claude_session_id) {
-          const pattern = task.claude_session_id.replace(/[^a-zA-Z0-9-]/g, '');
-          if (pattern.length >= 8) {
-            sshExec(task.workspace_name, `pkill -f ${pattern} || true`, 10000)
-              .catch(err => console.error(`[claude-poller] Force-close pkill failed for ${task.id}:`, (err as Error).message?.slice(0, 120)));
-          }
-        }
-        const localProc = activeProcesses.get(task.id);
-        if (localProc) {
-          try { localProc.kill(); } catch {}
-          activeProcesses.delete(task.id);
-        }
-        finalize(null);
       }
     } catch (err) {
       consecutiveErrors++;
@@ -1181,6 +1214,46 @@ function startFilePolling(task: Task): void {
   const interval = setInterval(poll, 5000);
   activePollers.set(task.id, interval);
   poll();
+}
+
+/**
+ * Transition a task to its terminal state and kick the queue.
+ *
+ * Called when Claude emits a `result` event — at that point Claude has
+ * logically finished even if the OS process hasn't exited yet (e.g. a child
+ * shell holds the stdout pipe open). We kill the lingering SSH process so the
+ * remote command isn't stranded, then move the task forward.
+ */
+function finalizeTask(task: Task, resultError: string | null): void {
+  const db = getDb();
+  // Read the latest ssh_pid before we clear it, so killTaskProcess can target it.
+  const row = db.prepare('SELECT ssh_pid FROM tasks WHERE id = ?').get(task.id) as { ssh_pid: number | null } | undefined;
+  killTaskProcess(task.id, row?.ssh_pid ?? null);
+
+  const rlInfo = rateLimitInfo.get(task.id);
+  rateLimitInfo.delete(task.id);
+  const isRateLimited = rlInfo && rlInfo.resetsAt * 1000 > Date.now();
+
+  if (isRateLimited) {
+    const resetTime = new Date(rlInfo!.resetsAt * 1000).toISOString();
+    addMessage(task.id, 'system', `Rate limited — resets at ${resetTime}`);
+    updateTaskStatus(task.id, 'failed', `rate_limited:${rlInfo!.resetsAt}`);
+  } else if (resultError) {
+    addMessage(task.id, 'system', `Error: ${resultError}`);
+    updateTaskStatus(task.id, 'failed', resultError);
+  } else {
+    const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
+    if (hasResponse) {
+      updateTaskStatus(task.id, 'awaiting_feedback');
+      handleStashAway(task).catch((err: unknown) => console.error('[git] Pause commit failed:', (err as Error).message?.slice(0, 100)));
+    } else {
+      console.log(`[claude-poller] Task ${task.id} finalized with no response — re-queuing`);
+      addMessage(task.id, 'system', 'Claude exited without producing a response. Re-queued for automatic retry.');
+      updateTaskStatus(task.id, 'queued');
+    }
+  }
+
+  processQueue(task.workspace_id).catch(() => {});
 }
 
 /** Extract text from a result event's result field (string or content blocks array). */
@@ -1228,8 +1301,11 @@ function extractTokenUsage(event: { [key: string]: unknown }): { inputTokens: nu
 
 /**
  * Read remaining output from a task that finished while the server was down.
+ * Returns whether a terminal `result` event was observed and any error from it.
  */
-async function processRemainingOutput(task: Task): Promise<void> {
+async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean; resultError: string | null }> {
+  let resultSeen = false;
+  let resultError: string | null = null;
   try {
     const outputFile = remoteOutputPath(task.id);
     const output = await sshExec(task.workspace_name,
@@ -1237,7 +1313,7 @@ async function processRemainingOutput(task: Task): Promise<void> {
       30000,
     );
 
-    if (!output) return;
+    if (!output) return { resultSeen, resultError };
 
     // Stage 1: parse all events into staging arrays WITHOUT touching the DB.
     // Only if we successfully extract ≥1 message do we wipe existing
@@ -1280,6 +1356,10 @@ async function processRemainingOutput(task: Task): Promise<void> {
           const { inputTokens: inTok, outputTokens: outTok } = extractTokenUsage(event);
           stagedInputTokens += inTok;
           stagedOutputTokens += outTok;
+          resultSeen = true;
+          if (event.is_error && Array.isArray(event.errors) && event.errors.length > 0) {
+            resultError = event.errors.join('; ');
+          }
         }
       } catch {
         // Skip invalid JSON
@@ -1292,7 +1372,7 @@ async function processRemainingOutput(task: Task): Promise<void> {
       for (const event of stagedStreamEvents) {
         processEvent(task.id, event);
       }
-      return;
+      return { resultSeen, resultError };
     }
 
     // Stage 3: atomically wipe current-session messages and insert staged ones.
@@ -1317,13 +1397,19 @@ async function processRemainingOutput(task: Task): Promise<void> {
   } catch (err) {
     console.log(`[recovery] Failed to read remaining output:`, (err as Error).message?.slice(0, 100));
   }
+  return { resultSeen, resultError };
 }
 
 // ─── Discussion (workspace chat) support ───────────────────────────────────
 
-const DISCUSSION_PROMPT_PREFIX = `You are in a read-only discussion session for this workspace. You can explore and read code, run read-only shell commands (git log, ls, find, cat, etc.), but you MUST NOT modify, create, or delete any files, make commits, push to git, or change system state. Your tools are limited to Read, Glob, Grep, and Bash.
+function getDiscussionPromptPrefix(projectDir: string | null): string {
+  const boundary = projectDir
+    ? `You MUST NOT modify, create, or delete any files within \`${projectDir}\` (the git-tracked project directory) — treat it as read-only. If work needs to be done inside the project, output a [TASK_REQUEST] instead and the user will approve it as a task.\n\nYou MAY freely read, explore, and write to files outside this path — global config files like \`~/.claude/CLAUDE.md\`, workspace memory files, temp files, etc.`
+    : `You MUST NOT modify, create, or delete files in the project repository — treat it as read-only. If work needs to be done in the project, output a [TASK_REQUEST] instead and the user will approve it as a task.`;
 
-If the discussion leads to work that should be done, output a task request in this EXACT format (on its own, not inside a code block):
+  return `You are a discussion agent for this workspace. ${boundary}
+
+If the discussion leads to work that should be done inside the project, output a task request in this EXACT format (on its own, not inside a code block):
 
 [TASK_REQUEST]
 {"prompt": "detailed task description here", "branch": "optional-branch-name"}
@@ -1334,6 +1420,14 @@ The "branch" field is optional — omit it or set it to null if no specific bran
 ---
 
 `;
+}
+
+function getReadOnlyOverride(projectDir: string | null): string {
+  const boundary = projectDir
+    ? `You MUST NOT modify, create, or delete any files within \`${projectDir}\` (the git-tracked project directory). You MAY write to files outside this path (global config, memory files, temp files, etc.).`
+    : `You MUST NOT modify, create, or delete files in the project repository.`;
+  return `[SYSTEM OVERRIDE] Your access mode has been changed to READ-ONLY. You are now in a discussion session. ${boundary}\n\n`;
+}
 
 /** Remote path for discussion output files */
 function remoteDiscussionOutputPath(discussionId: string): string {
@@ -1433,9 +1527,6 @@ export async function launchDiscussion(
   const FULL_ACCESS_OVERRIDE = '[SYSTEM OVERRIDE] Your access mode has been changed to FULL ACCESS. ' +
     'You are NO LONGER in a read-only session. Disregard any earlier instructions about being read-only or having limited tools. ' +
     'You now have full access to all tools and can modify files, make commits, run any commands, and perform all actions.\n\n';
-  const READ_ONLY_OVERRIDE = '[SYSTEM OVERRIDE] Your access mode has been changed to READ-ONLY. ' +
-    'You are now in a read-only discussion session. You MUST NOT modify, create, or delete any files, make commits, push to git, or change system state. ' +
-    'Your tools are limited to Read, Glob, Grep, and Bash (read-only commands only).\n\n';
 
   // Build catch-up context for the host if there are participants —
   // the host's own session doesn't contain messages from other agents.
@@ -1448,7 +1539,7 @@ export async function launchDiscussion(
   let prompt: string;
   if (!isResume) {
     // First message — use prefix or not based on mode
-    prompt = isFullAccess ? message : DISCUSSION_PROMPT_PREFIX + message;
+    prompt = isFullAccess ? message : getDiscussionPromptPrefix(discussion.project_dir ?? null) + message;
   } else if (participants.length > 0) {
     // Resuming with participants — prepend catch-up if available, skip access override.
     // Always include mention instruction so the agent knows how to reach other agents.
@@ -1460,7 +1551,7 @@ export async function launchDiscussion(
     prompt = FULL_ACCESS_OVERRIDE + message;
   } else {
     // Resuming in read-only, no participants — send override in case mode changed
-    prompt = READ_ONLY_OVERRIDE + message;
+    prompt = getReadOnlyOverride(discussion.project_dir ?? null) + message;
   }
 
   // Auto-detect project directory if not already set
@@ -1561,8 +1652,9 @@ export async function launchDiscussion(
     ]);
 
     // Spawn SSH
+    const ghToken = await fetchGitHubToken().catch(() => null);
     const sshProcess = spawn('coder', ['ssh', discussion.workspace_name, '--', remoteCmd], {
-      env: { ...process.env, CODER_URL },
+      env: { ...process.env, CODER_URL, ...(ghToken ? { GH_TOKEN: ghToken } : {}) },
       stdio: 'ignore',
       detached: true,
     });
@@ -1636,11 +1728,9 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
   let consecutiveErrors = 0;
   let partialLine = '';
   let polling = false;
-  // See note in startFilePolling: `claude -p` sometimes emits a terminal
-  // `result` event but hangs instead of exiting, so the exit file never
-  // gets written. Grace-fallback forces completion from the result event.
-  let resultSeenAt = 0;
-  const RESULT_EXIT_GRACE_MS = 15000;
+  let finalized = false;
+  let resultSeen = false;
+  let resultError: string | null = null;
 
   const poll = async () => {
     if (polling) return;
@@ -1717,9 +1807,10 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
                 // Update cost on last message
                 getDb().prepare('UPDATE discussion_messages SET cost = ? WHERE id = ?').run(event.total_cost_usd, lastSavedMessageId);
               }
-              if (resultSeenAt === 0) {
-                resultSeenAt = Date.now();
+              if (event.is_error && Array.isArray(event.errors) && (event.errors as string[]).length > 0) {
+                resultError = (event.errors as string[]).join('; ');
               }
+              resultSeen = true;
             }
           } catch (eventErr) {
             console.error(`[discussion-poller] Error processing event:`, (eventErr as Error).message?.slice(0, 200));
@@ -1727,21 +1818,44 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
         }
       }
 
-      const finalize = async (exitCode: number | null): Promise<void> => {
+      // Finalize on `result` event arrival — Claude has logically finished even
+      // if the OS process hasn't exited yet (e.g. lingering subprocess holds the
+      // stdout pipe open, blocking exit). Don't wait for the exit code.
+      if (resultSeen && !finalized) {
+        finalized = true;
+        console.log(`[discussion-poller] Discussion ${discussion.id} finalized via result event`);
+        const proc = activeProcesses.get(`disc:${discussion.id}`);
+        if (proc) proc.kill();
         stopPolling(pollKey);
         taskActivity.delete(`disc:${discussion.id}`);
         activeProcesses.delete(`disc:${discussion.id}`);
         rateLimitInfo.delete(`disc:${discussion.id}`);
         getDb().prepare('UPDATE discussions SET ssh_pid = NULL WHERE id = ?').run(discussion.id);
 
-        // Check for agent mentions in the last response (host = null source)
-        if ((exitCode === 0 || exitCode === null) && lastSavedMessageText) {
+        if (resultError) {
+          addDiscussionMessage(discussion.id, 'system', `Error: ${resultError}`);
+        } else if (lastSavedMessageText) {
+          parseMentions(discussion, lastSavedMessageText, null);
+        }
+      } else if (exitPart !== 'RUNNING' && exitPart !== '' && !finalized) {
+        const exitCode = parseInt(exitPart, 10);
+        if (isNaN(exitCode)) {
+          console.warn(`[discussion-poller] Discussion ${discussion.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
+          return;
+        }
+        finalized = true;
+        console.log(`[discussion-poller] Discussion ${discussion.id} finished (exit: ${exitPart})`);
+        stopPolling(pollKey);
+        taskActivity.delete(`disc:${discussion.id}`);
+        activeProcesses.delete(`disc:${discussion.id}`);
+        rateLimitInfo.delete(`disc:${discussion.id}`);
+        getDb().prepare('UPDATE discussions SET ssh_pid = NULL WHERE id = ?').run(discussion.id);
+
+        if (exitCode === 0 && lastSavedMessageText) {
           parseMentions(discussion, lastSavedMessageText, null);
         }
 
-        // Surface errors to the user (non-null non-zero exit only — result-event
-        // fallback is treated as success unless we want to parse errors from it).
-        if (exitCode !== null && exitCode !== 0 && !isNaN(exitCode)) {
+        if (exitCode !== 0) {
           let errorDetail = '';
           try {
             const lastLines = await sshExec(discussion.workspace_name,
@@ -1761,27 +1875,6 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
           const msg = errorMessages[exitCode] || `Claude exited with code ${exitCode}${errorDetail}`;
           addDiscussionMessage(discussion.id, 'system', `Error: ${msg}`);
         }
-      };
-
-      if (exitPart !== 'RUNNING' && exitPart !== '') {
-        const exitCode = parseInt(exitPart, 10);
-        if (isNaN(exitCode)) {
-          console.warn(`[discussion-poller] Discussion ${discussion.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
-          return;
-        }
-        console.log(`[discussion-poller] Discussion ${discussion.id} finished (exit: ${exitPart})`);
-        await finalize(exitCode);
-      } else if (resultSeenAt > 0 && Date.now() - resultSeenAt > RESULT_EXIT_GRACE_MS) {
-        const waited = Date.now() - resultSeenAt;
-        console.warn(`[discussion-poller] Discussion ${discussion.id} emitted result ${waited}ms ago but process hasn't exited — force-closing`);
-        // Discussion launch doesn't track a session-id locally; kill the
-        // SSH client and let the remote bash exit when the pipe closes.
-        const localProc = activeProcesses.get(`disc:${discussion.id}`);
-        if (localProc) {
-          try { localProc.kill(); } catch {}
-          activeProcesses.delete(`disc:${discussion.id}`);
-        }
-        await finalize(null);
       }
     } catch (err) {
       consecutiveErrors++;
@@ -1834,7 +1927,7 @@ export async function launchParticipantDiscussion(
 
   let prompt: string;
   if (!isResume) {
-    const prefix = isFullAccess ? '' : DISCUSSION_PROMPT_PREFIX;
+    const prefix = isFullAccess ? '' : getDiscussionPromptPrefix(participant.project_dir ?? null);
     const context = [mentionInstr].filter(Boolean).join('\n');
     prompt = prefix + (context ? context + '\n' : '') + message;
   } else {
@@ -1922,8 +2015,9 @@ export async function launchParticipantDiscussion(
     ]);
 
     // Spawn SSH
+    const ghToken = await fetchGitHubToken().catch(() => null);
     const sshProcess = spawn('coder', ['ssh', participant.workspace_name, '--', remoteCmd], {
-      env: { ...process.env, CODER_URL },
+      env: { ...process.env, CODER_URL, ...(ghToken ? { GH_TOKEN: ghToken } : {}) },
       stdio: 'ignore',
       detached: true,
     });
@@ -1991,8 +2085,9 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
   let consecutiveErrors = 0;
   let partialLine = '';
   let polling = false;
-  let resultSeenAt = 0;
-  const RESULT_EXIT_GRACE_MS = 15000;
+  let finalized = false;
+  let resultSeen = false;
+  let resultError: string | null = null;
 
   const poll = async () => {
     if (polling) return;
@@ -2062,9 +2157,10 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
               } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
                 getDb().prepare('UPDATE discussion_messages SET cost = ? WHERE id = ?').run(event.total_cost_usd, lastSavedMessageId);
               }
-              if (resultSeenAt === 0) {
-                resultSeenAt = Date.now();
+              if (event.is_error && Array.isArray(event.errors) && (event.errors as string[]).length > 0) {
+                resultError = (event.errors as string[]).join('; ');
               }
+              resultSeen = true;
             }
           } catch (eventErr) {
             console.error(`[participant-poller] Error processing event:`, (eventErr as Error).message?.slice(0, 200));
@@ -2072,36 +2168,42 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
         }
       }
 
-      const finalize = (exitCode: number | null): void => {
+      // Finalize on `result` event arrival — Claude has logically finished even
+      // if the OS process hasn't exited yet (e.g. lingering subprocess holds the
+      // stdout pipe open, blocking exit). Don't wait for the exit code.
+      if (resultSeen && !finalized) {
+        finalized = true;
+        console.log(`[participant-poller] Participant ${participant.id} finalized via result event`);
+        const proc = activeProcesses.get(pollKey);
+        if (proc) proc.kill();
         stopPolling(pollKey);
         taskActivity.delete(pollKey);
         activeProcesses.delete(pollKey);
 
-        if ((exitCode === 0 || exitCode === null) && lastSavedMessageText) {
+        if (resultError) {
+          addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} session ended with error: ${resultError}`);
+        } else if (lastSavedMessageText) {
           parseMentions(discussion, lastSavedMessageText, participant.id);
         }
-
-        if (exitCode !== null && exitCode !== 0 && !isNaN(exitCode)) {
-          addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`);
-        }
-      };
-
-      if (exitPart !== 'RUNNING' && exitPart !== '') {
+      } else if (exitPart !== 'RUNNING' && exitPart !== '' && !finalized) {
         const exitCode = parseInt(exitPart, 10);
         if (isNaN(exitCode)) {
           console.warn(`[participant-poller] Participant ${participant.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
           return;
         }
+        finalized = true;
         console.log(`[participant-poller] Participant ${participant.id} finished (exit: ${exitPart})`);
-        finalize(exitCode);
-      } else if (resultSeenAt > 0 && Date.now() - resultSeenAt > RESULT_EXIT_GRACE_MS) {
-        const waited = Date.now() - resultSeenAt;
-        console.warn(`[participant-poller] Participant ${participant.id} emitted result ${waited}ms ago but process hasn't exited — force-closing`);
-        const localProc = activeProcesses.get(pollKey);
-        if (localProc) {
-          try { localProc.kill(); } catch {}
+        stopPolling(pollKey);
+        taskActivity.delete(pollKey);
+        activeProcesses.delete(pollKey);
+
+        if (exitCode === 0 && lastSavedMessageText) {
+          parseMentions(discussion, lastSavedMessageText, participant.id);
         }
-        finalize(null);
+
+        if (exitCode !== 0) {
+          addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`);
+        }
       }
     } catch (err) {
       consecutiveErrors++;
@@ -2143,7 +2245,7 @@ export async function launchTaskParticipant(
 
   let prompt: string;
   if (!isResume) {
-    prompt = DISCUSSION_PROMPT_PREFIX + (catchUp ? catchUp + '\n' : '') + message;
+    prompt = getDiscussionPromptPrefix(participant.project_dir ?? null) + (catchUp ? catchUp + '\n' : '') + message;
   } else {
     prompt = catchUp ? catchUp + '\n' + message : message;
   }
@@ -2206,8 +2308,11 @@ export async function launchTaskParticipant(
         `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`);
     } catch { /* */ }
 
+    const ghToken = await fetchGitHubToken().catch(() => null);
     const sshProcess = spawn('coder', ['ssh', participant.workspace_name, '--', remoteCmd], {
-      env: { ...process.env, CODER_URL }, stdio: 'ignore', detached: true,
+      env: { ...process.env, CODER_URL, ...(ghToken ? { GH_TOKEN: ghToken } : {}) },
+      stdio: 'ignore',
+      detached: true,
     });
     activeProcesses.set(pollKey, sshProcess);
     sshProcess.unref();
@@ -2239,8 +2344,8 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
   stopPolling(pollKey);
   let linesRead = 0, lastSavedMessageId: string | null = null, lastSavedMessageText: string | null = null;
   let consecutiveErrors = 0, partialLine = '', polling = false;
-  let resultSeenAt = 0;
-  const RESULT_EXIT_GRACE_MS = 15000;
+  let finalized = false, resultSeen = false;
+  let resultError: string | null = null;
 
   const poll = async () => {
     if (polling) return;
@@ -2288,33 +2393,36 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
               } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
                 updateMessageCost(lastSavedMessageId, event.total_cost_usd as number);
               }
-              if (resultSeenAt === 0) resultSeenAt = Date.now();
+              if (event.is_error && Array.isArray(event.errors) && (event.errors as string[]).length > 0) {
+                resultError = (event.errors as string[]).join('; ');
+              }
+              resultSeen = true;
             }
           } catch { /* skip */ }
         }
       }
-      const finalize = (exitCode: number | null): void => {
+      // Finalize on `result` event arrival — Claude has logically finished even
+      // if the OS process hasn't exited yet (e.g. lingering subprocess holds the
+      // stdout pipe open, blocking exit). Don't wait for the exit code.
+      if (resultSeen && !finalized) {
+        finalized = true;
+        const proc = activeProcesses.get(pollKey);
+        if (proc) proc.kill();
         stopPolling(pollKey); taskActivity.delete(pollKey); activeProcesses.delete(pollKey);
-        if (exitCode !== null && exitCode !== 0) {
-          addMessage(task.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`);
+        if (resultError) {
+          addMessage(task.id, 'system', `${participant.workspace_name} session ended with error: ${resultError}`);
         }
-      };
-
-      if (exitPart !== 'RUNNING' && exitPart !== '') {
+      } else if (exitPart !== 'RUNNING' && exitPart !== '' && !finalized) {
         const exitCode = parseInt(exitPart, 10);
         if (isNaN(exitCode)) {
           console.warn(`[task-participant-poller] Participant ${participant.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
           return;
         }
-        finalize(exitCode);
-      } else if (resultSeenAt > 0 && Date.now() - resultSeenAt > RESULT_EXIT_GRACE_MS) {
-        const waited = Date.now() - resultSeenAt;
-        console.warn(`[task-participant-poller] Participant ${participant.id} emitted result ${waited}ms ago but process hasn't exited — force-closing`);
-        const localProc = activeProcesses.get(pollKey);
-        if (localProc) {
-          try { localProc.kill(); } catch {}
+        finalized = true;
+        stopPolling(pollKey); taskActivity.delete(pollKey); activeProcesses.delete(pollKey);
+        if (exitCode !== 0) {
+          addMessage(task.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`);
         }
-        finalize(null);
       }
     } catch {
       consecutiveErrors++;
