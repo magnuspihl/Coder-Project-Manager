@@ -42,7 +42,6 @@ export interface TaskRequest {
   id: string;
   discussion_id: string;
   prompt: string;
-  branch: string | null;
   status: string;
   created_task_id: string | null;
   created_at: string;
@@ -193,12 +192,12 @@ export function deleteCurrentDiscussionAssistantMessages(discussionId: string): 
 
 // Task request management
 
-export function createTaskRequest(discussionId: string, prompt: string, branch?: string): TaskRequest {
+export function createTaskRequest(discussionId: string, prompt: string): TaskRequest {
   const db = getDb();
   const id = uuid();
   db.prepare(
-    'INSERT INTO task_requests (id, discussion_id, prompt, branch, status) VALUES (?, ?, ?, ?, ?)'
-  ).run(id, discussionId, prompt, branch || null, 'pending');
+    'INSERT INTO task_requests (id, discussion_id, prompt, status) VALUES (?, ?, ?, ?)'
+  ).run(id, discussionId, prompt, 'pending');
   return db.prepare('SELECT * FROM task_requests WHERE id = ?').get(id) as TaskRequest;
 }
 

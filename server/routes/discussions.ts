@@ -307,7 +307,6 @@ router.post('/discussions/:discussionId/task-requests/:requestId/approve', requi
     userId: req.user!.id,
     username: req.user!.username,
     prompt: taskRequest.prompt,
-    branch: taskRequest.branch || undefined,
   });
 
   approveTaskRequest(taskRequest.id, task.id);
