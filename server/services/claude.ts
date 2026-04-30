@@ -4,7 +4,7 @@ import { randomUUID } from 'crypto';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, getPendingCompletionTask, setPendingComplete, type Task, type TaskParticipant } from './tasks.js';
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { getDb } from '../db/index.js';
-import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, handleStashAway, fetchGitHubToken } from './git.js';
+import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, handleStashAway, fetchGitHubToken, isRemoteAllowed } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
 import { getAttachmentsByTask, type Attachment } from '../routes/uploads.js';
 import { writeCpmGuidelines } from './workspace-memory.js';
@@ -167,6 +167,25 @@ export function getGlobalRateLimits(): Record<string, RateLimitUsage> {
 export function getTaskActivity(taskId: string): TaskActivity | undefined {
   return taskActivity.get(taskId);
 }
+
+// CPM owns git for tasks: completion creates a fresh task branch, commits the
+// working tree, pushes, and opens+merges a PR. If the agent branches/commits
+// on its own, that flow falls apart (HEAD on a non-default branch blocks
+// completion). This prompt is appended whenever the workspace has remote
+// pushes enabled.
+const CPM_GIT_OWNERSHIP_PROMPT = `MANDATORY GIT RULE — CPM OWNS THE GIT WORKFLOW:
+This task runs inside the Coder Project Manager (CPM). When the task is marked complete, CPM creates a fresh branch off the default branch, commits your working-tree changes, pushes, opens a pull request, and merges it. You must not pre-empt any of this.
+
+Do NOT run any git command that mutates state:
+- git branch / checkout / switch (no creating, deleting, or switching branches)
+- git add / commit / commit --amend
+- git push / pull / fetch (with refspec) / merge / rebase / reset / revert / cherry-pick / stash
+
+Do NOT run gh pr commands (create, merge, edit, close, comment).
+
+Just edit files and leave the working tree dirty on whatever branch is currently checked out. CPM handles all git operations at completion.
+
+Read-only inspection commands are fine: git status, git diff, git log, git show, git rev-parse, gh pr view, gh pr list, gh pr diff.`;
 
 // Caveman mode prompt — reduces output token usage by forcing terse communication
 function buildCavemanPrompt(intensity: string): string {
@@ -606,6 +625,12 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   if (task.caveman) {
     claudeParts.push('--append-system-prompt', shellEscape(buildCavemanPrompt(task.caveman)));
     console.log(`[caveman] Task ${task.id} using caveman mode: ${task.caveman} (via --append-system-prompt)`);
+  }
+
+  // CPM owns git when remote pushes are enabled — tell the agent to stay out
+  // of branching/committing so completion's fresh-branch+PR+merge flow works.
+  if (isRemoteAllowed(task.workspace_id)) {
+    claudeParts.push('--append-system-prompt', shellEscape(CPM_GIT_OWNERSHIP_PROMPT));
   }
 
   const claudeCmd = claudeParts.join(' ');

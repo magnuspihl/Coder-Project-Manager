@@ -115,7 +115,7 @@ async function hasGitRepo(workspaceName: string, projectDir: string): Promise<bo
 /**
  * Check if git remote operations are allowed for a workspace.
  */
-function isRemoteAllowed(workspaceId: string): boolean {
+export function isRemoteAllowed(workspaceId: string): boolean {
   const row = getDb().prepare('SELECT git_push_enabled FROM workspace_settings WHERE workspace_id = ?')
     .get(workspaceId) as { git_push_enabled: number } | undefined;
   return row?.git_push_enabled !== 0; // default true
