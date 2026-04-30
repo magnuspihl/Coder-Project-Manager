@@ -1392,6 +1392,8 @@ If the discussion leads to work that should be done inside the project, output a
 
 The user will be prompted to approve the task before it runs.
 
+When writing the task prompt, describe the WORK only. Do NOT specify a git branch name, and do NOT instruct the executing agent to create branches, commit, push, or open PRs. CPM creates a fresh task branch automatically from the task title and handles commit/push/PR/merge at completion — including a "Branch:" line in the prompt causes the executing agent to drift onto a self-named branch and blocks completion.
+
 ---
 
 `;
