@@ -1399,7 +1399,7 @@ Other running workspaces you can target:
 ${otherRunning.map(n => `  - ${n}`).join('\n')}
 
 Only set \`targetWorkspace\` when you have specific reason to believe the task belongs elsewhere (e.g. the user asked you to relay it). When unsure, omit the field.`
-    : `[TASK_REQUEST] always runs in this workspace (\`${ownWorkspaceName}\`).`;
+    : `By default, a [TASK_REQUEST] runs in this workspace (\`${ownWorkspaceName}\`). You may also suggest a task in a different workspace by adding \`"targetWorkspace": "workspace-name"\` to the [TASK_REQUEST] JSON — the user can confirm the target before approving.`;
 
   return `You are a discussion agent for this workspace (\`${ownWorkspaceName}\`). ${boundary}
 
