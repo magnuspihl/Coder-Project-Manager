@@ -44,6 +44,8 @@ export interface TaskRequest {
   prompt: string;
   status: string;
   created_task_id: string | null;
+  target_workspace_id: string | null;
+  target_workspace_name: string | null;
   created_at: string;
 }
 
@@ -192,13 +194,27 @@ export function deleteCurrentDiscussionAssistantMessages(discussionId: string): 
 
 // Task request management
 
-export function createTaskRequest(discussionId: string, prompt: string): TaskRequest {
+export function createTaskRequest(
+  discussionId: string,
+  prompt: string,
+  target?: { workspace_id: string; workspace_name: string } | null,
+): TaskRequest {
   const db = getDb();
   const id = uuid();
   db.prepare(
-    'INSERT INTO task_requests (id, discussion_id, prompt, status) VALUES (?, ?, ?, ?)'
-  ).run(id, discussionId, prompt, 'pending');
+    'INSERT INTO task_requests (id, discussion_id, prompt, status, target_workspace_id, target_workspace_name) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(id, discussionId, prompt, 'pending', target?.workspace_id ?? null, target?.workspace_name ?? null);
   return db.prepare('SELECT * FROM task_requests WHERE id = ?').get(id) as TaskRequest;
+}
+
+export function setTaskRequestTarget(
+  id: string,
+  target: { workspace_id: string; workspace_name: string } | null,
+): void {
+  const db = getDb();
+  db.prepare(
+    'UPDATE task_requests SET target_workspace_id = ?, target_workspace_name = ? WHERE id = ? AND status = \'pending\''
+  ).run(target?.workspace_id ?? null, target?.workspace_name ?? null, id);
 }
 
 export function getTaskRequests(discussionId: string): TaskRequest[] {

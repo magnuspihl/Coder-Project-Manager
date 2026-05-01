@@ -3,6 +3,7 @@ import { createReadStream, createWriteStream } from 'fs';
 import { randomUUID } from 'crypto';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, getPendingCompletionTask, setPendingComplete, type Task, type TaskParticipant } from './tasks.js';
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
+import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, handleStashAway, fetchGitHubToken, isRemoteAllowed } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
@@ -1377,18 +1378,38 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
 
 // ─── Discussion (workspace chat) support ───────────────────────────────────
 
-function getDiscussionPromptPrefix(projectDir: string | null): string {
+function getDiscussionPromptPrefix(
+  projectDir: string | null,
+  ownWorkspaceName: string,
+  userId: string | null,
+): string {
   const boundary = projectDir
     ? `You MUST NOT modify, create, or delete any files within \`${projectDir}\` (the git-tracked project directory) — treat it as read-only. If work needs to be done inside the project, output a [TASK_REQUEST] instead and the user will approve it as a task.\n\nYou MAY freely read, explore, and write to files outside this path — global config files like \`~/.claude/CLAUDE.md\`, workspace memory files, temp files, etc.`
     : `You MUST NOT modify, create, or delete files in the project repository — treat it as read-only. If work needs to be done in the project, output a [TASK_REQUEST] instead and the user will approve it as a task.`;
 
-  return `You are a discussion agent for this workspace. ${boundary}
+  const workspaces = userId ? getWorkspacesForUser(userId) : null;
+  const otherRunning = (workspaces ?? [])
+    .filter(w => w.running && w.name !== ownWorkspaceName)
+    .map(w => w.name);
+
+  const targetingBlock = otherRunning.length > 0
+    ? `By default, a [TASK_REQUEST] runs in this workspace (\`${ownWorkspaceName}\`). If the work clearly belongs to a DIFFERENT workspace the user has access to, you may suggest it there by adding a \`targetWorkspace\` field with that workspace's name. The user will see the chosen target and can change it before approving.
+
+Other running workspaces you can target:
+${otherRunning.map(n => `  - ${n}`).join('\n')}
+
+Only set \`targetWorkspace\` when you have specific reason to believe the task belongs elsewhere (e.g. the user asked you to relay it). When unsure, omit the field.`
+    : `[TASK_REQUEST] always runs in this workspace (\`${ownWorkspaceName}\`).`;
+
+  return `You are a discussion agent for this workspace (\`${ownWorkspaceName}\`). ${boundary}
 
 If the discussion leads to work that should be done inside the project, output a task request in this EXACT format (on its own, not inside a code block):
 
 [TASK_REQUEST]
 {"prompt": "detailed task description here"}
 [/TASK_REQUEST]
+
+${targetingBlock}
 
 The user will be prompted to approve the task before it runs.
 
@@ -1416,17 +1437,30 @@ function remoteDiscussionExitCodePath(discussionId: string): string {
 
 /**
  * Parse [TASK_REQUEST] blocks from text and create task_requests entries.
+ * Resolves an optional targetWorkspace name against the user's cached
+ * workspace list. Unresolved/missing target falls back to the discussion's
+ * own workspace at approval time.
  */
-function parseTaskRequests(discussionId: string, text: string): void {
+function parseTaskRequests(discussion: Discussion, text: string): void {
   const regex = /\[TASK_REQUEST\]\s*([\s\S]*?)\s*\[\/TASK_REQUEST\]/g;
   let match;
   while ((match = regex.exec(text)) !== null) {
     try {
       const data = JSON.parse(match[1]);
-      if (data.prompt && typeof data.prompt === 'string') {
-        createTaskRequest(discussionId, data.prompt);
-        console.log(`[discussion] Task request created for discussion ${discussionId}`);
+      if (!data.prompt || typeof data.prompt !== 'string') continue;
+
+      let target: { workspace_id: string; workspace_name: string } | null = null;
+      const requested = typeof data.targetWorkspace === 'string' ? data.targetWorkspace.trim() : null;
+      if (requested && requested !== discussion.workspace_name) {
+        const found = findUserWorkspaceByName(discussion.user_id, requested);
+        if (found) {
+          target = { workspace_id: found.id, workspace_name: found.name };
+        } else {
+          console.log(`[discussion] Task request targetWorkspace "${requested}" not in user's workspace list — falling back to host`);
+        }
       }
+      createTaskRequest(discussion.id, data.prompt, target);
+      console.log(`[discussion] Task request created for discussion ${discussion.id}${target ? ` (target: ${target.workspace_name})` : ''}`);
     } catch {
       console.log(`[discussion] Failed to parse task request JSON`);
     }
@@ -1513,7 +1547,7 @@ export async function launchDiscussion(
   let prompt: string;
   if (!isResume) {
     // First message — use prefix or not based on mode
-    prompt = isFullAccess ? message : getDiscussionPromptPrefix(discussion.project_dir ?? null) + message;
+    prompt = isFullAccess ? message : getDiscussionPromptPrefix(discussion.project_dir ?? null, discussion.workspace_name, discussion.user_id) + message;
   } else if (participants.length > 0) {
     // Resuming with participants — prepend catch-up if available, skip access override.
     // Always include mention instruction so the agent knows how to reach other agents.
@@ -1764,7 +1798,7 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
                     const dmsg = addDiscussionMessage(discussion.id, 'assistant', block.text);
                     lastSavedMessageId = dmsg.id;
                     lastSavedMessageText = block.text;
-                    parseTaskRequests(discussion.id, block.text);
+                    parseTaskRequests(discussion, block.text);
                   } else if (block.type === 'tool_use') {
                     taskActivity.set(`disc:${discussion.id}`, { timestamp: now, summary: `Using ${(block as { name?: string }).name || 'tool'}` });
                   }
@@ -1776,7 +1810,7 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
                 const dmsg = addDiscussionMessage(discussion.id, 'assistant', resultText, event.total_cost_usd as number | undefined);
                 lastSavedMessageId = dmsg.id;
                 lastSavedMessageText = resultText;
-                parseTaskRequests(discussion.id, resultText);
+                parseTaskRequests(discussion, resultText);
               } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
                 // Update cost on last message
                 getDb().prepare('UPDATE discussion_messages SET cost = ? WHERE id = ?').run(event.total_cost_usd, lastSavedMessageId);
@@ -1901,7 +1935,7 @@ export async function launchParticipantDiscussion(
 
   let prompt: string;
   if (!isResume) {
-    const prefix = isFullAccess ? '' : getDiscussionPromptPrefix(participant.project_dir ?? null);
+    const prefix = isFullAccess ? '' : getDiscussionPromptPrefix(participant.project_dir ?? null, participant.workspace_name, discussion.user_id);
     const context = [mentionInstr].filter(Boolean).join('\n');
     prompt = prefix + (context ? context + '\n' : '') + message;
   } else {
@@ -2115,7 +2149,7 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
                     const dmsg = addDiscussionMessage(discussion.id, 'assistant', block.text, undefined, participant.workspace_name, participant.id);
                     lastSavedMessageId = dmsg.id;
                     lastSavedMessageText = block.text;
-                    parseTaskRequests(discussion.id, block.text);
+                    parseTaskRequests(discussion, block.text);
                   } else if (block.type === 'tool_use') {
                     taskActivity.set(pollKey, { timestamp: now, summary: `Using ${block.name || 'tool'}` });
                   }
@@ -2127,7 +2161,7 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
                 const dmsg = addDiscussionMessage(discussion.id, 'assistant', resultText, event.total_cost_usd as number | undefined, participant.workspace_name, participant.id);
                 lastSavedMessageId = dmsg.id;
                 lastSavedMessageText = resultText;
-                parseTaskRequests(discussion.id, resultText);
+                parseTaskRequests(discussion, resultText);
               } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
                 getDb().prepare('UPDATE discussion_messages SET cost = ? WHERE id = ?').run(event.total_cost_usd, lastSavedMessageId);
               }
@@ -2219,7 +2253,7 @@ export async function launchTaskParticipant(
 
   let prompt: string;
   if (!isResume) {
-    prompt = getDiscussionPromptPrefix(participant.project_dir ?? null) + (catchUp ? catchUp + '\n' : '') + message;
+    prompt = getDiscussionPromptPrefix(participant.project_dir ?? null, participant.workspace_name, task.user_id) + (catchUp ? catchUp + '\n' : '') + message;
   } else {
     prompt = catchUp ? catchUp + '\n' + message : message;
   }

@@ -108,6 +108,8 @@ CREATE TABLE IF NOT EXISTS task_requests (
   branch TEXT,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'created', 'dismissed')),
   created_task_id TEXT,
+  target_workspace_id TEXT,
+  target_workspace_name TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (discussion_id) REFERENCES discussions(id) ON DELETE CASCADE,
   FOREIGN KEY (created_task_id) REFERENCES tasks(id)

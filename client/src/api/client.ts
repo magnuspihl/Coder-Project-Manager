@@ -350,6 +350,8 @@ export interface TaskRequestItem {
   prompt: string;
   status: string;
   created_task_id: string | null;
+  target_workspace_id: string | null;
+  target_workspace_name: string | null;
   created_at: string;
 }
 
@@ -417,11 +419,20 @@ export const closeDiscussion = (discussionId: string) =>
 export const interruptDiscussion = (discussionId: string) =>
   request<{ ok: boolean }>(`/api/discussions/${discussionId}/interrupt`, { method: 'POST' });
 
-export const approveTaskRequest = (discussionId: string, requestId: string) =>
-  request<{ task: Task }>(`/api/discussions/${discussionId}/task-requests/${requestId}/approve`, { method: 'POST' });
+export const approveTaskRequest = (discussionId: string, requestId: string, targetWorkspaceId?: string | null) =>
+  request<{ task: Task }>(`/api/discussions/${discussionId}/task-requests/${requestId}/approve`, {
+    method: 'POST',
+    body: JSON.stringify(targetWorkspaceId === undefined ? {} : { targetWorkspaceId }),
+  });
 
 export const dismissTaskRequest = (discussionId: string, requestId: string) =>
   request<{ ok: boolean }>(`/api/discussions/${discussionId}/task-requests/${requestId}/dismiss`, { method: 'POST' });
+
+export const updateTaskRequestTarget = (discussionId: string, requestId: string, targetWorkspaceId: string | null) =>
+  request<{ ok: boolean; target: { id: string; name: string } | null }>(
+    `/api/discussions/${discussionId}/task-requests/${requestId}/target`,
+    { method: 'PATCH', body: JSON.stringify({ targetWorkspaceId }) },
+  );
 
 // Participants
 export const addDiscussionParticipant = (discussionId: string, workspaceId: string, workspaceName: string) =>

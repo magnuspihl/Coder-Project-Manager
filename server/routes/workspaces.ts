@@ -7,6 +7,7 @@ import { getLatestDiscussionMessageByWorkspace } from '../services/discussions.j
 import { getWorkspaceUsages, getGlobalRateLimits } from '../services/claude.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { getModelsForWorkspace } from '../services/models.js';
+import { setWorkspacesForUser } from '../services/workspace-cache.js';
 
 const router = Router();
 
@@ -58,6 +59,11 @@ async function withTokenRefresh<T>(
 router.get('/', requireAuth, async (req: Request, res: Response) => {
   const workspaces = await withTokenRefresh(req, res, (token) => listWorkspaces(token), 'Failed to fetch workspaces from Coder');
   if (workspaces === undefined) return;
+  setWorkspacesForUser(req.user!.id, workspaces.map(w => ({
+    id: w.id,
+    name: w.name,
+    running: w.latest_build.status === 'running',
+  })));
   assignDefaultVoices(workspaces.map(w => w.id));
   const taskCounts = getTaskCountsByWorkspace();
   const tokenTotals = getTokenTotalsByWorkspace();

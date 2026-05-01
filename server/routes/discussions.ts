@@ -16,6 +16,7 @@ import {
   getPendingTaskRequests,
   approveTaskRequest,
   dismissTaskRequest,
+  setTaskRequestTarget,
   getDiscussionFullAccess,
   setDiscussionFullAccess,
   addParticipant,
@@ -36,6 +37,7 @@ import {
   launchParticipantDiscussion, stopParticipant, isParticipantRunning, getParticipantActivity, isAnyAgentRunning,
 } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
+import { findUserWorkspaceById, findUserWorkspaceByName } from '../services/workspace-cache.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { processQueue } from '../services/claude.js';
 
@@ -282,7 +284,9 @@ router.post('/discussions/:discussionId/interrupt', requireAuth, (req: Request, 
   res.status(400).json({ error: 'No agent is currently running' });
 });
 
-// Approve a task request (creates a real task)
+// Approve a task request (creates a real task). Optional body
+// `{ targetWorkspaceId }` overrides the stored target at approval time —
+// used by the UI dropdown so the user can redirect before confirming.
 router.post('/discussions/:discussionId/task-requests/:requestId/approve', requireAuth, async (req: Request, res: Response) => {
   const discussion = getDiscussion(req.params.discussionId);
   if (!discussion) {
@@ -300,22 +304,78 @@ router.post('/discussions/:discussionId/task-requests/:requestId/approve', requi
     return;
   }
 
-  // Create the actual task
+  // Determine target workspace: explicit body override > stored target > host
+  let workspaceId = discussion.workspace_id;
+  let workspaceName = discussion.workspace_name;
+  const overrideId = typeof req.body?.targetWorkspaceId === 'string' ? req.body.targetWorkspaceId : null;
+  const chosenId = overrideId ?? taskRequest.target_workspace_id;
+
+  if (chosenId && chosenId !== discussion.workspace_id) {
+    const cached = findUserWorkspaceById(req.user!.id, chosenId);
+    if (cached) {
+      workspaceId = cached.id;
+      workspaceName = cached.name;
+    } else {
+      res.status(400).json({ error: 'Target workspace not found or you do not have access to it.' });
+      return;
+    }
+  }
+
   const task = createTask({
-    workspaceId: discussion.workspace_id,
-    workspaceName: discussion.workspace_name,
+    workspaceId,
+    workspaceName,
     userId: req.user!.id,
     username: req.user!.username,
     prompt: taskRequest.prompt,
   });
 
   approveTaskRequest(taskRequest.id, task.id);
-  addDiscussionMessage(discussion.id, 'system', `Task created: "${task.title}" (${task.id})`);
+  const crossWorkspace = workspaceId !== discussion.workspace_id;
+  const msg = crossWorkspace
+    ? `Task created in ${workspaceName}: "${task.title}" (${task.id})`
+    : `Task created: "${task.title}" (${task.id})`;
+  addDiscussionMessage(discussion.id, 'system', msg);
 
-  // Kick the queue
-  await processQueue(discussion.workspace_id);
+  await processQueue(workspaceId);
 
   res.json({ task });
+});
+
+// Update the target workspace on a pending task request. Lets the user pick
+// a different destination from the proposed-task card before approving.
+router.patch('/discussions/:discussionId/task-requests/:requestId/target', requireAuth, (req: Request, res: Response) => {
+  const discussion = getDiscussion(req.params.discussionId);
+  if (!discussion) {
+    res.status(404).json({ error: 'Discussion not found' });
+    return;
+  }
+  const taskRequest = getTaskRequest(req.params.requestId);
+  if (!taskRequest || taskRequest.discussion_id !== discussion.id) {
+    res.status(404).json({ error: 'Task request not found' });
+    return;
+  }
+  if (taskRequest.status !== 'pending') {
+    res.status(400).json({ error: 'Task request already processed' });
+    return;
+  }
+
+  const { targetWorkspaceId } = req.body ?? {};
+  if (targetWorkspaceId === null || targetWorkspaceId === discussion.workspace_id) {
+    setTaskRequestTarget(taskRequest.id, null);
+    res.json({ ok: true, target: null });
+    return;
+  }
+  if (typeof targetWorkspaceId !== 'string') {
+    res.status(400).json({ error: 'targetWorkspaceId must be a string or null' });
+    return;
+  }
+  const cached = findUserWorkspaceById(req.user!.id, targetWorkspaceId);
+  if (!cached) {
+    res.status(400).json({ error: 'Target workspace not found or you do not have access to it.' });
+    return;
+  }
+  setTaskRequestTarget(taskRequest.id, { workspace_id: cached.id, workspace_name: cached.name });
+  res.json({ ok: true, target: { id: cached.id, name: cached.name } });
 });
 
 // Dismiss a task request

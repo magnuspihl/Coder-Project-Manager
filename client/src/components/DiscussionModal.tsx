@@ -9,6 +9,7 @@ import {
   updateDiscussionSettings,
   approveTaskRequest,
   dismissTaskRequest,
+  updateTaskRequestTarget,
   addDiscussionParticipant,
   removeDiscussionParticipant,
   sendParticipantMessage,
@@ -192,6 +193,11 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const [availableWorkspaces, setAvailableWorkspaces] = useState<Workspace[]>([]);
   const [loadingWorkspaces, setLoadingWorkspaces] = useState(false);
   const lastParticipantsJsonRef = useRef('');
+
+  // Per-request target override (lets user change destination before approving).
+  // Keyed by task_request id; absent key means "use whatever's stored on the request".
+  const [requestTargetOverride, setRequestTargetOverride] = useState<Record<string, string>>({});
+  const [allRunningWorkspaces, setAllRunningWorkspaces] = useState<Workspace[] | null>(null);
 
   // Voice mode state
   const [voiceModeActive, setVoiceModeActive] = useState(false);
@@ -619,6 +625,24 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     }
   };
 
+  // Lazy-load the running workspace list once a pending task request appears,
+  // so the proposed-task card can offer a target dropdown without an extra
+  // click. Refreshed only when the list of pending request ids changes.
+  useEffect(() => {
+    if (taskRequests.length === 0 || allRunningWorkspaces !== null) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await getWorkspaces();
+        if (cancelled) return;
+        setAllRunningWorkspaces(data.workspaces.filter(ws => ws.latest_build.status === 'running'));
+      } catch {
+        if (!cancelled) setAllRunningWorkspaces([]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [taskRequests.length, allRunningWorkspaces]);
+
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') closeModal();
@@ -727,15 +751,31 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     onClose();
   };
 
-  const handleApprove = async (requestId: string) => {
+  const handleApprove = async (requestId: string, targetWorkspaceId: string | null, targetName: string) => {
     if (processingRequest) return;
+    if (targetWorkspaceId && targetWorkspaceId !== workspaceId) {
+      const ok = confirm(
+        `This task will run in "${targetName}", a DIFFERENT workspace from this discussion ("${workspaceName}"). ` +
+        `It will be queued there and run with that workspace's project context. Continue?`
+      );
+      if (!ok) return;
+    }
     setProcessingRequest(requestId);
     try {
-      await approveTaskRequest(discussionId, requestId);
+      await approveTaskRequest(discussionId, requestId, targetWorkspaceId);
       onTaskCreated?.();
       await loadData();
     } finally {
       setProcessingRequest(null);
+    }
+  };
+
+  const handleChangeTarget = async (requestId: string, targetWorkspaceId: string) => {
+    setRequestTargetOverride(prev => ({ ...prev, [requestId]: targetWorkspaceId }));
+    try {
+      await updateTaskRequestTarget(discussionId, requestId, targetWorkspaceId === workspaceId ? null : targetWorkspaceId);
+    } catch (err) {
+      console.error('Failed to update task request target:', err);
     }
   };
 
@@ -977,33 +1017,78 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
               )}
 
               {/* Pending task requests */}
-              {taskRequests.map((tr) => (
-                <div
-                  key={tr.id}
-                  className="rounded-lg p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800"
-                >
-                  <div className="flex items-center gap-2 mb-2">
-                    <span className="text-xs font-medium text-amber-700 dark:text-amber-400 uppercase">Proposed Task</span>
+              {taskRequests.map((tr) => {
+                const selectedTargetId = requestTargetOverride[tr.id] ?? tr.target_workspace_id ?? workspaceId;
+                const isCrossWorkspace = selectedTargetId !== workspaceId;
+                const selectedWorkspace = allRunningWorkspaces?.find(w => w.id === selectedTargetId);
+                const selectedTargetName = isCrossWorkspace
+                  ? (selectedWorkspace?.name ?? tr.target_workspace_name ?? 'unknown')
+                  : workspaceName;
+                const cardClass = isCrossWorkspace
+                  ? 'rounded-lg p-4 bg-rose-50 dark:bg-rose-900/20 border-2 border-rose-300 dark:border-rose-700'
+                  : 'rounded-lg p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800';
+                const labelClass = isCrossWorkspace
+                  ? 'text-xs font-semibold text-rose-700 dark:text-rose-400 uppercase'
+                  : 'text-xs font-medium text-amber-700 dark:text-amber-400 uppercase';
+                const createBtnClass = isCrossWorkspace
+                  ? 'text-xs px-3 py-1.5 bg-rose-600 text-white rounded hover:bg-rose-700 disabled:opacity-50 disabled:cursor-not-allowed'
+                  : 'text-xs px-3 py-1.5 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed';
+                return (
+                  <div key={tr.id} className={cardClass}>
+                    <div className="flex items-center gap-2 mb-2">
+                      <span className={labelClass}>
+                        {isCrossWorkspace ? 'Proposed Task — Cross-Workspace' : 'Proposed Task'}
+                      </span>
+                    </div>
+                    <p className="text-sm text-gray-900 dark:text-gray-100 whitespace-pre-wrap mb-3">{tr.prompt}</p>
+                    <div className="flex items-center gap-2 mb-3 text-xs text-gray-700 dark:text-gray-300">
+                      <label htmlFor={`target-${tr.id}`}>Run in:</label>
+                      <select
+                        id={`target-${tr.id}`}
+                        value={selectedTargetId}
+                        onChange={(e) => handleChangeTarget(tr.id, e.target.value)}
+                        disabled={processingRequest !== null}
+                        className="text-xs px-2 py-1 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded disabled:opacity-50"
+                      >
+                        <option value={workspaceId}>{workspaceName} (this workspace)</option>
+                        {(allRunningWorkspaces ?? [])
+                          .filter(ws => ws.id !== workspaceId)
+                          .map(ws => (
+                            <option key={ws.id} value={ws.id}>{ws.name}</option>
+                          ))}
+                        {/* If the agent suggested a target that isn't in the loaded list yet, still show it */}
+                        {tr.target_workspace_id && tr.target_workspace_id !== workspaceId &&
+                          !(allRunningWorkspaces ?? []).some(ws => ws.id === tr.target_workspace_id) && (
+                            <option value={tr.target_workspace_id}>{tr.target_workspace_name ?? 'unknown'}</option>
+                          )}
+                      </select>
+                    </div>
+                    {isCrossWorkspace && (
+                      <p className="text-xs text-rose-700 dark:text-rose-300 mb-3">
+                        ⚠ This task will be queued in <strong>{selectedTargetName}</strong>, not in this discussion's workspace. You'll be asked to confirm.
+                      </p>
+                    )}
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => handleApprove(tr.id, isCrossWorkspace ? selectedTargetId : null, selectedTargetName)}
+                        disabled={processingRequest !== null}
+                        className={createBtnClass}
+                      >
+                        {processingRequest === tr.id
+                          ? 'Creating...'
+                          : isCrossWorkspace ? `Create in ${selectedTargetName}` : 'Create Task'}
+                      </button>
+                      <button
+                        onClick={() => handleDismiss(tr.id)}
+                        disabled={processingRequest !== null}
+                        className="text-xs px-3 py-1.5 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {processingRequest === tr.id ? 'Dismissing...' : 'Dismiss'}
+                      </button>
+                    </div>
                   </div>
-                  <p className="text-sm text-gray-900 dark:text-gray-100 whitespace-pre-wrap mb-2">{tr.prompt}</p>
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => handleApprove(tr.id)}
-                      disabled={processingRequest !== null}
-                      className="text-xs px-3 py-1.5 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      {processingRequest === tr.id ? 'Creating...' : 'Create Task'}
-                    </button>
-                    <button
-                      onClick={() => handleDismiss(tr.id)}
-                      disabled={processingRequest !== null}
-                      className="text-xs px-3 py-1.5 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      {processingRequest === tr.id ? 'Dismissing...' : 'Dismiss'}
-                    </button>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
 
             {/* Footer: target selector + message input + actions */}
