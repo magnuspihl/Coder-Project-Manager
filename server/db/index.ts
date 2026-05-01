@@ -154,6 +154,15 @@ export function getDb(): Database.Database {
       db.exec("ALTER TABLE discussion_messages ADD COLUMN participant_id TEXT");
     }
 
+    // Task requests migrations: cross-workspace task suggestions
+    const trCols = db.prepare("PRAGMA table_info(task_requests)").all() as Array<{ name: string }>;
+    if (!trCols.some(c => c.name === 'target_workspace_id')) {
+      db.exec("ALTER TABLE task_requests ADD COLUMN target_workspace_id TEXT");
+    }
+    if (!trCols.some(c => c.name === 'target_workspace_name')) {
+      db.exec("ALTER TABLE task_requests ADD COLUMN target_workspace_name TEXT");
+    }
+
     // Play-on-open: track last time each discussion/task was opened
     if (!discCols.some(c => c.name === 'last_opened_at')) {
       db.exec("ALTER TABLE discussions ADD COLUMN last_opened_at TEXT");
