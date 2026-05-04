@@ -280,6 +280,13 @@ export function updateTaskPosition(taskId: string, newPosition: number): void {
   );
 }
 
+export function updateTaskTitle(taskId: string, newTitle: string): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET title = ?, updated_at = ? WHERE id = ?').run(
+    newTitle, new Date().toISOString(), taskId
+  );
+}
+
 export function deleteTask(taskId: string): void {
   const db = getDb();
   db.prepare('UPDATE tasks SET deleted_at = ? WHERE id = ?').run(new Date().toISOString(), taskId);

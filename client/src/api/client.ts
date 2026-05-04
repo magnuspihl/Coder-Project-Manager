@@ -255,6 +255,12 @@ export async function uploadFiles(files: File[]): Promise<AttachmentInfo[]> {
   return data.attachments;
 }
 
+export const updateTaskTitle = (taskId: string, title: string) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}`, {
+    method: 'PUT',
+    body: JSON.stringify({ title }),
+  });
+
 export const completeTask = (taskId: string) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/complete`, { method: 'POST' });
 
