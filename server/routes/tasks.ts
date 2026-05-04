@@ -6,6 +6,7 @@ import {
   createTask,
   updateTaskStatus,
   updateTaskPosition,
+  updateTaskTitle,
   deleteTask,
   restoreTask,
   addMessage,
@@ -152,6 +153,23 @@ router.put('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
 
   if (req.body.position !== undefined) {
     updateTaskPosition(task.id, req.body.position);
+  }
+
+  if (req.body.title !== undefined) {
+    if (typeof req.body.title !== 'string') {
+      res.status(400).json({ error: 'Title must be a string' });
+      return;
+    }
+    const trimmed = req.body.title.trim();
+    if (!trimmed) {
+      res.status(400).json({ error: 'Title cannot be empty' });
+      return;
+    }
+    if (trimmed.length > 200) {
+      res.status(400).json({ error: 'Title must be 200 characters or fewer' });
+      return;
+    }
+    updateTaskTitle(task.id, trimmed);
   }
 
   res.json({ task: getTask(task.id) });

@@ -6,6 +6,7 @@ import {
   completeTask,
   reopenTask,
   retryTask,
+  updateTaskTitle,
   interruptTask,
   cancelTask,
   deleteTask,
@@ -78,6 +79,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [settingActive, setSettingActive] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [completing, setCompleting] = useState(false);
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState('');
+  const [savingTitle, setSavingTitle] = useState(false);
+  const titleInputRef = useRef<HTMLInputElement>(null);
+  const editingTitleRef = useRef(false);
+  editingTitleRef.current = editingTitle;
+  const skipNextTitleBlurRef = useRef(false);
   const [participants, setParticipants] = useState<TaskParticipant[]>([]);
   const [targetParticipantId, setTargetParticipantId] = useState<string | null>(null);
   const [showInviteMenu, setShowInviteMenu] = useState(false);
@@ -328,7 +336,12 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   // Keyboard shortcuts: Escape to close, Alt+C to mark complete
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') closeModal();
+      if (e.key === 'Escape') {
+        // While editing the title, Escape cancels the edit; the input's own
+        // handler manages that. Don't also close the modal.
+        if (editingTitleRef.current) return;
+        closeModal();
+      }
       if (e.altKey && e.key === 'c' && taskStatusRef.current === 'awaiting_feedback' && !completing) {
         e.preventDefault();
         handleComplete();
@@ -480,6 +493,59 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     closeAndNotify();
   };
 
+  const startEditTitle = () => {
+    if (!task) return;
+    setTitleDraft(task.title);
+    setEditingTitle(true);
+    requestAnimationFrame(() => {
+      titleInputRef.current?.focus();
+      titleInputRef.current?.select();
+    });
+  };
+
+  const cancelEditTitle = () => {
+    skipNextTitleBlurRef.current = true;
+    setEditingTitle(false);
+    setTitleDraft('');
+  };
+
+  const saveTitle = async () => {
+    if (skipNextTitleBlurRef.current) {
+      skipNextTitleBlurRef.current = false;
+      return;
+    }
+    if (!task) return;
+    const trimmed = titleDraft.trim();
+    if (!trimmed || trimmed === task.title) {
+      cancelEditTitle();
+      return;
+    }
+    setSavingTitle(true);
+    try {
+      const { task: updated } = await updateTaskTitle(taskId, trimmed);
+      setTask(prev => (prev ? { ...prev, title: updated.title } : prev));
+      lastTaskJsonRef.current = '';
+      setEditingTitle(false);
+      setTitleDraft('');
+      onTaskChanged?.();
+    } catch (err: any) {
+      alert(err?.message || 'Failed to update title');
+    } finally {
+      setSavingTitle(false);
+    }
+  };
+
+  const handleTitleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      saveTitle();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      cancelEditTitle();
+    }
+  };
+
   // Participant handlers
   const handleOpenInviteMenu = async () => {
     setShowInviteMenu(true);
@@ -614,7 +680,28 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
             {/* Header */}
             <div className="flex items-start justify-between gap-3 p-5 border-b border-gray-200 dark:border-gray-800">
               <div className="flex-1 min-w-0">
-                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100 truncate">{task.title}</h2>
+                {editingTitle ? (
+                  <input
+                    ref={titleInputRef}
+                    type="text"
+                    value={titleDraft}
+                    onChange={(e) => setTitleDraft(e.target.value)}
+                    onKeyDown={handleTitleKeyDown}
+                    onBlur={saveTitle}
+                    disabled={savingTitle}
+                    maxLength={200}
+                    className="w-full text-lg font-semibold text-gray-900 dark:text-gray-100 bg-transparent border border-blue-400 dark:border-blue-500 rounded px-2 py-0.5 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                    aria-label="Task title"
+                  />
+                ) : (
+                  <h2
+                    className="text-lg font-semibold text-gray-900 dark:text-gray-100 truncate cursor-text rounded px-2 py-0.5 -mx-2 hover:bg-gray-100 dark:hover:bg-gray-800/60 transition-colors"
+                    onClick={startEditTitle}
+                    title="Click to edit title"
+                  >
+                    {task.title}
+                  </h2>
+                )}
                 <div className="flex items-center gap-2 mt-1 flex-wrap">
                   <span className={`text-xs px-2 py-0.5 rounded-full ${STATUS_COLORS[task.status] || ''}`}>
                     {task.status.replace('_', ' ')}
