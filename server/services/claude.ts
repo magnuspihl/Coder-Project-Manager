@@ -373,21 +373,36 @@ async function transferFilesToWorkspace(
         });
       } else {
         await new Promise<void>((resolve, reject) => {
+          // `head -c <size>` reads exactly `size` bytes then exits cleanly —
+          // unlike `cat`, it doesn't depend on stdin EOF, which `coder ssh`
+          // does not reliably propagate to the remote side (observed: 5+ min
+          // hangs after data fully transferred).
           const proc = spawn('coder', [
             'ssh', workspaceName, '--',
-            `cat > ${shellEscape(remotePath)}`,
+            `head -c ${att.size} > ${shellEscape(remotePath)}`,
           ], {
             env: { ...process.env, CODER_URL },
             stdio: ['pipe', 'ignore', 'pipe'],
           });
+          // Belt-and-suspenders timeout in case SSH itself hangs (network /
+          // workspace stall). 30s base + ~1ms/KB scales to the 20MB cap.
+          const timeoutMs = 30_000 + Math.ceil(att.size / 1024);
+          const timer = setTimeout(() => {
+            proc.kill('SIGKILL');
+            reject(new Error(`File transfer timed out for ${att.original_name} (${att.size} bytes, ${timeoutMs}ms)`));
+          }, timeoutMs);
           const fileStream = createReadStream(att.storage_path);
           fileStream.pipe(proc.stdin);
-          fileStream.on('error', (err) => { proc.kill(); reject(err); });
+          // Suppress EPIPE if remote closes stdin once it has its bytes —
+          // proc.on('close') is authoritative.
+          proc.stdin.on('error', () => {});
+          fileStream.on('error', (err) => { clearTimeout(timer); proc.kill(); reject(err); });
           proc.on('close', (code) => {
+            clearTimeout(timer);
             if (code === 0) resolve();
             else reject(new Error(`SCP failed for ${att.original_name} (exit ${code})`));
           });
-          proc.on('error', reject);
+          proc.on('error', (err) => { clearTimeout(timer); reject(err); });
         });
       }
       pathMap.set(att.id, remotePath);
