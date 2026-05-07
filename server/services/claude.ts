@@ -1003,6 +1003,7 @@ function startFilePolling(task: Task): void {
   let lastSavedMessageText: string | null = null;
   let resultError: string | null = null;
   let consecutiveErrors = 0;
+  let lastPollError = '';
   let partialLine = '';  // Buffer for incomplete last line from previous poll
   let polling = false;   // Guard against overlapping polls
   let finalized = false; // Set once we've transitioned status (via result event or exit code)
@@ -1188,14 +1189,18 @@ function startFilePolling(task: Task): void {
       }
     } catch (err) {
       consecutiveErrors++;
-      console.log(`[claude-poller] Error polling task ${task.id} (${consecutiveErrors}):`, (err as Error).message?.slice(0, 100));
+      lastPollError = (err as Error).message?.slice(0, 300) || String(err);
+      console.log(`[claude-poller] Error polling task ${task.id} (${consecutiveErrors}):`, lastPollError.slice(0, 100));
 
       if (consecutiveErrors > 20) {
         console.log(`[claude-poller] Too many errors, marking task ${task.id} as failed`);
         stopPolling(task.id);
         taskActivity.delete(task.id);
-        addMessage(task.id, 'system', 'Error: Lost connection to workspace');
-        updateTaskStatus(task.id, 'failed', 'Lost connection to workspace');
+        const reason = lastPollError
+          ? `Lost connection to workspace: ${lastPollError}`
+          : 'Lost connection to workspace';
+        addMessage(task.id, 'system', `Error: ${reason}`);
+        updateTaskStatus(task.id, 'failed', reason);
       }
     } finally {
       polling = false;
@@ -1749,6 +1754,7 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
   let lastSavedMessageId: string | null = null;
   let lastSavedMessageText: string | null = null;
   let consecutiveErrors = 0;
+  let lastPollError = '';
   let partialLine = '';
   let polling = false;
   let finalized = false;
@@ -1901,13 +1907,17 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
       }
     } catch (err) {
       consecutiveErrors++;
-      console.log(`[discussion-poller] Error (${consecutiveErrors}):`, (err as Error).message?.slice(0, 100));
+      lastPollError = (err as Error).message?.slice(0, 300) || String(err);
+      console.log(`[discussion-poller] Error (${consecutiveErrors}):`, lastPollError.slice(0, 100));
 
       if (consecutiveErrors > 20) {
         console.log(`[discussion-poller] Too many errors, stopping polling for discussion ${discussion.id}`);
         stopPolling(pollKey);
         taskActivity.delete(`disc:${discussion.id}`);
-        addDiscussionMessage(discussion.id, 'system', 'Error: Lost connection to workspace');
+        const reason = lastPollError
+          ? `Lost connection to workspace: ${lastPollError}`
+          : 'Lost connection to workspace';
+        addDiscussionMessage(discussion.id, 'system', `Error: ${reason}`);
       }
     } finally {
       polling = false;
