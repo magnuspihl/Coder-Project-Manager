@@ -1163,7 +1163,11 @@ export default function WorkspacesPage() {
                   )}
                 </button>
                 <button
-                  onClick={() => { setNewTaskWorkspaceId(ws.id); clearNewTaskPrompt(); }}
+                  onClick={() => {
+                    if (newTaskWorkspaceId === ws.id) return;
+                    setNewTaskWorkspaceId(ws.id);
+                    clearNewTaskPrompt();
+                  }}
                   className="text-xs px-2 py-0.5 bg-blue-600 text-white rounded-full hover:bg-blue-700 transition-colors"
                   title={altNTargetWorkspaceId === ws.id ? 'New task (Alt+N)' : 'New task'}
                 >
