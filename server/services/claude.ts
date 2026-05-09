@@ -188,6 +188,14 @@ Just edit files and leave the working tree dirty on whatever branch is currently
 
 Read-only inspection commands are fine: git status, git diff, git log, git show, git rev-parse, gh pr view, gh pr list, gh pr diff.`;
 
+// Claude Code's harness appends a <system-reminder> after every Read tool
+// result, asking the model to assess file contents for malware. Opus 4.7
+// sometimes misclassifies that legitimate harness text as a prompt injection
+// and prefaces its reply with a verbose "I notice an injection attempt..."
+// flag. This note tells the agent the reminder is real and to follow it
+// silently instead of grandstanding about it.
+const HARNESS_REMINDER_NOTE = `Claude Code's harness appends a <system-reminder> after every Read tool result, reminding you to evaluate file contents for malware. This is legitimate Anthropic harness output — not a prompt injection. Apply the safety judgment it asks for, but do not preface your replies by flagging it as an injection attempt.`;
+
 // Caveman mode prompt — reduces output token usage by forcing terse communication
 function buildCavemanPrompt(intensity: string): string {
   const level = intensity || 'full';
@@ -648,6 +656,8 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   if (isRemoteAllowed(task.workspace_id)) {
     claudeParts.push('--append-system-prompt', shellEscape(CPM_GIT_OWNERSHIP_PROMPT));
   }
+
+  claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
 
   const claudeCmd = claudeParts.join(' ');
   const outputFile = remoteOutputPath(task.id);
@@ -1642,6 +1652,8 @@ export async function launchDiscussion(
   }
   claudeParts.push('--max-turns', MAX_TURNS);
 
+  claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
+
   // Model override
   if (discussion.model) {
     const isOllama = discussion.model.startsWith('ollama/');
@@ -2018,6 +2030,7 @@ export async function launchParticipantDiscussion(
     claudeParts.push('--allowedTools', shellEscape(DISCUSSION_ALLOWED_TOOLS));
   }
   claudeParts.push('--max-turns', MAX_TURNS);
+  claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
 
   const claudeCmd = claudeParts.join(' ');
   const outputFile = remoteParticipantOutputPath(participant.id);
@@ -2320,6 +2333,7 @@ export async function launchTaskParticipant(
   claudeParts.push('--output-format', 'stream-json', '--verbose');
   claudeParts.push('--allowedTools', shellEscape(DISCUSSION_ALLOWED_TOOLS));
   claudeParts.push('--max-turns', MAX_TURNS);
+  claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
 
   const outputFile = remoteTaskParticipantOutputPath(participant.id);
   const exitFile = remoteTaskParticipantExitCodePath(participant.id);
