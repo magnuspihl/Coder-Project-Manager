@@ -329,14 +329,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [touchResult, loading, conversationMode, ttsVoices.length, messages]);
 
-  // When closing via non-back-button means (Escape, X, etc.), pop the history entry we pushed
   const closeModal = () => {
-    // Only go back if we're still on the state we pushed
-    if (window.history.state?.modal === 'task-detail') {
-      window.history.back();
-    } else {
-      onClose();
-    }
+    onClose();
   };
 
   // Keyboard shortcuts: Escape to close, Alt+C to mark complete
