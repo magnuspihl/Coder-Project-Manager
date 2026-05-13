@@ -265,4 +265,45 @@ router.patch('/:workspaceId/voice-settings', requireAuth, (req: Request, res: Re
   res.json({ ok: true, voiceIds });
 });
 
+// Preview settings: per-workspace iframe preview URL (auto-detected or user-set)
+router.get('/:workspaceId/preview-settings', requireAuth, (req: Request, res: Response) => {
+  const row = getDb().prepare('SELECT preview_url FROM workspace_settings WHERE workspace_id = ?')
+    .get(req.params.workspaceId) as { preview_url: string | null } | undefined;
+  res.json({ previewUrl: row?.preview_url ?? null });
+});
+
+router.patch('/:workspaceId/preview-settings', requireAuth, (req: Request, res: Response) => {
+  const { previewUrl } = req.body as { previewUrl: unknown };
+  if (previewUrl !== null && typeof previewUrl !== 'string') {
+    res.status(400).json({ error: 'previewUrl must be a string or null' });
+    return;
+  }
+  let normalized: string | null = null;
+  if (typeof previewUrl === 'string') {
+    const trimmed = previewUrl.trim();
+    if (trimmed === '') {
+      normalized = null;
+    } else {
+      try {
+        const parsed = new URL(trimmed);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+          res.status(400).json({ error: 'previewUrl must use http or https' });
+          return;
+        }
+        normalized = parsed.toString();
+      } catch {
+        res.status(400).json({ error: 'previewUrl is not a valid URL' });
+        return;
+      }
+    }
+  }
+  const now = new Date().toISOString();
+  getDb().prepare(
+    `INSERT INTO workspace_settings (workspace_id, preview_url, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(workspace_id) DO UPDATE SET preview_url = excluded.preview_url, updated_at = excluded.updated_at`
+  ).run(req.params.workspaceId, normalized, now);
+  res.json({ ok: true, previewUrl: normalized });
+});
+
 export default router;

@@ -30,6 +30,8 @@ import { playChime } from '../utils/chime';
 import { playListenChime } from '../utils/listenChime';
 import RateLimitBanner from './RateLimitBanner';
 import { useDraft } from '../hooks/useDraft';
+import { useWorkspacePreview } from '../hooks/useWorkspacePreview';
+import WorkspacePreviewPanel, { PreviewToggleButton } from './WorkspacePreviewPanel';
 import { linkify } from '../utils/linkify';
 import Markdown from './Markdown';
 import { useTTSVoice } from '../hooks/useTTSVoice';
@@ -121,6 +123,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const prevTtsSpeakingIdRef = useRef<string | null>(null);
   const [touchResult, setTouchResult] = useState<{ previousOpenedAt: string | null } | null>(null);
   const playOnOpenDoneRef = useRef(false);
+
 
   const toggleConversationMode = useCallback(() => {
     setConversationMode(v => {
@@ -297,6 +300,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       .then(setTouchResult)
       .catch(() => setTouchResult({ previousOpenedAt: null }));
   }, [taskId]);
+
+  const preview = useWorkspacePreview(task?.workspace_id ?? null, taskId);
 
   // Play-on-open: once initial load is done, speak assistant messages newer than previousOpenedAt
   useEffect(() => {
@@ -703,7 +708,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       onClick={handleOverlayClick}
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
     >
-      <div className="bg-white dark:bg-gray-950 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 w-full max-w-3xl max-h-[90vh] flex flex-col">
+      <div className={`flex items-stretch gap-3 w-full ${preview.previewEffective ? '' : 'max-w-3xl'} max-h-[90vh]`}>
+      <div className="bg-white dark:bg-gray-950 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 w-full max-w-3xl shrink-0 max-h-[90vh] flex flex-col">
         {loading ? (
           <div className="p-8 text-center text-gray-500 dark:text-gray-400">Loading task...</div>
         ) : !task ? (
@@ -853,6 +859,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   )}
                 </div>
               </div>
+              <PreviewToggleButton state={preview} />
               <button
                 onClick={closeModal}
                 className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 p-1"
@@ -1416,6 +1423,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
             </div>
           </>
         )}
+      </div>
+      {preview.previewEffective && task && <WorkspacePreviewPanel state={preview} />}
       </div>
     </div>
   );

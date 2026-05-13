@@ -23,6 +23,8 @@ import {
   type Workspace,
 } from '../api/client';
 import { useDraft } from '../hooks/useDraft';
+import { useWorkspacePreview } from '../hooks/useWorkspacePreview';
+import WorkspacePreviewPanel, { PreviewToggleButton } from './WorkspacePreviewPanel';
 import { useTTSVoice } from '../hooks/useTTSVoice';
 import { useVoiceMode } from '../hooks/useVoiceMode';
 import { useVoiceRecorder } from '../hooks/useVoiceRecorder';
@@ -199,6 +201,8 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   // Keyed by task_request id; absent key means "use whatever's stored on the request".
   const [requestTargetOverride, setRequestTargetOverride] = useState<Record<string, string>>({});
   const [allRunningWorkspaces, setAllRunningWorkspaces] = useState<Workspace[] | null>(null);
+
+  const preview = useWorkspacePreview(workspaceId, discussionId);
 
   // Voice mode state
   const [voiceModeActive, setVoiceModeActive] = useState(false);
@@ -847,7 +851,8 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
       onClick={handleOverlayClick}
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
     >
-      <div className="bg-white dark:bg-gray-950 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 w-full max-w-3xl max-h-[90vh] flex flex-col">
+      <div className={`flex items-stretch gap-3 w-full ${preview.previewEffective ? '' : 'max-w-3xl'} max-h-[90vh]`}>
+      <div className="bg-white dark:bg-gray-950 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 w-full max-w-3xl shrink-0 max-h-[90vh] flex flex-col">
         {loading ? (
           <div className="p-8 text-center text-gray-500 dark:text-gray-400">Loading discussion...</div>
         ) : !discussion ? (
@@ -935,6 +940,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                   </span>
                 </div>
               </div>
+              <PreviewToggleButton state={preview} />
               <button
                 onClick={closeModal}
                 className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 p-1"
@@ -1339,6 +1345,8 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
             </div>
           </>
         )}
+      </div>
+      {preview.previewEffective && <WorkspacePreviewPanel state={preview} />}
       </div>
     </div>
   );

@@ -133,6 +133,10 @@ export function getDb(): Database.Database {
       db.exec("ALTER TABLE workspace_settings ADD COLUMN voice_ids TEXT");
     }
 
+    if (!wsCols.some(c => c.name === 'preview_url')) {
+      db.exec("ALTER TABLE workspace_settings ADD COLUMN preview_url TEXT");
+    }
+
     if (!wsCols.some(c => c.name === 'default_voice_id')) {
       db.exec("ALTER TABLE workspace_settings ADD COLUMN default_voice_id TEXT");
       // Migrate: single-kokoro voice_ids entries were auto-assigned defaults —

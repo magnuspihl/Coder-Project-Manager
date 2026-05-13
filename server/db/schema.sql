@@ -151,6 +151,7 @@ CREATE INDEX IF NOT EXISTS idx_task_participants ON task_participants(task_id, s
 CREATE TABLE IF NOT EXISTS workspace_settings (
   workspace_id TEXT PRIMARY KEY,
   discussion_full_access INTEGER NOT NULL DEFAULT 0,
+  preview_url TEXT,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

@@ -379,6 +379,15 @@ export const updateWorkspaceVoiceSettings = (workspaceId: string, voiceIds: stri
     body: JSON.stringify({ voiceIds }),
   });
 
+export const getPreviewSettings = (workspaceId: string) =>
+  request<{ previewUrl: string | null }>(`/api/workspaces/${workspaceId}/preview-settings`);
+
+export const updatePreviewSettings = (workspaceId: string, previewUrl: string | null) =>
+  request<{ ok: boolean; previewUrl: string | null }>(`/api/workspaces/${workspaceId}/preview-settings`, {
+    method: 'PATCH',
+    body: JSON.stringify({ previewUrl }),
+  });
+
 export const getDiscussionSettings = (workspaceId: string) =>
   request<{ fullAccess: boolean }>(`/api/workspaces/${workspaceId}/discussion-settings`);
 
