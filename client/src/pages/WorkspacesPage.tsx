@@ -19,6 +19,8 @@ import {
   getModels,
   getGitSettings,
   updateGitSettings,
+  getPreviewSettings,
+  updatePreviewSettings,
   getWorkspaceVoiceSettings,
   updateWorkspaceVoiceSettings,
   uploadFiles,
@@ -122,6 +124,10 @@ export default function WorkspacesPage() {
   const [chatCreating, setChatCreating] = useState(false);
   const [settingsOpenWsId, setSettingsOpenWsId] = useState<string | null>(null);
   const [gitPushSettings, setGitPushSettings] = useState<Record<string, boolean>>({});
+  const [previewUrlSettings, setPreviewUrlSettings] = useState<Record<string, string>>({});
+  const [previewUrlDrafts, setPreviewUrlDrafts] = useState<Record<string, string>>({});
+  const [previewUrlSaving, setPreviewUrlSaving] = useState<Record<string, boolean>>({});
+  const [previewUrlError, setPreviewUrlError] = useState<Record<string, string | null>>({});
   const [wsVoiceSettings, setWsVoiceSettings] = useState<Record<string, string[]>>({});
   const [wsDefaultVoices, setWsDefaultVoices] = useState<Record<string, string | null>>({});
   const [availableVoices, setAvailableVoices] = useState<Array<{ id: string; name: string }>>([]);
@@ -598,6 +604,15 @@ export default function WorkspacesPage() {
         setGitPushSettings(prev => ({ ...prev, [workspaceId]: gitPushEnabled }));
       } catch { /* default shown as true */ }
     }
+    // Fetch saved preview URL
+    if (!(workspaceId in previewUrlSettings)) {
+      try {
+        const { previewUrl } = await getPreviewSettings(workspaceId);
+        const v = previewUrl ?? '';
+        setPreviewUrlSettings(prev => ({ ...prev, [workspaceId]: v }));
+        setPreviewUrlDrafts(prev => ({ ...prev, [workspaceId]: v }));
+      } catch { /* leave empty */ }
+    }
     // Fetch voice settings — skip if key already present (optimistic add may have
     // raced ahead of this fetch; don't clobber the already-updated state)
     if (!(workspaceId in wsVoiceSettings)) {
@@ -650,6 +665,26 @@ export default function WorkspacesPage() {
       await updateWorkspaceVoiceSettings(workspaceId, next);
     } catch {
       setWsVoiceSettings(prev => ({ ...prev, [workspaceId]: current }));
+    }
+  };
+
+  const handleSavePreviewUrl = async (workspaceId: string) => {
+    const raw = (previewUrlDrafts[workspaceId] ?? '').trim();
+    const next = raw === '' ? null : raw;
+    setPreviewUrlSaving(prev => ({ ...prev, [workspaceId]: true }));
+    setPreviewUrlError(prev => ({ ...prev, [workspaceId]: null }));
+    try {
+      const { previewUrl } = await updatePreviewSettings(workspaceId, next);
+      const v = previewUrl ?? '';
+      setPreviewUrlSettings(prev => ({ ...prev, [workspaceId]: v }));
+      setPreviewUrlDrafts(prev => ({ ...prev, [workspaceId]: v }));
+    } catch (err: unknown) {
+      setPreviewUrlError(prev => ({
+        ...prev,
+        [workspaceId]: err instanceof Error ? err.message : 'Failed to save',
+      }));
+    } finally {
+      setPreviewUrlSaving(prev => ({ ...prev, [workspaceId]: false }));
     }
   };
 
@@ -973,6 +1008,42 @@ export default function WorkspacesPage() {
                 />
                 <span className="text-gray-600 dark:text-gray-300">Allow git remote operations</span>
               </label>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-gray-500 dark:text-gray-400 shrink-0">Preview URL:</span>
+                <input
+                  type="url"
+                  inputMode="url"
+                  placeholder="auto-detect from open ports"
+                  value={previewUrlDrafts[ws.id] ?? ''}
+                  onChange={(e) => setPreviewUrlDrafts(prev => ({ ...prev, [ws.id]: e.target.value }))}
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleSavePreviewUrl(ws.id); }}
+                  className="flex-1 min-w-[12rem] text-[11px] font-mono px-1.5 py-0.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200 focus:outline-none focus:border-blue-400"
+                />
+                {((previewUrlDrafts[ws.id] ?? '') !== (previewUrlSettings[ws.id] ?? '')) && (
+                  <button
+                    onClick={() => handleSavePreviewUrl(ws.id)}
+                    disabled={previewUrlSaving[ws.id]}
+                    className="text-[10px] px-2 py-0.5 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    {previewUrlSaving[ws.id] ? 'Saving…' : 'Save'}
+                  </button>
+                )}
+                {(previewUrlSettings[ws.id] ?? '') !== '' && ((previewUrlDrafts[ws.id] ?? '') === (previewUrlSettings[ws.id] ?? '')) && (
+                  <button
+                    onClick={() => {
+                      setPreviewUrlDrafts(prev => ({ ...prev, [ws.id]: '' }));
+                      handleSavePreviewUrl(ws.id);
+                    }}
+                    className="text-[10px] px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600 text-gray-500 hover:text-red-500 hover:border-red-300"
+                    title="Clear and auto-detect"
+                  >
+                    Clear
+                  </button>
+                )}
+                {previewUrlError[ws.id] && (
+                  <span className="text-[10px] text-red-500">{previewUrlError[ws.id]}</span>
+                )}
+              </div>
               <div className="flex items-center gap-1.5 flex-wrap">
                 <span className="text-gray-500 dark:text-gray-400 shrink-0">Voice:</span>
                 {(wsVoiceSettings[ws.id] ?? []).map((vid, idx) => {

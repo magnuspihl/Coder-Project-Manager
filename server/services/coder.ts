@@ -215,6 +215,55 @@ async function getListeningPorts(
   }
 }
 
+async function enrichWorkspaceWithPortsAndApps(token: string, ws: CoderWorkspace): Promise<void> {
+  if (ws.latest_build.status !== 'running') return;
+  for (const resource of ws.latest_build.resources) {
+    if (!resource.agents) continue;
+    for (const agent of resource.agents) {
+      if (agent.status !== 'connected') continue;
+      ws.listening_ports = await getListeningPorts(token, agent.id, agent.name, ws.name, ws.owner_name);
+      if (agent.apps && agent.apps.length > 0) {
+        const baseDomain = getCoderBaseDomain();
+        const appList = agent.apps
+          .filter((app) => app.health !== 'initializing')
+          .map((app) => {
+            let appUrl = app.url;
+            if (app.subdomain && baseDomain) {
+              appUrl = `https://${app.slug}--${agent.name.toLowerCase()}--${ws.name.toLowerCase()}--${ws.owner_name.toLowerCase()}.${baseDomain}`;
+            } else if (!app.external && baseDomain) {
+              appUrl = `${CODER_URL}/@${ws.owner_name}/${ws.name}.${agent.name}/apps/${app.slug}/`;
+            }
+            let icon = app.icon || '';
+            if (icon.startsWith('/')) {
+              icon = `${CODER_URL}${icon}`;
+            }
+            return {
+              slug: app.slug,
+              display_name: app.display_name,
+              icon,
+              favicon_url: null as string | null,
+              url: appUrl,
+              external: app.external,
+              subdomain: app.subdomain,
+            };
+          });
+        ws.apps = await Promise.all(
+          appList.map(async (app) => {
+            if (app.subdomain && app.url) {
+              const probe = await probePortUrl(app.url, token);
+              if (probe.favicon_url) {
+                app.favicon_url = probe.favicon_url;
+              }
+            }
+            return app;
+          }),
+        );
+      }
+      return;
+    }
+  }
+}
+
 export async function listWorkspaces(token: string): Promise<CoderWorkspace[]> {
   const res = await fetch(`${CODER_URL}/api/v2/workspaces`, {
     headers: { 'Coder-Session-Token': token },
@@ -225,65 +274,7 @@ export async function listWorkspaces(token: string): Promise<CoderWorkspace[]> {
   }
   const data = await res.json();
   const workspaces = data.workspaces as CoderWorkspace[];
-
-  // Fetch listening ports and apps for running workspaces in parallel
-  await Promise.all(workspaces.map(async (ws) => {
-    if (ws.latest_build.status !== 'running') return;
-    for (const resource of ws.latest_build.resources) {
-      if (resource.agents) {
-        for (const agent of resource.agents) {
-          if (agent.status === 'connected') {
-            ws.listening_ports = await getListeningPorts(token, agent.id, agent.name, ws.name, ws.owner_name);
-            // Extract registered apps from the agent
-            if (agent.apps && agent.apps.length > 0) {
-              const baseDomain = getCoderBaseDomain();
-              const appList = agent.apps
-                .filter((app) => app.health !== 'initializing')
-                .map((app) => {
-                  let appUrl = app.url;
-                  // For subdomain apps, build the proxied URL
-                  if (app.subdomain && baseDomain) {
-                    appUrl = `https://${app.slug}--${agent.name.toLowerCase()}--${ws.name.toLowerCase()}--${ws.owner_name.toLowerCase()}.${baseDomain}`;
-                  } else if (!app.external && baseDomain) {
-                    // Path-based app proxy
-                    appUrl = `${CODER_URL}/@${ws.owner_name}/${ws.name}.${agent.name}/apps/${app.slug}/`;
-                  }
-                  // Resolve relative icon paths against Coder URL
-                  let icon = app.icon || '';
-                  if (icon.startsWith('/')) {
-                    icon = `${CODER_URL}${icon}`;
-                  }
-
-                  return {
-                    slug: app.slug,
-                    display_name: app.display_name,
-                    icon,
-                    favicon_url: null as string | null,
-                    url: appUrl,
-                    external: app.external,
-                    subdomain: app.subdomain,
-                  };
-                });
-              // Probe subdomain apps for their site favicon
-              ws.apps = await Promise.all(
-                appList.map(async (app) => {
-                  if (app.subdomain && app.url) {
-                    const probe = await probePortUrl(app.url, token);
-                    if (probe.favicon_url) {
-                      app.favicon_url = probe.favicon_url;
-                    }
-                  }
-                  return app;
-                }),
-              );
-            }
-            return;
-          }
-        }
-      }
-    }
-  }));
-
+  await Promise.all(workspaces.map((ws) => enrichWorkspaceWithPortsAndApps(token, ws)));
   return workspaces;
 }
 
@@ -325,5 +316,7 @@ export async function getWorkspace(token: string, workspaceId: string): Promise<
     if (res.status === 401) throw new CoderAuthError('Coder token expired');
     throw new Error(`Failed to get workspace: ${res.status}`);
   }
-  return res.json() as Promise<CoderWorkspace>;
+  const ws = await res.json() as CoderWorkspace;
+  await enrichWorkspaceWithPortsAndApps(token, ws);
+  return ws;
 }

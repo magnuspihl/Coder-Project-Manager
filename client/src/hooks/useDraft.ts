@@ -36,6 +36,35 @@ export function useDraft(key: string, initial = ''): [string, (v: string) => voi
 }
 
 /**
+ * Like useState, but persists to localStorage so the value survives across
+ * tab closes and browser restarts. Per-device (each device has its own copy).
+ */
+export function useLocalStorageState<T>(key: string, initial: T): [T, (v: T) => void] {
+  const storageKey = `state:${key}`;
+
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const stored = localStorage.getItem(storageKey);
+      return stored !== null ? JSON.parse(stored) as T : initial;
+    } catch {
+      return initial;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      if (value === null || value === undefined) {
+        localStorage.removeItem(storageKey);
+      } else {
+        localStorage.setItem(storageKey, JSON.stringify(value));
+      }
+    } catch { /* ignore */ }
+  }, [storageKey, value]);
+
+  return [value, setValue];
+}
+
+/**
  * Persist a simple value (like an open panel ID) to sessionStorage.
  */
 export function useSessionState<T>(key: string, initial: T): [T, (v: T) => void] {
