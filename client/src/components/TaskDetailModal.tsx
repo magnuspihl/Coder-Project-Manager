@@ -74,6 +74,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [loading, setLoading] = useState(true);
   const [reply, setReply, clearReply] = useDraft(`reply:${taskId}`);
   const [sending, setSending] = useState(false);
+  const [optimisticMessage, setOptimisticMessage] = useState<Message | null>(null);
   const [idCopied, setIdCopied] = useState(false);
   const [checkingOut, setCheckingOut] = useState(false);
   const [settingActive, setSettingActive] = useState(false);
@@ -270,7 +271,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
         }
       }
     }
-  }, [loading, messages.length, streamLog.length]);
+  }, [loading, messages.length, streamLog.length, optimisticMessage?.id]);
 
   useEffect(() => {
     if (logOpen && logEndRef.current) {
@@ -386,6 +387,16 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     clearReply();
     setPendingFiles([]);
     setUploadedAttachmentIds([]);
+    setOptimisticMessage({
+      id: `optimistic-${Date.now()}`,
+      task_id: taskId,
+      role: 'user',
+      content: trimmed || 'See attached files.',
+      cost: null,
+      username: null,
+      participant_id: null,
+      created_at: new Date().toISOString(),
+    });
     try {
       await replyToTask(taskId, trimmed || 'See attached files.', attIds);
       closeAndNotify();
@@ -393,6 +404,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       setReply(trimmed);
     } finally {
       setSending(false);
+      setOptimisticMessage(null);
     }
   };
 
@@ -414,13 +426,23 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     clearReply();
     setPendingFiles([]);
     setUploadedAttachmentIds([]);
+    setOptimisticMessage({
+      id: `optimistic-${Date.now()}`,
+      task_id: taskId,
+      role: 'user',
+      content: trimmed || 'See attached files.',
+      cost: null,
+      username: null,
+      participant_id: null,
+      created_at: new Date().toISOString(),
+    });
     try {
       await replyToTask(taskId, trimmed || 'See attached files.', attIds);
       onTaskChanged?.();
       await loadData();
     } catch {
       setReply(trimmed);
-    } finally { setSending(false); }
+    } finally { setSending(false); setOptimisticMessage(null); }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reply, uploadedAttachmentIds, sending, taskId]);
 
@@ -587,6 +609,16 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     if (!trimmed || !targetParticipantId) return;
     setSending(true);
     clearReply();
+    setOptimisticMessage({
+      id: `optimistic-${Date.now()}`,
+      task_id: taskId,
+      role: 'user',
+      content: trimmed,
+      cost: null,
+      username: null,
+      participant_id: targetParticipantId,
+      created_at: new Date().toISOString(),
+    });
     try {
       await sendTaskParticipantMessage(taskId, targetParticipantId, trimmed);
       await loadData();
@@ -594,6 +626,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       setReply(trimmed);
     } finally {
       setSending(false);
+      setOptimisticMessage(null);
     }
   };
 
@@ -900,6 +933,25 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                 );
               })}
 
+              {optimisticMessage && (
+                <div className="rounded-lg p-4 bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800 ml-8 opacity-70">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-xs font-medium uppercase text-gray-500 dark:text-gray-400">
+                      user
+                      {optimisticMessage.participant_id && (
+                        <span className="ml-1 normal-case font-normal opacity-70">
+                          → {participants.find(p => p.id === optimisticMessage.participant_id)?.workspace_name || 'advisor'}
+                        </span>
+                      )}
+                    </span>
+                    <span className="text-xs text-gray-400 dark:text-gray-500">
+                      {new Date(optimisticMessage.created_at).toLocaleTimeString()}
+                    </span>
+                  </div>
+                  <Markdown content={optimisticMessage.content} breaks />
+                </div>
+              )}
+
               {attachments.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 px-1">
                   {attachments.map(att => (
@@ -918,18 +970,18 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                 </div>
               )}
 
-              {task.status === 'working' && (
+              {(task.status === 'working' || (sending && !targetParticipantId)) && (
                 <div className="text-sm text-blue-600 dark:text-blue-400 p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg border border-blue-100 dark:border-blue-800">
                   <div className="flex items-center gap-2">
                     <div className="animate-spin h-4 w-4 border-2 border-blue-600 dark:border-blue-400 border-t-transparent rounded-full" />
-                    <span>Claude is working...</span>
-                    {task.activity && (
+                    <span>{task.status === 'working' ? 'Claude is working...' : 'Sending message...'}</span>
+                    {task.status === 'working' && task.activity && (
                       <span className="text-xs text-gray-400 dark:text-gray-500 ml-auto">
                         Last activity {timeAgo(task.activity.timestamp)}
                       </span>
                     )}
                   </div>
-                  {task.activity && (
+                  {task.status === 'working' && task.activity && (
                     <p className="mt-1 text-xs text-blue-500 dark:text-blue-300 truncate ml-6">
                       {linkify(task.activity.summary)}
                     </p>
@@ -956,6 +1008,16 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   )}
                 </div>
               ))}
+
+              {/* Sending-to-participant transient indicator (before polling picks up running state) */}
+              {sending && targetParticipantId && !participants.find(p => p.id === targetParticipantId)?.running && (
+                <div className="text-sm text-teal-600 dark:text-teal-400 p-4 bg-teal-50 dark:bg-teal-900/20 rounded-lg border border-teal-100 dark:border-teal-800">
+                  <div className="flex items-center gap-2">
+                    <div className="animate-spin h-4 w-4 border-2 border-teal-600 dark:border-teal-400 border-t-transparent rounded-full" />
+                    <span>Sending message...</span>
+                  </div>
+                </div>
+              )}
 
               {/* Stream Log */}
               {streamLog.length > 0 && (

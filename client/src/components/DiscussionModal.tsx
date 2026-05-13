@@ -168,6 +168,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const [loading, setLoading] = useState(true);
   const [message, setMessage, clearMessage] = useDraft(`discussion:${discussionId}`);
   const [sending, setSending] = useState(false);
+  const [optimisticMessage, setOptimisticMessage] = useState<DiscussionMessage | null>(null);
   const [editingSession, setEditingSession] = useState(false);
   const [sessionIdDraft, setSessionIdDraft] = useState('');
   const [sessionError, setSessionError] = useState('');
@@ -406,7 +407,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
         }
       }
     }
-  }, [loading, messages.length]);
+  }, [loading, messages.length, optimisticMessage?.id]);
 
   // Browser back button
   useEffect(() => {
@@ -712,6 +713,16 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     setSending(true);
     clearMessage();
     shouldForceScroll.current = true;
+    setOptimisticMessage({
+      id: `optimistic-${Date.now()}`,
+      discussion_id: discussionId,
+      role: 'user',
+      content: trimmed,
+      cost: null,
+      username: null,
+      participant_id: targetId,
+      created_at: new Date().toISOString(),
+    });
     try {
       if (targetId) {
         await sendParticipantMessage(discussionId, targetId, trimmed);
@@ -723,6 +734,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
       setMessage(trimmed);
     } finally {
       setSending(false);
+      setOptimisticMessage(null);
     }
   };
 
@@ -969,8 +981,14 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                 return <MessageRow key={msg.id} msg={msg} hostWorkspaceName={workspaceName} participants={participants} onSpeak={onSpeak} isSpeaking={ttsSpeakingId === msg.id} />;
               })}
 
+              {optimisticMessage && (
+                <div className="opacity-70">
+                  <MessageRow msg={optimisticMessage} hostWorkspaceName={workspaceName} participants={participants} />
+                </div>
+              )}
+
               {/* Working indicator */}
-              {isAnyRunning && (
+              {(isAnyRunning || sending) && (
                 <div className={`text-sm p-4 rounded-lg border ${
                   runningParticipant
                     ? 'text-teal-600 dark:text-teal-400 bg-teal-50 dark:bg-teal-900/20 border-teal-100 dark:border-teal-800'
@@ -980,23 +998,25 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                     <div className={`animate-spin h-4 w-4 border-2 border-t-transparent rounded-full ${
                       runningParticipant ? 'border-teal-600 dark:border-teal-400' : 'border-purple-600 dark:border-purple-400'
                     }`} />
-                    <span>{runningAgentName || 'Agent'} is thinking...</span>
+                    <span>{isAnyRunning ? `${runningAgentName || 'Agent'} is thinking...` : 'Sending message...'}</span>
                     {(discussion.activity || runningParticipant?.activity) && (
                       <span className="text-xs text-gray-400 dark:text-gray-500 ml-auto">
                         {timeAgo((runningParticipant?.activity || discussion.activity)!.timestamp)}
                       </span>
                     )}
-                    <button
-                      onClick={async () => {
-                        try { await interruptDiscussion(discussionId); } catch {}
-                      }}
-                      className="ml-auto text-amber-500 hover:text-amber-600 dark:text-amber-400 dark:hover:text-amber-300 p-1 rounded hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors"
-                      title="Interrupt"
-                    >
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                        <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zM7 8a1 1 0 012 0v4a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" />
-                      </svg>
-                    </button>
+                    {isAnyRunning && (
+                      <button
+                        onClick={async () => {
+                          try { await interruptDiscussion(discussionId); } catch {}
+                        }}
+                        className="ml-auto text-amber-500 hover:text-amber-600 dark:text-amber-400 dark:hover:text-amber-300 p-1 rounded hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors"
+                        title="Interrupt"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                          <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zM7 8a1 1 0 012 0v4a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" />
+                        </svg>
+                      </button>
+                    )}
                   </div>
                   {(discussion.activity || runningParticipant?.activity) && (
                     <p className={`mt-1 text-xs truncate ml-6 ${
