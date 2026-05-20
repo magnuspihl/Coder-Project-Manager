@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, type FormEvent } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback, type FormEvent } from 'react';
 import {
   getTaskDetail,
   getStreamLog,
@@ -100,6 +100,18 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastParticipantsJsonRef = useRef('');
+
+  // @-mention autocomplete. Same shape and behavior as DiscussionModal — when
+  // there are participants, typing '@' (or tapping the "@ Mention" pill on
+  // mobile) opens a picker for inserting an agent name into the reply.
+  const replyTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const isComposingRef = useRef(false);
+  const [mentionMenu, setMentionMenu] = useState<{
+    open: boolean;
+    anchorStart: number;
+    query: string;
+    selectedIndex: number;
+  }>({ open: false, anchorStart: -1, query: '', selectedIndex: 0 });
   const prevStatusRef = useRef<string | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
@@ -413,12 +425,224 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     }
   };
 
+  const mentionCandidates = useMemo(() => {
+    const hostName = task?.workspace_name;
+    const names = [hostName, ...participants.map(p => p.workspace_name)].filter(
+      (n): n is string => typeof n === 'string' && n.length > 0,
+    );
+    return Array.from(new Set(names));
+  }, [task?.workspace_name, participants]);
+
+  const mentionMatches = useMemo(() => {
+    if (!mentionMenu.open) return [];
+    const q = mentionMenu.query.toLowerCase();
+    if (!q) return mentionCandidates;
+    return mentionCandidates.filter(n => n.toLowerCase().includes(q));
+  }, [mentionMenu.open, mentionMenu.query, mentionCandidates]);
+
+  const detectMention = (text: string, caret: number): { start: number; query: string } | null => {
+    let i = caret - 1;
+    while (i >= 0) {
+      const ch = text[i];
+      if (ch === '@') {
+        if (i === 0 || /\s/.test(text[i - 1])) {
+          const query = text.slice(i + 1, caret);
+          if (/\s/.test(query)) return null;
+          return { start: i, query };
+        }
+        return null;
+      }
+      if (/\s/.test(ch)) return null;
+      i--;
+    }
+    return null;
+  };
+
+  const refreshMentionMenu = useCallback((value: string, caret: number) => {
+    if (participants.length === 0) {
+      if (mentionMenu.open) setMentionMenu({ open: false, anchorStart: -1, query: '', selectedIndex: 0 });
+      return;
+    }
+    const ctx = detectMention(value, caret);
+    if (ctx) {
+      setMentionMenu(prev => ({
+        open: true,
+        anchorStart: ctx.start,
+        query: ctx.query,
+        selectedIndex: prev.open && prev.query === ctx.query ? prev.selectedIndex : 0,
+      }));
+    } else if (mentionMenu.open) {
+      setMentionMenu({ open: false, anchorStart: -1, query: '', selectedIndex: 0 });
+    }
+  }, [participants.length, mentionMenu.open]);
+
+  const handleReplyChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const value = e.target.value;
+    setReply(value);
+    if (isComposingRef.current) return;
+    const caret = e.target.selectionStart ?? value.length;
+    refreshMentionMenu(value, caret);
+  };
+
+  const handleReplyCompositionEnd = (e: React.CompositionEvent<HTMLTextAreaElement>) => {
+    isComposingRef.current = false;
+    const el = e.currentTarget;
+    refreshMentionMenu(el.value, el.selectionStart ?? el.value.length);
+  };
+
+  const handleReplySelect = (e: React.SyntheticEvent<HTMLTextAreaElement>) => {
+    if (isComposingRef.current) return;
+    const el = e.currentTarget;
+    refreshMentionMenu(el.value, el.selectionStart ?? el.value.length);
+  };
+
+  const openMentionMenu = () => {
+    const el = replyTextareaRef.current;
+    const caret = el?.selectionStart ?? reply.length;
+    const before = reply.slice(0, caret);
+    const after = reply.slice(caret);
+    const needsLeadingSpace = before.length > 0 && !/\s$/.test(before);
+    const insert = (needsLeadingSpace ? ' ' : '') + '@';
+    const next = before + insert + after;
+    const atIndex = before.length + insert.length - 1;
+    setReply(next);
+    setMentionMenu({ open: true, anchorStart: atIndex, query: '', selectedIndex: 0 });
+    requestAnimationFrame(() => {
+      const t = replyTextareaRef.current;
+      if (!t) return;
+      t.focus();
+      const c = atIndex + 1;
+      t.setSelectionRange(c, c);
+    });
+  };
+
+  const insertMention = (name: string) => {
+    if (!mentionMenu.open || mentionMenu.anchorStart < 0) return;
+    const before = reply.slice(0, mentionMenu.anchorStart);
+    const caret = replyTextareaRef.current?.selectionStart ?? reply.length;
+    const after = reply.slice(caret);
+    const inserted = `@${name} `;
+    const next = before + inserted + after;
+    setReply(next);
+    setMentionMenu({ open: false, anchorStart: -1, query: '', selectedIndex: 0 });
+    const newCaret = before.length + inserted.length;
+    requestAnimationFrame(() => {
+      const el = replyTextareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(newCaret, newCaret);
+    });
+  };
+
   const handleReplyKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (mentionMenu.open && mentionMatches.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setMentionMenu(m => ({ ...m, selectedIndex: (m.selectedIndex + 1) % mentionMatches.length }));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setMentionMenu(m => ({
+          ...m,
+          selectedIndex: (m.selectedIndex - 1 + mentionMatches.length) % mentionMatches.length,
+        }));
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        const pick = mentionMatches[Math.min(mentionMenu.selectedIndex, mentionMatches.length - 1)];
+        if (pick) insertMention(pick);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setMentionMenu({ open: false, anchorStart: -1, query: '', selectedIndex: 0 });
+        return;
+      }
+    }
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       handleReply();
     }
   };
+
+  // Variant used by the "Send to participant" textarea — same mention-menu
+  // behavior, but Ctrl/Cmd+Enter submits to the participant form instead.
+  const handleParticipantReplyKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (mentionMenu.open && mentionMatches.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setMentionMenu(m => ({ ...m, selectedIndex: (m.selectedIndex + 1) % mentionMatches.length }));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setMentionMenu(m => ({
+          ...m,
+          selectedIndex: (m.selectedIndex - 1 + mentionMatches.length) % mentionMatches.length,
+        }));
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        const pick = mentionMatches[Math.min(mentionMenu.selectedIndex, mentionMatches.length - 1)];
+        if (pick) insertMention(pick);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setMentionMenu({ open: false, anchorStart: -1, query: '', selectedIndex: 0 });
+        return;
+      }
+    }
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      handleSendToParticipant();
+    }
+  };
+
+  // Reusable mention-dropdown JSX. Rendered above whichever textarea is active.
+  const mentionDropdown = mentionMenu.open && mentionMatches.length > 0 ? (
+    <div
+      className="absolute bottom-full left-0 mb-1 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl z-50 min-w-[200px] max-h-[200px] overflow-y-auto"
+      role="listbox"
+    >
+      <div className="px-3 py-1 text-[10px] text-gray-400 dark:text-gray-500 uppercase tracking-wide border-b border-gray-100 dark:border-gray-800">
+        Mention agent
+      </div>
+      {mentionMatches.map((name, idx) => {
+        const isHost = name === task?.workspace_name;
+        const isSelected = idx === mentionMenu.selectedIndex;
+        return (
+          <button
+            key={name}
+            type="button"
+            role="option"
+            aria-selected={isSelected}
+            onMouseDown={(e) => {
+              e.preventDefault();
+              insertMention(name);
+            }}
+            onMouseEnter={() => setMentionMenu(m => ({ ...m, selectedIndex: idx }))}
+            className={`w-full text-left text-xs px-3 py-2 flex items-center gap-2 ${
+              isSelected
+                ? isHost
+                  ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300'
+                  : 'bg-teal-50 dark:bg-teal-900/30 text-teal-700 dark:text-teal-300'
+                : 'text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800'
+            }`}
+          >
+            <span className={`inline-block h-1.5 w-1.5 rounded-full ${isHost ? 'bg-blue-500' : 'bg-teal-500'}`} />
+            <span className="font-medium">{name}</span>
+            {isHost && (
+              <span className="ml-auto text-[10px] uppercase opacity-60">task agent</span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  ) : null;
 
   // Like handleReply but stays in the modal — used by voice auto-send so the
   // conversation loop continues instead of closing the task detail view.
@@ -1111,6 +1335,16 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                           </button>
                         </div>
                       ))}
+                      {/* @-mention trigger — tappable fallback for mobile where the
+                          textarea may not fire onChange cleanly for the @ key. */}
+                      <button
+                        type="button"
+                        onClick={openMentionMenu}
+                        title="Mention an agent"
+                        className="text-xs px-2 py-1 rounded-full border border-dashed border-gray-300 dark:border-gray-600 text-gray-400 dark:text-gray-500 hover:border-teal-400 hover:text-teal-600 dark:hover:border-teal-600 dark:hover:text-teal-400 transition-colors"
+                      >
+                        @ Mention
+                      </button>
                       {/* Invite button in selector bar */}
                       <div className="relative">
                         <button
@@ -1151,16 +1385,25 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   {targetParticipantId ? (
                     /* Sending to a participant */
                     <form onSubmit={handleSendToParticipant} className="flex flex-col gap-2">
-                      <textarea
-                        value={reply}
-                        onChange={(e) => setReply(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); handleSendToParticipant(); } }}
-                        placeholder={anyParticipantRunning ? 'Advisor is thinking...' : `Ask ${participants.find(p => p.id === targetParticipantId)?.workspace_name || 'advisor'}...`}
-                        rows={3}
-                        autoFocus
-                        disabled={sending || anyParticipantRunning}
-                        className="w-full px-3 py-2 border border-teal-300 dark:border-teal-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-teal-500 resize-y disabled:opacity-50"
-                      />
+                      <div className="relative">
+                        <textarea
+                          ref={replyTextareaRef}
+                          value={reply}
+                          onChange={handleReplyChange}
+                          onKeyDown={handleParticipantReplyKeyDown}
+                          onSelect={handleReplySelect}
+                          onCompositionStart={() => { isComposingRef.current = true; }}
+                          onCompositionEnd={handleReplyCompositionEnd}
+                          placeholder={anyParticipantRunning
+                            ? 'Advisor is thinking...'
+                            : `${`Ask ${participants.find(p => p.id === targetParticipantId)?.workspace_name || 'advisor'}...`}${participants.length > 0 ? ' (type @ to mention)' : ''}`}
+                          rows={3}
+                          autoFocus
+                          disabled={sending || anyParticipantRunning}
+                          className="w-full px-3 py-2 border border-teal-300 dark:border-teal-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-teal-500 resize-y disabled:opacity-50"
+                        />
+                        {mentionDropdown}
+                      </div>
                       <button
                         type="submit"
                         disabled={sending || !reply.trim() || anyParticipantRunning}
@@ -1172,16 +1415,27 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   ) : (
                     /* Sending to the task agent (normal reply) */
                     <form onSubmit={handleReply} className="flex flex-col gap-2">
-                      <textarea
-                        value={reply}
-                        onChange={(e) => setReply(e.target.value)}
-                        onKeyDown={handleReplyKeyDown}
-                        placeholder={anyParticipantRunning ? 'Advisor is thinking...' : 'Reply with feedback...'}
-                        rows={3}
-                        autoFocus
-                        disabled={anyParticipantRunning}
-                        className="w-full px-3 py-2 border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y disabled:opacity-50"
-                      />
+                      <div className="relative">
+                        <textarea
+                          ref={replyTextareaRef}
+                          value={reply}
+                          onChange={handleReplyChange}
+                          onKeyDown={handleReplyKeyDown}
+                          onSelect={handleReplySelect}
+                          onCompositionStart={() => { isComposingRef.current = true; }}
+                          onCompositionEnd={handleReplyCompositionEnd}
+                          placeholder={anyParticipantRunning
+                            ? 'Advisor is thinking...'
+                            : participants.length > 0
+                              ? 'Reply with feedback... (type @ to mention)'
+                              : 'Reply with feedback...'}
+                          rows={3}
+                          autoFocus
+                          disabled={anyParticipantRunning}
+                          className="w-full px-3 py-2 border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y disabled:opacity-50"
+                        />
+                        {mentionDropdown}
+                      </div>
                       {pendingFiles.length > 0 && (
                         <div className="flex flex-wrap gap-1.5">
                           {pendingFiles.map((f, i) => (
