@@ -1616,9 +1616,9 @@ export async function launchDiscussion(
       if (sessionPath) {
         remoteSessionExists = true;
         // If the session isn't in the project dir's scope, fall back to home dir.
-        // Claude encodes /home/coder/my-project as -home-coder-my-project
+        // Claude encodes every non-alphanumeric char as '-', so /home/coder/My.App → -home-coder-My-App
         const projectDirEncoded = discussion.project_dir
-          ? '-' + discussion.project_dir.replace(/^\//, '').replace(/\//g, '-')
+          ? discussion.project_dir.replace(/[^a-zA-Z0-9]/g, '-')
           : null;
         if (projectDirEncoded && !sessionPath.includes(`/projects/${projectDirEncoded}/`)) {
           sessionWorkDir = '/home/coder';
@@ -2000,7 +2000,7 @@ export async function launchParticipantDiscussion(
       if (checkResult.trim()) {
         remoteSessionExists = true;
         const projectDirEncoded = participant.project_dir
-          ? '-' + participant.project_dir.replace(/^\//, '').replace(/\//g, '-')
+          ? participant.project_dir.replace(/[^a-zA-Z0-9]/g, '-')
           : null;
         if (projectDirEncoded && !checkResult.includes(`/projects/${projectDirEncoded}/`)) {
           sessionWorkDir = '/home/coder';
@@ -2314,7 +2314,7 @@ export async function launchTaskParticipant(
       if (checkResult.trim()) {
         remoteSessionExists = true;
         const projectDirEncoded = participant.project_dir
-          ? '-' + participant.project_dir.replace(/^\//, '').replace(/\//g, '-')
+          ? participant.project_dir.replace(/[^a-zA-Z0-9]/g, '-')
           : null;
         if (projectDirEncoded && !checkResult.includes(`/projects/${projectDirEncoded}/`)) {
           sessionWorkDir = '/home/coder';
