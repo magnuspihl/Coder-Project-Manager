@@ -197,6 +197,17 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const [loadingWorkspaces, setLoadingWorkspaces] = useState(false);
   const lastParticipantsJsonRef = useRef('');
 
+  // @-mention autocomplete state. anchorStart is the index of the '@' in the
+  // textarea value; query is the text typed after it.
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const isComposingRef = useRef(false);
+  const [mentionMenu, setMentionMenu] = useState<{
+    open: boolean;
+    anchorStart: number;
+    query: string;
+    selectedIndex: number;
+  }>({ open: false, anchorStart: -1, query: '', selectedIndex: 0 });
+
   // Per-request target override (lets user change destination before approving).
   // Keyed by task_request id; absent key means "use whatever's stored on the request".
   const [requestTargetOverride, setRequestTargetOverride] = useState<Record<string, string>>({});
@@ -754,7 +765,155 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     handleSend();
   }, [message]);
 
+  // Full set of agents the user can mention: host + invited participants.
+  const mentionCandidates = useMemo(() => {
+    const names = [workspaceName, ...participants.map(p => p.workspace_name)];
+    // Deduplicate (shouldn't happen, but be safe) while preserving order.
+    return Array.from(new Set(names));
+  }, [workspaceName, participants]);
+
+  // Filtered list shown in the dropdown based on the typed query.
+  const mentionMatches = useMemo(() => {
+    if (!mentionMenu.open) return [];
+    const q = mentionMenu.query.toLowerCase();
+    if (!q) return mentionCandidates;
+    return mentionCandidates.filter(n => n.toLowerCase().includes(q));
+  }, [mentionMenu.open, mentionMenu.query, mentionCandidates]);
+
+  // Walk back from the caret to detect a valid "@query" being typed.
+  // Returns the @ index and the query text, or null if not in a mention.
+  const detectMention = (text: string, caret: number): { start: number; query: string } | null => {
+    let i = caret - 1;
+    while (i >= 0) {
+      const ch = text[i];
+      if (ch === '@') {
+        if (i === 0 || /\s/.test(text[i - 1])) {
+          const query = text.slice(i + 1, caret);
+          if (/\s/.test(query)) return null;
+          return { start: i, query };
+        }
+        return null;
+      }
+      if (/\s/.test(ch)) return null;
+      i--;
+    }
+    return null;
+  };
+
+  // Run mention detection against a given text + caret. Used both from onChange
+  // and from onSelect (so moving the caret next to an existing '@' re-opens the
+  // menu) and after composition ends.
+  const refreshMentionMenu = useCallback((value: string, caret: number) => {
+    if (participants.length === 0) {
+      if (mentionMenu.open) setMentionMenu({ open: false, anchorStart: -1, query: '', selectedIndex: 0 });
+      return;
+    }
+    const ctx = detectMention(value, caret);
+    if (ctx) {
+      setMentionMenu(prev => ({
+        open: true,
+        anchorStart: ctx.start,
+        query: ctx.query,
+        selectedIndex: prev.open && prev.query === ctx.query ? prev.selectedIndex : 0,
+      }));
+    } else if (mentionMenu.open) {
+      setMentionMenu({ open: false, anchorStart: -1, query: '', selectedIndex: 0 });
+    }
+  }, [participants.length, mentionMenu.open]);
+
+  const handleMessageChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const value = e.target.value;
+    setMessage(value);
+    // Don't try to detect mid-IME composition — selection/value are unstable.
+    if (isComposingRef.current) return;
+    const caret = e.target.selectionStart ?? value.length;
+    refreshMentionMenu(value, caret);
+  };
+
+  const handleCompositionEnd = (e: React.CompositionEvent<HTMLTextAreaElement>) => {
+    isComposingRef.current = false;
+    const el = e.currentTarget;
+    refreshMentionMenu(el.value, el.selectionStart ?? el.value.length);
+  };
+
+  const handleSelect = (e: React.SyntheticEvent<HTMLTextAreaElement>) => {
+    if (isComposingRef.current) return;
+    const el = e.currentTarget;
+    refreshMentionMenu(el.value, el.selectionStart ?? el.value.length);
+  };
+
+  // Mobile-friendly: tap to insert "@" at the caret and open the menu directly,
+  // bypassing any keyboard-event quirks (composition, autocorrect) that prevent
+  // the onChange-based detection from firing.
+  const openMentionMenu = () => {
+    const el = textareaRef.current;
+    const caret = el?.selectionStart ?? message.length;
+    const before = message.slice(0, caret);
+    const after = message.slice(caret);
+    // Insert a space before '@' if needed so detection always recognises it.
+    const needsLeadingSpace = before.length > 0 && !/\s$/.test(before);
+    const insert = (needsLeadingSpace ? ' ' : '') + '@';
+    const next = before + insert + after;
+    const atIndex = before.length + insert.length - 1; // position of the '@'
+    setMessage(next);
+    setMentionMenu({ open: true, anchorStart: atIndex, query: '', selectedIndex: 0 });
+    requestAnimationFrame(() => {
+      const t = textareaRef.current;
+      if (!t) return;
+      t.focus();
+      const c = atIndex + 1;
+      t.setSelectionRange(c, c);
+    });
+  };
+
+  const insertMention = (name: string) => {
+    if (!mentionMenu.open || mentionMenu.anchorStart < 0) return;
+    const before = message.slice(0, mentionMenu.anchorStart);
+    const caret = textareaRef.current?.selectionStart ?? message.length;
+    const after = message.slice(caret);
+    // Insert "@Name " (with trailing space) so the next token starts cleanly.
+    const inserted = `@${name} `;
+    const next = before + inserted + after;
+    setMessage(next);
+    setMentionMenu({ open: false, anchorStart: -1, query: '', selectedIndex: 0 });
+    // Restore caret position right after the inserted mention (next animation frame
+    // because React updates the textarea value asynchronously).
+    const newCaret = before.length + inserted.length;
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(newCaret, newCaret);
+    });
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (mentionMenu.open && mentionMatches.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setMentionMenu(m => ({ ...m, selectedIndex: (m.selectedIndex + 1) % mentionMatches.length }));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setMentionMenu(m => ({
+          ...m,
+          selectedIndex: (m.selectedIndex - 1 + mentionMatches.length) % mentionMatches.length,
+        }));
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        const pick = mentionMatches[Math.min(mentionMenu.selectedIndex, mentionMatches.length - 1)];
+        if (pick) insertMention(pick);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setMentionMenu({ open: false, anchorStart: -1, query: '', selectedIndex: 0 });
+        return;
+      }
+    }
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       handleSend();
@@ -1158,6 +1317,16 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                       </button>
                     </div>
                   ))}
+                  {/* @-mention trigger — works on mobile where the keyboard may not fire
+                      the @ keypress reliably. */}
+                  <button
+                    type="button"
+                    onClick={openMentionMenu}
+                    title="Mention an agent"
+                    className="text-xs px-2 py-1 rounded-full border border-dashed border-gray-300 dark:border-gray-600 text-gray-400 dark:text-gray-500 hover:border-teal-400 hover:text-teal-600 dark:hover:border-teal-600 dark:hover:text-teal-400 transition-colors"
+                  >
+                    @ Mention
+                  </button>
                   {/* Invite button */}
                   <div className="relative">
                     <button
@@ -1196,20 +1365,75 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
               )}
 
               <form onSubmit={handleSend} className="flex flex-col gap-2">
-                <textarea
-                  value={message}
-                  onChange={(e) => setMessage(e.target.value)}
-                  onKeyDown={handleKeyDown}
-                  placeholder={isAnyRunning ? `${runningAgentName || 'Agent'} is thinking...` : `Message ${targetName}...`}
-                  rows={3}
-                  autoFocus
-                  disabled={sending || isAnyRunning}
-                  className={`w-full px-3 py-2 border bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 resize-y disabled:opacity-50 ${
-                    targetId
-                      ? 'border-teal-300 dark:border-teal-700 focus:ring-teal-500'
-                      : 'border-gray-300 dark:border-gray-700 focus:ring-purple-500'
-                  }`}
-                />
+                <div className="relative">
+                  <textarea
+                    ref={textareaRef}
+                    value={message}
+                    onChange={handleMessageChange}
+                    onKeyDown={handleKeyDown}
+                    onSelect={handleSelect}
+                    onCompositionStart={() => { isComposingRef.current = true; }}
+                    onCompositionEnd={handleCompositionEnd}
+                    placeholder={isAnyRunning
+                      ? `${runningAgentName || 'Agent'} is thinking...`
+                      : participants.length > 0
+                        ? `Message ${targetName}... (type @ to mention)`
+                        : `Message ${targetName}...`}
+                    rows={3}
+                    autoFocus
+                    disabled={sending || isAnyRunning}
+                    className={`w-full px-3 py-2 border bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 resize-y disabled:opacity-50 ${
+                      targetId
+                        ? 'border-teal-300 dark:border-teal-700 focus:ring-teal-500'
+                        : 'border-gray-300 dark:border-gray-700 focus:ring-purple-500'
+                    }`}
+                  />
+                  {mentionMenu.open && mentionMatches.length > 0 && (
+                    <div
+                      className="absolute bottom-full left-0 mb-1 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl z-50 min-w-[200px] max-h-[200px] overflow-y-auto"
+                      role="listbox"
+                    >
+                      <div className="px-3 py-1 text-[10px] text-gray-400 dark:text-gray-500 uppercase tracking-wide border-b border-gray-100 dark:border-gray-800">
+                        Mention agent
+                      </div>
+                      {mentionMatches.map((name, idx) => {
+                        const isHost = name === workspaceName;
+                        const isSelected = idx === mentionMenu.selectedIndex;
+                        return (
+                          <button
+                            key={name}
+                            type="button"
+                            role="option"
+                            aria-selected={isSelected}
+                            onMouseDown={(e) => {
+                              // Prevent textarea blur before click fires.
+                              e.preventDefault();
+                              insertMention(name);
+                            }}
+                            onMouseEnter={() => setMentionMenu(m => ({ ...m, selectedIndex: idx }))}
+                            className={`w-full text-left text-xs px-3 py-2 flex items-center gap-2 ${
+                              isSelected
+                                ? isHost
+                                  ? 'bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300'
+                                  : 'bg-teal-50 dark:bg-teal-900/30 text-teal-700 dark:text-teal-300'
+                                : 'text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800'
+                            }`}
+                          >
+                            <span
+                              className={`inline-block h-1.5 w-1.5 rounded-full ${
+                                isHost ? 'bg-purple-500' : 'bg-teal-500'
+                              }`}
+                            />
+                            <span className="font-medium">{name}</span>
+                            {isHost && (
+                              <span className="ml-auto text-[10px] uppercase opacity-60">host</span>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-3">
                     <button
