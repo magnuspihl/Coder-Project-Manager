@@ -634,11 +634,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   };
 
   const closeModal = () => {
-    if (window.history.state?.modal === 'discussion') {
-      window.history.back();
-    } else {
-      onClose();
-    }
+    onClose();
   };
 
   // Lazy-load the running workspace list once a pending task request appears,
