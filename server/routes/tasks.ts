@@ -428,6 +428,46 @@ router.post('/tasks/:taskId/reset-session', requireAuth, async (req: Request, re
   res.json({ task: getTask(task.id) });
 });
 
+// Compact a task's Claude session — sends the `/compact` slash command via
+// --resume so Claude Code summarizes prior turns and frees up context.
+// Preserves the session id (unlike reset-session).
+router.post('/tasks/:taskId/compact-session', requireAuth, async (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  if (task.status === 'working') {
+    res.status(409).json({ error: 'Interrupt the task before compacting its session.' });
+    return;
+  }
+  if (task.status !== 'failed' && task.status !== 'awaiting_feedback' && task.status !== 'cancelled') {
+    res.status(400).json({ error: `Cannot compact session for a ${task.status} task.` });
+    return;
+  }
+  if (!task.claude_session_id || task.session_initialized === 0) {
+    res.status(400).json({ error: 'No Claude session to compact yet — the task must have run at least once.' });
+    return;
+  }
+  const msgs = getMessages(task.id);
+  if (!msgs.some(m => m.role === 'assistant')) {
+    res.status(400).json({ error: 'No assistant turns to compact yet.' });
+    return;
+  }
+
+  addMessage(task.id, 'system', 'Compacting session — Claude will summarize prior turns to free up context.');
+  addMessage(task.id, 'user', '/compact', undefined, req.user!.username);
+
+  if (task.pending_complete) {
+    setPendingComplete(task.id, false);
+  }
+
+  updateTaskStatus(task.id, 'queued');
+  await processQueue(task.workspace_id);
+
+  res.json({ task: getTask(task.id) });
+});
+
 // Interrupt a working task (kills process but transitions to 'awaiting_feedback' so user can continue)
 router.post('/tasks/:taskId/interrupt', requireAuth, (req: Request, res: Response) => {
   const task = getTask(req.params.taskId);
