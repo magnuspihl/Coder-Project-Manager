@@ -90,6 +90,7 @@ export interface Task {
   model: string | null;
   caveman: string | null;
   pending_complete?: number;
+  session_initialized?: number;
   total_input_tokens: number;
   total_output_tokens: number;
   total_cost_usd?: number;
@@ -269,6 +270,12 @@ export const reopenTask = (taskId: string) =>
 
 export const retryTask = (taskId: string) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/retry`, { method: 'POST' });
+
+export const resetTaskSession = (taskId: string, continuationPrompt: string) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}/reset-session`, {
+    method: 'POST',
+    body: JSON.stringify({ continuationPrompt }),
+  });
 
 export const checkoutTaskBranch = (taskId: string) =>
   request<{ ok: boolean; message: string }>(`/api/tasks/${taskId}/checkout`, { method: 'POST' });

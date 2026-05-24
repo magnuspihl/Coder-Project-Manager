@@ -6,6 +6,7 @@ import {
   completeTask,
   reopenTask,
   retryTask,
+  resetTaskSession,
   updateTaskTitle,
   interruptTask,
   cancelTask,
@@ -82,6 +83,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [settingActive, setSettingActive] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [completing, setCompleting] = useState(false);
+  const [resetSessionOpen, setResetSessionOpen] = useState(false);
+  const [resetSessionPrompt, setResetSessionPrompt] = useState('');
+  const [resettingSession, setResettingSession] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
   const [savingTitle, setSavingTitle] = useState(false);
@@ -706,6 +710,22 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     closeAndNotify();
   };
 
+  const handleResetSession = async () => {
+    const trimmed = resetSessionPrompt.trim();
+    if (!trimmed) return;
+    setResettingSession(true);
+    try {
+      await resetTaskSession(taskId, trimmed);
+      setResetSessionOpen(false);
+      setResetSessionPrompt('');
+      closeAndNotify();
+    } catch (err: any) {
+      alert(err?.message || 'Failed to reset session');
+    } finally {
+      setResettingSession(false);
+    }
+  };
+
   const handleReopen = async () => {
     await reopenTask(taskId);
     closeAndNotify();
@@ -1303,6 +1323,39 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
             {/* Actions footer */}
             <div className="border-t border-gray-200 dark:border-gray-800 p-5">
+              {resetSessionOpen && (
+                <div className="mb-3 space-y-2 border border-gray-200 dark:border-gray-700 rounded-md p-3 bg-gray-50 dark:bg-gray-800/50">
+                  <div className="text-xs text-gray-600 dark:text-gray-400">
+                    Type a continuation message. The agent will start with a clean context
+                    and only see this message — refer to file paths or summarize what's needed.
+                  </div>
+                  <textarea
+                    value={resetSessionPrompt}
+                    onChange={(e) => setResetSessionPrompt(e.target.value)}
+                    placeholder="e.g. Continue where we left off. The current code is on disk at <path>."
+                    className="w-full text-sm p-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100"
+                    rows={4}
+                    autoFocus
+                    disabled={resettingSession}
+                  />
+                  <div className="flex gap-2">
+                    <button
+                      onClick={handleResetSession}
+                      disabled={!resetSessionPrompt.trim() || resettingSession}
+                      className="bg-blue-600 text-white text-sm px-4 py-2 rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {resettingSession ? 'Starting...' : 'Start fresh session'}
+                    </button>
+                    <button
+                      onClick={() => { setResetSessionOpen(false); setResetSessionPrompt(''); }}
+                      disabled={resettingSession}
+                      className="text-sm text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 px-3 py-2"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
               {task.status === 'awaiting_feedback' && (
                 <div className="space-y-3">
                   {!!task.pending_complete && (
@@ -1567,6 +1620,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                     >
                       Retry
                     </button>
+                    <button
+                      onClick={() => setResetSessionOpen(o => !o)}
+                      className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 px-2"
+                      title="Start a fresh Claude session for this task — drops in-session memory but keeps the task and its prior messages"
+                    >
+                      Reset session
+                    </button>
                     {/* Invite button when no participants yet */}
                     {participants.length === 0 && (
                       <div className="relative">
@@ -1618,6 +1678,35 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                       onResume={handleRetry}
                       resumeLabel="Retry"
                     />
+                  ) : task.failed_reason?.startsWith('context_window_exceeded:') ? (
+                    <div className="space-y-2">
+                      <div className="text-sm text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700 p-3 rounded-md">
+                        <div className="font-medium mb-1">Session too large to continue</div>
+                        <div className="text-xs">
+                          This task's Claude session has grown past the model's context window
+                          ({task.failed_reason.slice('context_window_exceeded:'.length).trim()}).
+                          Retrying with the same session will hit the same limit. Start a fresh
+                          session instead — prior messages stay visible here but the agent will
+                          not have them in context.
+                        </div>
+                      </div>
+                      {!resetSessionOpen ? (
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => setResetSessionOpen(true)}
+                            className="bg-blue-600 text-white text-sm px-4 py-2 rounded-md hover:bg-blue-700"
+                          >
+                            Start fresh session
+                          </button>
+                          <button
+                            onClick={handleRetry}
+                            className="text-sm text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 px-2"
+                          >
+                            Retry anyway
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
                   ) : (
                     <>
                       {task.failed_reason && (
@@ -1625,12 +1714,23 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                           {task.failed_reason}
                         </div>
                       )}
-                      <button
-                        onClick={handleRetry}
-                        className="bg-blue-600 text-white text-sm px-4 py-2 rounded-md hover:bg-blue-700"
-                      >
-                        Retry
-                      </button>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={handleRetry}
+                          className="bg-blue-600 text-white text-sm px-4 py-2 rounded-md hover:bg-blue-700"
+                        >
+                          Retry
+                        </button>
+                        {!resetSessionOpen && (
+                          <button
+                            onClick={() => setResetSessionOpen(true)}
+                            className="text-sm text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 px-3 py-2"
+                            title="Start a fresh Claude session — discards in-session memory but keeps the task and its prior messages"
+                          >
+                            Start fresh session
+                          </button>
+                        )}
+                      </div>
                     </>
                   )}
                 </div>

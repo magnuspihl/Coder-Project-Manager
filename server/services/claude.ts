@@ -1,7 +1,7 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { createReadStream, createWriteStream } from 'fs';
 import { randomUUID } from 'crypto';
-import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, getPendingCompletionTask, setPendingComplete, type Task, type TaskParticipant } from './tasks.js';
+import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, getPendingCompletionTask, setPendingComplete, markSessionInitialized, type Task, type TaskParticipant } from './tasks.js';
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
@@ -626,8 +626,13 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   claudeParts.push('claude');
   claudeParts.push('-p', shellEscape(prompt));
 
-  if (isResume && task.claude_session_id) {
-    claudeParts.push('--resume', shellEscape(task.claude_session_id));
+  // Use --resume only when the current session_id has actually been created
+  // by a prior Claude run. After a session reset, session_initialized=0 forces
+  // --session-id (creates a fresh session on disk) even though we have a
+  // user-supplied continuation message.
+  const canResume = isResume && task.claude_session_id && task.session_initialized !== 0;
+  if (canResume) {
+    claudeParts.push('--resume', shellEscape(task.claude_session_id!));
   } else if (task.claude_session_id) {
     claudeParts.push('--session-id', shellEscape(task.claude_session_id));
   }
@@ -736,6 +741,12 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
 
     // Store PID in DB so we can find orphaned processes after restart
     getDb().prepare('UPDATE tasks SET ssh_pid = ? WHERE id = ?').run(sshProcess.pid ?? null, task.id);
+
+    // Once the launch has spawned, the session_id will be (or already is)
+    // committed on disk by Claude, so subsequent turns can safely --resume.
+    if (task.session_initialized === 0) {
+      markSessionInitialized(task.id);
+    }
 
     activeProcesses.set(task.id, sshProcess);
 
@@ -1064,24 +1075,24 @@ function startFilePolling(task: Task): void {
       }
 
       if (event.type === 'result') {
+        const fatal = extractFatalError(event);
         const resultText = extractResultText(event);
-        // Save result text as a message if it has content distinct from the last assistant message
-        if (resultText && resultText !== lastSavedMessageText) {
+        // For non-error results, save the result text as an assistant message
+        // (when distinct from the last). For errors, skip — finalizeTask will
+        // write a structured system message instead of leaking the raw error
+        // string as a confusing "assistant said: Prompt is too long" entry.
+        if (!fatal && resultText && resultText !== lastSavedMessageText) {
           const msg = addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined);
           lastSavedMessageId = msg.id;
           lastSavedMessageText = resultText;
         } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
-          // Attach session cost to the last assistant message
           updateMessageCost(lastSavedMessageId, event.total_cost_usd);
         }
-        // Accumulate token usage
         const { inputTokens: inTok, outputTokens: outTok } = extractTokenUsage(event);
         if (inTok > 0 || outTok > 0) {
           addTokenUsage(task.id, inTok, outTok);
         }
-        if (event.is_error && Array.isArray(event.errors) && (event.errors as string[]).length > 0) {
-          resultError = (event.errors as string[]).join('; ');
-        }
+        if (fatal) resultError = fatal;
         resultSeen = true;
       }
     } catch (eventErr) {
@@ -1276,6 +1287,30 @@ function extractResultText(event: { [key: string]: unknown }): string {
   return '';
 }
 
+export const CONTEXT_WINDOW_ERROR_PREFIX = 'context_window_exceeded:';
+
+/**
+ * Extract a fatal error from a result event. Handles both shapes:
+ * - `is_error: true` with an `errors[]` array (older / normal CLI errors)
+ * - `is_error: true` with no errors array, where the failure message is in the
+ *   `result` field itself (e.g. API 400s like "Prompt is too long")
+ *
+ * Returns null if the result event is not an error.
+ *
+ * Context-window failures are tagged with CONTEXT_WINDOW_ERROR_PREFIX so the UI
+ * can offer a session-reset recovery path instead of showing a generic error.
+ */
+function extractFatalError(event: { [key: string]: unknown }): string | null {
+  if (!event.is_error) return null;
+  const errors = Array.isArray(event.errors) ? (event.errors as string[]) : [];
+  let errMsg = errors.length > 0 ? errors.join('; ') : extractResultText(event);
+  if (!errMsg) return null;
+  if (/prompt is too long|input is too long|context.*length|too many tokens/i.test(errMsg)) {
+    return `${CONTEXT_WINDOW_ERROR_PREFIX}${errMsg}`;
+  }
+  return errMsg;
+}
+
 /**
  * Extract token usage from a result event.
  * The CLI stream-json format nests tokens under `usage` and/or `modelUsage`.
@@ -1351,9 +1386,12 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
           }
         }
         if (event.type === 'result') {
+          const fatal = extractFatalError(event);
           const resultText = extractResultText(event);
           const cost = typeof event.total_cost_usd === 'number' ? event.total_cost_usd as number : undefined;
-          if (resultText && resultText !== lastStagedText) {
+          // Skip staging the result text as an assistant message when it's a
+          // fatal error — finalizeTask will surface it as a system error instead.
+          if (!fatal && resultText && resultText !== lastStagedText) {
             stagedMessages.push({ text: resultText, cost });
             lastStagedText = resultText;
           } else if (cost !== undefined && stagedMessages.length > 0) {
@@ -1363,9 +1401,7 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
           stagedInputTokens += inTok;
           stagedOutputTokens += outTok;
           resultSeen = true;
-          if (event.is_error && Array.isArray(event.errors) && event.errors.length > 0) {
-            resultError = event.errors.join('; ');
-          }
+          if (fatal) resultError = fatal;
         }
       } catch {
         // Skip invalid JSON
@@ -1838,19 +1874,17 @@ function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boo
                 }
               }
             } else if (event.type === 'result') {
+              const fatal = extractFatalError(event);
               const resultText = extractResultText(event);
-              if (resultText && resultText !== lastSavedMessageText) {
+              if (!fatal && resultText && resultText !== lastSavedMessageText) {
                 const dmsg = addDiscussionMessage(discussion.id, 'assistant', resultText, event.total_cost_usd as number | undefined);
                 lastSavedMessageId = dmsg.id;
                 lastSavedMessageText = resultText;
                 parseTaskRequests(discussion, resultText);
               } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
-                // Update cost on last message
                 getDb().prepare('UPDATE discussion_messages SET cost = ? WHERE id = ?').run(event.total_cost_usd, lastSavedMessageId);
               }
-              if (event.is_error && Array.isArray(event.errors) && (event.errors as string[]).length > 0) {
-                resultError = (event.errors as string[]).join('; ');
-              }
+              if (fatal) resultError = fatal;
               resultSeen = true;
             }
           } catch (eventErr) {
@@ -2194,8 +2228,9 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
                 }
               }
             } else if (event.type === 'result') {
+              const fatal = extractFatalError(event);
               const resultText = extractResultText(event);
-              if (resultText && resultText !== lastSavedMessageText) {
+              if (!fatal && resultText && resultText !== lastSavedMessageText) {
                 const dmsg = addDiscussionMessage(discussion.id, 'assistant', resultText, event.total_cost_usd as number | undefined, participant.workspace_name, participant.id);
                 lastSavedMessageId = dmsg.id;
                 lastSavedMessageText = resultText;
@@ -2203,9 +2238,7 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
               } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
                 getDb().prepare('UPDATE discussion_messages SET cost = ? WHERE id = ?').run(event.total_cost_usd, lastSavedMessageId);
               }
-              if (event.is_error && Array.isArray(event.errors) && (event.errors as string[]).length > 0) {
-                resultError = (event.errors as string[]).join('; ');
-              }
+              if (fatal) resultError = fatal;
               resultSeen = true;
             }
           } catch (eventErr) {
@@ -2433,16 +2466,15 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
                 }
               }
             } else if (event.type === 'result') {
+              const fatal = extractFatalError(event);
               const resultText = extractResultText(event);
-              if (resultText && resultText !== lastSavedMessageText) {
+              if (!fatal && resultText && resultText !== lastSavedMessageText) {
                 const saved = addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined, participant.workspace_name, participant.id);
                 lastSavedMessageId = saved.id; lastSavedMessageText = resultText;
               } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
                 updateMessageCost(lastSavedMessageId, event.total_cost_usd as number);
               }
-              if (event.is_error && Array.isArray(event.errors) && (event.errors as string[]).length > 0) {
-                resultError = (event.errors as string[]).join('; ');
-              }
+              if (fatal) resultError = fatal;
               resultSeen = true;
             }
           } catch { /* skip */ }

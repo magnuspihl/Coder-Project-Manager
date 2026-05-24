@@ -21,6 +21,7 @@ export interface Task {
   github_repo_url: string | null;
   caveman: string | null;
   pending_complete: number;
+  session_initialized: number;
   total_input_tokens: number;
   total_output_tokens: number;
   created_at: string;
@@ -313,6 +314,25 @@ export function getWorkingTask(workspaceId: string): Task | undefined {
 
 export function setPendingComplete(taskId: string, value: boolean): void {
   getDb().prepare('UPDATE tasks SET pending_complete = ? WHERE id = ?').run(value ? 1 : 0, taskId);
+}
+
+/**
+ * Replace the task's claude_session_id with a new UUID and mark the session as
+ * uninitialized. The next launch will use `--session-id` (creating a fresh
+ * Claude session) instead of `--resume`. Used to recover from context-window
+ * exhaustion on long-running tasks.
+ */
+export function resetTaskSession(taskId: string): string {
+  const newSessionId = uuid();
+  getDb()
+    .prepare('UPDATE tasks SET claude_session_id = ?, session_initialized = 0, updated_at = ? WHERE id = ?')
+    .run(newSessionId, new Date().toISOString(), taskId);
+  return newSessionId;
+}
+
+/** Mark the task's current claude_session_id as initialized — called once a launch has spawned. */
+export function markSessionInitialized(taskId: string): void {
+  getDb().prepare('UPDATE tasks SET session_initialized = 1 WHERE id = ?').run(taskId);
 }
 
 export function getPendingCompletionTask(workspaceId: string): Task | undefined {
