@@ -294,6 +294,22 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     }
   }, [streamLog.length, logOpen]);
 
+  // Clear the optimistic reply once a matching real message arrives — either
+  // via the explicit reload after send, or via a polling tick that races the
+  // in-flight send. Without this, the optimistic and the real message both
+  // render until the API call's finally clears the optimistic.
+  useEffect(() => {
+    if (!optimisticMessage) return;
+    const optTime = new Date(optimisticMessage.created_at).getTime();
+    const matched = messages.some(m =>
+      m.role === 'user' &&
+      m.content === optimisticMessage.content &&
+      m.participant_id === optimisticMessage.participant_id &&
+      new Date(m.created_at).getTime() >= optTime - 60_000,
+    );
+    if (matched) setOptimisticMessage(null);
+  }, [messages, optimisticMessage]);
+
   // Push a history entry so the browser back button closes the modal
   useEffect(() => {
     window.history.pushState({ modal: 'task-detail' }, '');

@@ -424,6 +424,22 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     }
   }, [loading, messages.length, optimisticMessage?.id]);
 
+  // Clear the optimistic message as soon as a matching real message appears in
+  // the list (either via the explicit reload after send, or via a polling tick
+  // that races the API response). Otherwise the optimistic stays mounted for
+  // the full duration of the in-flight send and shows as a duplicate.
+  useEffect(() => {
+    if (!optimisticMessage) return;
+    const optTime = new Date(optimisticMessage.created_at).getTime();
+    const matched = messages.some(m =>
+      m.role === 'user' &&
+      m.content === optimisticMessage.content &&
+      m.participant_id === optimisticMessage.participant_id &&
+      new Date(m.created_at).getTime() >= optTime - 60_000,
+    );
+    if (matched) setOptimisticMessage(null);
+  }, [messages, optimisticMessage]);
+
   // Browser back button
   useEffect(() => {
     window.history.pushState({ modal: 'discussion' }, '');
