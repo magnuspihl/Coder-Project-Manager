@@ -113,6 +113,21 @@ async function hasGitRepo(workspaceName: string, projectDir: string): Promise<bo
 }
 
 /**
+ * Check if the repository has at least one commit. A freshly `git init`'d repo
+ * has an unborn HEAD: `rev-parse --is-inside-work-tree` succeeds, but stash,
+ * checkout, push, and `rev-parse --abbrev-ref HEAD` all fail until the first
+ * commit lands. Skip the entire git lifecycle in that state.
+ */
+async function hasCommits(workspaceName: string, projectDir: string): Promise<boolean> {
+  try {
+    await sshExec(workspaceName, `cd ${projectDir} && git rev-parse --verify HEAD`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Check if git remote operations are allowed for a workspace.
  */
 export function isRemoteAllowed(workspaceId: string): boolean {
@@ -217,6 +232,10 @@ export async function handleSwitchToTask(task: Task): Promise<void> {
 
   try {
     if (!await hasGitRepo(ws, dir)) return;
+    if (!await hasCommits(ws, dir)) {
+      setLastActiveTaskId(task.workspace_id, task.id);
+      return;
+    }
 
     const remoteAllowed = isRemoteAllowed(task.workspace_id);
 
@@ -379,6 +398,10 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
 
   try {
     if (!await hasGitRepo(ws, dir)) return true;
+    if (!await hasCommits(ws, dir)) {
+      setLastActiveTaskId(task.workspace_id, null);
+      return true;
+    }
 
     // If another task's changes are in the working tree, stash them first
     const lastActiveId = getLastActiveTaskId(task.workspace_id);
