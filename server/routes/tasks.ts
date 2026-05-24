@@ -16,6 +16,7 @@ import {
   getTaskCostsByWorkspace,
   getWorkingTask,
   setPendingComplete,
+  resetTaskSession,
   addTaskParticipant,
   removeTaskParticipant,
   getTaskParticipants,
@@ -380,6 +381,50 @@ router.post('/tasks/:taskId/retry', requireAuth, async (req: Request, res: Respo
   }
 
   await resumeTask(task, continuationPrompt);
+  res.json({ task: getTask(task.id) });
+});
+
+// Reset a task's Claude session — generates a new session_id so the next run
+// starts fresh. Used to recover from context-window exhaustion. The caller
+// supplies a continuation prompt that seeds the new session; prior CPM-visible
+// messages remain in the UI but won't be in Claude's context.
+router.post('/tasks/:taskId/reset-session', requireAuth, async (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  if (task.status === 'working') {
+    res.status(409).json({ error: 'Interrupt the task before resetting its session.' });
+    return;
+  }
+  if (task.status !== 'failed' && task.status !== 'awaiting_feedback' && task.status !== 'cancelled') {
+    res.status(400).json({ error: `Cannot reset session for a ${task.status} task.` });
+    return;
+  }
+
+  const { continuationPrompt } = req.body;
+  if (!continuationPrompt || typeof continuationPrompt !== 'string' || !continuationPrompt.trim()) {
+    res.status(400).json({ error: 'continuationPrompt is required' });
+    return;
+  }
+
+  resetTaskSession(task.id);
+  addMessage(task.id, 'system', 'Session reset — starting a fresh Claude session. Prior messages remain visible here but are not in the agent\'s context.');
+  addMessage(task.id, 'user', continuationPrompt, undefined, req.user!.username);
+
+  if (task.pending_complete) {
+    setPendingComplete(task.id, false);
+  }
+
+  // If another task is working on this workspace, queue this one; the queue
+  // will pick it up later. Otherwise transition straight to queued and kick
+  // the processor, which will route through launchTask with isResume=true
+  // and feedback=continuationPrompt — and launchTask will see
+  // session_initialized=0 and use --session-id, creating a fresh session.
+  updateTaskStatus(task.id, 'queued');
+  await processQueue(task.workspace_id);
+
   res.json({ task: getTask(task.id) });
 });
 

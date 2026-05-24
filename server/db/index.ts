@@ -180,6 +180,12 @@ export function getDb(): Database.Database {
     if (!tasksCols2.some(c => c.name === 'pending_complete')) {
       db.exec("ALTER TABLE tasks ADD COLUMN pending_complete INTEGER NOT NULL DEFAULT 0");
     }
+    // session_initialized: 1 when the current claude_session_id has been used by
+    // Claude (so --resume works); 0 immediately after a session reset, before
+    // the first launch. Default 1 so pre-existing tasks behave as before.
+    if (!tasksCols2.some(c => c.name === 'session_initialized')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN session_initialized INTEGER NOT NULL DEFAULT 1");
+    }
 
     // Enforce one-working-task-per-workspace at the DB level. If the DB is
     // inconsistent (leftover working tasks from a crash), mark all but the
