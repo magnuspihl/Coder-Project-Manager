@@ -7,6 +7,7 @@ import {
   reopenTask,
   retryTask,
   resetTaskSession,
+  compactTaskSession,
   updateTaskTitle,
   interruptTask,
   cancelTask,
@@ -86,6 +87,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [resetSessionOpen, setResetSessionOpen] = useState(false);
   const [resetSessionPrompt, setResetSessionPrompt] = useState('');
   const [resettingSession, setResettingSession] = useState(false);
+  const [compactingSession, setCompactingSession] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
   const [savingTitle, setSavingTitle] = useState(false);
@@ -723,6 +725,18 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       alert(err?.message || 'Failed to reset session');
     } finally {
       setResettingSession(false);
+    }
+  };
+
+  const handleCompactSession = async () => {
+    setCompactingSession(true);
+    try {
+      await compactTaskSession(taskId);
+      closeAndNotify();
+    } catch (err: any) {
+      alert(err?.message || 'Failed to compact session');
+    } finally {
+      setCompactingSession(false);
     }
   };
 
@@ -1621,6 +1635,14 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                       Retry
                     </button>
                     <button
+                      onClick={handleCompactSession}
+                      disabled={compactingSession}
+                      className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 px-2 disabled:opacity-50"
+                      title="Ask Claude Code to summarize prior turns and free up context — preserves the session"
+                    >
+                      {compactingSession ? 'Compacting...' : 'Compact session'}
+                    </button>
+                    <button
                       onClick={() => setResetSessionOpen(o => !o)}
                       className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 px-2"
                       title="Start a fresh Claude session for this task — drops in-session memory but keeps the task and its prior messages"
@@ -1685,16 +1707,22 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         <div className="text-xs">
                           This task's Claude session has grown past the model's context window
                           ({task.failed_reason.slice('context_window_exceeded:'.length).trim()}).
-                          Retrying with the same session will hit the same limit. Start a fresh
-                          session instead — prior messages stay visible here but the agent will
-                          not have them in context.
+                          Compacting will ask Claude Code to summarize prior turns so the session
+                          can continue. Starting fresh discards in-session memory entirely.
                         </div>
                       </div>
                       {!resetSessionOpen ? (
                         <div className="flex gap-2">
                           <button
+                            onClick={handleCompactSession}
+                            disabled={compactingSession}
+                            className="bg-blue-600 text-white text-sm px-4 py-2 rounded-md hover:bg-blue-700 disabled:opacity-50"
+                          >
+                            {compactingSession ? 'Compacting...' : 'Compact session'}
+                          </button>
+                          <button
                             onClick={() => setResetSessionOpen(true)}
-                            className="bg-blue-600 text-white text-sm px-4 py-2 rounded-md hover:bg-blue-700"
+                            className="text-sm text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 px-3 py-2"
                           >
                             Start fresh session
                           </button>
@@ -1720,6 +1748,14 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                           className="bg-blue-600 text-white text-sm px-4 py-2 rounded-md hover:bg-blue-700"
                         >
                           Retry
+                        </button>
+                        <button
+                          onClick={handleCompactSession}
+                          disabled={compactingSession}
+                          className="text-sm text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 px-3 py-2 disabled:opacity-50"
+                          title="Ask Claude Code to summarize prior turns and free up context — preserves the session"
+                        >
+                          {compactingSession ? 'Compacting...' : 'Compact session'}
                         </button>
                         {!resetSessionOpen && (
                           <button
