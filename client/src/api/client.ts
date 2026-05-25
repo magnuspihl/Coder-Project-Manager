@@ -277,6 +277,9 @@ export const resetTaskSession = (taskId: string, continuationPrompt: string) =>
     body: JSON.stringify({ continuationPrompt }),
   });
 
+export const compactTaskSession = (taskId: string) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}/compact-session`, { method: 'POST' });
+
 export const checkoutTaskBranch = (taskId: string) =>
   request<{ ok: boolean; message: string }>(`/api/tasks/${taskId}/checkout`, { method: 'POST' });
 

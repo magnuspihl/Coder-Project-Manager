@@ -556,11 +556,15 @@ export async function processQueue(workspaceId: string): Promise<void> {
 async function launchTask(task: Task, isResume = false, feedback?: string): Promise<void> {
   const rawPrompt = isResume && feedback ? feedback : task.prompt;
 
+  // Slash commands (e.g. /compact) must reach Claude Code as the bare prompt —
+  // skip all prepends/appends so the harness recognizes the command.
+  const isSlashCommand = isResume && !!feedback && rawPrompt.startsWith('/') && !rawPrompt.includes('\n');
+
   // Append instruction for the agent to provide Coder deep links
   // Use VSCODE_PROXY_URI if available (has the exact pattern), otherwise build from parts
   const proxyUri = process.env.VSCODE_PROXY_URI || '';
   let coderUrlNote = '';
-  if (proxyUri) {
+  if (!isSlashCommand && proxyUri) {
     // VSCODE_PROXY_URI looks like: https://{{port}}--main--Workspace--user.coder.example.com
     // Replace the workspace-specific parts with the target workspace's info
     const coderUrlNote_example = proxyUri.replace('{{port}}', 'PORT');
@@ -569,7 +573,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
       `config changes, refactors, or other non-visual work. ` +
       `This project runs inside a Coder workspace, so use Coder-routed URLs (not localhost). ` +
       `For web apps, use the Coder port-forwarding URL format: ${coderUrlNote_example} (replace PORT with the actual port number, e.g. 5173 for Vite).`;
-  } else if (CODER_URL) {
+  } else if (!isSlashCommand && CODER_URL) {
     coderUrlNote = `\n\nIMPORTANT: Only if your changes result in something visually testable in a browser (e.g. a webapp UI change), ` +
       `provide a deep link URL where the change can be seen. Do NOT include a "view live" link for backend-only changes, ` +
       `config changes, refactors, or other non-visual work. ` +
@@ -580,10 +584,12 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
 
   // Host's Claude session does not contain participant messages — inject them
   // as catch-up context so the host can see what invited agents have said.
-  const taskParticipants = getTaskParticipants(task.id);
-  if (taskParticipants.length > 0) {
-    const hostCatchUp = buildTaskParticipantContext(task.id, '__host__');
-    if (hostCatchUp) prompt = hostCatchUp + '\n' + prompt;
+  if (!isSlashCommand) {
+    const taskParticipants = getTaskParticipants(task.id);
+    if (taskParticipants.length > 0) {
+      const hostCatchUp = buildTaskParticipantContext(task.id, '__host__');
+      if (hostCatchUp) prompt = hostCatchUp + '\n' + prompt;
+    }
   }
 
   // Auto-detect project directory if not already set
@@ -602,8 +608,8 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     await handleTaskLaunchGit(task);
   }
 
-  // Transfer any attached files to the remote workspace
-  const attachments = getAttachmentsByTask(task.id);
+  // Transfer any attached files to the remote workspace (skip for slash commands)
+  const attachments = isSlashCommand ? [] : getAttachmentsByTask(task.id);
   if (attachments.length > 0) {
     const remoteAttachDir = `/tmp/cpm-attachments-${task.id}`;
     try {
