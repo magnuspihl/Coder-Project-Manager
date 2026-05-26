@@ -2117,7 +2117,7 @@ export async function launchParticipantDiscussion(
   } catch (err) {
     const errorMsg = (err as Error).message || 'Failed to launch participant session';
     console.error('[participant] Launch failed:', errorMsg);
-    addDiscussionMessage(discussion.id, 'system', `Error launching ${participant.workspace_name}: ${errorMsg}`);
+    addDiscussionMessage(discussion.id, 'system', `Error launching ${participant.workspace_name}: ${errorMsg}`, undefined, undefined, participant.id);
   }
 }
 
@@ -2266,7 +2266,7 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
         activeProcesses.delete(pollKey);
 
         if (resultError) {
-          addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} session ended with error: ${resultError}`);
+          addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} session ended with error: ${resultError}`, undefined, undefined, participant.id);
         } else if (lastSavedMessageText) {
           parseMentions(discussion, lastSavedMessageText, participant.id);
         }
@@ -2287,7 +2287,7 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
         }
 
         if (exitCode !== 0) {
-          addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`);
+          addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`, undefined, undefined, participant.id);
         }
       }
     } catch (err) {
@@ -2298,7 +2298,7 @@ function startParticipantPolling(discussion: Discussion, participant: Discussion
         console.log(`[participant-poller] Too many errors, stopping polling for participant ${participant.id}`);
         stopPolling(pollKey);
         taskActivity.delete(pollKey);
-        addDiscussionMessage(discussion.id, 'system', `Error: Lost connection to ${participant.workspace_name}`);
+        addDiscussionMessage(discussion.id, 'system', `Error: Lost connection to ${participant.workspace_name}`, undefined, undefined, participant.id);
       }
     } finally {
       polling = false;

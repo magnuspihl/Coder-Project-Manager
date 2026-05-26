@@ -171,6 +171,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
   const [message, setMessage, clearMessage] = useDraft(`discussion:${discussionId}`);
   const [sending, setSending] = useState(false);
   const [optimisticMessage, setOptimisticMessage] = useState<DiscussionMessage | null>(null);
+  const [retrying, setRetrying] = useState(false);
   const [editingSession, setEditingSession] = useState(false);
   const [sessionIdDraft, setSessionIdDraft] = useState('');
   const [sessionError, setSessionError] = useState('');
@@ -765,6 +766,36 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     }
   };
 
+  const handleRetry = async (participantId: string | null) => {
+    if (retrying || sending) return;
+    setRetrying(true);
+    shouldForceScroll.current = true;
+    const continuationPrompt = 'Continue where you left off.';
+    setOptimisticMessage({
+      id: `optimistic-${Date.now()}`,
+      discussion_id: discussionId,
+      role: 'user',
+      content: continuationPrompt,
+      cost: null,
+      username: null,
+      participant_id: participantId,
+      created_at: new Date().toISOString(),
+    });
+    try {
+      if (participantId) {
+        await sendParticipantMessage(discussionId, participantId, continuationPrompt);
+      } else {
+        await sendDiscussionMessage(discussionId, continuationPrompt);
+      }
+      await loadData();
+    } catch {
+      // Leave the error in place — user can manually compose a message
+    } finally {
+      setRetrying(false);
+      setOptimisticMessage(null);
+    }
+  };
+
   // Voice mode: auto-send when silence timeout sets the pending flag
   useEffect(() => {
     if (!voicePendingSendRef.current) return;
@@ -1204,6 +1235,34 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                   )}
                 </div>
               )}
+
+              {/* Retry button — shown when the most recent message is a recoverable system error */}
+              {(() => {
+                if (isAnyRunning || sending || retrying) return null;
+                if (discussion.rate_limit) return null;
+                const last = visibleMessages[visibleMessages.length - 1];
+                if (!last || last.role !== 'system') return null;
+                const isError =
+                  last.content.startsWith('Error:') ||
+                  last.content.includes('session ended with error');
+                if (!isError) return null;
+                const retryParticipantId = last.participant_id ?? null;
+                const retryTargetName = retryParticipantId
+                  ? participants.find(p => p.id === retryParticipantId)?.workspace_name || 'participant'
+                  : workspaceName;
+                return (
+                  <div className="flex">
+                    <button
+                      onClick={() => handleRetry(retryParticipantId)}
+                      className="bg-blue-600 text-white text-sm px-4 py-2 rounded-md hover:bg-blue-700 disabled:opacity-50"
+                      disabled={retrying}
+                      title={`Resume ${retryTargetName} with "Continue where you left off."`}
+                    >
+                      {retrying ? 'Retrying...' : `Retry ${retryTargetName}`}
+                    </button>
+                  </div>
+                );
+              })()}
 
               {/* Rate limit banner */}
               {!discussion.running && discussion.rate_limit && (
