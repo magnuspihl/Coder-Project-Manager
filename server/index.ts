@@ -11,6 +11,8 @@ import discussionRoutes from './routes/discussions.js';
 import uploadRoutes from './routes/uploads.js';
 import ttsRoutes from './routes/tts.js';
 import sttRoutes from './routes/stt.js';
+import { requireAuth } from './middleware/auth.js';
+import { handleMcpRequest, handleMcpMethodNotAllowed } from './mcp/index.js';
 
 // Initialize database on import
 import './db/index.js';
@@ -38,6 +40,11 @@ app.use('/api', discussionRoutes);
 app.use('/api', uploadRoutes);
 app.use('/api', ttsRoutes);
 app.use('/api', sttRoutes);
+
+// MCP endpoint — Bearer-token or cookie-authed, one stateless server per request.
+app.post('/mcp', requireAuth, handleMcpRequest);
+app.get('/mcp', requireAuth, handleMcpMethodNotAllowed);
+app.delete('/mcp', requireAuth, handleMcpMethodNotAllowed);
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Coder Project Manager running on http://localhost:${PORT}`);

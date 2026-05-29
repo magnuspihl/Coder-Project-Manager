@@ -187,6 +187,36 @@ export function getDb(): Database.Database {
       db.exec("ALTER TABLE tasks ADD COLUMN session_initialized INTEGER NOT NULL DEFAULT 1");
     }
 
+    // Provenance migrations — track which client originated each row (UI vs. API).
+    const tasksCols3 = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+    if (!tasksCols3.some(c => c.name === 'source')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN source TEXT");
+    }
+    if (!tasksCols3.some(c => c.name === 'client_label')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN client_label TEXT");
+    }
+    const discCols2 = db.prepare("PRAGMA table_info(discussions)").all() as Array<{ name: string }>;
+    if (!discCols2.some(c => c.name === 'source')) {
+      db.exec("ALTER TABLE discussions ADD COLUMN source TEXT");
+    }
+    if (!discCols2.some(c => c.name === 'client_label')) {
+      db.exec("ALTER TABLE discussions ADD COLUMN client_label TEXT");
+    }
+    const msgCols2 = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
+    if (!msgCols2.some(c => c.name === 'source')) {
+      db.exec("ALTER TABLE messages ADD COLUMN source TEXT");
+    }
+    if (!msgCols2.some(c => c.name === 'client_label')) {
+      db.exec("ALTER TABLE messages ADD COLUMN client_label TEXT");
+    }
+    const dmCols2 = db.prepare("PRAGMA table_info(discussion_messages)").all() as Array<{ name: string }>;
+    if (!dmCols2.some(c => c.name === 'source')) {
+      db.exec("ALTER TABLE discussion_messages ADD COLUMN source TEXT");
+    }
+    if (!dmCols2.some(c => c.name === 'client_label')) {
+      db.exec("ALTER TABLE discussion_messages ADD COLUMN client_label TEXT");
+    }
+
     // Enforce one-working-task-per-workspace at the DB level. If the DB is
     // inconsistent (leftover working tasks from a crash), mark all but the
     // most recent as failed so the unique index can apply cleanly.

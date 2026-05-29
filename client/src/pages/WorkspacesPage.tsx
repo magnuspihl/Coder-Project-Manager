@@ -760,9 +760,19 @@ export default function WorkspacesPage() {
     >
       <div className="flex items-start justify-between gap-2">
         <h4 className="text-sm font-medium text-gray-900 dark:text-gray-100 line-clamp-2 flex-1">{task.title}</h4>
-        <span className={`text-xs px-2 py-0.5 rounded-full whitespace-nowrap shrink-0 ${STATUS_COLORS[task.status] || ''}`}>
-          {task.status.replace('_', ' ')}
-        </span>
+        <div className="flex items-center gap-1 shrink-0">
+          {task.source === 'api' && (
+            <span
+              title={`Created via API${task.client_label ? ` (${task.client_label})` : ''}`}
+              className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 border border-purple-200 dark:border-purple-800"
+            >
+              {task.client_label || 'API'}
+            </span>
+          )}
+          <span className={`text-xs px-2 py-0.5 rounded-full whitespace-nowrap ${STATUS_COLORS[task.status] || ''}`}>
+            {task.status.replace('_', ' ')}
+          </span>
+        </div>
       </div>
       {task.git_branch && (
         <div className="mt-1 flex items-center gap-1">

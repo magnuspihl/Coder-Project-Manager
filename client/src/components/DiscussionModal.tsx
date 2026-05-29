@@ -110,6 +110,14 @@ const MessageRow = memo(function MessageRow({ msg, hostWorkspaceName, participan
           {recipientLabel && (
             <span className="ml-1 normal-case font-normal opacity-70">→ {recipientLabel}</span>
           )}
+          {msg.source === 'api' && (
+            <span
+              title={`Originated via API${msg.client_label ? ` (${msg.client_label})` : ''}`}
+              className="ml-2 inline-block px-1.5 py-0.5 rounded text-[10px] font-medium normal-case bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 border border-purple-200 dark:border-purple-800"
+            >
+              via {msg.client_label || 'API'}
+            </span>
+          )}
         </span>
         <div className="flex items-center gap-2">
           {msg.role === 'assistant' && onSpeak && (

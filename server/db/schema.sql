@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   branch TEXT,
   model TEXT,
   pending_complete INTEGER NOT NULL DEFAULT 0,
+  source TEXT,
+  client_label TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT,
@@ -49,6 +51,8 @@ CREATE TABLE IF NOT EXISTS messages (
   content TEXT NOT NULL,
   cost REAL,
   username TEXT,
+  source TEXT,
+  client_label TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
@@ -79,6 +83,8 @@ CREATE TABLE IF NOT EXISTS discussions (
   full_access INTEGER NOT NULL DEFAULT 0,
   model TEXT,
   ssh_pid INTEGER,
+  source TEXT,
+  client_label TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (user_id) REFERENCES users(id)
@@ -94,6 +100,8 @@ CREATE TABLE IF NOT EXISTS discussion_messages (
   content TEXT NOT NULL,
   cost REAL,
   username TEXT,
+  source TEXT,
+  client_label TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (discussion_id) REFERENCES discussions(id) ON DELETE CASCADE
 );

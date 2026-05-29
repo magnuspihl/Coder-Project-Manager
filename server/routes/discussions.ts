@@ -109,6 +109,8 @@ router.post('/workspaces/:workspaceId/discussion', requireAuth, async (req: Requ
     userId: req.user!.id,
     fullAccess,
     model: model || undefined,
+    source: req.authSource,
+    clientLabel: req.clientLabel,
   });
 
   res.status(201).json({ discussion: { ...discussion, activity: null, running: false }, messages: [], taskRequests: [], participants: [] });
@@ -213,7 +215,7 @@ router.post('/discussions/:discussionId/message', requireAuth, async (req: Reque
   }
 
   // Store user message
-  addDiscussionMessage(discussion.id, 'user', message, undefined, req.user!.username);
+  addDiscussionMessage(discussion.id, 'user', message, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
 
   // Check if this is the first message or a follow-up
   const messages = getDiscussionMessages(discussion.id);
@@ -266,7 +268,7 @@ router.post('/discussions/:discussionId/interrupt', requireAuth, (req: Request, 
   // Stop host if running
   if (isDiscussionRunning(discussion.id)) {
     stopDiscussion(discussion.id);
-    addDiscussionMessage(discussion.id, 'system', 'Discussion was interrupted by user.');
+    addDiscussionMessage(discussion.id, 'system', 'Discussion was interrupted by user.', undefined, undefined, undefined, req.authSource, req.clientLabel);
     res.json({ ok: true });
     return;
   }
@@ -276,7 +278,7 @@ router.post('/discussions/:discussionId/interrupt', requireAuth, (req: Request, 
   const runningParticipant = participants.find(p => isParticipantRunning(p.id));
   if (runningParticipant) {
     stopParticipant(runningParticipant.id);
-    addDiscussionMessage(discussion.id, 'system', `${runningParticipant.workspace_name} was interrupted by user.`);
+    addDiscussionMessage(discussion.id, 'system', `${runningParticipant.workspace_name} was interrupted by user.`, undefined, undefined, undefined, req.authSource, req.clientLabel);
     res.json({ ok: true });
     return;
   }
@@ -327,6 +329,8 @@ router.post('/discussions/:discussionId/task-requests/:requestId/approve', requi
     userId: req.user!.id,
     username: req.user!.username,
     prompt: taskRequest.prompt,
+    source: req.authSource,
+    clientLabel: req.clientLabel,
   });
 
   approveTaskRequest(taskRequest.id, task.id);
@@ -334,7 +338,7 @@ router.post('/discussions/:discussionId/task-requests/:requestId/approve', requi
   const msg = crossWorkspace
     ? `Task created in ${workspaceName}: "${task.title}" (${task.id})`
     : `Task created: "${task.title}" (${task.id})`;
-  addDiscussionMessage(discussion.id, 'system', msg);
+  addDiscussionMessage(discussion.id, 'system', msg, undefined, undefined, undefined, req.authSource, req.clientLabel);
 
   await processQueue(workspaceId);
 
@@ -421,7 +425,7 @@ router.patch('/workspaces/:workspaceId/discussion-settings', requireAuth, (req: 
     updateDiscussionFullAccess(active.id, fullAccess);
     // Add a system message so it's visible in the chat
     const modeLabel = fullAccess ? 'Full Access' : 'Read-Only';
-    addDiscussionMessage(active.id, 'system', `Access mode changed to ${modeLabel}. This takes effect on the next message.`);
+    addDiscussionMessage(active.id, 'system', `Access mode changed to ${modeLabel}. This takes effect on the next message.`, undefined, undefined, undefined, req.authSource, req.clientLabel);
   }
   res.json({ ok: true, fullAccess });
 });
@@ -475,7 +479,7 @@ router.post('/discussions/:discussionId/participants', requireAuth, (req: Reques
   }
 
   const participant = addParticipant(discussion.id, workspaceId, workspaceName);
-  addDiscussionMessage(discussion.id, 'system', `${workspaceName} joined the discussion.`);
+  addDiscussionMessage(discussion.id, 'system', `${workspaceName} joined the discussion.`, undefined, undefined, undefined, req.authSource, req.clientLabel);
 
   res.status(201).json({ participant: { ...participant, running: false, activity: null } });
 });
@@ -500,7 +504,7 @@ router.delete('/discussions/:discussionId/participants/:participantId', requireA
   }
 
   removeParticipant(participant.id);
-  addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} left the discussion.`);
+  addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} left the discussion.`, undefined, undefined, undefined, req.authSource, req.clientLabel);
 
   res.json({ ok: true });
 });
@@ -537,7 +541,7 @@ router.post('/discussions/:discussionId/participants/:participantId/message', re
   }
 
   // Store user message tagged with participant
-  addDiscussionMessage(discussion.id, 'user', message, undefined, req.user!.username, participant.id);
+  addDiscussionMessage(discussion.id, 'user', message, undefined, req.user!.username, participant.id, req.authSource, req.clientLabel);
 
   // Check if this participant has spoken before (to determine resume)
   const messages = getDiscussionMessages(discussion.id);

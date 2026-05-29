@@ -91,6 +91,8 @@ router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, 
       prompt,
       model: typeof model === 'string' ? model.trim() : undefined,
       caveman: typeof caveman === 'string' && ['lite', 'full', 'ultra'].includes(caveman) ? caveman : undefined,
+      source: req.authSource,
+      clientLabel: req.clientLabel,
     });
 
     if (Array.isArray(attachmentIds) && attachmentIds.length > 0) {
@@ -194,12 +196,12 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
     return;
   }
 
-  addMessage(task.id, 'user', message, undefined, req.user!.username);
+  addMessage(task.id, 'user', message, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
 
   // User replied → cancel any pending completion: they're asking to continue.
   if (task.pending_complete) {
     setPendingComplete(task.id, false);
-    addMessage(task.id, 'system', 'Pending completion cancelled — reply received.');
+    addMessage(task.id, 'system', 'Pending completion cancelled — reply received.', undefined, undefined, undefined, req.authSource, req.clientLabel);
   }
 
   if (Array.isArray(attachmentIds) && attachmentIds.length > 0) {
@@ -258,7 +260,7 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
   if (working && working.id !== task.id) {
     if (!task.pending_complete) {
       setPendingComplete(task.id, true);
-      addMessage(task.id, 'system', `Completion queued — will finalize after task "${working.title}" finishes on this workspace.`);
+      addMessage(task.id, 'system', `Completion queued — will finalize after task "${working.title}" finishes on this workspace.`, undefined, undefined, undefined, req.authSource, req.clientLabel);
     }
     res.status(202).json({ task: getTask(task.id), queued: true });
     return;
@@ -322,7 +324,7 @@ router.post('/tasks/:taskId/set-active', requireAuth, async (req: Request, res: 
   }
   try {
     const message = await switchActiveTask(task);
-    addMessage(task.id, 'system', message);
+    addMessage(task.id, 'system', message, undefined, undefined, undefined, req.authSource, req.clientLabel);
     res.json({ ok: true, message, activeTaskId: task.id });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to set active task' });
@@ -344,7 +346,7 @@ router.post('/tasks/:taskId/checkout', requireAuth, async (req: Request, res: Re
   }
   try {
     const message = await checkoutTaskBranch(task);
-    addMessage(task.id, 'system', message);
+    addMessage(task.id, 'system', message, undefined, undefined, undefined, req.authSource, req.clientLabel);
     res.json({ ok: true, message });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to checkout branch' });
@@ -364,12 +366,12 @@ router.post('/tasks/:taskId/retry', requireAuth, async (req: Request, res: Respo
   }
 
   const continuationPrompt = 'Continue where you left off.';
-  addMessage(task.id, 'user', continuationPrompt, undefined, req.user!.username);
+  addMessage(task.id, 'user', continuationPrompt, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
 
   // Retry → cancel pending completion; user is re-engaging.
   if (task.pending_complete) {
     setPendingComplete(task.id, false);
-    addMessage(task.id, 'system', 'Pending completion cancelled — retry requested.');
+    addMessage(task.id, 'system', 'Pending completion cancelled — retry requested.', undefined, undefined, undefined, req.authSource, req.clientLabel);
   }
 
   // If another task is working on this workspace, queue instead of resuming immediately
@@ -410,8 +412,8 @@ router.post('/tasks/:taskId/reset-session', requireAuth, async (req: Request, re
   }
 
   resetTaskSession(task.id);
-  addMessage(task.id, 'system', 'Session reset — starting a fresh Claude session. Prior messages remain visible here but are not in the agent\'s context.');
-  addMessage(task.id, 'user', continuationPrompt, undefined, req.user!.username);
+  addMessage(task.id, 'system', 'Session reset — starting a fresh Claude session. Prior messages remain visible here but are not in the agent\'s context.', undefined, undefined, undefined, req.authSource, req.clientLabel);
+  addMessage(task.id, 'user', continuationPrompt, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
 
   if (task.pending_complete) {
     setPendingComplete(task.id, false);
@@ -455,8 +457,8 @@ router.post('/tasks/:taskId/compact-session', requireAuth, async (req: Request, 
     return;
   }
 
-  addMessage(task.id, 'system', 'Compacting session — Claude will summarize prior turns to free up context.');
-  addMessage(task.id, 'user', '/compact', undefined, req.user!.username);
+  addMessage(task.id, 'system', 'Compacting session — Claude will summarize prior turns to free up context.', undefined, undefined, undefined, req.authSource, req.clientLabel);
+  addMessage(task.id, 'user', '/compact', undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
 
   if (task.pending_complete) {
     setPendingComplete(task.id, false);
@@ -593,7 +595,7 @@ router.post('/tasks/:taskId/participants', requireAuth, (req: Request, res: Resp
   }
 
   const participant = addTaskParticipant(task.id, workspaceId, workspaceName);
-  addMessage(task.id, 'system', `${workspaceName} joined as an advisor.`);
+  addMessage(task.id, 'system', `${workspaceName} joined as an advisor.`, undefined, undefined, undefined, req.authSource, req.clientLabel);
 
   res.status(201).json({ participant: { ...participant, running: false, activity: null } });
 });
@@ -617,7 +619,7 @@ router.delete('/tasks/:taskId/participants/:participantId', requireAuth, (req: R
   }
 
   removeTaskParticipant(participant.id);
-  addMessage(task.id, 'system', `${participant.workspace_name} left the task.`);
+  addMessage(task.id, 'system', `${participant.workspace_name} left the task.`, undefined, undefined, undefined, req.authSource, req.clientLabel);
 
   res.json({ ok: true });
 });
@@ -650,7 +652,7 @@ router.post('/tasks/:taskId/participants/:participantId/message', requireAuth, a
   }
 
   // Store user message tagged with participant
-  addMessage(task.id, 'user', message, undefined, req.user!.username, participant.id);
+  addMessage(task.id, 'user', message, undefined, req.user!.username, participant.id, req.authSource, req.clientLabel);
 
   // Check if this participant has spoken before (to determine resume)
   const msgs = getMessages(req.params.taskId);
