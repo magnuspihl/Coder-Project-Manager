@@ -24,6 +24,8 @@ export interface Task {
   session_initialized: number;
   total_input_tokens: number;
   total_output_tokens: number;
+  source: string | null;
+  client_label: string | null;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
@@ -36,6 +38,8 @@ export interface Message {
   content: string;
   cost: number | null;
   participant_id: string | null;
+  source?: string | null;
+  client_label?: string | null;
   created_at: string;
 }
 
@@ -228,6 +232,8 @@ export function createTask(params: {
   projectDir?: string;
   model?: string;
   caveman?: string;
+  source?: string | null;
+  clientLabel?: string | null;
 }): Task {
   const db = getDb();
   const id = uuid();
@@ -243,12 +249,12 @@ export function createTask(params: {
   const title = generateTitleFallback(params.prompt);
 
   db.prepare(
-    `INSERT INTO tasks (id, workspace_id, workspace_name, user_id, title, prompt, status, position, project_dir, claude_session_id, model, caveman)
-     VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`
-  ).run(id, params.workspaceId, params.workspaceName, params.userId, title, params.prompt, position, params.projectDir || null, claudeSessionId, params.model || null, params.caveman || null);
+    `INSERT INTO tasks (id, workspace_id, workspace_name, user_id, title, prompt, status, position, project_dir, claude_session_id, model, caveman, source, client_label)
+     VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)`
+  ).run(id, params.workspaceId, params.workspaceName, params.userId, title, params.prompt, position, params.projectDir || null, claudeSessionId, params.model || null, params.caveman || null, params.source || null, params.clientLabel || null);
 
-  // Store the initial prompt as a user message
-  addMessage(id, 'user', params.prompt, undefined, params.username);
+  // Store the initial prompt as a user message (inherits provenance from the task creation call)
+  addMessage(id, 'user', params.prompt, undefined, params.username, undefined, params.source || null, params.clientLabel || null);
 
   // Fire off async LLM title generation (updates DB when ready)
   generateTitleAsync(id, params.prompt);
@@ -351,13 +357,22 @@ function extractVerificationUrl(content: string): string | null {
   return match ? match[0] : null;
 }
 
-export function addMessage(taskId: string, role: string, content: string, cost?: number, username?: string, participantId?: string): Message {
+export function addMessage(
+  taskId: string,
+  role: string,
+  content: string,
+  cost?: number,
+  username?: string,
+  participantId?: string,
+  source?: string | null,
+  clientLabel?: string | null,
+): Message {
   const db = getDb();
   const id = uuid();
   const now = new Date().toISOString();
   db.prepare(
-    'INSERT INTO messages (id, task_id, role, content, cost, username, participant_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(id, taskId, role, content, cost ?? null, username ?? null, participantId ?? null, now);
+    'INSERT INTO messages (id, task_id, role, content, cost, username, participant_id, source, client_label, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, taskId, role, content, cost ?? null, username ?? null, participantId ?? null, source ?? null, clientLabel ?? null, now);
 
   // Extract verification URL from assistant messages and store on the task
   if (role === 'assistant') {

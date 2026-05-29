@@ -12,6 +12,8 @@ export interface Discussion {
   full_access: number;
   model: string | null;
   ssh_pid: number | null;
+  source: string | null;
+  client_label: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -24,6 +26,8 @@ export interface DiscussionMessage {
   cost: number | null;
   username: string | null;
   participant_id: string | null;
+  source?: string | null;
+  client_label?: string | null;
   created_at: string;
 }
 
@@ -70,6 +74,8 @@ export function createDiscussion(params: {
   userId: string;
   fullAccess?: boolean;
   model?: string;
+  source?: string | null;
+  clientLabel?: string | null;
 }): Discussion {
   const db = getDb();
   const id = uuid();
@@ -77,9 +83,9 @@ export function createDiscussion(params: {
   const fullAccess = params.fullAccess ? 1 : 0;
 
   db.prepare(
-    `INSERT INTO discussions (id, workspace_id, workspace_name, user_id, claude_session_id, full_access, model, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`
-  ).run(id, params.workspaceId, params.workspaceName, params.userId, claudeSessionId, fullAccess, params.model || null);
+    `INSERT INTO discussions (id, workspace_id, workspace_name, user_id, claude_session_id, full_access, model, status, source, client_label)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
+  ).run(id, params.workspaceId, params.workspaceName, params.userId, claudeSessionId, fullAccess, params.model || null, params.source || null, params.clientLabel || null);
 
   return getDiscussion(id)!;
 }
@@ -126,15 +132,17 @@ export function addDiscussionMessage(
   content: string,
   cost?: number,
   username?: string,
-  participantId?: string
+  participantId?: string,
+  source?: string | null,
+  clientLabel?: string | null,
 ): DiscussionMessage {
   const db = getDb();
   const id = uuid();
   const now = new Date().toISOString();
   db.prepare(
-    'INSERT INTO discussion_messages (id, discussion_id, role, content, cost, username, participant_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(id, discussionId, role, content, cost ?? null, username ?? null, participantId ?? null, now);
-  return { id, discussion_id: discussionId, role, content, cost: cost ?? null, username: username ?? null, participant_id: participantId ?? null, created_at: now };
+    'INSERT INTO discussion_messages (id, discussion_id, role, content, cost, username, participant_id, source, client_label, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, discussionId, role, content, cost ?? null, username ?? null, participantId ?? null, source ?? null, clientLabel ?? null, now);
+  return { id, discussion_id: discussionId, role, content, cost: cost ?? null, username: username ?? null, participant_id: participantId ?? null, source: source ?? null, client_label: clientLabel ?? null, created_at: now };
 }
 
 export function getDiscussionMessages(discussionId: string, limit?: number, beforeId?: string): DiscussionMessage[] {

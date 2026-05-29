@@ -94,6 +94,8 @@ export interface Task {
   total_input_tokens: number;
   total_output_tokens: number;
   total_cost_usd?: number;
+  source?: string | null;
+  client_label?: string | null;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
@@ -109,6 +111,8 @@ export interface Message {
   cost: number | null;
   username: string | null;
   participant_id: string | null;
+  source?: string | null;
+  client_label?: string | null;
   created_at: string;
 }
 
@@ -332,6 +336,8 @@ export interface Discussion {
   activity: TaskActivity | null;
   running: boolean;
   rate_limit: RateLimitInfo | null;
+  source?: string | null;
+  client_label?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -344,6 +350,8 @@ export interface DiscussionMessage {
   cost: number | null;
   username: string | null;
   participant_id: string | null;
+  source?: string | null;
+  client_label?: string | null;
   created_at: string;
 }
 
