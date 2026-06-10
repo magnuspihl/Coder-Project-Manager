@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo, useCallback, type FormEvent } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback, type FormEvent } from 'react';
 import {
   getTaskDetail,
   getStreamLog,
@@ -25,6 +25,7 @@ import {
   type Message,
   type StreamLogEntry,
   type TaskParticipant,
+  type TaskTurn,
   type Workspace,
   type AttachmentInfo,
 } from '../api/client';
@@ -95,6 +96,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const editingTitleRef = useRef(false);
   editingTitleRef.current = editingTitle;
   const skipNextTitleBlurRef = useRef(false);
+  const [turns, setTurns] = useState<TaskTurn[]>([]);
   const [participants, setParticipants] = useState<TaskParticipant[]>([]);
   const [targetParticipantId, setTargetParticipantId] = useState<string | null>(null);
   const [showInviteMenu, setShowInviteMenu] = useState(false);
@@ -191,7 +193,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
   const loadData = async () => {
     try {
-      const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments, activeTaskId: newActiveTaskId } = await getTaskDetail(taskId);
+      const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments, activeTaskId: newActiveTaskId, turns: newTurns } = await getTaskDetail(taskId);
       setActiveTaskId(newActiveTaskId);
       if (prevStatusRef.current && prevStatusRef.current !== 'awaiting_feedback' && newTask.status === 'awaiting_feedback') {
         playChime();
@@ -214,6 +216,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
         setParticipants(newParticipants || []);
       }
       if (newAttachments) setAttachments(newAttachments);
+      if (newTurns) setTurns(newTurns);
     } catch {
       // ignore
     } finally {
@@ -1142,24 +1145,62 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
             {/* Scrollable body */}
             <div ref={scrollBodyRef} className="flex-1 overflow-y-auto p-5 space-y-4">
               {/* Conversation */}
-              {messages.map((msg) => {
-                const isParticipantMsg = msg.role === 'assistant' && msg.participant_id;
-                const participantName = msg.participant_id
-                  ? participants.find(p => p.id === msg.participant_id)?.workspace_name
-                  : null;
-                // For user messages targeted at a participant, show the recipient
-                const recipientLabel = msg.role === 'user' && msg.participant_id && participants.length > 0
-                  ? participants.find(p => p.id === msg.participant_id)?.workspace_name
-                  : null;
+              {(() => {
+                const turnMap = new Map(turns.map(t => [t.id, t]));
+                let lastTurnId: string | null | undefined = undefined;
+                return messages.map((msg) => {
+                  const isParticipantMsg = msg.role === 'assistant' && msg.participant_id;
+                  const participantName = msg.participant_id
+                    ? participants.find(p => p.id === msg.participant_id)?.workspace_name
+                    : null;
+                  const recipientLabel = msg.role === 'user' && msg.participant_id && participants.length > 0
+                    ? participants.find(p => p.id === msg.participant_id)?.workspace_name
+                    : null;
 
-                return (
+                  const turnChanged = msg.turn_id !== undefined && msg.turn_id !== lastTurnId;
+                  if (turnChanged) lastTurnId = msg.turn_id;
+                  const turn = msg.turn_id ? turnMap.get(msg.turn_id) : undefined;
+                  const isReviewerMsg = turn?.role === 'reviewer';
+
+                  return (
+                    <React.Fragment key={msg.id}>
+                      {turnChanged && turn && (
+                        <div className="flex items-center gap-2 py-1">
+                          <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
+                          <span className={`flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full border ${
+                            turn.role === 'reviewer'
+                              ? turn.review_outcome === 'pass'
+                                ? 'text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800'
+                                : turn.review_outcome === 'fail'
+                                ? 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/30 border-amber-200 dark:border-amber-800'
+                                : 'text-purple-700 dark:text-purple-300 bg-purple-50 dark:bg-purple-900/30 border-purple-200 dark:border-purple-800'
+                              : 'text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700'
+                          }`}>
+                            {turn.role === 'reviewer' ? (
+                              <>
+                                <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z" /></svg>
+                                Reviewer
+                                {turn.review_outcome === 'pass' && <span className="text-green-600 dark:text-green-400">· Passed ✓</span>}
+                                {turn.review_outcome === 'fail' && <span className="text-amber-600 dark:text-amber-400">· Issues found</span>}
+                              </>
+                            ) : (
+                              <>
+                                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z"/></svg>
+                                Implementer{turn.turn_number > 1 ? ` · Turn ${Math.ceil(turn.turn_number / 2)}` : ''}
+                              </>
+                            )}
+                          </span>
+                          <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
+                        </div>
+                      )}
                   <div
-                    key={msg.id}
                     className={`rounded-lg p-4 ${
                       msg.role === 'user'
                         ? 'bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800 ml-8'
                         : msg.role === 'assistant' && isParticipantMsg
                         ? 'bg-teal-50 dark:bg-teal-900/20 border border-teal-200 dark:border-teal-800 mr-8'
+                        : msg.role === 'assistant' && isReviewerMsg
+                        ? 'bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 mr-8'
                         : msg.role === 'assistant'
                         ? 'bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 mr-8'
                         : msg.content.startsWith('Error:')
@@ -1213,8 +1254,10 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                     </div>
                     <Markdown content={msg.content} breaks={msg.role === 'user'} />
                   </div>
-                );
-              })}
+                    </React.Fragment>
+                  );
+                });
+              })()}
 
               {optimisticMessage && (
                 <div className="rounded-lg p-4 bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800 ml-8 opacity-70">
@@ -1254,10 +1297,24 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
               )}
 
               {(task.status === 'working' || (sending && !targetParticipantId)) && (
-                <div className="text-sm text-blue-600 dark:text-blue-400 p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg border border-blue-100 dark:border-blue-800">
+                <div className={`text-sm p-4 rounded-lg border ${
+                  task.active_turn_role === 'reviewer'
+                    ? 'text-purple-600 dark:text-purple-400 bg-purple-50 dark:bg-purple-900/20 border-purple-100 dark:border-purple-800'
+                    : 'text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/20 border-blue-100 dark:border-blue-800'
+                }`}>
                   <div className="flex items-center gap-2">
-                    <div className="animate-spin h-4 w-4 border-2 border-blue-600 dark:border-blue-400 border-t-transparent rounded-full" />
-                    <span>{task.status === 'working' ? 'Claude is working...' : 'Sending message...'}</span>
+                    <div className={`animate-spin h-4 w-4 border-2 border-t-transparent rounded-full ${
+                      task.active_turn_role === 'reviewer'
+                        ? 'border-purple-600 dark:border-purple-400'
+                        : 'border-blue-600 dark:border-blue-400'
+                    }`} />
+                    <span>{
+                      task.active_turn_role === 'reviewer'
+                        ? 'Reviewer is checking the work...'
+                        : task.status === 'working'
+                        ? 'Claude is working...'
+                        : 'Sending message...'
+                    }</span>
                     {task.status === 'working' && task.activity && (
                       <span className="text-xs text-gray-400 dark:text-gray-500 ml-auto">
                         Last activity {timeAgo(task.activity.timestamp)}
@@ -1265,7 +1322,11 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                     )}
                   </div>
                   {task.status === 'working' && task.activity && (
-                    <p className="mt-1 text-xs text-blue-500 dark:text-blue-300 truncate ml-6">
+                    <p className={`mt-1 text-xs truncate ml-6 ${
+                      task.active_turn_role === 'reviewer'
+                        ? 'text-purple-500 dark:text-purple-300'
+                        : 'text-blue-500 dark:text-blue-300'
+                    }`}>
                       {linkify(task.activity.summary)}
                     </p>
                   )}

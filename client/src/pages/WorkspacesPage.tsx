@@ -108,6 +108,7 @@ export default function WorkspacesPage() {
   const [newTaskPrompt, setNewTaskPrompt, clearNewTaskPrompt] = useDraft('newTaskPrompt');
   const [newTaskModel, setNewTaskModel] = useState('');
   const [newTaskCaveman, setNewTaskCaveman] = useState('');
+  const [newTaskAutoReview, setNewTaskAutoReview] = useState(true);
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
   const [creatingTask, setCreatingTask] = useState(false);
@@ -728,7 +729,7 @@ export default function WorkspacesPage() {
       const model = newTaskModel || undefined;
       const caveman = newTaskCaveman || undefined;
       const attIds = newTaskAttachmentIds.length > 0 ? newTaskAttachmentIds : undefined;
-      await createTask(workspaceId, newTaskPrompt.trim(), model, caveman, attIds);
+      await createTask(workspaceId, newTaskPrompt.trim(), model, caveman, attIds, newTaskAutoReview);
       try {
         const defaults = JSON.parse(localStorage.getItem('taskDefaults') || '{}');
         defaults[workspaceId] = { model: newTaskModel, caveman: newTaskCaveman };
@@ -1319,6 +1320,16 @@ export default function WorkspacesPage() {
                 <option value="full">Caveman: Full — fragments, no articles</option>
                 <option value="ultra">Caveman: Ultra — max compression</option>
               </select>
+              <label className="flex items-center gap-2 mt-1.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={newTaskAutoReview}
+                  onChange={(e) => setNewTaskAutoReview(e.target.checked)}
+                  disabled={creatingTask}
+                  className="w-3.5 h-3.5 accent-blue-600"
+                />
+                <span className="text-xs text-gray-600 dark:text-gray-400">Auto-review — red-team pass before surfacing to you</span>
+              </label>
               {newTaskFiles.length > 0 && (
                 <div className="flex flex-wrap gap-1 mt-1">
                   {newTaskFiles.map((f, i) => (

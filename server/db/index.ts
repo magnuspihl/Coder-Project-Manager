@@ -249,5 +249,38 @@ export function getDb(): Database.Database {
         AND deleted_at IS NULL
     `);
   }
+
+  // Auto-review migrations
+  const tasksCols5 = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+  if (!tasksCols5.some(c => c.name === 'auto_review')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN auto_review INTEGER NOT NULL DEFAULT 1");
+  }
+  if (!tasksCols5.some(c => c.name === 'review_loop_count')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN review_loop_count INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!tasksCols5.some(c => c.name === 'active_turn_role')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN active_turn_role TEXT");
+  }
+
+  db.exec(`CREATE TABLE IF NOT EXISTS task_turns (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('implementer', 'reviewer')),
+    turn_number INTEGER NOT NULL,
+    claude_session_id TEXT,
+    review_outcome TEXT CHECK (review_outcome IN ('pass', 'fail', NULL)),
+    review_summary TEXT,
+    review_issues TEXT,
+    files_changed INTEGER,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT
+  )`);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_task_turns_task ON task_turns(task_id, turn_number)");
+
+  const msgCols = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
+  if (!msgCols.some(c => c.name === 'turn_id')) {
+    db.exec("ALTER TABLE messages ADD COLUMN turn_id TEXT REFERENCES task_turns(id)");
+  }
+
   return db;
 }

@@ -28,8 +28,25 @@ export interface Task {
   total_output_tokens: number;
   source: string | null;
   client_label: string | null;
+  auto_review: number;
+  review_loop_count: number;
+  active_turn_role: string | null;
   created_at: string;
   updated_at: string;
+  completed_at: string | null;
+}
+
+export interface TaskTurn {
+  id: string;
+  task_id: string;
+  role: 'implementer' | 'reviewer';
+  turn_number: number;
+  claude_session_id: string | null;
+  review_outcome: 'pass' | 'fail' | null;
+  review_summary: string | null;
+  review_issues: string | null;
+  files_changed: number | null;
+  started_at: string;
   completed_at: string | null;
 }
 
@@ -40,6 +57,7 @@ export interface Message {
   content: string;
   cost: number | null;
   participant_id: string | null;
+  turn_id: string | null;
   source?: string | null;
   client_label?: string | null;
   created_at: string;
@@ -236,6 +254,7 @@ export function createTask(params: {
   caveman?: string;
   source?: string | null;
   clientLabel?: string | null;
+  autoReview?: boolean;
 }): Task {
   const db = getDb();
   const id = uuid();
@@ -250,10 +269,12 @@ export function createTask(params: {
   // Immediate heuristic title; LLM will refine it async
   const title = generateTitleFallback(params.prompt);
 
+  const autoReview = params.autoReview === false ? 0 : 1;
+
   db.prepare(
-    `INSERT INTO tasks (id, workspace_id, workspace_name, user_id, title, prompt, status, position, project_dir, claude_session_id, model, caveman, source, client_label)
-     VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)`
-  ).run(id, params.workspaceId, params.workspaceName, params.userId, title, params.prompt, position, params.projectDir || null, claudeSessionId, params.model || null, params.caveman || null, params.source || null, params.clientLabel || null);
+    `INSERT INTO tasks (id, workspace_id, workspace_name, user_id, title, prompt, status, position, project_dir, claude_session_id, model, caveman, source, client_label, auto_review)
+     VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(id, params.workspaceId, params.workspaceName, params.userId, title, params.prompt, position, params.projectDir || null, claudeSessionId, params.model || null, params.caveman || null, params.source || null, params.clientLabel || null, autoReview);
 
   // Store the initial prompt as a user message (inherits provenance from the task creation call)
   addMessage(id, 'user', params.prompt, undefined, params.username, undefined, params.source || null, params.clientLabel || null);
@@ -304,6 +325,60 @@ export function deleteTask(taskId: string): void {
 export function restoreTask(taskId: string): void {
   const db = getDb();
   db.prepare('UPDATE tasks SET deleted_at = NULL WHERE id = ?').run(taskId);
+}
+
+// ---------------------------------------------------------------------------
+// Task turns (auto-review)
+// ---------------------------------------------------------------------------
+
+export function createTaskTurn(params: {
+  taskId: string;
+  role: 'implementer' | 'reviewer';
+  claudeSessionId?: string | null;
+  filesChanged?: number | null;
+}): TaskTurn {
+  const db = getDb();
+  const id = uuid();
+  const maxRow = db.prepare('SELECT COALESCE(MAX(turn_number), 0) AS max_n FROM task_turns WHERE task_id = ?').get(params.taskId) as { max_n: number };
+  const turnNumber = maxRow.max_n + 1;
+  const now = new Date().toISOString();
+  db.prepare(
+    'INSERT INTO task_turns (id, task_id, role, turn_number, claude_session_id, files_changed, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, params.taskId, params.role, turnNumber, params.claudeSessionId ?? null, params.filesChanged ?? null, now);
+  return db.prepare('SELECT * FROM task_turns WHERE id = ?').get(id) as TaskTurn;
+}
+
+export function getTaskTurns(taskId: string): TaskTurn[] {
+  const db = getDb();
+  return db.prepare('SELECT * FROM task_turns WHERE task_id = ? ORDER BY turn_number').all(taskId) as TaskTurn[];
+}
+
+export function getLatestTaskTurn(taskId: string): TaskTurn | undefined {
+  const db = getDb();
+  return db.prepare('SELECT * FROM task_turns WHERE task_id = ? ORDER BY turn_number DESC LIMIT 1').get(taskId) as TaskTurn | undefined;
+}
+
+export function completeTaskTurn(turnId: string, outcome?: 'pass' | 'fail', summary?: string, issues?: string[]): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    'UPDATE task_turns SET completed_at = ?, review_outcome = ?, review_summary = ?, review_issues = ? WHERE id = ?'
+  ).run(now, outcome ?? null, summary ?? null, issues ? JSON.stringify(issues) : null, turnId);
+}
+
+export function setActiveTaskTurnRole(taskId: string, role: 'implementer' | 'reviewer' | null): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET active_turn_role = ?, updated_at = ? WHERE id = ?').run(role, new Date().toISOString(), taskId);
+}
+
+export function incrementReviewLoopCount(taskId: string): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET review_loop_count = review_loop_count + 1, updated_at = ? WHERE id = ?').run(new Date().toISOString(), taskId);
+}
+
+export function resetReviewLoopCount(taskId: string): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET review_loop_count = 0, updated_at = ? WHERE id = ?').run(new Date().toISOString(), taskId);
 }
 
 export function getNextQueuedTask(workspaceId: string): Task | undefined {
@@ -383,13 +458,14 @@ export function addMessage(
   participantId?: string,
   source?: string | null,
   clientLabel?: string | null,
+  turnId?: string | null,
 ): Message {
   const db = getDb();
   const id = uuid();
   const now = new Date().toISOString();
   db.prepare(
-    'INSERT INTO messages (id, task_id, role, content, cost, username, participant_id, source, client_label, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(id, taskId, role, content, cost ?? null, username ?? null, participantId ?? null, source ?? null, clientLabel ?? null, now);
+    'INSERT INTO messages (id, task_id, role, content, cost, username, participant_id, source, client_label, turn_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, taskId, role, content, cost ?? null, username ?? null, participantId ?? null, source ?? null, clientLabel ?? null, turnId ?? null, now);
 
   // Extract verification URL from assistant messages and store on the task
   if (role === 'assistant') {
@@ -400,7 +476,7 @@ export function addMessage(
   }
 
   // Return constructed message without a read-back query
-  return { id, task_id: taskId, role, content, cost: cost ?? null, participant_id: participantId ?? null, created_at: now };
+  return { id, task_id: taskId, role, content, cost: cost ?? null, participant_id: participantId ?? null, turn_id: turnId ?? null, created_at: now };
 }
 
 export function addTokenUsage(taskId: string, inputTokens: number, outputTokens: number): void {
