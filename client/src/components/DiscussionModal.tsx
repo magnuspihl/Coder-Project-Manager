@@ -4,9 +4,10 @@ import {
   getOlderDiscussionMessages,
   sendDiscussionMessage,
   closeDiscussion,
+  discardDiscussionWorktree,
   interruptDiscussion,
   updateDiscussionSession,
-  updateDiscussionSettings,
+  createTask,
   approveTaskRequest,
   dismissTaskRequest,
   updateTaskRequestTarget,
@@ -973,7 +974,22 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
 
   const handleClose = async () => {
     if (!confirm('Close this discussion? You can start a new one later.')) return;
-    await closeDiscussion(discussionId);
+    const result = await closeDiscussion(discussionId);
+    if (result.hasChanges && result.branchName) {
+      const convert = confirm(
+        `This Chat session made file changes on branch \`${result.branchName}\`.\n\n` +
+        `Create a task to continue this work? (Choose Cancel to discard the changes.)`
+      );
+      if (convert) {
+        await createTask(
+          workspaceId,
+          `Continue Chat session work from branch \`${result.branchName}\`. ` +
+          `Review the uncommitted changes in that branch and complete or refine the work.`
+        );
+      } else {
+        await discardDiscussionWorktree(discussionId);
+      }
+    }
     onClose();
   };
 
@@ -1016,17 +1032,6 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
     }
   };
 
-  const handleToggleFullAccess = async () => {
-    if (!discussion || discussion.running) return;
-    const newValue = !discussion.full_access;
-    try {
-      await updateDiscussionSettings(workspaceId, newValue);
-      // Update local state immediately
-      setDiscussion({ ...discussion, full_access: newValue ? 1 : 0 });
-    } catch {
-      // ignore
-    }
-  };
 
   const handleEditSession = () => {
     setSessionIdDraft(discussion?.claude_session_id || '');
@@ -1130,25 +1135,6 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
                 {sessionError && (
                   <p className="text-[10px] text-red-500 mt-0.5">{sessionError}</p>
                 )}
-                {/* Full Access toggle */}
-                <div className="flex items-center gap-1.5 mt-1.5">
-                  <span className="text-[10px] text-gray-400 dark:text-gray-500 uppercase tracking-wide shrink-0">Access</span>
-                  <button
-                    onClick={handleToggleFullAccess}
-                    disabled={discussion.running}
-                    className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
-                      discussion.full_access ? 'bg-amber-500' : 'bg-gray-300 dark:bg-gray-600'
-                    } ${discussion.running ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
-                    title={discussion.full_access ? 'Full Access — Claude can modify project files directly' : 'Project files are read-only — Claude proposes tasks for project changes'}
-                  >
-                    <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${
-                      discussion.full_access ? 'translate-x-3.5' : 'translate-x-0.5'
-                    }`} />
-                  </button>
-                  <span className={`text-[10px] ${discussion.full_access ? 'text-amber-600 dark:text-amber-400' : 'text-gray-400 dark:text-gray-500'}`}>
-                    {discussion.full_access ? 'Full Access' : 'Project read-only'}
-                  </span>
-                </div>
               </div>
               <PreviewToggleButton state={preview} />
               <button
@@ -1166,7 +1152,7 @@ export default function DiscussionModal({ discussionId, workspaceId, workspaceNa
             <div ref={scrollBodyRef} className="flex-1 overflow-y-auto p-5 space-y-4">
               {messages.length === 0 && !discussion.running && (
                 <div className="text-center text-gray-400 dark:text-gray-500 text-sm py-8">
-                  Start a conversation about this workspace. Claude can read code but won't modify anything.
+                  Start a conversation about this workspace. Changes are isolated in a git branch and can be converted to a task.
                 </div>
               )}
 

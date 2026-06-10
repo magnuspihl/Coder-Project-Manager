@@ -1,5 +1,6 @@
 import { sshExec, detectProjectDir } from './claude.js';
 import { addMessage, getTask, type Task } from './tasks.js';
+import { type Discussion } from './discussions.js';
 import { getDb } from '../db/index.js';
 import { execFile } from 'child_process';
 
@@ -221,6 +222,96 @@ export async function removeTaskWorktree(task: Task): Promise<void> {
     console.log(`[git] Removed worktree for task ${task.id}`);
   } catch (err: any) {
     console.error(`[git] Failed to remove worktree for task ${task.id}:`, err.message);
+  }
+}
+
+// ─── Discussion worktrees ─────────────────────────────────────────────────────
+
+const CPM_DISCUSSION_WORKTREE_BASE = process.env.CPM_DISCUSSION_WORKTREE_BASE || '/home/coder/.cpm/discussion-worktrees';
+
+/**
+ * Create a worktree for a new discussion session.
+ * No-ops if the workspace has no git repo, no commits, or remote pushes disabled.
+ */
+export async function handleDiscussionLaunchGit(discussion: Discussion): Promise<void> {
+  const dir = discussion.project_dir;
+  if (!dir || discussion.worktree_path) return;
+
+  const ws = discussion.workspace_name;
+  try {
+    if (!await hasGitRepo(ws, dir)) return;
+    if (!await hasCommits(ws, dir)) return;
+
+    const branchName = `chat/disc-${discussion.id.slice(0, 8)}`;
+    const defaultBranch = await getDefaultBranch(ws, dir);
+    const worktreePath = `${CPM_DISCUSSION_WORKTREE_BASE}/disc-${discussion.id}`;
+
+    await sshExec(ws,
+      `mkdir -p ${shellEscape(CPM_DISCUSSION_WORKTREE_BASE)} && ` +
+      `cd ${shellEscape(dir)} && ` +
+      `git fetch origin ${defaultBranch} 2>/dev/null || true && ` +
+      `git worktree add ${shellEscape(worktreePath)} -b ${shellEscape(branchName)} origin/${defaultBranch}`,
+      60000,
+    );
+
+    getDb().prepare('UPDATE discussions SET worktree_path = ? WHERE id = ?').run(worktreePath, discussion.id);
+    discussion.worktree_path = worktreePath;
+    console.log(`[git] Created discussion worktree ${worktreePath} on branch ${branchName}`);
+  } catch (err: any) {
+    console.error(`[git] Discussion worktree creation failed for ${discussion.id}:`, err.message);
+  }
+}
+
+/**
+ * Check if a discussion's worktree has uncommitted changes.
+ * Returns { hasChanges, branchName }.
+ */
+export async function checkDiscussionChanges(discussion: Discussion): Promise<{ hasChanges: boolean; branchName: string | null }> {
+  const worktreePath = discussion.worktree_path;
+  if (!worktreePath) return { hasChanges: false, branchName: null };
+
+  const ws = discussion.workspace_name;
+  try {
+    const statusOut = await sshExec(ws, `cd ${shellEscape(worktreePath)} && git status --porcelain`, 10000);
+    const branchOut = await sshExec(ws, `cd ${shellEscape(worktreePath)} && git rev-parse --abbrev-ref HEAD`, 10000);
+    return {
+      hasChanges: statusOut.trim().length > 0,
+      branchName: branchOut.trim() || null,
+    };
+  } catch {
+    return { hasChanges: false, branchName: null };
+  }
+}
+
+/**
+ * Remove a discussion's worktree and branch.
+ */
+export async function removeDiscussionWorktree(discussion: Discussion): Promise<void> {
+  const worktreePath = discussion.worktree_path;
+  if (!worktreePath) return;
+
+  const ws = discussion.workspace_name;
+  const dir = discussion.project_dir;
+  try {
+    const gitRoot = dir ? `cd ${shellEscape(dir)} && ` : '';
+    await sshExec(ws,
+      `${gitRoot}git worktree remove ${shellEscape(worktreePath)} --force 2>/dev/null || true`,
+      15000,
+    );
+    // Also delete the branch
+    const branchOut = await sshExec(ws,
+      `${gitRoot}git for-each-ref --format='%(refname:short)' refs/heads/chat/ | grep disc-${discussion.id.slice(0, 8)} || true`,
+      10000,
+    ).catch(() => '');
+    const branch = branchOut.trim();
+    if (branch && dir) {
+      await sshExec(ws, `cd ${shellEscape(dir)} && git branch -D ${shellEscape(branch)} 2>/dev/null || true`, 10000).catch(() => {});
+    }
+    getDb().prepare('UPDATE discussions SET worktree_path = NULL WHERE id = ?').run(discussion.id);
+    discussion.worktree_path = null;
+    console.log(`[git] Removed discussion worktree for ${discussion.id}`);
+  } catch (err: any) {
+    console.error(`[git] Failed to remove discussion worktree for ${discussion.id}:`, err.message);
   }
 }
 

@@ -7,7 +7,6 @@ import {
   createDiscussion,
   closeDiscussion,
   updateDiscussionSessionId,
-  updateDiscussionFullAccess,
   addDiscussionMessage,
   getDiscussionMessages,
   getDiscussionMessageCount,
@@ -17,14 +16,13 @@ import {
   approveTaskRequest,
   dismissTaskRequest,
   setTaskRequestTarget,
-  getDiscussionFullAccess,
-  setDiscussionFullAccess,
   addParticipant,
   removeParticipant,
   getParticipants,
   getParticipant,
   buildCatchUpContext,
 } from '../services/discussions.js';
+import { checkDiscussionChanges, removeDiscussionWorktree } from '../services/git.js';
 
 const CATCHUP_NUDGE = 'The user has switched to you. Review the conversation context above. ' +
   'If you have something relevant to add — a response, a question, or useful context — please do. ' +
@@ -101,13 +99,12 @@ router.post('/workspaces/:workspaceId/discussion', requireAuth, async (req: Requ
     }
   }
 
-  const fullAccess = getDiscussionFullAccess(workspaceId);
   const model = typeof req.body?.model === 'string' ? req.body.model.trim() : undefined;
   discussion = createDiscussion({
     workspaceId,
     workspaceName: workspace.name,
     userId: req.user!.id,
-    fullAccess,
+    fullAccess: false,
     model: model || undefined,
     source: req.authSource,
     clientLabel: req.clientLabel,
@@ -242,18 +239,35 @@ router.post('/discussions/:discussionId/touch', requireAuth, (req: Request, res:
   res.json({ previousOpenedAt, openedAt: now });
 });
 
-// Close a discussion
-router.post('/discussions/:discussionId/close', requireAuth, (req: Request, res: Response) => {
+// Close a discussion — checks for uncommitted worktree changes before cleaning up
+router.post('/discussions/:discussionId/close', requireAuth, async (req: Request, res: Response) => {
   const discussion = getDiscussion(req.params.discussionId);
   if (!discussion) {
     res.status(404).json({ error: 'Discussion not found' });
     return;
   }
 
-  // Stop any running process
   stopDiscussion(discussion.id);
   closeDiscussion(discussion.id);
 
+  if (discussion.worktree_path) {
+    const { hasChanges, branchName } = await checkDiscussionChanges(discussion);
+    if (hasChanges) {
+      // Keep the worktree — caller will offer the user a "convert to task" choice
+      res.json({ ok: true, hasChanges: true, branchName });
+      return;
+    }
+    await removeDiscussionWorktree(discussion);
+  }
+
+  res.json({ ok: true, hasChanges: false });
+});
+
+// Discard the worktree branch left behind after a Chat session with changes
+router.post('/discussions/:discussionId/discard-worktree', requireAuth, async (req: Request, res: Response) => {
+  const discussion = getDiscussion(req.params.discussionId);
+  if (!discussion) { res.status(404).json({ error: 'Discussion not found' }); return; }
+  await removeDiscussionWorktree(discussion);
   res.json({ ok: true });
 });
 
@@ -402,32 +416,6 @@ router.post('/discussions/:discussionId/task-requests/:requestId/dismiss', requi
 
   dismissTaskRequest(taskRequest.id);
   res.json({ ok: true });
-});
-
-// Get workspace discussion settings
-router.get('/workspaces/:workspaceId/discussion-settings', requireAuth, (req: Request, res: Response) => {
-  const fullAccess = getDiscussionFullAccess(req.params.workspaceId);
-  res.json({ fullAccess });
-});
-
-// Update workspace discussion settings (persists across discussions)
-router.patch('/workspaces/:workspaceId/discussion-settings', requireAuth, (req: Request, res: Response) => {
-  const { fullAccess } = req.body;
-  if (typeof fullAccess !== 'boolean') {
-    res.status(400).json({ error: 'fullAccess must be a boolean' });
-    return;
-  }
-  // Persist for future discussions
-  setDiscussionFullAccess(req.params.workspaceId, fullAccess);
-  // Also update the current active discussion if one exists
-  const active = getActiveDiscussion(req.params.workspaceId);
-  if (active && active.full_access !== (fullAccess ? 1 : 0)) {
-    updateDiscussionFullAccess(active.id, fullAccess);
-    // Add a system message so it's visible in the chat
-    const modeLabel = fullAccess ? 'Full Access' : 'Read-Only';
-    addDiscussionMessage(active.id, 'system', `Access mode changed to ${modeLabel}. This takes effect on the next message.`, undefined, undefined, undefined, req.authSource, req.clientLabel);
-  }
-  res.json({ ok: true, fullAccess });
 });
 
 // ─── Participant endpoints ──────────────────────────────

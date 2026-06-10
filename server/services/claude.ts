@@ -5,7 +5,7 @@ import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueued
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
-import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, removeTaskWorktree, fetchGitHubToken, isRemoteAllowed } from './git.js';
+import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, removeTaskWorktree, handleDiscussionLaunchGit, fetchGitHubToken, isRemoteAllowed } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
 import { getAttachmentsByTask, type Attachment } from '../routes/uploads.js';
 import { writeCpmGuidelines } from './workspace-memory.js';
@@ -36,7 +36,7 @@ function allocatePortRange(_workspaceId: string): number | null {
   return null;
 }
 
-async function cleanupPortRange(task: Task): Promise<void> {
+export async function cleanupPortRange(task: Task): Promise<void> {
   if (task.port_range_start === null || task.port_range_start === undefined) return;
   const ports = Array.from({ length: PORT_RANGE_SIZE }, (_, i) => `${task.port_range_start! + i}/tcp`).join(' ');
   await sshExec(task.workspace_name, `fuser -k ${ports} 2>/dev/null || true`, 10000).catch(() => {});
@@ -1502,10 +1502,13 @@ function getDiscussionPromptPrefix(
   projectDir: string | null,
   ownWorkspaceName: string,
   userId: string | null,
+  worktreePath: string | null = null,
 ): string {
-  const boundary = projectDir
-    ? `You MUST NOT modify, create, or delete any files within \`${projectDir}\` (the git-tracked project directory) — treat it as read-only. If work needs to be done inside the project, output a [TASK_REQUEST] instead and the user will approve it as a task.\n\nYou MAY freely read, explore, and write to files outside this path — global config files like \`~/.claude/CLAUDE.md\`, workspace memory files, temp files, etc.`
-    : `You MUST NOT modify, create, or delete files in the project repository — treat it as read-only. If work needs to be done in the project, output a [TASK_REQUEST] instead and the user will approve it as a task.`;
+  const boundary = worktreePath
+    ? `You are working in an isolated git branch (\`${worktreePath}\`). You have full access to read and modify files — your changes are isolated from the main project branch and will only be merged if you or the user decides to. You can also output a [TASK_REQUEST] to create a formal tracked task.`
+    : projectDir
+      ? `You MUST NOT modify, create, or delete any files within \`${projectDir}\` (the git-tracked project directory) — treat it as read-only. If work needs to be done inside the project, output a [TASK_REQUEST] instead and the user will approve it as a task.\n\nYou MAY freely read, explore, and write to files outside this path — global config files like \`~/.claude/CLAUDE.md\`, workspace memory files, temp files, etc.`
+      : `You MUST NOT modify, create, or delete files in the project repository — treat it as read-only. If work needs to be done in the project, output a [TASK_REQUEST] instead and the user will approve it as a task.`;
 
   const workspaces = userId ? getWorkspacesForUser(userId) : null;
   const otherRunning = (workspaces ?? [])
@@ -1651,35 +1654,12 @@ export async function launchDiscussion(
   username?: string,
   skipCatchUp?: boolean
 ): Promise<void> {
-  const isFullAccess = discussion.full_access === 1;
-  const FULL_ACCESS_OVERRIDE = '[SYSTEM OVERRIDE] Your access mode has been changed to FULL ACCESS. ' +
-    'You are NO LONGER in a read-only session. Disregard any earlier instructions about being read-only or having limited tools. ' +
-    'You now have full access to all tools and can modify files, make commits, run any commands, and perform all actions.\n\n';
-
   // Build catch-up context for the host if there are participants —
   // the host's own session doesn't contain messages from other agents.
   const participants = getDiscussionParticipants(discussion.id);
   let hostCatchUp = '';
   if (participants.length > 0 && isResume && !skipCatchUp) {
     hostCatchUp = buildCatchUpContext(discussion.id, '__host__');
-  }
-
-  let prompt: string;
-  if (!isResume) {
-    // First message — use prefix or not based on mode
-    prompt = isFullAccess ? message : getDiscussionPromptPrefix(discussion.project_dir ?? null, discussion.workspace_name, discussion.user_id) + message;
-  } else if (participants.length > 0) {
-    // Resuming with participants — prepend catch-up if available, skip access override.
-    // Always include mention instruction so the agent knows how to reach other agents.
-    const mentionInstr = hostCatchUp ? '' : buildMentionInstruction(discussion.id);
-    const prefix = [hostCatchUp, mentionInstr].filter(Boolean).join('\n');
-    prompt = prefix ? prefix + '\n' + message : message;
-  } else if (isFullAccess) {
-    // Resuming with full access, no participants — send override in case mode changed
-    prompt = FULL_ACCESS_OVERRIDE + message;
-  } else {
-    // Resuming in read-only, no participants — send override in case mode changed
-    prompt = getReadOnlyOverride(discussion.project_dir ?? null) + message;
   }
 
   // Auto-detect project directory if not already set
@@ -1691,12 +1671,28 @@ export async function launchDiscussion(
     }
   }
 
-  // Check if the session already exists on the remote workspace
-  // (e.g. user pasted an existing session ID via the edit field, or resuming a CCW session).
-  // Claude scopes sessions to the cwd's project path, so we also resolve the correct working
-  // directory by checking whether the session lives under the project dir or the home dir.
+  // Create a worktree on first launch so the discussion is isolated from tasks
+  if (!isResume && !discussion.worktree_path) {
+    await handleDiscussionLaunchGit(discussion);
+  }
+
+  let prompt: string;
+  if (!isResume) {
+    prompt = getDiscussionPromptPrefix(discussion.project_dir ?? null, discussion.workspace_name, discussion.user_id, discussion.worktree_path) + message;
+  } else if (participants.length > 0) {
+    // Resuming with participants — prepend catch-up if available.
+    const mentionInstr = hostCatchUp ? '' : buildMentionInstruction(discussion.id);
+    const prefix = [hostCatchUp, mentionInstr].filter(Boolean).join('\n');
+    prompt = prefix ? prefix + '\n' + message : message;
+  } else {
+    prompt = message;
+  }
+
+  // Check if the session already exists on the remote workspace.
+  // Worktree path is the preferred working directory; fall back to project_dir or home.
+  const preferredWorkDir = discussion.worktree_path || discussion.project_dir;
   let remoteSessionExists = isResume;
-  let sessionWorkDir = discussion.project_dir;
+  let sessionWorkDir = preferredWorkDir;
   if (discussion.claude_session_id) {
     try {
       const checkResult = await sshExec(discussion.workspace_name,
@@ -1705,17 +1701,15 @@ export async function launchDiscussion(
       const sessionPath = checkResult.trim();
       if (sessionPath) {
         remoteSessionExists = true;
-        // If the session isn't in the project dir's scope, fall back to home dir.
-        // Claude encodes every non-alphanumeric char as '-', so /home/coder/My.App → -home-coder-My-App
-        const projectDirEncoded = discussion.project_dir
-          ? discussion.project_dir.replace(/[^a-zA-Z0-9]/g, '-')
+        const workDirEncoded = preferredWorkDir
+          ? preferredWorkDir.replace(/[^a-zA-Z0-9]/g, '-')
           : null;
-        if (projectDirEncoded && !sessionPath.includes(`/projects/${projectDirEncoded}/`)) {
+        if (workDirEncoded && !sessionPath.includes(`/projects/${workDirEncoded}/`)) {
           sessionWorkDir = '/home/coder';
         }
       }
     } catch {
-      // Non-fatal — assume new session, use default project_dir
+      // Non-fatal — assume new session, use default working dir
     }
   }
 
@@ -1735,11 +1729,8 @@ export async function launchDiscussion(
 
   claudeParts.push('--output-format', 'stream-json');
   claudeParts.push('--verbose');
-  if (isFullAccess) {
-    claudeParts.push('--dangerously-skip-permissions');
-  } else {
-    claudeParts.push('--allowedTools', shellEscape(DISCUSSION_ALLOWED_TOOLS));
-  }
+  // Discussions always run with full permissions — the worktree provides filesystem isolation
+  claudeParts.push('--dangerously-skip-permissions');
   claudeParts.push('--max-turns', MAX_TURNS);
 
   claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));

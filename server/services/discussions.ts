@@ -10,6 +10,7 @@ export interface Discussion {
   status: string;
   project_dir: string | null;
   full_access: number;
+  worktree_path: string | null;
   model: string | null;
   ssh_pid: number | null;
   source: string | null;

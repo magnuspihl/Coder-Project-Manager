@@ -333,6 +333,7 @@ export interface Discussion {
   status: string;
   project_dir: string | null;
   full_access: number;
+  worktree_path: string | null;
   model: string | null;
   ssh_pid: number | null;
   activity: TaskActivity | null;
@@ -449,7 +450,10 @@ export const sendDiscussionMessage = (discussionId: string, message: string) =>
   });
 
 export const closeDiscussion = (discussionId: string) =>
-  request<{ ok: boolean }>(`/api/discussions/${discussionId}/close`, { method: 'POST' });
+  request<{ ok: boolean; hasChanges?: boolean; branchName?: string | null }>(`/api/discussions/${discussionId}/close`, { method: 'POST' });
+
+export const discardDiscussionWorktree = (discussionId: string) =>
+  request<{ ok: boolean }>(`/api/discussions/${discussionId}/discard-worktree`, { method: 'POST' });
 
 export const interruptDiscussion = (discussionId: string) =>
   request<{ ok: boolean }>(`/api/discussions/${discussionId}/interrupt`, { method: 'POST' });
