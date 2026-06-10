@@ -374,6 +374,9 @@ router.post('/tasks/:taskId/retry', requireAuth, async (req: Request, res: Respo
     addMessage(task.id, 'system', 'Pending completion cancelled — retry requested.', undefined, undefined, undefined, req.authSource, req.clientLabel);
   }
 
+  // resumeTask guards on awaiting_feedback — transition before calling it
+  updateTaskStatus(task.id, 'awaiting_feedback');
+
   // If another task is working on this workspace, queue instead of resuming immediately
   const working = getWorkingTask(task.workspace_id);
   if (working) {
