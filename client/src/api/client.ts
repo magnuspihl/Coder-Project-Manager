@@ -72,6 +72,20 @@ export interface RateLimitInfo {
   rateLimitType: string;
 }
 
+export interface TaskTurn {
+  id: string;
+  task_id: string;
+  role: 'implementer' | 'reviewer';
+  turn_number: number;
+  claude_session_id: string | null;
+  review_outcome: 'pass' | 'fail' | null;
+  review_summary: string | null;
+  review_issues: string | null;
+  files_changed: number | null;
+  started_at: string;
+  completed_at: string | null;
+}
+
 export interface Task {
   id: string;
   workspace_id: string;
@@ -91,6 +105,9 @@ export interface Task {
   port_range_start: number | null;
   model: string | null;
   caveman: string | null;
+  auto_review: number;
+  review_loop_count: number;
+  active_turn_role: 'implementer' | 'reviewer' | null;
   pending_complete?: number;
   session_initialized?: number;
   total_input_tokens: number;
@@ -113,6 +130,7 @@ export interface Message {
   cost: number | null;
   username: string | null;
   participant_id: string | null;
+  turn_id: string | null;
   source?: string | null;
   client_label?: string | null;
   created_at: string;
@@ -212,10 +230,10 @@ export const getModels = (workspaceId: string) =>
 export const getTasks = (workspaceId: string) =>
   request<{ tasks: Task[]; activeTaskId: string | null }>(`/api/workspaces/${workspaceId}/tasks`);
 
-export const createTask = (workspaceId: string, prompt: string, model?: string, caveman?: string, attachmentIds?: string[]) =>
+export const createTask = (workspaceId: string, prompt: string, model?: string, caveman?: string, attachmentIds?: string[], autoReview?: boolean) =>
   request<{ task: Task }>(`/api/workspaces/${workspaceId}/tasks`, {
     method: 'POST',
-    body: JSON.stringify({ prompt, ...(model ? { model } : {}), ...(caveman ? { caveman } : {}), ...(attachmentIds?.length ? { attachmentIds } : {}) }),
+    body: JSON.stringify({ prompt, ...(model ? { model } : {}), ...(caveman ? { caveman } : {}), ...(attachmentIds?.length ? { attachmentIds } : {}), ...(autoReview === false ? { autoReview: false } : {}) }),
   });
 
 export interface AttachmentInfo {
@@ -229,7 +247,7 @@ export interface AttachmentInfo {
 }
 
 export const getTaskDetail = (taskId: string) =>
-  request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[]; activeTaskId: string | null }>(`/api/tasks/${taskId}`);
+  request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[]; activeTaskId: string | null; turns: TaskTurn[] }>(`/api/tasks/${taskId}`);
 
 export const getStreamLog = (taskId: string, afterId?: number) =>
   request<{ streamLog: StreamLogEntry[] }>(`/api/tasks/${taskId}/stream-log${afterId ? `?after=${afterId}` : ''}`);

@@ -1,7 +1,7 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { createReadStream, createWriteStream } from 'fs';
 import { randomUUID } from 'crypto';
-import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, getPendingCompletionTask, setPendingComplete, markSessionInitialized, type Task, type TaskParticipant } from './tasks.js';
+import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, type Task, type TaskParticipant } from './tasks.js';
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
@@ -262,6 +262,101 @@ NOT: "Sure! I'd be happy to help you with that. The issue you're experiencing is
 YES: "Bug in auth middleware. Token expiry check use < not <=. Fix:"
 
 Exception: security warnings + irreversible action confirmations use normal language. Code/commits/PRs written normally.`;
+}
+
+// ---------------------------------------------------------------------------
+// Auto-review (red team)
+// ---------------------------------------------------------------------------
+
+const REVIEWER_ALLOWED_TOOLS = 'Read,Glob,Grep,Bash';
+const MAX_REVIEW_LOOPS = parseInt(process.env.CPM_REVIEW_MAX_LOOPS || '2', 10);
+
+function remoteReviewerOutputPath(taskId: string): string {
+  return `/tmp/cpm-task-${taskId}-review.jsonl`;
+}
+
+function remoteReviewerExitCodePath(taskId: string): string {
+  return `/tmp/cpm-task-${taskId}-review.exit`;
+}
+
+async function worktreeHasChanges(worktreePath: string, workspaceName: string): Promise<boolean> {
+  try {
+    const out = await sshExec(workspaceName, `git -C ${shellEscape(worktreePath)} status --porcelain 2>/dev/null`, 10000);
+    return out.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function getGitDiff(worktreePath: string, workspaceName: string): Promise<string> {
+  try {
+    const diff = await sshExec(workspaceName, `git -C ${shellEscape(worktreePath)} diff HEAD 2>/dev/null`, 15000);
+    const untracked = await sshExec(workspaceName, `git -C ${shellEscape(worktreePath)} ls-files --others --exclude-standard 2>/dev/null`, 10000);
+    const parts: string[] = [];
+    if (diff.trim()) parts.push(diff.trim());
+    if (untracked.trim()) parts.push(`Untracked files:\n${untracked.trim()}`);
+    const combined = parts.join('\n\n');
+    // Truncate if very large (~8000 tokens ≈ 32000 chars)
+    if (combined.length > 32000) {
+      return combined.slice(0, 32000) + '\n\n[diff truncated — use Read tool to inspect remaining files]';
+    }
+    return combined || '(no diff output)';
+  } catch {
+    return '(could not retrieve diff)';
+  }
+}
+
+function buildReviewerSystemPrompt(): string {
+  return `MANDATORY REVIEW RULES — RED TEAM MODE:
+
+You are a code reviewer who did not write this code. Your job is to find problems the implementer missed, not to confirm that things work.
+
+Focus on:
+- Does the implementation actually fulfill the original task?
+- Missing input validation or boundary checks
+- Unhandled error paths and edge cases
+- Incorrect logic that would produce wrong results under specific conditions
+- Missing or wrong tests for critical behaviour
+- Security issues (injection, auth gaps, unsafe operations)
+
+Do NOT:
+- Praise the implementation
+- Describe what the code does (assume the reader knows)
+- Create, edit, or delete any files
+- Run commands that modify state (no git commits, no writes, no installs)
+
+You MAY run read-only commands: git diff, git log, git status, cat, grep, find, npm test / go test / pytest (read test results — do not write new test files).
+
+When you are done, include the following block as the LAST line of your response, with no trailing text:
+
+REVIEW_DECISION: {"outcome":"pass","summary":"<one sentence>"}
+   or
+REVIEW_DECISION: {"outcome":"fail","summary":"<one sentence>","issues":["<specific issue>","..."]}
+
+"pass" means: no significant issues; the implementer's work is ready for user review.
+"fail" means: specific actionable issues were found that the implementer should fix. List only genuine problems, not stylistic preferences.`;
+}
+
+interface ReviewDecision {
+  outcome: 'pass' | 'fail';
+  summary: string;
+  issues?: string[];
+}
+
+function parseReviewDecision(text: string): ReviewDecision | null {
+  const match = text.match(/^REVIEW_DECISION:\s*(\{.+\})$/m);
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[1]);
+    if (parsed.outcome !== 'pass' && parsed.outcome !== 'fail') return null;
+    return {
+      outcome: parsed.outcome,
+      summary: typeof parsed.summary === 'string' ? parsed.summary : '',
+      issues: Array.isArray(parsed.issues) ? parsed.issues : undefined,
+    };
+  } catch {
+    return null;
+  }
 }
 
 // Stream log per task — persisted to database
@@ -762,6 +857,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     }
 
     updateTaskStatus(task.id, 'working');
+    setActiveTaskTurnRole(task.id, 'implementer');
     taskActivity.set(task.id, { timestamp: new Date().toISOString(), summary: 'Starting Claude session' });
 
     // Archive the previous run's output/exit to .prev before spawning SSH.
@@ -1287,6 +1383,256 @@ function startFilePolling(task: Task): void {
 }
 
 /**
+ * Called after the implementer turn completes successfully. Decides whether
+ * to launch the reviewer or transition directly to awaiting_feedback.
+ */
+async function onImplementerTurnComplete(task: Task): Promise<void> {
+  const current = getTask(task.id);
+  if (!current) return;
+
+  // No auto-review: check the flag, and also skip if no worktree (pre-worktrees task)
+  if (!current.auto_review || !current.worktree_path) {
+    setActiveTaskTurnRole(task.id, null);
+    updateTaskStatus(task.id, 'awaiting_feedback');
+    processQueue(task.workspace_id).catch(() => {});
+    return;
+  }
+
+  const hasChanges = await worktreeHasChanges(current.worktree_path, current.workspace_name);
+
+  if (!hasChanges) {
+    // Worktree clean — skip review (discussion/speccing turn or stuck loop)
+    const wasLooping = current.review_loop_count > 0;
+    if (wasLooping) {
+      // Implementer ran after a failed review but made no changes — escalate
+      const latestTurn = getTaskTurns(task.id).filter(t => t.role === 'reviewer').pop();
+      const issues = latestTurn?.review_issues ? (JSON.parse(latestTurn.review_issues) as string[]) : [];
+      const issueList = issues.map((s, i) => `${i + 1}. ${s}`).join('\n');
+      addMessage(task.id, 'system',
+        `Auto-review escalated: the implementer made no changes after reviewer feedback.\n\nUnresolved issues:\n${issueList || '(see reviewer output above)'}`
+      );
+    }
+    setActiveTaskTurnRole(task.id, null);
+    updateTaskStatus(task.id, 'awaiting_feedback');
+    processQueue(task.workspace_id).catch(() => {});
+    return;
+  }
+
+  // Changes detected — launch reviewer
+  await launchReviewerOnTask(current);
+}
+
+/**
+ * Launch a read-only reviewer Claude instance for a task.
+ * The reviewer runs a fresh session, sees the git diff, and emits a
+ * REVIEW_DECISION line that the server parses to determine next action.
+ */
+async function launchReviewerOnTask(task: Task): Promise<void> {
+  const reviewerSessionId = randomUUID();
+  const turn = createTaskTurn({
+    taskId: task.id,
+    role: 'reviewer',
+    claudeSessionId: reviewerSessionId,
+    filesChanged: 1,
+  });
+
+  setActiveTaskTurnRole(task.id, 'reviewer');
+  appendStreamLog(task.id, 'reviewer_start', `Reviewer turn ${turn.turn_number} starting`);
+
+  const gitDiff = await getGitDiff(task.worktree_path!, task.workspace_name);
+
+  const reviewerPrompt = `Original task:\n${task.prompt}\n\nChanges made by the implementer:\n${gitDiff}`;
+
+  const claudeParts: string[] = [];
+  claudeParts.push('claude');
+  claudeParts.push('-p', shellEscape(reviewerPrompt));
+  claudeParts.push('--session-id', shellEscape(reviewerSessionId));
+  claudeParts.push('--output-format', 'stream-json');
+  claudeParts.push('--verbose');
+  claudeParts.push('--allowedTools', shellEscape(REVIEWER_ALLOWED_TOOLS));
+  claudeParts.push('--max-turns', '20');
+  if (task.model && !task.model.startsWith('ollama/')) {
+    claudeParts.push('--model', shellEscape(task.model));
+  }
+  claudeParts.push('--append-system-prompt', shellEscape(buildReviewerSystemPrompt()));
+  claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
+
+  const claudeCmd = claudeParts.join(' ');
+  const outputFile = remoteReviewerOutputPath(task.id);
+  const exitFile = remoteReviewerExitCodePath(task.id);
+
+  let remoteCmd = 'export PATH="$HOME/.local/bin:$PATH" && ';
+  const workDir = task.worktree_path || task.project_dir;
+  if (workDir) {
+    remoteCmd += `cd ${shellEscape(workDir)} && `;
+  }
+  remoteCmd += `rm -f ${shellEscape(outputFile)} ${shellEscape(exitFile)} && `;
+  remoteCmd += `${claudeCmd} > ${shellEscape(outputFile)} 2>&1; `;
+  remoteCmd += `echo $? > ${shellEscape(exitFile)}`;
+
+  console.log(`[auto-review] Launching reviewer for task ${task.id} (turn ${turn.turn_number})`);
+
+  try {
+    const sshProcess = isLocalWorkspace(task.workspace_name)
+      ? spawn('bash', ['-c', remoteCmd], { env: { ...process.env }, stdio: 'ignore', detached: true })
+      : spawn('coder', ['ssh', task.workspace_name, '--', remoteCmd], {
+          env: { ...process.env, CODER_URL },
+          stdio: 'ignore',
+          detached: true,
+        });
+
+    sshProcess.unref();
+    startReviewerPolling(task, turn.id, reviewerSessionId);
+  } catch (err) {
+    const errorMsg = (err as Error).message || 'Failed to launch reviewer';
+    console.error('[auto-review] Launch failed:', errorMsg);
+    completeTaskTurn(turn.id, 'fail', `Reviewer launch failed: ${errorMsg}`);
+    setActiveTaskTurnRole(task.id, null);
+    updateTaskStatus(task.id, 'awaiting_feedback');
+    processQueue(task.workspace_id).catch(() => {});
+  }
+}
+
+function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: string): void {
+  const pollKey = `review:${task.id}`;
+  stopPolling(pollKey);
+
+  let linesRead = 0;
+  let partialLine = '';
+  let polling = false;
+  let finalized = false;
+  let allAssistantText = '';
+
+  const poll = async () => {
+    if (polling) return;
+    polling = true;
+    try {
+      const outputFile = remoteReviewerOutputPath(task.id);
+      const exitFile = remoteReviewerExitCodePath(task.id);
+      const { jsonPart, exitPart } = await pollOutputAndExit(task.workspace_name, outputFile, exitFile, linesRead);
+
+      if (jsonPart.trim() || partialLine) {
+        const fullData = partialLine + jsonPart;
+        partialLine = '';
+        const allLines = fullData.split('\n');
+        const lastElement = allLines[allLines.length - 1];
+        if (lastElement && lastElement.trim()) {
+          partialLine = allLines.pop()!;
+        }
+
+        for (const line of allLines) {
+          linesRead++;
+          if (!line.trim()) continue;
+          let event: { type: string; [key: string]: unknown };
+          try { event = JSON.parse(line); } catch { continue; }
+
+          if (event.type === 'assistant' && (event.message as { content?: unknown })?.content) {
+            let turnText = '';
+            for (const block of (event.message as { content: Array<{ type: string; text?: string }> }).content) {
+              if (block.type === 'text' && block.text) turnText += block.text;
+            }
+            if (turnText) {
+              allAssistantText += turnText;
+              addMessage(task.id, 'assistant', turnText, undefined, undefined, undefined, undefined, undefined, turnId);
+              appendStreamLog(task.id, 'reviewer_output', `[Reviewer] ${turnText.slice(0, 200)}`);
+            }
+          } else if (event.type === 'tool_use') {
+            const block = event as { name?: string };
+            appendStreamLog(task.id, 'tool_use', `[Reviewer] ${block.name || 'tool'}`);
+          } else if (event.type === 'result') {
+            const resultText = extractResultText(event);
+            if (resultText && resultText !== allAssistantText.slice(-resultText.length)) {
+              allAssistantText += resultText;
+              addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined, undefined, undefined, undefined, undefined, turnId);
+            }
+            const { inputTokens, outputTokens } = extractTokenUsage(event);
+            if (inputTokens > 0 || outputTokens > 0) addTokenUsage(task.id, inputTokens, outputTokens);
+          }
+        }
+      }
+
+      const done = exitPart !== 'RUNNING' && exitPart !== '';
+      if (done && !finalized) {
+        finalized = true;
+        stopPolling(pollKey);
+        finalizeReviewer(task, turnId, allAssistantText);
+      }
+    } catch (err) {
+      console.error(`[auto-review] Poll error for task ${task.id}:`, (err as Error).message?.slice(0, 100));
+    } finally {
+      polling = false;
+    }
+  };
+
+  const interval = setInterval(poll, 3000) as unknown as NodeJS.Timeout;
+  activePollers.set(pollKey, interval);
+  poll();
+}
+
+function finalizeReviewer(task: Task, turnId: string, allText: string): void {
+  const current = getTask(task.id);
+  if (!current) return;
+
+  const decision = parseReviewDecision(allText);
+
+  if (!decision) {
+    console.warn(`[auto-review] No REVIEW_DECISION found for task ${task.id} — treating as fail`);
+    completeTaskTurn(turnId, 'fail', 'Reviewer did not produce a structured decision');
+    escalateToUser(task, ['Reviewer did not produce a structured decision — manual review needed.']);
+    return;
+  }
+
+  completeTaskTurn(turnId, decision.outcome, decision.summary, decision.issues);
+  appendStreamLog(task.id, decision.outcome === 'pass' ? 'reviewer_pass' : 'reviewer_fail',
+    `[Reviewer] ${decision.outcome.toUpperCase()}: ${decision.summary}`);
+
+  if (decision.outcome === 'pass') {
+    console.log(`[auto-review] Task ${task.id} reviewer passed`);
+    resetReviewLoopCount(task.id);
+    setActiveTaskTurnRole(task.id, null);
+    updateTaskStatus(task.id, 'awaiting_feedback');
+    processQueue(task.workspace_id).catch(() => {});
+    return;
+  }
+
+  // Reviewer failed — check loop limit
+  incrementReviewLoopCount(task.id);
+  const refreshed = getTask(task.id);
+  if (!refreshed) return;
+
+  if (refreshed.review_loop_count >= MAX_REVIEW_LOOPS) {
+    escalateToUser(refreshed, decision.issues ?? [decision.summary]);
+    return;
+  }
+
+  // Send issues back to the implementer as a new resume turn
+  const issueList = (decision.issues ?? [decision.summary])
+    .map((s, i) => `${i + 1}. ${s}`)
+    .join('\n');
+  const retryPrompt = `The reviewer found the following issues with your previous implementation:\n\n${issueList}\n\nPlease address these issues. Original task:\n${task.prompt}`;
+
+  addMessage(task.id, 'system', `Auto-review found issues — resuming implementer:\n${issueList}`);
+  setActiveTaskTurnRole(task.id, 'implementer');
+  launchTask(refreshed, true, retryPrompt).catch(err => {
+    console.error(`[auto-review] Failed to re-launch implementer for task ${task.id}:`, (err as Error).message?.slice(0, 200));
+    setActiveTaskTurnRole(task.id, null);
+    updateTaskStatus(task.id, 'awaiting_feedback');
+    processQueue(task.workspace_id).catch(() => {});
+  });
+}
+
+function escalateToUser(task: Task, issues: string[]): void {
+  const issueList = issues.map((s, i) => `${i + 1}. ${s}`).join('\n');
+  addMessage(task.id, 'system',
+    `Auto-review reached the loop limit (${MAX_REVIEW_LOOPS} passes) without resolving all issues. Your input is needed.\n\nUnresolved issues:\n${issueList}`
+  );
+  resetReviewLoopCount(task.id);
+  setActiveTaskTurnRole(task.id, null);
+  updateTaskStatus(task.id, 'awaiting_feedback');
+  processQueue(task.workspace_id).catch(() => {});
+}
+
+/**
  * Transition a task to its terminal state and kick the queue.
  *
  * Called when Claude emits a `result` event — at that point Claude has
@@ -1307,24 +1653,33 @@ function finalizeTask(task: Task, resultError: string | null): void {
   if (isRateLimited) {
     const resetTime = new Date(rlInfo!.resetsAt * 1000).toISOString();
     addMessage(task.id, 'system', `Rate limited — resets at ${resetTime}`);
+    setActiveTaskTurnRole(task.id, null);
     updateTaskStatus(task.id, 'failed', `rate_limited:${rlInfo!.resetsAt}`);
     cleanupPortRange(task).catch(() => {});
+    processQueue(task.workspace_id).catch(() => {});
   } else if (resultError) {
     addMessage(task.id, 'system', `Error: ${resultError}`);
+    setActiveTaskTurnRole(task.id, null);
     updateTaskStatus(task.id, 'failed', resultError);
     cleanupPortRange(task).catch(() => {});
+    processQueue(task.workspace_id).catch(() => {});
   } else {
     const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
     if (hasResponse) {
-      updateTaskStatus(task.id, 'awaiting_feedback');
+      onImplementerTurnComplete(task).catch(err => {
+        console.error(`[auto-review] Error in post-implementer hook for task ${task.id}:`, (err as Error).message?.slice(0, 200));
+        setActiveTaskTurnRole(task.id, null);
+        updateTaskStatus(task.id, 'awaiting_feedback');
+        processQueue(task.workspace_id).catch(() => {});
+      });
     } else {
       console.log(`[claude-poller] Task ${task.id} finalized with no response — re-queuing`);
       addMessage(task.id, 'system', 'Claude exited without producing a response. Re-queued for automatic retry.');
+      setActiveTaskTurnRole(task.id, null);
       updateTaskStatus(task.id, 'queued');
+      processQueue(task.workspace_id).catch(() => {});
     }
   }
-
-  processQueue(task.workspace_id).catch(() => {});
 }
 
 /** Extract text from a result event's result field (string or content blocks array). */

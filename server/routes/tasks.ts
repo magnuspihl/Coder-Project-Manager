@@ -21,6 +21,8 @@ import {
   removeTaskParticipant,
   getTaskParticipants,
   getTaskParticipant,
+  getTaskTurns,
+  resetReviewLoopCount,
 } from '../services/tasks.js';
 import { processQueue, resumeTask, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
@@ -46,7 +48,7 @@ router.get('/workspaces/:workspaceId/tasks', requireAuth, (req: Request, res: Re
 
 // Create a new task
 router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, res: Response) => {
-  const { prompt, model, caveman, attachmentIds } = req.body;
+  const { prompt, model, caveman, attachmentIds, autoReview } = req.body;
   if (!prompt) {
     res.status(400).json({ error: 'Prompt is required' });
     return;
@@ -93,6 +95,7 @@ router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, 
       caveman: typeof caveman === 'string' && ['lite', 'full', 'ultra'].includes(caveman) ? caveman : undefined,
       source: req.authSource,
       clientLabel: req.clientLabel,
+      autoReview: autoReview === false ? false : true,
     });
 
     if (Array.isArray(attachmentIds) && attachmentIds.length > 0) {
@@ -128,7 +131,8 @@ router.get('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
   }));
   const attachments = getAttachmentsByTask(task.id);
   const activeTaskId = getLastActiveTaskId(task.workspace_id);
-  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages, participants, attachments, activeTaskId });
+  const turns = getTaskTurns(task.id);
+  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages, participants, attachments, activeTaskId, turns });
 });
 
 // Get stream log for a task (loaded on demand)
@@ -197,6 +201,9 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
   }
 
   addMessage(task.id, 'user', message, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
+
+  // User reply resets the review loop so the next implementer turn gets a fresh review
+  resetReviewLoopCount(task.id);
 
   // User replied → cancel any pending completion: they're asking to continue.
   if (task.pending_complete) {

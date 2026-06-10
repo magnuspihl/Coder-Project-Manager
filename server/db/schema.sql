@@ -37,6 +37,23 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_workspace_status ON tasks(workspace_id, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_workspace_position ON tasks(workspace_id, position);
 
+-- Task turns table: tracks each implementer/reviewer turn within a task
+CREATE TABLE IF NOT EXISTS task_turns (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  role TEXT NOT NULL CHECK (role IN ('implementer', 'reviewer')),
+  turn_number INTEGER NOT NULL,
+  claude_session_id TEXT,
+  review_outcome TEXT CHECK (review_outcome IN ('pass', 'fail', NULL)),
+  review_summary TEXT,
+  review_issues TEXT,
+  files_changed INTEGER,
+  started_at TEXT NOT NULL DEFAULT (datetime('now')),
+  completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_turns_task ON task_turns(task_id, turn_number);
+
 -- Messages table: conversation history per task
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
@@ -47,6 +64,7 @@ CREATE TABLE IF NOT EXISTS messages (
   username TEXT,
   source TEXT,
   client_label TEXT,
+  turn_id TEXT REFERENCES task_turns(id),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
