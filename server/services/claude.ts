@@ -1,11 +1,11 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { createReadStream, createWriteStream } from 'fs';
 import { randomUUID } from 'crypto';
-import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, getPendingCompletionTask, setPendingComplete, markSessionInitialized, type Task, type TaskParticipant } from './tasks.js';
+import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, getPendingCompletionTask, setPendingComplete, markSessionInitialized, type Task, type TaskParticipant } from './tasks.js';
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
-import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, handleStashAway, fetchGitHubToken, isRemoteAllowed } from './git.js';
+import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, removeTaskWorktree, fetchGitHubToken, isRemoteAllowed } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
 import { getAttachmentsByTask, type Attachment } from '../routes/uploads.js';
 import { writeCpmGuidelines } from './workspace-memory.js';
@@ -15,6 +15,32 @@ const OLLAMA_BASE_URL = getOllamaBaseUrl();
 const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || '50';
 const ALLOWED_TOOLS = process.env.CLAUDE_ALLOWED_TOOLS || 'Read,Edit,Write,Bash,Glob,Grep';
 const DISCUSSION_ALLOWED_TOOLS = 'Read,Edit,Write,MultiEdit,Bash,Glob,Grep,mcp__coder__coder_report_task';
+
+const PORT_RANGE_START = parseInt(process.env.CPM_PORT_RANGE_START || '40000');
+const PORT_RANGE_SIZE = parseInt(process.env.CPM_PORT_RANGE_SIZE || '10');
+const PORT_RANGE_SLOTS = parseInt(process.env.CPM_PORT_RANGE_SLOTS || '100');
+
+function allocatePortRange(_workspaceId: string): number | null {
+  const usedRanges = new Set<number>(
+    (getDb().prepare(`
+      SELECT port_range_start FROM tasks
+      WHERE port_range_start IS NOT NULL
+        AND status IN ('working', 'awaiting_feedback')
+        AND deleted_at IS NULL
+    `).all() as Array<{ port_range_start: number }>).map(r => r.port_range_start)
+  );
+  for (let i = 0; i < PORT_RANGE_SLOTS; i++) {
+    const start = PORT_RANGE_START + i * PORT_RANGE_SIZE;
+    if (!usedRanges.has(start)) return start;
+  }
+  return null;
+}
+
+async function cleanupPortRange(task: Task): Promise<void> {
+  if (task.port_range_start === null || task.port_range_start === undefined) return;
+  const ports = Array.from({ length: PORT_RANGE_SIZE }, (_, i) => `${task.port_range_start! + i}/tcp`).join(' ');
+  await sshExec(task.workspace_name, `fuser -k ${ports} 2>/dev/null || true`, 10000).catch(() => {});
+}
 
 // Track active SSH processes per task so we can kill them
 const activeProcesses = new Map<string, ChildProcess>();
@@ -498,13 +524,7 @@ export async function withWorkspaceLock<T>(workspaceId: string, fn: () => Promis
  */
 export async function processQueue(workspaceId: string): Promise<void> {
   await withWorkspaceLock(workspaceId, async () => {
-    const working = getWorkingTask(workspaceId);
-    if (working) {
-      return;
-    }
-
     // Flush any tasks whose completion was deferred while a task was working.
-    // Running git completion now (with no working agent) is safe.
     let pending = getPendingCompletionTask(workspaceId);
     while (pending) {
       try {
@@ -513,8 +533,6 @@ export async function processQueue(workspaceId: string): Promise<void> {
           setPendingComplete(pending.id, false);
           updateTaskStatus(pending.id, 'completed');
         } else {
-          // Blocked by uncommitted changes + remote disabled — clear the flag
-          // and leave the user a message so they can handle it and retry.
           setPendingComplete(pending.id, false);
           addMessage(pending.id, 'system', 'Queued completion could not proceed — uncommitted changes and remote pushes are disabled. Resolve manually and try again.');
         }
@@ -525,25 +543,27 @@ export async function processQueue(workspaceId: string): Promise<void> {
       pending = getPendingCompletionTask(workspaceId);
     }
 
-    const next = getNextQueuedTask(workspaceId);
-    if (!next) {
-      return;
-    }
+    // Launch queued tasks up to the concurrency limit
+    const maxConcurrent = getMaxConcurrent(workspaceId);
+    while (true) {
+      const workingCount = getWorkingTaskCount(workspaceId);
+      if (workingCount >= maxConcurrent) break;
 
-    // Check if this is a resume-pending task (was awaiting_feedback, user replied,
-    // but another task was working so it was re-queued). Detect by checking if the
-    // task already has a session and the last message is from the user.
-    if (next.claude_session_id) {
-      const msgs = getMessages(next.id);
-      const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
-      if (lastMsg && lastMsg.role === 'user' && msgs.some(m => m.role === 'assistant')) {
-        // This task has a prior session and a pending user reply — resume it
-        await launchTask(next, true, lastMsg.content);
-        return;
+      const next = getNextQueuedTask(workspaceId);
+      if (!next) break;
+
+      // Detect resume-pending task (was awaiting_feedback, user replied, got re-queued)
+      if (next.claude_session_id) {
+        const msgs = getMessages(next.id);
+        const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+        if (lastMsg && lastMsg.role === 'user' && msgs.some(m => m.role === 'assistant')) {
+          await launchTask(next, true, lastMsg.content);
+          continue;
+        }
       }
-    }
 
-    await launchTask(next);
+      await launchTask(next);
+    }
   });
 }
 
@@ -601,11 +621,21 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     }
   }
 
-  // Git: stash-based task switching + force-checkout default (when remote allowed)
+  // Git: worktree creation on launch, no-op on resume
   if (isResume) {
     await handleTaskResumeGit(task);
   } else {
     await handleTaskLaunchGit(task);
+  }
+
+  // Allocate port range for new tasks
+  if (!isResume && (task.port_range_start === null || task.port_range_start === undefined)) {
+    const portStart = allocatePortRange(task.workspace_id);
+    if (portStart !== null) {
+      getDb().prepare('UPDATE tasks SET port_range_start = ? WHERE id = ?').run(portStart, task.id);
+      task.port_range_start = portStart;
+      console.log(`[claude-executor] Allocated port range ${portStart}-${portStart + PORT_RANGE_SIZE - 1} for task ${task.id}`);
+    }
   }
 
   // Transfer any attached files to the remote workspace (skip for slash commands)
@@ -662,6 +692,14 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     console.log(`[caveman] Task ${task.id} using caveman mode: ${task.caveman} (via --append-system-prompt)`);
   }
 
+  // Port range instruction — tell agent which ports to use
+  if (!isSlashCommand && task.port_range_start !== null && task.port_range_start !== undefined && proxyUri) {
+    const portEnd = task.port_range_start + PORT_RANGE_SIZE - 1;
+    const previewUrl = proxyUri.replace('{{port}}', String(task.port_range_start));
+    const portNote = `This task runs in a dedicated git worktree. Use ports ${task.port_range_start}–${portEnd} for any services you start — do not use default ports like 3000 or 5173 (those are reserved). Your primary preview URL is: ${previewUrl}`;
+    claudeParts.push('--append-system-prompt', shellEscape(portNote));
+  }
+
   // CPM owns git when remote pushes are enabled — tell the agent to stay out
   // of branching/committing so completion's fresh-branch+PR+merge flow works.
   if (isRemoteAllowed(task.workspace_id)) {
@@ -683,8 +721,16 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   if (isOllama) {
     remoteCmd += `export ANTHROPIC_BASE_URL="${OLLAMA_BASE_URL}" ANTHROPIC_API_KEY="" ANTHROPIC_AUTH_TOKEN=ollama && `;
   }
-  if (task.project_dir) {
-    remoteCmd += `cd ${shellEscape(task.project_dir)} && `;
+
+  // Expose port range to the agent
+  if (task.port_range_start !== null && task.port_range_start !== undefined) {
+    const portEnd = task.port_range_start + PORT_RANGE_SIZE - 1;
+    remoteCmd += `export PORT=${task.port_range_start} CPM_PORT_RANGE="${task.port_range_start}-${portEnd}" && `;
+  }
+
+  const workDir = task.worktree_path || task.project_dir;
+  if (workDir) {
+    remoteCmd += `cd ${shellEscape(workDir)} && `;
   }
   // Exit file was archived to .prev above; rm -f is idempotent as a second
   // layer in case the archive SSH failed.
@@ -693,7 +739,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   remoteCmd += `echo $? > ${shellEscape(exitFile)}`;
 
   console.log('[claude-executor] Launching on workspace:', task.workspace_name);
-  console.log('[claude-executor] Project dir:', task.project_dir || '(none - home dir)');
+  console.log('[claude-executor] Project dir:', (task.worktree_path || task.project_dir) || '(none - home dir)');
   console.log('[claude-executor] Model:', task.model || '(default)', isOllama ? `→ Ollama (${actualModel})` : '');
   console.log('[claude-executor] Remote cmd:', remoteCmd.slice(0, 300));
 
@@ -706,12 +752,12 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
       console.log(`[claude-executor] Task ${task.id} no longer launchable (status=${current?.status ?? 'deleted'}); aborting`);
       return;
     }
-    // Also fail fast if another task has somehow entered 'working' on this
-    // workspace. The workspace lock should prevent this, but the DB is the
-    // source of truth.
-    const existingWorking = getWorkingTask(task.workspace_id);
-    if (existingWorking && existingWorking.id !== task.id) {
-      console.log(`[claude-executor] Refusing to launch ${task.id}: task ${existingWorking.id} is already working on workspace ${task.workspace_id}`);
+    // Fail fast if the workspace is already at the concurrency limit.
+    // The workspace lock should prevent this, but the DB is the source of truth.
+    const workingCount = getWorkingTaskCount(task.workspace_id);
+    const maxConcurrent = getMaxConcurrent(task.workspace_id);
+    if (workingCount >= maxConcurrent) {
+      console.log(`[claude-executor] Refusing to launch ${task.id}: workspace at concurrency limit ${maxConcurrent}`);
       return;
     }
 
@@ -778,14 +824,18 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
  */
 export async function resumeTask(task: Task, feedback: string): Promise<void> {
   await withWorkspaceLock(task.workspace_id, async () => {
-    // Under the lock, re-check that no other task has started working.
-    const working = getWorkingTask(task.workspace_id);
-    if (working && working.id !== task.id) {
-      // Another task beat us to it — re-queue this one so processQueue picks
-      // it up when the workspace is idle.
+    // Re-check the task is still awaiting feedback under the lock
+    const current = getTask(task.id);
+    if (!current || current.status !== 'awaiting_feedback') return;
+
+    // If at concurrency limit, re-queue to be picked up when a slot frees
+    const workingCount = getWorkingTaskCount(task.workspace_id);
+    const maxConcurrent = getMaxConcurrent(task.workspace_id);
+    if (workingCount >= maxConcurrent) {
       updateTaskStatus(task.id, 'queued');
       return;
     }
+
     await launchTask(task, true, feedback);
   });
 }
@@ -839,11 +889,10 @@ function processEvent(taskId: string, event: { type: string; [key: string]: unkn
   taskActivity.set(taskId, { timestamp: now, summary });
 }
 
-export function cancelTask(workspaceId: string): void {
+export function cancelTask(taskId: string): void {
   const db = getDb();
-  const task = db.prepare("SELECT id, workspace_name, ssh_pid, claude_session_id FROM tasks WHERE workspace_id = ? AND status = 'working' LIMIT 1")
-    .get(workspaceId) as { id: string; workspace_name: string; ssh_pid: number | null; claude_session_id: string | null } | undefined;
-
+  const task = db.prepare("SELECT id, workspace_name, ssh_pid, claude_session_id FROM tasks WHERE id = ?")
+    .get(taskId) as { id: string; workspace_name: string; ssh_pid: number | null; claude_session_id: string | null } | undefined;
   if (task) {
     killTaskProcess(task.id, task.ssh_pid, task.workspace_name, task.claude_session_id);
   }
@@ -982,7 +1031,6 @@ export async function reconnectWorkingTasks(): Promise<void> {
               } else {
                 console.log(`[recovery] Task "${task.title}" produced a result before SSH died — finalizing as awaiting_feedback`);
                 updateTaskStatus(task.id, 'awaiting_feedback');
-                await handleStashAway(task).catch((err: unknown) => console.error('[git] Pause commit failed:', (err as Error).message?.slice(0, 100)));
               }
             } else {
               console.log(`[recovery] Task "${task.title}" SSH process gone, no exit code, no result — re-queuing for automatic retry`);
@@ -1200,7 +1248,6 @@ function startFilePolling(task: Task): void {
           const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
           if (hasResponse) {
             updateTaskStatus(task.id, 'awaiting_feedback');
-            handleStashAway(task).catch((err: unknown) => console.error('[git] Pause commit failed:', (err as Error).message?.slice(0, 100)));
           } else {
             console.log(`[claude-poller] Task ${task.id} finished with no response — re-queuing`);
             addMessage(task.id, 'system', 'Claude exited without producing a response. Re-queued for automatic retry.');
@@ -1261,14 +1308,15 @@ function finalizeTask(task: Task, resultError: string | null): void {
     const resetTime = new Date(rlInfo!.resetsAt * 1000).toISOString();
     addMessage(task.id, 'system', `Rate limited — resets at ${resetTime}`);
     updateTaskStatus(task.id, 'failed', `rate_limited:${rlInfo!.resetsAt}`);
+    cleanupPortRange(task).catch(() => {});
   } else if (resultError) {
     addMessage(task.id, 'system', `Error: ${resultError}`);
     updateTaskStatus(task.id, 'failed', resultError);
+    cleanupPortRange(task).catch(() => {});
   } else {
     const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
     if (hasResponse) {
       updateTaskStatus(task.id, 'awaiting_feedback');
-      handleStashAway(task).catch((err: unknown) => console.error('[git] Pause commit failed:', (err as Error).message?.slice(0, 100)));
     } else {
       console.log(`[claude-poller] Task ${task.id} finalized with no response — re-queuing`);
       addMessage(task.id, 'system', 'Claude exited without producing a response. Re-queued for automatic retry.');

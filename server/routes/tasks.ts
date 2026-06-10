@@ -25,7 +25,7 @@ import {
 import { processQueue, resumeTask, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
-import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, switchActiveTask, getLastActiveTaskId } from '../services/git.js';
+import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, switchActiveTask, getLastActiveTaskId, removeTaskWorktree } from '../services/git.js';
 import { linkAttachmentsToTask, getAttachmentsByTask } from './uploads.js';
 import { getDb } from '../db/index.js';
 
@@ -502,10 +502,14 @@ router.post('/tasks/:taskId/cancel', requireAuth, async (req: Request, res: Resp
   }
 
   if (task.status === 'working') {
-    cancelTask(task.workspace_id);
+    cancelTask(task.id);
   }
 
   updateTaskStatus(task.id, 'cancelled');
+
+  if (task.worktree_path) {
+    removeTaskWorktree(task).catch(() => {});
+  }
 
   await processQueue(task.workspace_id);
 
@@ -521,7 +525,7 @@ router.delete('/tasks/:taskId', requireAuth, async (req: Request, res: Response)
   }
 
   if (task.status === 'working') {
-    cancelTask(task.workspace_id);
+    cancelTask(task.id);
   }
 
   // Stop any running advisor participants so they don't keep polling / writing
@@ -530,6 +534,10 @@ router.delete('/tasks/:taskId', requireAuth, async (req: Request, res: Response)
     if (isTaskParticipantRunning(p.id)) {
       try { stopTaskParticipant(p.id); } catch { /* ignore */ }
     }
+  }
+
+  if (task.worktree_path) {
+    removeTaskWorktree(task).catch(() => {});
   }
 
   deleteTask(task.id);

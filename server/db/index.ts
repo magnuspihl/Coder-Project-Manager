@@ -217,36 +217,37 @@ export function getDb(): Database.Database {
       db.exec("ALTER TABLE discussion_messages ADD COLUMN client_label TEXT");
     }
 
-    // Enforce one-working-task-per-workspace at the DB level. If the DB is
-    // inconsistent (leftover working tasks from a crash), mark all but the
-    // most recent as failed so the unique index can apply cleanly.
-    try {
-      db.exec(`
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_one_working_per_workspace
-          ON tasks(workspace_id)
-          WHERE status = 'working' AND deleted_at IS NULL
-      `);
-    } catch {
-      console.warn('[db] Duplicate working tasks detected — demoting older ones to failed.');
-      db.exec(`
-        UPDATE tasks SET status = 'failed', failed_reason = 'Orphaned: multiple working tasks on same workspace detected at startup.'
-        WHERE id IN (
-          SELECT id FROM tasks t1
-          WHERE status = 'working' AND deleted_at IS NULL
-            AND EXISTS (
-              SELECT 1 FROM tasks t2
-              WHERE t2.workspace_id = t1.workspace_id
-                AND t2.status = 'working' AND t2.deleted_at IS NULL
-                AND t2.updated_at > t1.updated_at
-            )
-        )
-      `);
-      db.exec(`
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_one_working_per_workspace
-          ON tasks(workspace_id)
-          WHERE status = 'working' AND deleted_at IS NULL
-      `);
+    // Worktree + parallel execution migrations
+    const tasksCols4 = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+    if (!tasksCols4.some(c => c.name === 'worktree_path')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN worktree_path TEXT");
     }
+    if (!tasksCols4.some(c => c.name === 'port_range_start')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN port_range_start INTEGER");
+    }
+
+    const wsCols2 = db.prepare("PRAGMA table_info(workspace_settings)").all() as Array<{ name: string }>;
+    if (!wsCols2.some(c => c.name === 'max_concurrent')) {
+      db.exec("ALTER TABLE workspace_settings ADD COLUMN max_concurrent INTEGER NOT NULL DEFAULT 3");
+    }
+
+    const discCols3 = db.prepare("PRAGMA table_info(discussions)").all() as Array<{ name: string }>;
+    if (!discCols3.some(c => c.name === 'worktree_path')) {
+      db.exec("ALTER TABLE discussions ADD COLUMN worktree_path TEXT");
+    }
+
+    // Drop the one-working-per-workspace constraint — replaced by configurable max_concurrent
+    db.exec("DROP INDEX IF EXISTS idx_tasks_one_working_per_workspace");
+
+    // Demote pre-upgrade working/awaiting_feedback tasks that have no worktree_path
+    db.exec(`
+      UPDATE tasks
+      SET status = 'failed',
+          failed_reason = 'Server upgraded to parallel execution. Please retry.'
+      WHERE status IN ('working', 'awaiting_feedback')
+        AND worktree_path IS NULL
+        AND deleted_at IS NULL
+    `);
   }
   return db;
 }

@@ -33,6 +33,7 @@ export interface WorkspacePreviewState {
 export function useWorkspacePreview(
   workspaceId: string | null,
   scopeKey: string,
+  taskPortStart: number | null = null,
 ): WorkspacePreviewState {
   const isMobile = useIsMobile();
   const [previewEnabled, setPreviewEnabled] = useLocalStorageState<boolean>(
@@ -86,6 +87,20 @@ export function useWorkspacePreview(
         candidates.push({ url: app.url, label: `app: ${app.display_name}` });
       }
     }
+  }
+
+  // If the task has an assigned port range, move that port to the front of candidates
+  // (or construct a candidate for it if the port isn't listening yet)
+  if (taskPortStart !== null) {
+    const portIdx = candidates.findIndex(c => {
+      try { return new URL(c.url).port === String(taskPortStart); } catch { return false; }
+    });
+    if (portIdx > 0) {
+      // Already in the list but not first — move it to front
+      candidates.unshift(...candidates.splice(portIdx, 1));
+    }
+    // Note: if the port isn't listening yet, it won't appear in candidates until it binds.
+    // The workspace poll (every 15s) will pick it up once the service starts.
   }
 
   useEffect(() => {

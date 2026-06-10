@@ -19,6 +19,8 @@ export interface Task {
   ssh_pid: number | null;
   git_branch: string | null;
   github_repo_url: string | null;
+  worktree_path: string | null;
+  port_range_start: number | null;
   caveman: string | null;
   pending_complete: number;
   session_initialized: number;
@@ -316,6 +318,21 @@ export function getWorkingTask(workspaceId: string): Task | undefined {
   return db
     .prepare("SELECT * FROM tasks WHERE workspace_id = ? AND status = 'working' AND deleted_at IS NULL LIMIT 1")
     .get(workspaceId) as Task | undefined;
+}
+
+export function getWorkingTaskCount(workspaceId: string): number {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT COUNT(*) as count FROM tasks WHERE workspace_id = ? AND status = 'working' AND deleted_at IS NULL")
+    .get(workspaceId) as { count: number };
+  return row.count;
+}
+
+export function getMaxConcurrent(workspaceId: string): number {
+  const row = getDb()
+    .prepare('SELECT max_concurrent FROM workspace_settings WHERE workspace_id = ?')
+    .get(workspaceId) as { max_concurrent: number } | undefined;
+  return row?.max_concurrent ?? 3;
 }
 
 export function setPendingComplete(taskId: string, value: boolean): void {

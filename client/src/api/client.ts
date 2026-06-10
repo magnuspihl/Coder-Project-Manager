@@ -87,6 +87,8 @@ export interface Task {
   verification_url: string | null;
   git_branch: string | null;
   github_repo_url: string | null;
+  worktree_path: string | null;
+  port_range_start: number | null;
   model: string | null;
   caveman: string | null;
   pending_complete?: number;

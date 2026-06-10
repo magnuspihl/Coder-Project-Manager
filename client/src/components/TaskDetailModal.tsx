@@ -335,7 +335,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       .catch(() => setTouchResult({ previousOpenedAt: null }));
   }, [taskId]);
 
-  const preview = useWorkspacePreview(task?.workspace_id ?? null, taskId);
+  const preview = useWorkspacePreview(task?.workspace_id ?? null, taskId, task?.port_range_start ?? null);
 
   // Play-on-open: once initial load is done, speak assistant messages newer than previousOpenedAt
   useEffect(() => {
