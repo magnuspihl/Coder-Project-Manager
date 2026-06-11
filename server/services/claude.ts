@@ -675,25 +675,67 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   // skip all prepends/appends so the harness recognizes the command.
   const isSlashCommand = isResume && !!feedback && rawPrompt.startsWith('/') && !rawPrompt.includes('\n');
 
+  // Allocate port range for new tasks before building prompts/system messages —
+  // the coderUrlNote and portNote below both read task.port_range_start.
+  if (!isResume && (task.port_range_start === null || task.port_range_start === undefined)) {
+    const allocated = allocatePortRange(task.workspace_id);
+    if (allocated !== null) {
+      getDb().prepare('UPDATE tasks SET port_range_start = ? WHERE id = ?').run(allocated, task.id);
+      task.port_range_start = allocated;
+      console.log(`[claude-executor] Allocated port range ${allocated}-${allocated + PORT_RANGE_SIZE - 1} for task ${task.id}`);
+    }
+  }
+
   // Append instruction for the agent to provide Coder deep links
   // Use VSCODE_PROXY_URI if available (has the exact pattern), otherwise build from parts
   const proxyUri = process.env.VSCODE_PROXY_URI || '';
+  // VSCODE_PROXY_URI is baked with CPM's own workspace name. If the task targets a
+  // different workspace, swap that segment so the preview URL points at the right host.
+  const proxyUriForTask = (() => {
+    if (!proxyUri || !LOCAL_WORKSPACE_NAME) return proxyUri;
+    if (!task.workspace_name || task.workspace_name === LOCAL_WORKSPACE_NAME) return proxyUri;
+    return proxyUri.split(`--${LOCAL_WORKSPACE_NAME}--`).join(`--${task.workspace_name}--`);
+  })();
+  const portStart = task.port_range_start ?? null;
+  const portEnd = portStart !== null ? portStart + PORT_RANGE_SIZE - 1 : null;
   let coderUrlNote = '';
-  if (!isSlashCommand && proxyUri) {
+  if (!isSlashCommand && proxyUriForTask) {
     // VSCODE_PROXY_URI looks like: https://{{port}}--main--Workspace--user.coder.example.com
-    // Replace the workspace-specific parts with the target workspace's info
-    const coderUrlNote_example = proxyUri.replace('{{port}}', 'PORT');
-    coderUrlNote = `\n\nIMPORTANT: Only if your changes result in something visually testable in a browser (e.g. a webapp UI change), ` +
-      `provide a deep link URL where the change can be seen. Do NOT include a "view live" link for backend-only changes, ` +
-      `config changes, refactors, or other non-visual work. ` +
-      `This project runs inside a Coder workspace, so use Coder-routed URLs (not localhost). ` +
-      `For web apps, use the Coder port-forwarding URL format: ${coderUrlNote_example} (replace PORT with the actual port number, e.g. 5173 for Vite).`;
+    if (portStart !== null) {
+      const previewUrl = proxyUriForTask.replace('{{port}}', String(portStart));
+      coderUrlNote = `\n\nIMPORTANT: Only if your changes result in something visually testable in a browser (e.g. a webapp UI change), ` +
+        `provide a deep link URL where the change can be seen. Do NOT include a "view live" link for backend-only changes, ` +
+        `config changes, refactors, or other non-visual work. ` +
+        `This project runs inside a Coder workspace, so use Coder-routed URLs (not localhost). ` +
+        `This task runs in a dedicated git worktree with ports ${portStart}–${portEnd} reserved for it. ` +
+        `Bind any dev/preview server you start to a port in that range (the env var $PORT is already set to ${portStart}). ` +
+        `Do NOT use default ports like 3000 or 5173 — those belong to the main checkout and would show the user main's preview, not yours. ` +
+        `Your primary preview URL is: ${previewUrl} (substitute another port from your range if you bind multiple services).`;
+    } else {
+      const coderUrlNote_example = proxyUriForTask.replace('{{port}}', 'PORT');
+      coderUrlNote = `\n\nIMPORTANT: Only if your changes result in something visually testable in a browser (e.g. a webapp UI change), ` +
+        `provide a deep link URL where the change can be seen. Do NOT include a "view live" link for backend-only changes, ` +
+        `config changes, refactors, or other non-visual work. ` +
+        `This project runs inside a Coder workspace, so use Coder-routed URLs (not localhost). ` +
+        `For web apps, use the Coder port-forwarding URL format: ${coderUrlNote_example} (replace PORT with the actual port number, e.g. 5173 for Vite).`;
+    }
   } else if (!isSlashCommand && CODER_URL) {
-    coderUrlNote = `\n\nIMPORTANT: Only if your changes result in something visually testable in a browser (e.g. a webapp UI change), ` +
-      `provide a deep link URL where the change can be seen. Do NOT include a "view live" link for backend-only changes, ` +
-      `config changes, refactors, or other non-visual work. ` +
-      `This project runs inside a Coder workspace, so use Coder-routed URLs (not localhost). ` +
-      `The Coder access URL is: ${CODER_URL}. The workspace name is: ${task.workspace_name}.`;
+    if (portStart !== null) {
+      coderUrlNote = `\n\nIMPORTANT: Only if your changes result in something visually testable in a browser (e.g. a webapp UI change), ` +
+        `provide a deep link URL where the change can be seen. Do NOT include a "view live" link for backend-only changes, ` +
+        `config changes, refactors, or other non-visual work. ` +
+        `This project runs inside a Coder workspace, so use Coder-routed URLs (not localhost). ` +
+        `This task runs in a dedicated git worktree with ports ${portStart}–${portEnd} reserved for it. ` +
+        `Bind any dev/preview server to a port in that range (env var $PORT is set to ${portStart}). ` +
+        `Do NOT use default ports like 3000 or 5173 — those belong to the main checkout. ` +
+        `The Coder access URL is: ${CODER_URL}. The workspace name is: ${task.workspace_name}.`;
+    } else {
+      coderUrlNote = `\n\nIMPORTANT: Only if your changes result in something visually testable in a browser (e.g. a webapp UI change), ` +
+        `provide a deep link URL where the change can be seen. Do NOT include a "view live" link for backend-only changes, ` +
+        `config changes, refactors, or other non-visual work. ` +
+        `This project runs inside a Coder workspace, so use Coder-routed URLs (not localhost). ` +
+        `The Coder access URL is: ${CODER_URL}. The workspace name is: ${task.workspace_name}.`;
+    }
   }
   let prompt = rawPrompt + coderUrlNote;
 
@@ -721,16 +763,6 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     await handleTaskResumeGit(task);
   } else {
     await handleTaskLaunchGit(task);
-  }
-
-  // Allocate port range for new tasks
-  if (!isResume && (task.port_range_start === null || task.port_range_start === undefined)) {
-    const portStart = allocatePortRange(task.workspace_id);
-    if (portStart !== null) {
-      getDb().prepare('UPDATE tasks SET port_range_start = ? WHERE id = ?').run(portStart, task.id);
-      task.port_range_start = portStart;
-      console.log(`[claude-executor] Allocated port range ${portStart}-${portStart + PORT_RANGE_SIZE - 1} for task ${task.id}`);
-    }
   }
 
   // Transfer any attached files to the remote workspace (skip for slash commands)
@@ -788,10 +820,9 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   }
 
   // Port range instruction — tell agent which ports to use
-  if (!isSlashCommand && task.port_range_start !== null && task.port_range_start !== undefined && proxyUri) {
-    const portEnd = task.port_range_start + PORT_RANGE_SIZE - 1;
-    const previewUrl = proxyUri.replace('{{port}}', String(task.port_range_start));
-    const portNote = `This task runs in a dedicated git worktree. Use ports ${task.port_range_start}–${portEnd} for any services you start — do not use default ports like 3000 or 5173 (those are reserved). Your primary preview URL is: ${previewUrl}`;
+  if (!isSlashCommand && portStart !== null && proxyUriForTask) {
+    const previewUrl = proxyUriForTask.replace('{{port}}', String(portStart));
+    const portNote = `This task runs in a dedicated git worktree. Use ports ${portStart}–${portEnd} for any services you start — do not use default ports like 3000 or 5173 (those are reserved). Your primary preview URL is: ${previewUrl}`;
     claudeParts.push('--append-system-prompt', shellEscape(portNote));
   }
 
