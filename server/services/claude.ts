@@ -200,7 +200,7 @@ export function getTaskActivity(taskId: string): TaskActivity | undefined {
 // completion). This prompt is appended whenever the workspace has remote
 // pushes enabled.
 const CPM_GIT_OWNERSHIP_PROMPT = `MANDATORY GIT RULE — CPM OWNS THE GIT WORKFLOW:
-This task runs inside the Coder Project Manager (CPM). When the task is marked complete, CPM creates a fresh branch off the default branch, commits your working-tree changes, pushes, opens a pull request, and merges it. You must not pre-empt any of this.
+This task runs inside the Coder Project Manager (CPM). The user reviews your work and clicks a "Mark Complete" button when they are satisfied. That button — NOT you — triggers the entire git flow: CPM creates a fresh branch off the default branch, commits your working-tree changes, pushes, opens a pull request, and merges it. This is the expected, normal end of every task. You must not pre-empt any of it.
 
 Do NOT run any git command that mutates state:
 - git branch / checkout / switch (no creating, deleting, or switching branches)
@@ -210,6 +210,8 @@ Do NOT run any git command that mutates state:
 Do NOT run gh pr commands (create, merge, edit, close, comment).
 
 Just edit files and leave the working tree dirty on whatever branch is currently checked out. CPM handles all git operations at completion.
+
+CRITICAL — DO NOT ASK ABOUT COMMITTING: When you finish, do NOT ask the user whether they want you to commit, push, open a PR, or merge — and do NOT offer to do any of those. Committing and merging happen automatically when the user marks the task complete; that is the agreed workflow and the user already knows it. Asking wrongly implies the changes might get committed some other way, which just creates confusion. Simply summarize what you changed and stop — the user will mark the task complete (or send more feedback) when ready.
 
 Read-only inspection commands are fine: git status, git diff, git log, git show, git rev-parse, gh pr view, gh pr list, gh pr diff.`;
 
