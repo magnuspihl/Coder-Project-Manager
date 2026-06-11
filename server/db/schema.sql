@@ -120,10 +120,12 @@ CREATE TABLE IF NOT EXISTS discussion_messages (
 
 CREATE INDEX IF NOT EXISTS idx_discussion_messages ON discussion_messages(discussion_id, created_at);
 
--- Task requests: proposed tasks from discussion sessions
+-- Task requests: proposed tasks emitted from a discussion OR a task session.
+-- Exactly one of discussion_id / task_id identifies the origin.
 CREATE TABLE IF NOT EXISTS task_requests (
   id TEXT PRIMARY KEY,
-  discussion_id TEXT NOT NULL,
+  discussion_id TEXT,
+  task_id TEXT,
   prompt TEXT NOT NULL,
   branch TEXT,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'created', 'dismissed')),
@@ -132,10 +134,15 @@ CREATE TABLE IF NOT EXISTS task_requests (
   target_workspace_name TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (discussion_id) REFERENCES discussions(id) ON DELETE CASCADE,
+  FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
   FOREIGN KEY (created_task_id) REFERENCES tasks(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_task_requests_discussion ON task_requests(discussion_id, status);
+-- idx_task_requests_task is created in the migration code (db/index.ts) after
+-- task_id is guaranteed to exist: on legacy DBs the column is added by a later
+-- migration, and schema.sql runs before migrations — indexing it here would
+-- throw "no such column: task_id" and abort startup.
 
 -- Discussion participants: additional workspace agents in a discussion
 CREATE TABLE IF NOT EXISTS discussion_participants (

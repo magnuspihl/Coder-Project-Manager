@@ -166,6 +166,44 @@ export function getDb(): Database.Database {
     if (!trCols.some(c => c.name === 'target_workspace_name')) {
       db.exec("ALTER TABLE task_requests ADD COLUMN target_workspace_name TEXT");
     }
+    // Convergence: task_requests may now originate from a task as well as a
+    // discussion. Rebuild the table to make discussion_id nullable and add a
+    // nullable task_id (SQLite can't relax NOT NULL via ALTER).
+    const trColsFull = db.prepare("PRAGMA table_info(task_requests)").all() as Array<{ name: string; notnull: number }>;
+    const discIdCol = trColsFull.find(c => c.name === 'discussion_id');
+    if (discIdCol && discIdCol.notnull === 1) {
+      db.exec("PRAGMA foreign_keys=OFF");
+      db.exec(`
+        CREATE TABLE task_requests_new (
+          id TEXT PRIMARY KEY,
+          discussion_id TEXT,
+          task_id TEXT,
+          prompt TEXT NOT NULL,
+          branch TEXT,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'created', 'dismissed')),
+          created_task_id TEXT,
+          target_workspace_id TEXT,
+          target_workspace_name TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          FOREIGN KEY (discussion_id) REFERENCES discussions(id) ON DELETE CASCADE,
+          FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+          FOREIGN KEY (created_task_id) REFERENCES tasks(id)
+        )
+      `);
+      db.exec("INSERT INTO task_requests_new (id, discussion_id, prompt, branch, status, created_task_id, target_workspace_id, target_workspace_name, created_at) SELECT id, discussion_id, prompt, branch, status, created_task_id, target_workspace_id, target_workspace_name, created_at FROM task_requests");
+      db.exec("DROP TABLE task_requests");
+      db.exec("ALTER TABLE task_requests_new RENAME TO task_requests");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_task_requests_discussion ON task_requests(discussion_id, status)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_task_requests_task ON task_requests(task_id, status)");
+      db.exec("PRAGMA foreign_keys=ON");
+    }
+    // Create the task_id index once the column exists (fresh DBs get task_id
+    // from schema.sql; legacy DBs got it from the rebuild above). Kept out of
+    // schema.sql because that runs before migrations add the column.
+    const trColsAfter = db.prepare("PRAGMA table_info(task_requests)").all() as Array<{ name: string }>;
+    if (trColsAfter.some(c => c.name === 'task_id')) {
+      db.exec("CREATE INDEX IF NOT EXISTS idx_task_requests_task ON task_requests(task_id, status)");
+    }
 
     // Play-on-open: track last time each discussion/task was opened
     if (!discCols.some(c => c.name === 'last_opened_at')) {

@@ -24,6 +24,14 @@ import {
   getTaskTurns,
   resetReviewLoopCount,
 } from '../services/tasks.js';
+import {
+  getTaskRequest,
+  getPendingTaskRequestsForTask,
+  approveTaskRequest,
+  dismissTaskRequest,
+  setTaskRequestTarget,
+} from '../services/discussions.js';
+import { findUserWorkspaceById } from '../services/workspace-cache.js';
 import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
@@ -132,7 +140,8 @@ router.get('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
   const attachments = getAttachmentsByTask(task.id);
   const activeTaskId = getLastActiveTaskId(task.workspace_id);
   const turns = getTaskTurns(task.id);
-  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages, participants, attachments, activeTaskId, turns });
+  const taskRequests = getPendingTaskRequestsForTask(task.id);
+  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages, participants, attachments, activeTaskId, turns, taskRequests });
 });
 
 // Get stream log for a task (loaded on demand)
@@ -665,6 +674,118 @@ router.post('/tasks/:taskId/participants/:participantId/message', requireAuth, a
 
   await launchTaskParticipant(task, participant, message, isResume);
 
+  res.json({ ok: true });
+});
+
+// Approve a task request emitted by this task (delegation → new tracked task).
+// Optional body `{ targetWorkspaceId }` overrides the stored target at approval
+// time. Delegated tasks always branch from main (a normal new task).
+router.post('/tasks/:taskId/task-requests/:requestId/approve', requireAuth, async (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+
+  const taskRequest = getTaskRequest(req.params.requestId);
+  if (!taskRequest || taskRequest.task_id !== task.id) {
+    res.status(404).json({ error: 'Task request not found' });
+    return;
+  }
+  if (taskRequest.status !== 'pending') {
+    res.status(400).json({ error: 'Task request already processed' });
+    return;
+  }
+
+  // Determine target workspace: explicit body override > stored target > host
+  let workspaceId = task.workspace_id;
+  let workspaceName = task.workspace_name;
+  const overrideId = typeof req.body?.targetWorkspaceId === 'string' ? req.body.targetWorkspaceId : null;
+  const chosenId = overrideId ?? taskRequest.target_workspace_id;
+
+  if (chosenId && chosenId !== task.workspace_id) {
+    const cached = findUserWorkspaceById(req.user!.id, chosenId);
+    if (cached) {
+      workspaceId = cached.id;
+      workspaceName = cached.name;
+    } else {
+      res.status(400).json({ error: 'Target workspace not found or you do not have access to it.' });
+      return;
+    }
+  }
+
+  const created = createTask({
+    workspaceId,
+    workspaceName,
+    userId: req.user!.id,
+    username: req.user!.username,
+    prompt: taskRequest.prompt,
+    source: req.authSource,
+    clientLabel: req.clientLabel,
+  });
+
+  approveTaskRequest(taskRequest.id, created.id);
+  const crossWorkspace = workspaceId !== task.workspace_id;
+  const msg = crossWorkspace
+    ? `Task created in ${workspaceName}: "${created.title}" (${created.id})`
+    : `Task created: "${created.title}" (${created.id})`;
+  addMessage(task.id, 'system', msg, undefined, undefined, undefined, req.authSource, req.clientLabel);
+
+  await processQueue(workspaceId);
+
+  res.json({ task: created });
+});
+
+// Update the target workspace on a pending task request before approving.
+router.patch('/tasks/:taskId/task-requests/:requestId/target', requireAuth, (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  const taskRequest = getTaskRequest(req.params.requestId);
+  if (!taskRequest || taskRequest.task_id !== task.id) {
+    res.status(404).json({ error: 'Task request not found' });
+    return;
+  }
+  if (taskRequest.status !== 'pending') {
+    res.status(400).json({ error: 'Task request already processed' });
+    return;
+  }
+
+  const { targetWorkspaceId } = req.body ?? {};
+  if (targetWorkspaceId === null || targetWorkspaceId === task.workspace_id) {
+    setTaskRequestTarget(taskRequest.id, null);
+    res.json({ ok: true, target: null });
+    return;
+  }
+  const cached = findUserWorkspaceById(req.user!.id, targetWorkspaceId);
+  if (!cached) {
+    res.status(400).json({ error: 'Target workspace not found or you do not have access to it.' });
+    return;
+  }
+  setTaskRequestTarget(taskRequest.id, { workspace_id: cached.id, workspace_name: cached.name });
+  res.json({ ok: true, target: { id: cached.id, name: cached.name } });
+});
+
+// Dismiss a task request
+router.post('/tasks/:taskId/task-requests/:requestId/dismiss', requireAuth, (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  const taskRequest = getTaskRequest(req.params.requestId);
+  if (!taskRequest || taskRequest.task_id !== task.id) {
+    res.status(404).json({ error: 'Task request not found' });
+    return;
+  }
+  if (taskRequest.status !== 'pending') {
+    res.status(400).json({ error: 'Task request already processed' });
+    return;
+  }
+
+  dismissTaskRequest(taskRequest.id);
   res.json({ ok: true });
 });
 

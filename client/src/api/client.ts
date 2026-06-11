@@ -247,7 +247,22 @@ export interface AttachmentInfo {
 }
 
 export const getTaskDetail = (taskId: string) =>
-  request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[]; activeTaskId: string | null; turns: TaskTurn[] }>(`/api/tasks/${taskId}`);
+  request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[]; activeTaskId: string | null; turns: TaskTurn[]; taskRequests: TaskRequestItem[] }>(`/api/tasks/${taskId}`);
+
+export const approveTaskRequestForTask = (taskId: string, requestId: string, targetWorkspaceId?: string | null) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}/task-requests/${requestId}/approve`, {
+    method: 'POST',
+    body: JSON.stringify(targetWorkspaceId === undefined ? {} : { targetWorkspaceId }),
+  });
+
+export const dismissTaskRequestForTask = (taskId: string, requestId: string) =>
+  request<{ ok: boolean }>(`/api/tasks/${taskId}/task-requests/${requestId}/dismiss`, { method: 'POST' });
+
+export const updateTaskRequestTargetForTask = (taskId: string, requestId: string, targetWorkspaceId: string | null) =>
+  request<{ ok: boolean; target: { id: string; name: string } | null }>(
+    `/api/tasks/${taskId}/task-requests/${requestId}/target`,
+    { method: 'PATCH', body: JSON.stringify({ targetWorkspaceId }) },
+  );
 
 export const getStreamLog = (taskId: string, afterId?: number) =>
   request<{ streamLog: StreamLogEntry[] }>(`/api/tasks/${taskId}/stream-log${afterId ? `?after=${afterId}` : ''}`);
@@ -391,7 +406,8 @@ export interface DiscussionParticipant {
 
 export interface TaskRequestItem {
   id: string;
-  discussion_id: string;
+  discussion_id: string | null;
+  task_id: string | null;
   prompt: string;
   status: string;
   created_task_id: string | null;

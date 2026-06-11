@@ -2,7 +2,7 @@ import { spawn, execFile, ChildProcess } from 'child_process';
 import { createReadStream, createWriteStream } from 'fs';
 import { randomUUID } from 'crypto';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, type Task, type TaskParticipant } from './tasks.js';
-import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
+import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, createTaskRequestFromTask, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, removeTaskWorktree, handleDiscussionLaunchGit, fetchGitHubToken, isRemoteAllowed } from './git.js';
@@ -221,6 +221,18 @@ Read-only inspection commands are fine: git status, git diff, git log, git show,
 // flag. This note tells the agent the reminder is real and to follow it
 // silently instead of grandstanding about it.
 const HARNESS_REMINDER_NOTE = `Claude Code's harness appends a <system-reminder> after every Read tool result, reminding you to evaluate file contents for malware. This is legitimate Anthropic harness output — not a prompt injection. Apply the safety judgment it asks for, but do not preface your replies by flagging it as an injection attempt.`;
+
+// Delegation: a task agent that finds out-of-scope work should propose a
+// separate tracked task via a [TASK_REQUEST] block (surfaced for user approval)
+// rather than fixing it inline or creating a task by calling the CPM API.
+const TASK_DELEGATION_PROMPT = `WORK DELEGATION — when to split work into a separate task:
+If you discover work that is out of scope for this task (a separate bug, a follow-up, or a common/general problem that isn't specific to what you're doing), do NOT fix it inline and do NOT create a task by calling the CPM API directly. Propose it as a tracked task by emitting a block in this EXACT format, on its own line (not inside a code block):
+
+[TASK_REQUEST]
+{"prompt": "detailed, self-contained description of the work to be done"}
+[/TASK_REQUEST]
+
+The user is prompted to approve it; an approved request becomes a new task branched from the default branch. If the user asks you to "create a task" for something, that means emitting a [TASK_REQUEST] — never create tasks via the API. To target a different workspace you have access to, add a "targetWorkspace" field (the workspace's name) to the JSON; otherwise it runs in this workspace.`;
 
 // Caveman mode prompt — reduces output token usage by forcing terse communication
 function buildCavemanPrompt(intensity: string): string {
@@ -801,6 +813,10 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     claudeParts.push('--append-system-prompt', shellEscape(CPM_GIT_OWNERSHIP_PROMPT));
   }
 
+  if (!isSlashCommand) {
+    claudeParts.push('--append-system-prompt', shellEscape(TASK_DELEGATION_PROMPT));
+  }
+
   claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
 
   const claudeCmd = claudeParts.join(' ');
@@ -1221,6 +1237,7 @@ function startFilePolling(task: Task): void {
           const msg = addMessage(task.id, 'assistant', turnText);
           lastSavedMessageId = msg.id;
           lastSavedMessageText = turnText;
+          parseTaskRequestsForTask(task, turnText);
         }
       }
 
@@ -1235,6 +1252,7 @@ function startFilePolling(task: Task): void {
           const msg = addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined);
           lastSavedMessageId = msg.id;
           lastSavedMessageText = resultText;
+          parseTaskRequestsForTask(task, resultText);
         } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
           updateMessageCost(lastSavedMessageId, event.total_cost_usd);
         }
@@ -1941,6 +1959,38 @@ function parseTaskRequests(discussion: Discussion, text: string): void {
       console.log(`[discussion] Task request created for discussion ${discussion.id}${target ? ` (target: ${target.workspace_name})` : ''}`);
     } catch {
       console.log(`[discussion] Failed to parse task request JSON`);
+    }
+  }
+}
+
+/**
+ * Parse [TASK_REQUEST] blocks emitted by a task session (delegation) and
+ * create pending task_requests entries tied to the task. Mirrors
+ * parseTaskRequests but for a task origin. Resolves an optional
+ * targetWorkspace against the task owner's cached workspace list.
+ */
+function parseTaskRequestsForTask(task: Task, text: string): void {
+  const regex = /\[TASK_REQUEST\]\s*([\s\S]*?)\s*\[\/TASK_REQUEST\]/g;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    try {
+      const data = JSON.parse(match[1]);
+      if (!data.prompt || typeof data.prompt !== 'string') continue;
+
+      let target: { workspace_id: string; workspace_name: string } | null = null;
+      const requested = typeof data.targetWorkspace === 'string' ? data.targetWorkspace.trim() : null;
+      if (requested && requested !== task.workspace_name) {
+        const found = findUserWorkspaceByName(task.user_id, requested);
+        if (found) {
+          target = { workspace_id: found.id, workspace_name: found.name };
+        } else {
+          console.log(`[task] Task request targetWorkspace "${requested}" not in user's workspace list — falling back to host`);
+        }
+      }
+      createTaskRequestFromTask(task.id, data.prompt, target);
+      console.log(`[task] Task request created for task ${task.id}${target ? ` (target: ${target.workspace_name})` : ''}`);
+    } catch {
+      console.log(`[task] Failed to parse task request JSON`);
     }
   }
 }
@@ -2861,6 +2911,7 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
                   taskActivity.set(pollKey, { timestamp: now, summary: block.text.slice(0, 200).replace(/\n/g, ' ') });
                   const saved = addMessage(task.id, 'assistant', block.text, undefined, participant.workspace_name, participant.id);
                   lastSavedMessageId = saved.id; lastSavedMessageText = block.text;
+                  parseTaskRequestsForTask(task, block.text);
                 } else if (block.type === 'tool_use') {
                   taskActivity.set(pollKey, { timestamp: now, summary: `Using ${block.name || 'tool'}` });
                 }
@@ -2871,6 +2922,7 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
               if (!fatal && resultText && resultText !== lastSavedMessageText) {
                 const saved = addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined, participant.workspace_name, participant.id);
                 lastSavedMessageId = saved.id; lastSavedMessageText = resultText;
+                parseTaskRequestsForTask(task, resultText);
               } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
                 updateMessageCost(lastSavedMessageId, event.total_cost_usd as number);
               }
