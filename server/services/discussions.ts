@@ -45,7 +45,8 @@ export interface DiscussionParticipant {
 
 export interface TaskRequest {
   id: string;
-  discussion_id: string;
+  discussion_id: string | null;
+  task_id: string | null;
   prompt: string;
   status: string;
   created_task_id: string | null;
@@ -214,6 +215,27 @@ export function createTaskRequest(
     'INSERT INTO task_requests (id, discussion_id, prompt, status, target_workspace_id, target_workspace_name) VALUES (?, ?, ?, ?, ?, ?)'
   ).run(id, discussionId, prompt, 'pending', target?.workspace_id ?? null, target?.workspace_name ?? null);
   return db.prepare('SELECT * FROM task_requests WHERE id = ?').get(id) as TaskRequest;
+}
+
+/** Create a task request that originated from a task session (delegation). */
+export function createTaskRequestFromTask(
+  taskId: string,
+  prompt: string,
+  target?: { workspace_id: string; workspace_name: string } | null,
+): TaskRequest {
+  const db = getDb();
+  const id = uuid();
+  db.prepare(
+    'INSERT INTO task_requests (id, task_id, prompt, status, target_workspace_id, target_workspace_name) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(id, taskId, prompt, 'pending', target?.workspace_id ?? null, target?.workspace_name ?? null);
+  return db.prepare('SELECT * FROM task_requests WHERE id = ?').get(id) as TaskRequest;
+}
+
+export function getPendingTaskRequestsForTask(taskId: string): TaskRequest[] {
+  const db = getDb();
+  return db.prepare(
+    "SELECT * FROM task_requests WHERE task_id = ? AND status = 'pending' ORDER BY created_at ASC"
+  ).all(taskId) as TaskRequest[];
 }
 
 export function setTaskRequestTarget(

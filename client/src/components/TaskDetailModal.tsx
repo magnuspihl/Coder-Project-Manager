@@ -21,6 +21,9 @@ import {
   uploadFiles,
   getWorkspaceVoiceSettings,
   touchTask,
+  approveTaskRequestForTask,
+  dismissTaskRequestForTask,
+  updateTaskRequestTargetForTask,
   type Task,
   type Message,
   type StreamLogEntry,
@@ -28,6 +31,7 @@ import {
   type TaskTurn,
   type Workspace,
   type AttachmentInfo,
+  type TaskRequestItem,
 } from '../api/client';
 import { playChime } from '../utils/chime';
 import { playListenChime } from '../utils/listenChime';
@@ -98,6 +102,10 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const skipNextTitleBlurRef = useRef(false);
   const [turns, setTurns] = useState<TaskTurn[]>([]);
   const [participants, setParticipants] = useState<TaskParticipant[]>([]);
+  const [taskRequests, setTaskRequests] = useState<TaskRequestItem[]>([]);
+  const [processingRequest, setProcessingRequest] = useState<string | null>(null);
+  const [requestTargetOverride, setRequestTargetOverride] = useState<Record<string, string>>({});
+  const [allRunningWorkspaces, setAllRunningWorkspaces] = useState<Workspace[] | null>(null);
   const [targetParticipantId, setTargetParticipantId] = useState<string | null>(null);
   const [showInviteMenu, setShowInviteMenu] = useState(false);
   const [availableWorkspaces, setAvailableWorkspaces] = useState<Workspace[]>([]);
@@ -193,8 +201,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
   const loadData = async () => {
     try {
-      const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments, activeTaskId: newActiveTaskId, turns: newTurns } = await getTaskDetail(taskId);
+      const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments, activeTaskId: newActiveTaskId, turns: newTurns, taskRequests: newTaskRequests } = await getTaskDetail(taskId);
       setActiveTaskId(newActiveTaskId);
+      setTaskRequests(newTaskRequests || []);
       if (prevStatusRef.current && prevStatusRef.current !== 'awaiting_feedback' && newTask.status === 'awaiting_feedback') {
         playChime();
       }
@@ -844,6 +853,61 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     }
   };
 
+  // Load the full list of running workspaces when a pending task request needs a target selector
+  useEffect(() => {
+    if (taskRequests.length === 0 || allRunningWorkspaces !== null) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { workspaces } = await getWorkspaces();
+        if (!cancelled) {
+          setAllRunningWorkspaces(workspaces.filter(ws => ws.latest_build?.status === 'running'));
+        }
+      } catch { /* ignore */ }
+    })();
+    return () => { cancelled = true; };
+  }, [taskRequests.length, allRunningWorkspaces]);
+
+  // Task request (delegation) handlers
+  const handleApproveRequest = async (requestId: string, targetWorkspaceId: string | null, targetName: string) => {
+    if (processingRequest) return;
+    if (targetWorkspaceId && targetWorkspaceId !== task?.workspace_id) {
+      const ok = confirm(
+        `This task will run in "${targetName}", a DIFFERENT workspace from this task ("${task?.workspace_name}"). ` +
+        `It will be queued there and run with that workspace's project context. Continue?`
+      );
+      if (!ok) return;
+    }
+    setProcessingRequest(requestId);
+    try {
+      await approveTaskRequestForTask(taskId, requestId, targetWorkspaceId);
+      onTaskChanged?.();
+      await loadData();
+    } finally {
+      setProcessingRequest(null);
+    }
+  };
+
+  const handleChangeRequestTarget = async (requestId: string, targetWorkspaceId: string) => {
+    setRequestTargetOverride(prev => ({ ...prev, [requestId]: targetWorkspaceId }));
+    try {
+      await updateTaskRequestTargetForTask(taskId, requestId, targetWorkspaceId === task?.workspace_id ? null : targetWorkspaceId);
+    } catch (err) {
+      console.error('Failed to update task request target:', err);
+    }
+  };
+
+  const handleDismissRequest = async (requestId: string) => {
+    if (processingRequest) return;
+    setProcessingRequest(requestId);
+    try {
+      await dismissTaskRequestForTask(taskId, requestId);
+      await loadData();
+    } finally {
+      setProcessingRequest(null);
+    }
+  };
+
   // Participant handlers
   const handleOpenInviteMenu = async () => {
     setShowInviteMenu(true);
@@ -1402,6 +1466,80 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   )}
                 </div>
               )}
+
+              {/* Pending task requests (delegated work proposed by the agent) */}
+              {taskRequests.map((tr) => {
+                const hostId = task.workspace_id;
+                const selectedTargetId = requestTargetOverride[tr.id] ?? tr.target_workspace_id ?? hostId;
+                const isCrossWorkspace = selectedTargetId !== hostId;
+                const selectedWorkspace = allRunningWorkspaces?.find(w => w.id === selectedTargetId);
+                const selectedTargetName = isCrossWorkspace
+                  ? (selectedWorkspace?.name ?? tr.target_workspace_name ?? 'unknown')
+                  : task.workspace_name;
+                const cardClass = isCrossWorkspace
+                  ? 'rounded-lg p-4 bg-rose-50 dark:bg-rose-900/20 border-2 border-rose-300 dark:border-rose-700'
+                  : 'rounded-lg p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800';
+                const labelClass = isCrossWorkspace
+                  ? 'text-xs font-semibold text-rose-700 dark:text-rose-400 uppercase'
+                  : 'text-xs font-medium text-amber-700 dark:text-amber-400 uppercase';
+                const createBtnClass = isCrossWorkspace
+                  ? 'text-xs px-3 py-1.5 bg-rose-600 text-white rounded hover:bg-rose-700 disabled:opacity-50 disabled:cursor-not-allowed'
+                  : 'text-xs px-3 py-1.5 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed';
+                return (
+                  <div key={tr.id} className={cardClass}>
+                    <div className="flex items-center gap-2 mb-2">
+                      <span className={labelClass}>
+                        {isCrossWorkspace ? 'Proposed Task — Cross-Workspace' : 'Proposed Task'}
+                      </span>
+                    </div>
+                    <p className="text-sm text-gray-900 dark:text-gray-100 whitespace-pre-wrap mb-3">{tr.prompt}</p>
+                    <div className="flex items-center gap-2 mb-3 text-xs text-gray-700 dark:text-gray-300">
+                      <label htmlFor={`task-target-${tr.id}`}>Run in:</label>
+                      <select
+                        id={`task-target-${tr.id}`}
+                        value={selectedTargetId}
+                        onChange={(e) => handleChangeRequestTarget(tr.id, e.target.value)}
+                        disabled={processingRequest !== null}
+                        className="text-xs px-2 py-1 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded disabled:opacity-50"
+                      >
+                        <option value={hostId}>{task.workspace_name} (this workspace)</option>
+                        {(allRunningWorkspaces ?? [])
+                          .filter(ws => ws.id !== hostId)
+                          .map(ws => (
+                            <option key={ws.id} value={ws.id}>{ws.name}</option>
+                          ))}
+                        {tr.target_workspace_id && tr.target_workspace_id !== hostId &&
+                          !(allRunningWorkspaces ?? []).some(ws => ws.id === tr.target_workspace_id) && (
+                            <option value={tr.target_workspace_id}>{tr.target_workspace_name ?? 'unknown'}</option>
+                          )}
+                      </select>
+                    </div>
+                    {isCrossWorkspace && (
+                      <p className="text-xs text-rose-700 dark:text-rose-300 mb-3">
+                        ⚠ This task will be queued in <strong>{selectedTargetName}</strong>, not in this task's workspace. You'll be asked to confirm.
+                      </p>
+                    )}
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => handleApproveRequest(tr.id, isCrossWorkspace ? selectedTargetId : null, selectedTargetName)}
+                        disabled={processingRequest !== null}
+                        className={createBtnClass}
+                      >
+                        {processingRequest === tr.id
+                          ? 'Creating...'
+                          : isCrossWorkspace ? `Create in ${selectedTargetName}` : 'Create Task'}
+                      </button>
+                      <button
+                        onClick={() => handleDismissRequest(tr.id)}
+                        disabled={processingRequest !== null}
+                        className="text-xs px-3 py-1.5 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {processingRequest === tr.id ? 'Dismissing...' : 'Dismiss'}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
 
             {/* Actions footer */}
