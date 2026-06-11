@@ -23,16 +23,14 @@ import {
   getTaskParticipant,
   getTaskTurns,
   resetReviewLoopCount,
-} from '../services/tasks.js';
-import {
   getTaskRequest,
   getPendingTaskRequestsForTask,
   approveTaskRequest,
   dismissTaskRequest,
   setTaskRequestTarget,
-} from '../services/discussions.js';
+} from '../services/tasks.js';
 import { findUserWorkspaceById } from '../services/workspace-cache.js';
-import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange } from '../services/claude.js';
+import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, switchActiveTask, getLastActiveTaskId, removeTaskWorktree } from '../services/git.js';
@@ -674,6 +672,42 @@ router.post('/tasks/:taskId/participants/:participantId/message', requireAuth, a
 
   await launchTaskParticipant(task, participant, message, isResume);
 
+  res.json({ ok: true });
+});
+
+// Nudge the host task agent to catch up on participant messages. Only acts when
+// the task is awaiting feedback (idle) and there's unseen context.
+router.post('/tasks/:taskId/catchup', requireAuth, async (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  if (task.status !== 'awaiting_feedback') {
+    res.status(409).json({ error: 'Task is not idle' });
+    return;
+  }
+  await triggerTaskHostCatchUp(task.id);
+  res.json({ ok: true });
+});
+
+// Nudge a participant agent to catch up on the task conversation.
+router.post('/tasks/:taskId/participants/:participantId/catchup', requireAuth, async (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  const participant = getTaskParticipant(req.params.participantId);
+  if (!participant || participant.task_id !== task.id || participant.status !== 'active') {
+    res.status(404).json({ error: 'Participant not found' });
+    return;
+  }
+  if (isTaskParticipantRunning(participant.id)) {
+    res.status(409).json({ error: 'Participant agent is currently processing' });
+    return;
+  }
+  await triggerTaskParticipantCatchUp(task.id, participant.id);
   res.json({ ok: true });
 });
 

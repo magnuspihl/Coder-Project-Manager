@@ -24,23 +24,6 @@ import {
   isTaskParticipantRunning,
   stopTaskParticipant,
 } from '../services/claude.js';
-import {
-  getActiveDiscussion,
-  getDiscussion,
-  createDiscussion,
-  closeDiscussion,
-  getDiscussionMessages,
-  addDiscussionMessage,
-  getDiscussionFullAccess,
-  getParticipants,
-} from '../services/discussions.js';
-import {
-  launchDiscussion,
-  stopDiscussion,
-  isDiscussionRunning,
-  isParticipantRunning,
-  isAnyAgentRunning,
-} from '../services/claude.js';
 import { listWorkspaces, getWorkspace, stopWorkspace, startWorkspace, CoderAuthError } from '../services/coder.js';
 
 type AuthCtx = {
@@ -163,38 +146,6 @@ function buildServer(ctx: AuthCtx): McpServer {
     },
   );
 
-  server.registerTool(
-    'list_discussions',
-    {
-      description: 'Get the active discussion for a workspace (or null if none). Discussions are workspace-level chats separate from tasks.',
-      inputSchema: { workspace_id: z.string().describe('Coder workspace ID') },
-      annotations: { readOnlyHint: true },
-    },
-    async ({ workspace_id }) => {
-      const discussion = getActiveDiscussion(workspace_id);
-      return jsonResult({ workspace_id, discussion: discussion ?? null });
-    },
-  );
-
-  server.registerTool(
-    'get_discussion',
-    {
-      description: 'Get a discussion with its message history and participants.',
-      inputSchema: {
-        discussion_id: z.string().describe('Discussion ID'),
-        message_limit: z.number().int().positive().max(500).optional().describe('Max messages to return'),
-      },
-      annotations: { readOnlyHint: true },
-    },
-    async ({ discussion_id, message_limit }) => {
-      const discussion = getDiscussion(discussion_id);
-      if (!discussion) return errorResult('Discussion not found');
-      const messages = getDiscussionMessages(discussion_id, message_limit);
-      const participants = getParticipants(discussion_id);
-      return jsonResult({ discussion, messages, participants });
-    },
-  );
-
   // ── Creation / reply tools ──────────────────────────────────────────────
 
   server.registerTool(
@@ -287,67 +238,6 @@ function buildServer(ctx: AuthCtx): McpServer {
     },
   );
 
-  server.registerTool(
-    'create_discussion',
-    {
-      description: 'Open (or return) the active discussion for a workspace. If one is already active, returns it instead of creating a new one.',
-      inputSchema: {
-        workspace_id: z.string(),
-        model: z.string().optional(),
-      },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
-    },
-    async ({ workspace_id, model }) => {
-      const existing = getActiveDiscussion(workspace_id);
-      if (existing) {
-        return jsonResult({ discussion: existing, created: false });
-      }
-      let workspace;
-      try {
-        workspace = await getWorkspace(ctx.token, workspace_id);
-      } catch (err) {
-        return errorResult(`Failed to fetch workspace: ${(err as Error).message}`);
-      }
-      const fullAccess = getDiscussionFullAccess(workspace_id);
-      const discussion = createDiscussion({
-        workspaceId: workspace_id,
-        workspaceName: workspace.name,
-        userId: ctx.userId,
-        fullAccess,
-        model,
-        source: ctx.authSource,
-        clientLabel: ctx.clientLabel,
-      });
-      return jsonResult({ discussion, created: true });
-    },
-  );
-
-  server.registerTool(
-    'send_discussion_message',
-    {
-      description: 'Send a message to a workspace discussion. Launches or resumes the discussion agent.',
-      inputSchema: {
-        discussion_id: z.string(),
-        message: z.string().min(1),
-      },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
-    },
-    async ({ discussion_id, message }) => {
-      const discussion = getDiscussion(discussion_id);
-      if (!discussion) return errorResult('Discussion not found');
-      if (discussion.status !== 'active') return errorResult('Discussion is closed');
-      const participantIds = getParticipants(discussion.id).map(p => p.id);
-      if (isAnyAgentRunning(discussion.id, participantIds)) {
-        return errorResult('An agent is currently processing. Wait for it to finish before sending another message.');
-      }
-      addDiscussionMessage(discussion.id, 'user', message, undefined, ctx.username, undefined, ctx.authSource, ctx.clientLabel);
-      const messages = getDiscussionMessages(discussion.id);
-      const isResume = messages.filter(m => m.role === 'assistant').length > 0;
-      await launchDiscussion(discussion, message, isResume, ctx.username);
-      return jsonResult({ ok: true });
-    },
-  );
-
   // ── Destructive / control tools ─────────────────────────────────────────
 
   server.registerTool(
@@ -405,49 +295,6 @@ function buildServer(ctx: AuthCtx): McpServer {
       deleteTask(task.id);
       await processQueue(task.workspace_id);
       return jsonResult({ ok: true, task_id });
-    },
-  );
-
-  server.registerTool(
-    'interrupt_discussion',
-    {
-      description: 'Interrupt a running discussion or its currently running participant.',
-      inputSchema: { discussion_id: z.string() },
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
-    },
-    async ({ discussion_id }) => {
-      const discussion = getDiscussion(discussion_id);
-      if (!discussion) return errorResult('Discussion not found');
-      if (isDiscussionRunning(discussion.id)) {
-        stopDiscussion(discussion.id);
-        addDiscussionMessage(discussion.id, 'system', 'Discussion was interrupted via API.', undefined, undefined, undefined, ctx.authSource, ctx.clientLabel);
-        return jsonResult({ ok: true, interrupted: 'host' });
-      }
-      const participants = getParticipants(discussion.id);
-      const running = participants.find(p => isParticipantRunning(p.id));
-      if (running) {
-        // host stopper also stops participants in the same process group; reuse it
-        stopDiscussion(discussion.id);
-        addDiscussionMessage(discussion.id, 'system', `${running.workspace_name} was interrupted via API.`, undefined, undefined, undefined, ctx.authSource, ctx.clientLabel);
-        return jsonResult({ ok: true, interrupted: running.workspace_name });
-      }
-      return errorResult('No agent is currently running');
-    },
-  );
-
-  server.registerTool(
-    'close_discussion',
-    {
-      description: 'Close a discussion. Stops any running agent and marks it as closed.',
-      inputSchema: { discussion_id: z.string() },
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
-    },
-    async ({ discussion_id }) => {
-      const discussion = getDiscussion(discussion_id);
-      if (!discussion) return errorResult('Discussion not found');
-      stopDiscussion(discussion.id);
-      closeDiscussion(discussion.id);
-      return jsonResult({ ok: true });
     },
   );
 

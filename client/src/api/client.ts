@@ -202,7 +202,7 @@ export interface RateLimitUsage {
 }
 
 export const getWorkspaces = () =>
-  request<{ workspaces: Workspace[]; taskCounts: Record<string, TaskCounts>; tokenTotals: Record<string, TokenTotals>; githubRepoUrls: Record<string, string>; latestDiscussionMessages: Record<string, string>; claudeUsage: Record<string, ClaudeUsage>; globalRateLimits: Record<string, RateLimitUsage> }>('/api/workspaces');
+  request<{ workspaces: Workspace[]; taskCounts: Record<string, TaskCounts>; tokenTotals: Record<string, TokenTotals>; githubRepoUrls: Record<string, string>; claudeUsage: Record<string, ClaudeUsage>; globalRateLimits: Record<string, RateLimitUsage> }>('/api/workspaces');
 
 export const getWorkspace = (id: string) =>
   request<{ workspace: Workspace }>(`/api/workspaces/${id}`);
@@ -356,54 +356,6 @@ export const sendTaskParticipantMessage = (taskId: string, participantId: string
     body: JSON.stringify({ message }),
   });
 
-// Discussions
-export interface Discussion {
-  id: string;
-  workspace_id: string;
-  workspace_name: string;
-  user_id: string;
-  claude_session_id: string | null;
-  status: string;
-  project_dir: string | null;
-  full_access: number;
-  worktree_path: string | null;
-  model: string | null;
-  ssh_pid: number | null;
-  activity: TaskActivity | null;
-  running: boolean;
-  rate_limit: RateLimitInfo | null;
-  source?: string | null;
-  client_label?: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface DiscussionMessage {
-  id: string;
-  discussion_id: string;
-  role: string;
-  content: string;
-  cost: number | null;
-  username: string | null;
-  participant_id: string | null;
-  source?: string | null;
-  client_label?: string | null;
-  created_at: string;
-}
-
-export interface DiscussionParticipant {
-  id: string;
-  discussion_id: string;
-  workspace_id: string;
-  workspace_name: string;
-  claude_session_id: string | null;
-  project_dir: string | null;
-  status: string;
-  running: boolean;
-  activity: TaskActivity | null;
-  created_at: string;
-}
-
 export interface TaskRequestItem {
   id: string;
   discussion_id: string | null;
@@ -443,97 +395,16 @@ export const updatePreviewSettings = (workspaceId: string, previewUrl: string | 
     body: JSON.stringify({ previewUrl }),
   });
 
-export const getDiscussionSettings = (workspaceId: string) =>
-  request<{ fullAccess: boolean }>(`/api/workspaces/${workspaceId}/discussion-settings`);
-
-export const updateDiscussionSettings = (workspaceId: string, fullAccess: boolean) =>
-  request<{ ok: boolean; fullAccess: boolean }>(`/api/workspaces/${workspaceId}/discussion-settings`, {
-    method: 'PATCH',
-    body: JSON.stringify({ fullAccess }),
-  });
-
-export const getDiscussionStatus = (workspaceId: string) =>
-  request<{ hasActive: boolean; discussionId: string | null }>(`/api/workspaces/${workspaceId}/discussion/status`);
-
-export const getOrCreateDiscussion = (workspaceId: string, model?: string) =>
-  request<{ discussion: Discussion; messages: DiscussionMessage[]; totalMessages?: number; taskRequests: TaskRequestItem[]; participants: DiscussionParticipant[] }>(
-    `/api/workspaces/${workspaceId}/discussion`,
-    { method: 'POST', body: JSON.stringify({ ...(model ? { model } : {}) }) }
-  );
-
-export const getDiscussionDetail = (discussionId: string, afterId?: string) =>
-  request<{ discussion: Discussion; messages: DiscussionMessage[]; totalMessages: number; taskRequests: TaskRequestItem[]; participants: DiscussionParticipant[] }>(
-    `/api/discussions/${discussionId}${afterId ? `?after=${afterId}` : ''}`
-  );
-
-export const getOlderDiscussionMessages = (discussionId: string, beforeId: string, limit = 50) =>
-  request<{ messages: DiscussionMessage[] }>(
-    `/api/discussions/${discussionId}/messages?before=${beforeId}&limit=${limit}`
-  );
-
-export const updateDiscussionSession = (discussionId: string, claudeSessionId: string) =>
-  request<{ ok: boolean; claudeSessionId: string }>(`/api/discussions/${discussionId}/session`, {
-    method: 'PATCH',
-    body: JSON.stringify({ claudeSessionId }),
-  });
-
-export const sendDiscussionMessage = (discussionId: string, message: string) =>
-  request<{ ok: boolean }>(`/api/discussions/${discussionId}/message`, {
-    method: 'POST',
-    body: JSON.stringify({ message }),
-  });
-
-export const closeDiscussion = (discussionId: string) =>
-  request<{ ok: boolean; hasChanges?: boolean; branchName?: string | null }>(`/api/discussions/${discussionId}/close`, { method: 'POST' });
-
-export const discardDiscussionWorktree = (discussionId: string) =>
-  request<{ ok: boolean }>(`/api/discussions/${discussionId}/discard-worktree`, { method: 'POST' });
-
-export const interruptDiscussion = (discussionId: string) =>
-  request<{ ok: boolean }>(`/api/discussions/${discussionId}/interrupt`, { method: 'POST' });
-
-export const approveTaskRequest = (discussionId: string, requestId: string, targetWorkspaceId?: string | null) =>
-  request<{ task: Task }>(`/api/discussions/${discussionId}/task-requests/${requestId}/approve`, {
-    method: 'POST',
-    body: JSON.stringify(targetWorkspaceId === undefined ? {} : { targetWorkspaceId }),
-  });
-
-export const dismissTaskRequest = (discussionId: string, requestId: string) =>
-  request<{ ok: boolean }>(`/api/discussions/${discussionId}/task-requests/${requestId}/dismiss`, { method: 'POST' });
-
-export const updateTaskRequestTarget = (discussionId: string, requestId: string, targetWorkspaceId: string | null) =>
-  request<{ ok: boolean; target: { id: string; name: string } | null }>(
-    `/api/discussions/${discussionId}/task-requests/${requestId}/target`,
-    { method: 'PATCH', body: JSON.stringify({ targetWorkspaceId }) },
-  );
-
-// Participants
-export const addDiscussionParticipant = (discussionId: string, workspaceId: string, workspaceName: string) =>
-  request<{ participant: DiscussionParticipant }>(`/api/discussions/${discussionId}/participants`, {
-    method: 'POST',
-    body: JSON.stringify({ workspaceId, workspaceName }),
-  });
-
-export const removeDiscussionParticipant = (discussionId: string, participantId: string) =>
-  request<{ ok: boolean }>(`/api/discussions/${discussionId}/participants/${participantId}`, { method: 'DELETE' });
-
-export const sendParticipantMessage = (discussionId: string, participantId: string, message: string) =>
-  request<{ ok: boolean }>(`/api/discussions/${discussionId}/participants/${participantId}/message`, {
-    method: 'POST',
-    body: JSON.stringify({ message }),
-  });
-
-export const sendHostCatchUp = (discussionId: string) =>
-  request<{ ok: boolean; skipped: boolean }>(`/api/discussions/${discussionId}/catchup`, { method: 'POST' });
-
 export const restartCpm = () =>
   request<{ ok: boolean; message: string }>('/api/workspaces/restart', { method: 'POST' });
 
-export const sendParticipantCatchUp = (discussionId: string, participantId: string) =>
-  request<{ ok: boolean; skipped: boolean }>(`/api/discussions/${discussionId}/participants/${participantId}/catchup`, { method: 'POST' });
+// Task multi-agent catch-up: nudge the host or a participant agent to catch up
+// on the task conversation.
+export const sendTaskHostCatchUp = (taskId: string) =>
+  request<{ ok: boolean }>(`/api/tasks/${taskId}/catchup`, { method: 'POST' });
 
-export const touchDiscussion = (discussionId: string) =>
-  request<{ previousOpenedAt: string | null; openedAt: string }>(`/api/discussions/${discussionId}/touch`, { method: 'POST' });
+export const sendTaskParticipantCatchUp = (taskId: string, participantId: string) =>
+  request<{ ok: boolean }>(`/api/tasks/${taskId}/participants/${participantId}/catchup`, { method: 'POST' });
 
 export const touchTask = (taskId: string) =>
   request<{ previousOpenedAt: string | null; openedAt: string }>(`/api/tasks/${taskId}/touch`, { method: 'POST' });

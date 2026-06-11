@@ -17,6 +17,7 @@ import {
   addTaskParticipant,
   removeTaskParticipant,
   sendTaskParticipantMessage,
+  sendTaskParticipantCatchUp,
   getWorkspaces,
   uploadFiles,
   getWorkspaceVoiceSettings,
@@ -440,6 +441,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       cost: null,
       username: null,
       participant_id: null,
+      turn_id: null,
       created_at: new Date().toISOString(),
     });
     try {
@@ -691,6 +693,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       cost: null,
       username: null,
       participant_id: null,
+      turn_id: null,
       created_at: new Date().toISOString(),
     });
     try {
@@ -943,6 +946,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     } catch { /* ignore */ }
   };
 
+  const handleParticipantCatchUp = async (participantId: string) => {
+    try {
+      await sendTaskParticipantCatchUp(taskId, participantId);
+      await loadData();
+    } catch { /* ignore */ }
+  };
+
   const handleSendToParticipant = async (e?: FormEvent) => {
     if (e) e.preventDefault();
     const trimmed = reply.trim();
@@ -957,6 +967,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       cost: null,
       username: null,
       participant_id: targetParticipantId,
+      turn_id: null,
       created_at: new Date().toISOString(),
     });
     try {
@@ -1609,6 +1620,14 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                           >
                             {p.workspace_name}
                             {p.running && <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-teal-500 animate-pulse" />}
+                          </button>
+                          <button
+                            onClick={() => handleParticipantCatchUp(p.id)}
+                            disabled={p.running}
+                            className="text-xs px-1.5 py-1 border-y border-gray-200 dark:border-gray-700 text-gray-400 hover:text-teal-500 hover:border-teal-300 dark:hover:border-teal-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                            title={`Catch ${p.workspace_name} up on the conversation`}
+                          >
+                            &#8635;
                           </button>
                           <button
                             onClick={() => handleRemoveParticipant(p.id)}

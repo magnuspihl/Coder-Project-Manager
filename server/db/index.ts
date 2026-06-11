@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { randomUUID } from 'crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -320,5 +321,112 @@ export function getDb(): Database.Database {
     db.exec("ALTER TABLE messages ADD COLUMN turn_id TEXT REFERENCES task_turns(id)");
   }
 
+  migrateDiscussionsToTasks(db);
+
   return db;
+}
+
+/**
+ * Convergence: Chat (discussions) has been collapsed into Tasks. Convert any
+ * still-active discussion with at least one message into a task that carries
+ * its session, messages, and participants. Worktree-backed discussions become
+ * resumable `awaiting_feedback` tasks; the rest become `completed` (read-only
+ * history) since the parallel-execution model requires a worktree to resume.
+ *
+ * Idempotent: migrated discussions are marked closed and skipped on re-run, and
+ * we skip any discussion whose session already backs a task. Discussion tables
+ * are intentionally left intact (not dropped) for safety/reversibility.
+ */
+function migrateDiscussionsToTasks(db: Database.Database): void {
+  // Older DBs may predate some discussion columns; guard the whole pass.
+  const discCols = db.prepare("PRAGMA table_info(discussions)").all() as Array<{ name: string }>;
+  if (discCols.length === 0) return;
+
+  const active = db.prepare(`
+    SELECT * FROM discussions d
+    WHERE d.status = 'active'
+      AND EXISTS (SELECT 1 FROM discussion_messages m WHERE m.discussion_id = d.id)
+  `).all() as Array<{
+    id: string; workspace_id: string; workspace_name: string; user_id: string;
+    claude_session_id: string | null; project_dir: string | null; model: string | null;
+    worktree_path: string | null; source: string | null; client_label: string | null;
+    created_at: string;
+  }>;
+  if (active.length === 0) return;
+
+  const run = db.transaction(() => {
+    for (const d of active) {
+      if (d.claude_session_id) {
+        const existing = db.prepare('SELECT id FROM tasks WHERE claude_session_id = ?').get(d.claude_session_id);
+        if (existing) {
+          db.prepare("UPDATE discussions SET status = 'closed' WHERE id = ?").run(d.id);
+          continue;
+        }
+      }
+
+      const msgs = db.prepare(
+        'SELECT * FROM discussion_messages WHERE discussion_id = ? ORDER BY created_at ASC'
+      ).all(d.id) as Array<{
+        id: string; role: string; content: string; cost: number | null;
+        username: string | null; source: string | null; client_label: string | null;
+        participant_id: string | null; created_at: string;
+      }>;
+
+      const taskId = randomUUID();
+      const firstUser = msgs.find(m => m.role === 'user');
+      const prompt = (firstUser?.content ?? '(migrated chat)').trim() || '(migrated chat)';
+      const title = (prompt.split('\n')[0].slice(0, 200) || 'Migrated chat');
+      const pos = (db.prepare(
+        'SELECT COALESCE(MAX(position), 0) + 1 AS p FROM tasks WHERE workspace_id = ?'
+      ).get(d.workspace_id) as { p: number }).p;
+      const status = d.worktree_path ? 'awaiting_feedback' : 'completed';
+
+      db.prepare(`
+        INSERT INTO tasks (
+          id, workspace_id, workspace_name, user_id, title, prompt, status, position,
+          project_dir, claude_session_id, model, worktree_path, source, client_label,
+          created_at, updated_at, completed_at, auto_review, session_initialized
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, 0, 1)
+      `).run(
+        taskId, d.workspace_id, d.workspace_name, d.user_id, title, prompt, status, pos,
+        d.project_dir, d.claude_session_id, d.model, d.worktree_path, d.source, d.client_label,
+        d.created_at, status === 'completed' ? new Date().toISOString() : null,
+      );
+
+      // Recreate participants, mapping old discussion-participant ids → new task ids.
+      const participants = db.prepare(
+        'SELECT * FROM discussion_participants WHERE discussion_id = ?'
+      ).all(d.id) as Array<{
+        id: string; workspace_id: string; workspace_name: string;
+        claude_session_id: string | null; project_dir: string | null; status: string; created_at: string;
+      }>;
+      const idMap = new Map<string, string>();
+      for (const p of participants) {
+        const newId = randomUUID();
+        idMap.set(p.id, newId);
+        db.prepare(`
+          INSERT INTO task_participants (
+            id, task_id, workspace_id, workspace_name, claude_session_id, project_dir, status, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(newId, taskId, p.workspace_id, p.workspace_name, p.claude_session_id, p.project_dir, p.status, p.created_at);
+      }
+
+      const insertMsg = db.prepare(`
+        INSERT INTO messages (
+          id, task_id, role, content, cost, username, source, client_label, participant_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const m of msgs) {
+        const mappedParticipant = m.participant_id ? (idMap.get(m.participant_id) ?? null) : null;
+        insertMsg.run(
+          randomUUID(), taskId, m.role, m.content, m.cost, m.username,
+          m.source, m.client_label, mappedParticipant, m.created_at,
+        );
+      }
+
+      db.prepare("UPDATE discussions SET status = 'closed' WHERE id = ?").run(d.id);
+      console.log(`[migration] Converted discussion ${d.id} → task ${taskId} (${status}, ${msgs.length} messages, ${participants.length} participants)`);
+    }
+  });
+  run();
 }
