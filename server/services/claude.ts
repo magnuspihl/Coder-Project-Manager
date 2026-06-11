@@ -818,7 +818,29 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   // by a prior Claude run. After a session reset, session_initialized=0 forces
   // --session-id (creates a fresh session on disk) even though we have a
   // user-supplied continuation message.
-  const canResume = isResume && task.claude_session_id && task.session_initialized !== 0;
+  //
+  // The session_initialized flag alone is not enough: the session .jsonl can
+  // disappear from the workspace (rebuild, ~/.claude cleared, etc.) even though
+  // the DB still says initialized. Resuming a missing session makes Claude exit
+  // with "No conversation found with session ID", which surfaced when reopening
+  // tasks. Verify the file exists on the workspace first (as discussions do) and
+  // fall back to --session-id so the turn starts a fresh session in place.
+  let canResume = isResume && !!task.claude_session_id && task.session_initialized !== 0;
+  if (canResume) {
+    try {
+      const found = await sshExec(task.workspace_name,
+        `find ~/.claude/projects/ -name '${task.claude_session_id!.replace(/[^a-zA-Z0-9-]/g, '')}.jsonl' 2>/dev/null | head -1`
+      );
+      if (!found.trim()) {
+        canResume = false;
+        console.warn(`[claude-executor] Session ${task.claude_session_id} not found on ${task.workspace_name}; starting fresh session (CPM history preserved)`);
+        addMessage(task.id, 'system', 'The previous Claude session was not found on the workspace, so a new session was started. Your task history here is preserved, but the agent does not retain the earlier conversation context.');
+      }
+    } catch {
+      // Non-fatal — if the check itself fails, fall through to --resume and let
+      // Claude report any real error rather than silently dropping context.
+    }
+  }
   if (canResume) {
     claudeParts.push('--resume', shellEscape(task.claude_session_id!));
   } else if (task.claude_session_id) {
