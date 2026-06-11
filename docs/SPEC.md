@@ -265,7 +265,7 @@ coder ssh {workspace_name} -- claude -p "{task_prompt}" \
   --session-id {session_uuid} \
   --output-format stream-json \
   --allowedTools "Read,Edit,Write,Bash,Glob,Grep" \
-  --max-turns 50
+  --max-turns 200
 ```
 
 For follow-up messages (when user replies to `awaiting_feedback`):
@@ -275,7 +275,7 @@ coder ssh {workspace_name} -- claude -p "{user_feedback}" \
   --resume {session_uuid} \
   --output-format stream-json \
   --allowedTools "Read,Edit,Write,Bash,Glob,Grep" \
-  --max-turns 50
+  --max-turns 200
 ```
 
 ### Coder SSH Authentication
@@ -526,7 +526,7 @@ The app is configured via environment variables:
 | `SESSION_SECRET` | Yes | Secret key for encrypting session cookies and tokens |
 | `PORT` | No | Server port (default: 3000) |
 | `DATABASE_PATH` | No | Path to SQLite database file (default: `./data/cpm.db`) |
-| `CLAUDE_MAX_TURNS` | No | Max agentic turns per Claude execution (default: 50) |
+| `CLAUDE_MAX_TURNS` | No | Max agentic turns per Claude execution (default: 200) |
 | `CLAUDE_ALLOWED_TOOLS` | No | Comma-separated list of tools Claude can use (default: `Read,Edit,Write,Bash,Glob,Grep`) |
 
 ---
