@@ -456,16 +456,49 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       }
     }
 
-    // Merge
+    // Sync local main with origin before merging — handles the case where origin/main
+    // has advanced (e.g. a PR was merged on GitHub before CPM performs its merge step).
+    // Only applies in worktree mode where task.project_dir is the main checkout.
+    if (task.worktree_path && task.project_dir) {
+      try {
+        await sshExec(ws,
+          `cd ${shellEscape(task.project_dir)} && ` +
+          `git fetch origin ${shellEscape(defaultBranch)} && ` +
+          `git merge --ff-only origin/${shellEscape(defaultBranch)}`,
+          30000,
+        );
+      } catch (syncErr: any) {
+        addMessage(task.id, 'system',
+          `Cannot complete: local \`${defaultBranch}\` has diverged from origin/${defaultBranch} and cannot be fast-forwarded: ${syncErr.message}. ` +
+          `Reconcile the branch manually then retry completion.`
+        );
+        return false;
+      }
+    }
+
+    // Merge PR
     try {
       await sshGh(ws, `cd ${shellEscape(dir)} && gh pr merge ${shellEscape(branchName)} --merge --delete-branch`);
       addMessage(task.id, 'system', `PR merged and branch \`${branchName}\` deleted.`);
     } catch (mergeErr: any) {
-      addMessage(task.id, 'system',
-        `Cannot complete: PR merge failed for \`${branchName}\`: ${mergeErr.message}. ` +
-        `Resolve any conflicts on the PR and retry completion.`
-      );
-      return false;
+      // Check if the PR was already merged on GitHub (e.g. by the user or auto-merge)
+      let alreadyMerged = false;
+      try {
+        const prState = await sshGh(ws,
+          `cd ${shellEscape(dir)} && gh pr view ${shellEscape(branchName)} --json state --jq .state`
+        );
+        alreadyMerged = prState.trim() === 'MERGED';
+      } catch { /* ignore state-check errors */ }
+
+      if (alreadyMerged) {
+        addMessage(task.id, 'system', `PR for branch \`${branchName}\` was already merged on GitHub.`);
+      } else {
+        addMessage(task.id, 'system',
+          `Cannot complete: PR merge failed for \`${branchName}\`: ${mergeErr.message}. ` +
+          `Resolve any conflicts on the PR and retry completion.`
+        );
+        return false;
+      }
     }
 
     // Remove worktree now that merge is done
