@@ -311,6 +311,12 @@ function buildReviewerSystemPrompt(): string {
 
 You are a code reviewer who did not write this code. Your job is to find problems the implementer missed, not to confirm that things work.
 
+YOUR ROLE IS READ-ONLY ANALYSIS ONLY. You are one step in an automated pipeline:
+- A separate implementer agent wrote the code.
+- You review it and emit a structured verdict.
+- If you emit "fail", the pipeline automatically routes your issues back to the implementer for fixing. You do NOT fix anything yourself.
+- You do NOT ask the user whether to fix anything. You do NOT interact with the user at all. The pipeline handles routing automatically.
+
 Focus on:
 - Does the implementation actually fulfill the original task?
 - Missing input validation or boundary checks
@@ -324,17 +330,20 @@ Do NOT:
 - Describe what the code does (assume the reader knows)
 - Create, edit, or delete any files
 - Run commands that modify state (no git commits, no writes, no installs)
+- Offer to fix issues, ask the user what they want to do, or request any input
 
 You MAY run read-only commands: git diff, git log, git status, cat, grep, find, npm test / go test / pytest (read test results — do not write new test files).
 
-When you are done, include the following block as the LAST line of your response, with no trailing text:
+REQUIRED — your response MUST end with exactly this block as the very last line, with no text after it:
 
 REVIEW_DECISION: {"outcome":"pass","summary":"<one sentence>"}
    or
 REVIEW_DECISION: {"outcome":"fail","summary":"<one sentence>","issues":["<specific issue>","..."]}
 
-"pass" means: no significant issues; the implementer's work is ready for user review.
-"fail" means: specific actionable issues were found that the implementer should fix. List only genuine problems, not stylistic preferences.`;
+"pass" means: no significant issues found.
+"fail" means: specific actionable issues were found. The pipeline will forward your issues list to the implementer — you do not need to do anything else.
+
+This signal is parsed by an automated system — omitting it breaks the pipeline. Do NOT skip it, do NOT ask for confirmation, do NOT add any text after it.`;
 }
 
 interface ReviewDecision {
@@ -1607,9 +1616,14 @@ function finalizeReviewer(task: Task, turnId: string, allText: string): void {
   const decision = parseReviewDecision(allText);
 
   if (!decision) {
-    console.warn(`[auto-review] No REVIEW_DECISION found for task ${task.id} — treating as fail`);
+    console.warn(`[auto-review] No REVIEW_DECISION found for task ${task.id} — surfacing to user`);
     completeTaskTurn(turnId, 'fail', 'Reviewer did not produce a structured decision');
-    escalateToUser(task, ['Reviewer did not produce a structured decision — manual review needed.']);
+    addMessage(task.id, 'system',
+      "The reviewer completed its check but did not emit a structured verdict. See the reviewer's response above — proceed when ready or reply to ask for clarification.");
+    resetReviewLoopCount(task.id);
+    setActiveTaskTurnRole(task.id, null);
+    updateTaskStatus(task.id, 'awaiting_feedback');
+    processQueue(task.workspace_id).catch(() => {});
     return;
   }
 
