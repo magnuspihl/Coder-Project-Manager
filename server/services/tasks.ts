@@ -74,6 +74,18 @@ export interface TaskParticipant {
   created_at: string;
 }
 
+export interface TaskRequest {
+  id: string;
+  discussion_id: string | null;
+  task_id: string | null;
+  prompt: string;
+  status: string;
+  created_task_id: string | null;
+  target_workspace_id: string | null;
+  target_workspace_name: string | null;
+  created_at: string;
+}
+
 export interface TaskCounts {
   working: number;
   queued: number;
@@ -666,8 +678,75 @@ export function buildTaskParticipantContext(taskId: string, participantId: strin
     lines.push(`[${label}]: ${msg.content}`);
   }
   lines.push('[END CONTEXT]');
-  lines.push(`Agents in this task: ${agentNames.join(', ')}.`);
+  lines.push(`Agents in this task: ${agentNames.join(', ')}. To direct a message to another agent, include [MENTION:workspace_name] at the end of your response (e.g. [MENTION:${agentNames[0]}]). The mentioned agent will receive the conversation and can respond.`);
   lines.push('');
   return lines.join('\n');
+}
+
+/**
+ * Short instruction telling a task agent about other participants and the
+ * mention system. Used when there's no catch-up context but participants exist
+ * (e.g. a participant's first message), so agents still learn the @mention syntax.
+ */
+export function buildTaskMentionInstruction(taskId: string): string {
+  const db = getDb();
+  const task = db.prepare('SELECT workspace_name FROM tasks WHERE id = ?').get(taskId) as { workspace_name: string } | undefined;
+  const hostName = task?.workspace_name || 'Host';
+  const participants = db.prepare(
+    "SELECT workspace_name FROM task_participants WHERE task_id = ? AND status = 'active'"
+  ).all(taskId) as Array<{ workspace_name: string }>;
+  if (participants.length === 0) return '';
+
+  const agentNames = [hostName, ...participants.map(p => p.workspace_name)];
+  return `[Multi-agent task. Agents: ${agentNames.join(', ')}. To direct a message to another agent, include [MENTION:workspace_name] at the end of your response. The mentioned agent will receive the conversation and can respond.]`;
+}
+
+// ─── Task requests (delegation) ─────────────────────────────────────────────
+
+/** Create a task request emitted by a task session (work delegation). */
+export function createTaskRequestFromTask(
+  taskId: string,
+  prompt: string,
+  target?: { workspace_id: string; workspace_name: string } | null,
+): TaskRequest {
+  const db = getDb();
+  const id = uuid();
+  db.prepare(
+    'INSERT INTO task_requests (id, task_id, prompt, status, target_workspace_id, target_workspace_name) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(id, taskId, prompt, 'pending', target?.workspace_id ?? null, target?.workspace_name ?? null);
+  return db.prepare('SELECT * FROM task_requests WHERE id = ?').get(id) as TaskRequest;
+}
+
+export function getPendingTaskRequestsForTask(taskId: string): TaskRequest[] {
+  const db = getDb();
+  return db.prepare(
+    "SELECT * FROM task_requests WHERE task_id = ? AND status = 'pending' ORDER BY created_at ASC"
+  ).all(taskId) as TaskRequest[];
+}
+
+export function getTaskRequest(id: string): TaskRequest | undefined {
+  const db = getDb();
+  return db.prepare('SELECT * FROM task_requests WHERE id = ?').get(id) as TaskRequest | undefined;
+}
+
+export function setTaskRequestTarget(
+  id: string,
+  target: { workspace_id: string; workspace_name: string } | null,
+): void {
+  const db = getDb();
+  db.prepare(
+    "UPDATE task_requests SET target_workspace_id = ?, target_workspace_name = ? WHERE id = ? AND status = 'pending'"
+  ).run(target?.workspace_id ?? null, target?.workspace_name ?? null, id);
+}
+
+export function approveTaskRequest(id: string, createdTaskId: string): void {
+  const db = getDb();
+  db.prepare("UPDATE task_requests SET status = 'created', created_task_id = ? WHERE id = ?")
+    .run(createdTaskId, id);
+}
+
+export function dismissTaskRequest(id: string): void {
+  const db = getDb();
+  db.prepare("UPDATE task_requests SET status = 'dismissed' WHERE id = ?").run(id);
 }
 

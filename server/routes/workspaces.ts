@@ -3,7 +3,6 @@ import { execFile, exec } from 'child_process';
 import { requireAuth } from '../middleware/auth.js';
 import { listWorkspaces, getWorkspace, stopWorkspace, startWorkspace, CoderAuthError } from '../services/coder.js';
 import { getTaskCountsByWorkspace, getTokenTotalsByWorkspace, getGithubRepoUrlsByWorkspace } from '../services/tasks.js';
-import { getLatestDiscussionMessageByWorkspace } from '../services/discussions.js';
 import { getWorkspaceUsages, getGlobalRateLimits } from '../services/claude.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { getModelsForWorkspace } from '../services/models.js';
@@ -68,10 +67,9 @@ router.get('/', requireAuth, async (req: Request, res: Response) => {
   const taskCounts = getTaskCountsByWorkspace();
   const tokenTotals = getTokenTotalsByWorkspace();
   const githubRepoUrls = getGithubRepoUrlsByWorkspace();
-  const latestDiscussionMessages = getLatestDiscussionMessageByWorkspace();
   const claudeUsage = getWorkspaceUsages();
   const globalRateLimits = getGlobalRateLimits();
-  res.json({ workspaces, taskCounts, tokenTotals, githubRepoUrls, latestDiscussionMessages, claudeUsage, globalRateLimits });
+  res.json({ workspaces, taskCounts, tokenTotals, githubRepoUrls, claudeUsage, globalRateLimits });
 });
 
 // Proxy favicon/icon images from workspace ports (they require Coder auth)

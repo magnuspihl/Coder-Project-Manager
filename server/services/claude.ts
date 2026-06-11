@@ -1,11 +1,10 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { createReadStream, createWriteStream } from 'fs';
 import { randomUUID } from 'crypto';
-import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, type Task, type TaskParticipant } from './tasks.js';
-import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, createTaskRequestFromTask, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
+import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, type Task, type TaskParticipant } from './tasks.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
-import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, removeTaskWorktree, handleDiscussionLaunchGit, fetchGitHubToken, isRemoteAllowed } from './git.js';
+import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, removeTaskWorktree, fetchGitHubToken, isRemoteAllowed } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
 import { getAttachmentsByTask, type Attachment } from '../routes/uploads.js';
 import { writeCpmGuidelines } from './workspace-memory.js';
@@ -1304,6 +1303,7 @@ function startFilePolling(task: Task): void {
           lastSavedMessageId = msg.id;
           lastSavedMessageText = turnText;
           parseTaskRequestsForTask(task, turnText);
+          parseTaskMentions(task, turnText, null);
         }
       }
 
@@ -1319,6 +1319,7 @@ function startFilePolling(task: Task): void {
           lastSavedMessageId = msg.id;
           lastSavedMessageText = resultText;
           parseTaskRequestsForTask(task, resultText);
+          parseTaskMentions(task, resultText, null);
         } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
           updateMessageCost(lastSavedMessageId, event.total_cost_usd);
         }
@@ -1985,55 +1986,6 @@ The user will be prompted to approve the task before it runs.
 `;
 }
 
-function getReadOnlyOverride(projectDir: string | null): string {
-  const boundary = projectDir
-    ? `You MUST NOT modify, create, or delete any files within \`${projectDir}\` (the git-tracked project directory). You MAY write to files outside this path (global config, memory files, temp files, etc.).`
-    : `You MUST NOT modify, create, or delete files in the project repository.`;
-  return `[SYSTEM OVERRIDE] Your access mode has been changed to READ-ONLY. You are now in a discussion session. ${boundary}\n\n`;
-}
-
-/** Remote path for discussion output files */
-function remoteDiscussionOutputPath(discussionId: string): string {
-  return `/tmp/cpm-discussion-${discussionId}.jsonl`;
-}
-
-/** Remote path for discussion exit code file */
-function remoteDiscussionExitCodePath(discussionId: string): string {
-  return `/tmp/cpm-discussion-${discussionId}.exit`;
-}
-
-/**
- * Parse [TASK_REQUEST] blocks from text and create task_requests entries.
- * Resolves an optional targetWorkspace name against the user's cached
- * workspace list. Unresolved/missing target falls back to the discussion's
- * own workspace at approval time.
- */
-function parseTaskRequests(discussion: Discussion, text: string): void {
-  const regex = /\[TASK_REQUEST\]\s*([\s\S]*?)\s*\[\/TASK_REQUEST\]/g;
-  let match;
-  while ((match = regex.exec(text)) !== null) {
-    try {
-      const data = JSON.parse(match[1]);
-      if (!data.prompt || typeof data.prompt !== 'string') continue;
-
-      let target: { workspace_id: string; workspace_name: string } | null = null;
-      const requested = typeof data.targetWorkspace === 'string' ? data.targetWorkspace.trim() : null;
-      if (requested && requested !== discussion.workspace_name) {
-        const found = findUserWorkspaceByName(discussion.user_id, requested);
-        if (found) {
-          target = { workspace_id: found.id, workspace_name: found.name };
-        } else {
-          console.log(`[discussion] Task request targetWorkspace "${requested}" not in user's workspace list — falling back to host`);
-        }
-      }
-      createTaskRequest(discussion.id, data.prompt, target);
-      console.log(`[discussion] Task request created for discussion ${discussion.id}${target ? ` (target: ${target.workspace_name})` : ''}`);
-    } catch {
-      console.log(`[discussion] Failed to parse task request JSON`);
-    }
-  }
-}
-
 /**
  * Parse [TASK_REQUEST] blocks emitted by a task session (delegation) and
  * create pending task_requests entries tied to the task. Mirrors
@@ -2066,11 +2018,19 @@ function parseTaskRequestsForTask(task: Task, text: string): void {
   }
 }
 
+// ─── Task multi-agent mentions & catch-up ───────────────────────────────
+
+const TASK_CATCHUP_NUDGE =
+  '[Catch up on the task conversation above. Other agents may have responded, or the user may want your input. Continue the discussion or task as appropriate.]';
+
+const TASK_MENTION_NUDGE =
+  '[You were mentioned by another agent in this task. Review the conversation above and respond.]';
+
 /**
- * Parse [MENTION:workspace_name] tags from assistant text and auto-trigger
- * catch-up for the mentioned agent. Strips the tag from the message.
+ * Parse [MENTION:workspace_name] tags from a task agent's text and auto-trigger
+ * catch-up for the mentioned agent (host or participant). Fire-and-forget.
  */
-function parseMentions(discussion: Discussion, text: string, sourceParticipantId: string | null): void {
+export function parseTaskMentions(task: Task, text: string, sourceParticipantId: string | null): void {
   const mentionRe = /\[MENTION:([^\]]+)\]/g;
   let match;
   const mentioned = new Set<string>();
@@ -2079,750 +2039,50 @@ function parseMentions(discussion: Discussion, text: string, sourceParticipantId
   }
   if (mentioned.size === 0) return;
 
-  const participants = getDiscussionParticipants(discussion.id);
+  const participants = getTaskParticipants(task.id);
 
   for (const name of mentioned) {
-    // Check if it's the host workspace
-    if (name === discussion.workspace_name && sourceParticipantId !== null) {
-      // Mentioned the host — trigger host catch-up (async, fire-and-forget)
-      const hostCatchUp = buildCatchUpContext(discussion.id, '__host__');
-      if (hostCatchUp) {
-        const nudge = hostCatchUp + '\n' + MENTION_NUDGE;
-        const messages = getDiscussionMessages(discussion.id);
-        const isResume = messages.some(m => m.role === 'assistant' && !m.participant_id);
-        console.log(`[mention] ${name} mentioned by participant, triggering host catch-up`);
-        launchDiscussion(discussion, nudge, isResume, undefined, true).catch(err => {
-          console.error('[mention] Failed to launch host catch-up:', (err as Error).message?.slice(0, 100));
-        });
-      }
+    // Mentioning the host workspace — only meaningful when a participant said it.
+    if (name === task.workspace_name && sourceParticipantId !== null) {
+      triggerTaskHostCatchUp(task.id, TASK_MENTION_NUDGE).catch(err =>
+        console.error('[task-mention] host catch-up failed:', err));
       continue;
     }
-
-    // Check if it's a participant
-    const participant = participants.find(p => p.workspace_name === name);
-    if (participant && participant.id !== sourceParticipantId) {
-      const catchUp = buildCatchUpContext(discussion.id, participant.id);
-      if (catchUp) {
-        const nudge = catchUp + '\n' + MENTION_NUDGE;
-        const messages = getDiscussionMessages(discussion.id);
-        const isResume = messages.some(m => m.role === 'assistant' && m.participant_id === participant.id);
-        console.log(`[mention] ${name} mentioned, triggering participant catch-up`);
-        launchParticipantDiscussion(discussion, participant, nudge, isResume, undefined, true).catch(err => {
-          console.error('[mention] Failed to launch participant catch-up:', (err as Error).message?.slice(0, 100));
-        });
-      }
+    const target = participants.find(p => p.workspace_name === name);
+    if (target && target.id !== sourceParticipantId) {
+      triggerTaskParticipantCatchUp(task.id, target.id, TASK_MENTION_NUDGE).catch(err =>
+        console.error('[task-mention] participant catch-up failed:', err));
     }
   }
 }
 
-const MENTION_NUDGE = 'Another agent has mentioned you in the conversation. Review the context above. ' +
-  'If you have something relevant to respond with, please do. ' +
-  'If the conversation doesn\'t require your input, just say so briefly (e.g. "Nothing to add from my side."). ' +
-  'You can mention other agents by including [MENTION:workspace_name] in your response to bring them into the conversation.';
-
 /**
- * Launch or resume a discussion session on a remote workspace.
+ * Nudge the host task agent to catch up on participant messages. Only fires
+ * when the task is awaiting feedback (idle) and there's unseen context.
+ * Routes through resumeTask so it holds the workspace lock and respects
+ * concurrency limits.
  */
-export async function launchDiscussion(
-  discussion: Discussion,
-  message: string,
-  isResume: boolean,
-  username?: string,
-  skipCatchUp?: boolean
-): Promise<void> {
-  // Build catch-up context for the host if there are participants —
-  // the host's own session doesn't contain messages from other agents.
-  const participants = getDiscussionParticipants(discussion.id);
-  let hostCatchUp = '';
-  if (participants.length > 0 && isResume && !skipCatchUp) {
-    hostCatchUp = buildCatchUpContext(discussion.id, '__host__');
-  }
-
-  // Auto-detect project directory if not already set
-  if (!discussion.project_dir) {
-    const detected = await detectProjectDir(discussion.workspace_name);
-    if (detected) {
-      discussion.project_dir = detected;
-      getDb().prepare('UPDATE discussions SET project_dir = ? WHERE id = ?').run(detected, discussion.id);
-    }
-  }
-
-  // Create a worktree on first launch so the discussion is isolated from tasks
-  if (!isResume && !discussion.worktree_path) {
-    await handleDiscussionLaunchGit(discussion);
-  }
-
-  let prompt: string;
-  if (!isResume) {
-    prompt = getDiscussionPromptPrefix(discussion.project_dir ?? null, discussion.workspace_name, discussion.user_id, discussion.worktree_path) + message;
-  } else if (participants.length > 0) {
-    // Resuming with participants — prepend catch-up if available.
-    const mentionInstr = hostCatchUp ? '' : buildMentionInstruction(discussion.id);
-    const prefix = [hostCatchUp, mentionInstr].filter(Boolean).join('\n');
-    prompt = prefix ? prefix + '\n' + message : message;
-  } else {
-    prompt = message;
-  }
-
-  // Check if the session already exists on the remote workspace.
-  // Worktree path is the preferred working directory; fall back to project_dir or home.
-  const preferredWorkDir = discussion.worktree_path || discussion.project_dir;
-  let remoteSessionExists = isResume;
-  let sessionWorkDir = preferredWorkDir;
-  if (discussion.claude_session_id) {
-    try {
-      const checkResult = await sshExec(discussion.workspace_name,
-        `find ~/.claude/projects/ -name '${discussion.claude_session_id}.jsonl' 2>/dev/null | head -1`
-      );
-      const sessionPath = checkResult.trim();
-      if (sessionPath) {
-        remoteSessionExists = true;
-        const workDirEncoded = preferredWorkDir
-          ? preferredWorkDir.replace(/[^a-zA-Z0-9]/g, '-')
-          : null;
-        if (workDirEncoded && !sessionPath.includes(`/projects/${workDirEncoded}/`)) {
-          sessionWorkDir = '/home/coder';
-        }
-      }
-    } catch {
-      // Non-fatal — assume new session, use default working dir
-    }
-  }
-
-  // Build the claude command
-  // When there are participants, always send the full prompt (with catch-up context)
-  // even on resume, since the host's session doesn't contain participant messages.
-  const claudeParts: string[] = [];
-  const useFullPrompt = participants.length > 0;
-  claudeParts.push('claude');
-  claudeParts.push('-p', shellEscape(remoteSessionExists && !useFullPrompt ? message : prompt));
-
-  if (remoteSessionExists && discussion.claude_session_id) {
-    claudeParts.push('--resume', shellEscape(discussion.claude_session_id));
-  } else if (discussion.claude_session_id) {
-    claudeParts.push('--session-id', shellEscape(discussion.claude_session_id));
-  }
-
-  claudeParts.push('--output-format', 'stream-json');
-  claudeParts.push('--verbose');
-  // Discussions always run with full permissions — the worktree provides filesystem isolation
-  claudeParts.push('--dangerously-skip-permissions');
-  claudeParts.push('--max-turns', MAX_TURNS);
-
-  claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
-
-  // Model override
-  if (discussion.model) {
-    const isOllama = discussion.model.startsWith('ollama/');
-    const actualModel = isOllama ? discussion.model.slice('ollama/'.length) : discussion.model;
-    claudeParts.push('--model', shellEscape(actualModel));
-  }
-
-  const claudeCmd = claudeParts.join(' ');
-  const outputFile = remoteDiscussionOutputPath(discussion.id);
-  const exitFile = remoteDiscussionExitCodePath(discussion.id);
-
-  let remoteCmd = 'export PATH="$HOME/.local/bin:$PATH" && ';
-  if (sessionWorkDir) {
-    remoteCmd += `cd ${shellEscape(sessionWorkDir)} && `;
-  }
-  remoteCmd += `rm -f ${shellEscape(exitFile)} && `;
-  remoteCmd += `${claudeCmd} > ${shellEscape(outputFile)} 2>&1; `;
-  remoteCmd += `echo $? > ${shellEscape(exitFile)}`;
-
-  console.log('[discussion] Launching on workspace:', discussion.workspace_name);
-
-  try {
-    // Update status
-    getDb().prepare("UPDATE discussions SET updated_at = ? WHERE id = ?")
-      .run(new Date().toISOString(), discussion.id);
-    taskActivity.set(`disc:${discussion.id}`, { timestamp: new Date().toISOString(), summary: 'Starting discussion session' });
-
-    // Pre-launch prep: archive stale output files + write the CPM guidelines
-    // memory file. Both are independent SSH calls and both are non-fatal.
-    await Promise.all([
-      sshExec(discussion.workspace_name,
-        `mv -f ${shellEscape(outputFile)} ${shellEscape(outputFile + '.prev')} 2>/dev/null; ` +
-        `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`
-      ).catch(() => { /* Non-fatal */ }),
-      writeCpmGuidelines(discussion.workspace_name),
-    ]);
-
-    // Spawn SSH
-    const ghToken = await fetchGitHubToken().catch(() => null);
-    const sshProcess = spawn('coder', ['ssh', discussion.workspace_name, '--', remoteCmd], {
-      env: { ...process.env, CODER_URL, ...(ghToken ? { GH_TOKEN: ghToken } : {}) },
-      stdio: 'ignore',
-      detached: true,
-    });
-
-    getDb().prepare('UPDATE discussions SET ssh_pid = ? WHERE id = ?').run(sshProcess.pid ?? null, discussion.id);
-    activeProcesses.set(`disc:${discussion.id}`, sshProcess);
-    sshProcess.unref();
-
-    // Poll output — skip message cleanup for catch-up launches
-    startDiscussionPolling(discussion, skipCatchUp);
-
-  } catch (err) {
-    const errorMsg = (err as Error).message || 'Failed to launch discussion';
-    console.error('[discussion] Launch failed:', errorMsg);
-    addDiscussionMessage(discussion.id, 'system', `Error: ${errorMsg}`);
-  }
+export async function triggerTaskHostCatchUp(taskId: string, nudge = TASK_CATCHUP_NUDGE): Promise<void> {
+  const task = getTask(taskId);
+  if (!task) return;
+  if (task.status !== 'awaiting_feedback') return;
+  // Nothing new for the host to see → skip.
+  if (!buildTaskParticipantContext(taskId, '__host__')) return;
+  await resumeTask(task, nudge);
 }
 
 /**
- * Cancel/stop an active discussion's SSH process.
+ * Nudge a participant agent to catch up on the task conversation. Skips if the
+ * participant is inactive or already running.
  */
-export function stopDiscussion(discussionId: string): void {
-  const proc = activeProcesses.get(`disc:${discussionId}`);
-  if (proc) {
-    proc.kill();
-    activeProcesses.delete(`disc:${discussionId}`);
-  }
-  stopPolling(`disc:${discussionId}`);
-  taskActivity.delete(`disc:${discussionId}`);
-  getDb().prepare('UPDATE discussions SET ssh_pid = NULL WHERE id = ?').run(discussionId);
-
-  // Also stop any active participants
-  const participants = getDiscussionParticipants(discussionId);
-  for (const p of participants) {
-    stopParticipant(p.id);
-  }
-}
-
-export function getDiscussionActivity(discussionId: string): TaskActivity | undefined {
-  return taskActivity.get(`disc:${discussionId}`);
-}
-
-/**
- * Check if a discussion is currently running (has an active SSH process).
- */
-export function isDiscussionRunning(discussionId: string): boolean {
-  return activeProcesses.has(`disc:${discussionId}`) || activePollers.has(`disc:${discussionId}`);
-}
-
-/**
- * Poll remote output file for a discussion session.
- */
-function startDiscussionPolling(discussion: Discussion, skipMessageCleanup?: boolean): void {
-  const pollKey = `disc:${discussion.id}`;
-  stopPolling(pollKey);
-
-  // Wipe stream_log and (optionally) current-session messages atomically.
-  // Skip cleanup for catch-up launches — there's no prior output to dedupe,
-  // and cleaning up would delete the host's previous legitimate responses.
-  const db = getDb();
-  db.transaction(() => {
-    db.prepare('DELETE FROM stream_log WHERE task_id = ?').run(pollKey);
-    if (!skipMessageCleanup) {
-      deleteCurrentDiscussionAssistantMessages(discussion.id);
-    }
-  })();
-
-  let linesRead = 0;
-  let lastSavedMessageId: string | null = null;
-  let lastSavedMessageText: string | null = null;
-  let consecutiveErrors = 0;
-  let lastPollError = '';
-  let partialLine = '';
-  let polling = false;
-  let finalized = false;
-  let resultSeen = false;
-  let resultError: string | null = null;
-
-  const poll = async () => {
-    if (polling) return;
-    polling = true;
-    try {
-      const outputFile = remoteDiscussionOutputPath(discussion.id);
-      const exitFile = remoteDiscussionExitCodePath(discussion.id);
-
-      const { jsonPart, exitPart } = await pollOutputAndExit(
-        discussion.workspace_name, outputFile, exitFile, linesRead,
-      );
-
-      consecutiveErrors = 0;
-
-      if (jsonPart.trim() || partialLine) {
-        const fullData = partialLine + jsonPart;
-        partialLine = '';
-
-        const allLines = fullData.split('\n');
-        const lastElement = allLines[allLines.length - 1];
-        if (lastElement && lastElement.trim()) {
-          partialLine = allLines.pop()!;
-        }
-
-        for (const line of allLines) {
-          linesRead++;
-          if (!line.trim()) continue;
-
-          let event: { type: string; [key: string]: unknown };
-          try {
-            event = JSON.parse(line);
-          } catch {
-            continue;
-          }
-
-          try {
-            // Track rate limit events
-            if (event.type === 'rate_limit_event') {
-              const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string; status?: string; utilization?: number } | undefined;
-              if (info) {
-                updateWorkspaceUsage(discussion.workspace_name, info);
-                if (info.status === 'rate_limited' && info.resetsAt && info.resetsAt * 1000 > Date.now()) {
-                  rateLimitInfo.set(`disc:${discussion.id}`, { resetsAt: info.resetsAt, rateLimitType: info.rateLimitType || 'unknown' });
-                }
-              }
-            }
-
-            // Update activity
-            const now = new Date().toISOString();
-            if (event.type === 'assistant' && event.message) {
-              const msg = event.message as { content?: Array<{ type: string; text?: string }> };
-              if (msg.content) {
-                for (const block of msg.content) {
-                  if (block.type === 'text' && block.text) {
-                    taskActivity.set(`disc:${discussion.id}`, { timestamp: now, summary: block.text.slice(0, 200).replace(/\n/g, ' ') });
-                    // Save and check for task requests
-                    const dmsg = addDiscussionMessage(discussion.id, 'assistant', block.text);
-                    lastSavedMessageId = dmsg.id;
-                    lastSavedMessageText = block.text;
-                    parseTaskRequests(discussion, block.text);
-                  } else if (block.type === 'tool_use') {
-                    taskActivity.set(`disc:${discussion.id}`, { timestamp: now, summary: `Using ${(block as { name?: string }).name || 'tool'}` });
-                  }
-                }
-              }
-            } else if (event.type === 'result') {
-              const fatal = extractFatalError(event);
-              const resultText = extractResultText(event);
-              if (!fatal && resultText && resultText !== lastSavedMessageText) {
-                const dmsg = addDiscussionMessage(discussion.id, 'assistant', resultText, event.total_cost_usd as number | undefined);
-                lastSavedMessageId = dmsg.id;
-                lastSavedMessageText = resultText;
-                parseTaskRequests(discussion, resultText);
-              } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
-                getDb().prepare('UPDATE discussion_messages SET cost = ? WHERE id = ?').run(event.total_cost_usd, lastSavedMessageId);
-              }
-              if (fatal) resultError = fatal;
-              resultSeen = true;
-            }
-          } catch (eventErr) {
-            console.error(`[discussion-poller] Error processing event:`, (eventErr as Error).message?.slice(0, 200));
-          }
-        }
-      }
-
-      // Finalize on `result` event arrival — Claude has logically finished even
-      // if the OS process hasn't exited yet (e.g. lingering subprocess holds the
-      // stdout pipe open, blocking exit). Don't wait for the exit code.
-      if (resultSeen && !finalized) {
-        finalized = true;
-        console.log(`[discussion-poller] Discussion ${discussion.id} finalized via result event`);
-        const proc = activeProcesses.get(`disc:${discussion.id}`);
-        if (proc) proc.kill();
-        stopPolling(pollKey);
-        taskActivity.delete(`disc:${discussion.id}`);
-        activeProcesses.delete(`disc:${discussion.id}`);
-        rateLimitInfo.delete(`disc:${discussion.id}`);
-        getDb().prepare('UPDATE discussions SET ssh_pid = NULL WHERE id = ?').run(discussion.id);
-
-        if (resultError) {
-          addDiscussionMessage(discussion.id, 'system', `Error: ${resultError}`);
-        } else if (lastSavedMessageText) {
-          parseMentions(discussion, lastSavedMessageText, null);
-        }
-      } else if (exitPart !== 'RUNNING' && exitPart !== '' && !finalized) {
-        const exitCode = parseInt(exitPart, 10);
-        if (isNaN(exitCode)) {
-          console.warn(`[discussion-poller] Discussion ${discussion.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
-          return;
-        }
-        finalized = true;
-        console.log(`[discussion-poller] Discussion ${discussion.id} finished (exit: ${exitPart})`);
-        stopPolling(pollKey);
-        taskActivity.delete(`disc:${discussion.id}`);
-        activeProcesses.delete(`disc:${discussion.id}`);
-        rateLimitInfo.delete(`disc:${discussion.id}`);
-        getDb().prepare('UPDATE discussions SET ssh_pid = NULL WHERE id = ?').run(discussion.id);
-
-        if (exitCode === 0 && lastSavedMessageText) {
-          parseMentions(discussion, lastSavedMessageText, null);
-        }
-
-        if (exitCode !== 0) {
-          let errorDetail = '';
-          try {
-            const lastLines = await sshExec(discussion.workspace_name,
-              `tail -5 ${shellEscape(outputFile)} 2>/dev/null | grep -v '^{' | head -3`,
-              10000
-            );
-            if (lastLines.trim()) {
-              errorDetail = ': ' + lastLines.trim().split('\n').join(' ').slice(0, 200);
-            }
-          } catch { /* ignore */ }
-
-          const errorMessages: Record<number, string> = {
-            127: 'Claude CLI not found. The workspace may need the Claude Code CLI installed.',
-            126: 'Claude CLI is not executable.',
-            1: 'Claude exited with an error' + errorDetail,
-          };
-          const msg = errorMessages[exitCode] || `Claude exited with code ${exitCode}${errorDetail}`;
-          addDiscussionMessage(discussion.id, 'system', `Error: ${msg}`);
-        }
-      }
-    } catch (err) {
-      consecutiveErrors++;
-      lastPollError = (err as Error).message?.slice(0, 300) || String(err);
-      console.log(`[discussion-poller] Error (${consecutiveErrors}):`, lastPollError.slice(0, 100));
-
-      if (consecutiveErrors > 20) {
-        console.log(`[discussion-poller] Too many errors, stopping polling for discussion ${discussion.id}`);
-        stopPolling(pollKey);
-        taskActivity.delete(`disc:${discussion.id}`);
-        const reason = lastPollError
-          ? `Lost connection to workspace: ${lastPollError}`
-          : 'Lost connection to workspace';
-        addDiscussionMessage(discussion.id, 'system', `Error: ${reason}`);
-      }
-    } finally {
-      polling = false;
-    }
-  };
-
-  const interval = setInterval(poll, 5000);
-  activePollers.set(pollKey, interval);
-  poll();
-}
-
-// ─── Multi-agent participant support ──────────────────────────────
-
-function remoteParticipantOutputPath(participantId: string): string {
-  return `/tmp/cpm-disc-participant-${participantId}.jsonl`;
-}
-
-function remoteParticipantExitCodePath(participantId: string): string {
-  return `/tmp/cpm-disc-participant-${participantId}.exit`;
-}
-
-/**
- * Launch or resume a participant's Claude session on their workspace.
- */
-export async function launchParticipantDiscussion(
-  discussion: Discussion,
-  participant: DiscussionParticipant,
-  message: string,
-  isResume: boolean,
-  username?: string,
-  skipCatchUp?: boolean
-): Promise<void> {
-  const isFullAccess = discussion.full_access === 1;
-
-  // Build catch-up context unless the caller already included it in the message.
-  const catchUp = skipCatchUp ? '' : buildCatchUpContext(discussion.id, participant.id);
-
-  // Include mention instruction if no catch-up (catch-up already has it)
-  const mentionInstr = catchUp ? '' : buildMentionInstruction(discussion.id);
-
-  let prompt: string;
-  if (!isResume) {
-    const prefix = isFullAccess ? '' : getDiscussionPromptPrefix(participant.project_dir ?? null, participant.workspace_name, discussion.user_id);
-    const context = [mentionInstr].filter(Boolean).join('\n');
-    prompt = prefix + (context ? context + '\n' : '') + message;
-  } else {
-    const context = [catchUp, mentionInstr].filter(Boolean).join('\n');
-    prompt = context ? context + '\n' + message : message;
-  }
-
-  // Auto-detect project directory if not already set
-  if (!participant.project_dir) {
-    const detected = await detectProjectDir(participant.workspace_name);
-    if (detected) {
-      participant.project_dir = detected;
-      updateParticipantProjectDir(participant.id, detected);
-    }
-  }
-
-  // Check if session already exists on remote
-  let remoteSessionExists = isResume;
-  let sessionWorkDir = participant.project_dir;
-  if (participant.claude_session_id) {
-    try {
-      const checkResult = await sshExec(participant.workspace_name,
-        `find ~/.claude/projects/ -name '${participant.claude_session_id}.jsonl' 2>/dev/null | head -1`
-      );
-      if (checkResult.trim()) {
-        remoteSessionExists = true;
-        const projectDirEncoded = participant.project_dir
-          ? participant.project_dir.replace(/[^a-zA-Z0-9]/g, '-')
-          : null;
-        if (projectDirEncoded && !checkResult.includes(`/projects/${projectDirEncoded}/`)) {
-          sessionWorkDir = '/home/coder';
-        }
-      }
-    } catch { /* Non-fatal */ }
-  }
-
-  // Build claude command
-  // Always send the full prompt (with catch-up context) for participants,
-  // even on resume — the participant's own session doesn't contain messages
-  // from other agents, so catch-up context is essential.
-  const claudeParts: string[] = ['claude'];
-  claudeParts.push('-p', shellEscape(prompt));
-
-  if (remoteSessionExists && participant.claude_session_id) {
-    claudeParts.push('--resume', shellEscape(participant.claude_session_id));
-  } else if (participant.claude_session_id) {
-    claudeParts.push('--session-id', shellEscape(participant.claude_session_id));
-  }
-
-  claudeParts.push('--output-format', 'stream-json');
-  claudeParts.push('--verbose');
-  if (isFullAccess) {
-    claudeParts.push('--dangerously-skip-permissions');
-  } else {
-    claudeParts.push('--allowedTools', shellEscape(DISCUSSION_ALLOWED_TOOLS));
-  }
-  claudeParts.push('--max-turns', MAX_TURNS);
-  claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
-
-  const claudeCmd = claudeParts.join(' ');
-  const outputFile = remoteParticipantOutputPath(participant.id);
-  const exitFile = remoteParticipantExitCodePath(participant.id);
-
-  let remoteCmd = 'export PATH="$HOME/.local/bin:$PATH" && ';
-  if (sessionWorkDir) {
-    remoteCmd += `cd ${shellEscape(sessionWorkDir)} && `;
-  }
-  remoteCmd += `rm -f ${shellEscape(exitFile)} && `;
-  remoteCmd += `${claudeCmd} > ${shellEscape(outputFile)} 2>&1; `;
-  remoteCmd += `echo $? > ${shellEscape(exitFile)}`;
-
-  console.log('[participant] Launching on workspace:', participant.workspace_name, 'for discussion:', discussion.id);
-
-  try {
-    const pollKey = `disc-p:${participant.id}`;
-    taskActivity.set(pollKey, { timestamp: new Date().toISOString(), summary: 'Starting participant session' });
-
-    // Pre-launch prep: archive stale output files + write the CPM guidelines
-    // memory file. Both are independent SSH calls and both are non-fatal.
-    await Promise.all([
-      sshExec(participant.workspace_name,
-        `mv -f ${shellEscape(outputFile)} ${shellEscape(outputFile + '.prev')} 2>/dev/null; ` +
-        `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`
-      ).catch(() => { /* Non-fatal */ }),
-      writeCpmGuidelines(participant.workspace_name),
-    ]);
-
-    // Spawn SSH
-    const ghToken = await fetchGitHubToken().catch(() => null);
-    const sshProcess = spawn('coder', ['ssh', participant.workspace_name, '--', remoteCmd], {
-      env: { ...process.env, CODER_URL, ...(ghToken ? { GH_TOKEN: ghToken } : {}) },
-      stdio: 'ignore',
-      detached: true,
-    });
-
-    activeProcesses.set(pollKey, sshProcess);
-    sshProcess.unref();
-
-    // Poll output
-    startParticipantPolling(discussion, participant);
-
-  } catch (err) {
-    const errorMsg = (err as Error).message || 'Failed to launch participant session';
-    console.error('[participant] Launch failed:', errorMsg);
-    addDiscussionMessage(discussion.id, 'system', `Error launching ${participant.workspace_name}: ${errorMsg}`, undefined, undefined, participant.id);
-  }
-}
-
-export function stopParticipant(participantId: string): void {
-  const pollKey = `disc-p:${participantId}`;
-  const proc = activeProcesses.get(pollKey);
-  if (proc) {
-    proc.kill();
-    activeProcesses.delete(pollKey);
-  }
-  stopPolling(pollKey);
-  taskActivity.delete(pollKey);
-}
-
-export function isParticipantRunning(participantId: string): boolean {
-  const pollKey = `disc-p:${participantId}`;
-  return activeProcesses.has(pollKey) || activePollers.has(pollKey);
-}
-
-export function getParticipantActivity(participantId: string): TaskActivity | undefined {
-  return taskActivity.get(`disc-p:${participantId}`);
-}
-
-/**
- * Check if ANY agent (host or participant) is currently running for a discussion.
- */
-export function isAnyAgentRunning(discussionId: string, participantIds: string[]): boolean {
-  if (isDiscussionRunning(discussionId)) return true;
-  return participantIds.some(pid => isParticipantRunning(pid));
-}
-
-/**
- * Stop all active participants for a discussion.
- */
-export function stopAllParticipants(participantIds: string[]): void {
-  for (const pid of participantIds) {
-    stopParticipant(pid);
-  }
-}
-
-/**
- * Poll remote output file for a participant session.
- */
-function startParticipantPolling(discussion: Discussion, participant: DiscussionParticipant): void {
-  const pollKey = `disc-p:${participant.id}`;
-  stopPolling(pollKey);
-
-  let linesRead = 0;
-  let lastSavedMessageId: string | null = null;
-  let lastSavedMessageText: string | null = null;
-  let consecutiveErrors = 0;
-  let partialLine = '';
-  let polling = false;
-  let finalized = false;
-  let resultSeen = false;
-  let resultError: string | null = null;
-
-  const poll = async () => {
-    if (polling) return;
-    polling = true;
-    try {
-      const outputFile = remoteParticipantOutputPath(participant.id);
-      const exitFile = remoteParticipantExitCodePath(participant.id);
-
-      const { jsonPart, exitPart } = await pollOutputAndExit(
-        participant.workspace_name, outputFile, exitFile, linesRead,
-      );
-
-      consecutiveErrors = 0;
-
-      if (jsonPart.trim() || partialLine) {
-        const fullData = partialLine + jsonPart;
-        partialLine = '';
-
-        const allLines = fullData.split('\n');
-        const lastElement = allLines[allLines.length - 1];
-        if (lastElement && lastElement.trim()) {
-          partialLine = allLines.pop()!;
-        }
-
-        for (const line of allLines) {
-          linesRead++;
-          if (!line.trim()) continue;
-
-          let event: { type: string; [key: string]: unknown };
-          try {
-            event = JSON.parse(line);
-          } catch { continue; }
-
-          try {
-            // Track rate limit events
-            if (event.type === 'rate_limit_event') {
-              const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string; status?: string; utilization?: number } | undefined;
-              if (info) {
-                updateWorkspaceUsage(participant.workspace_name, info);
-              }
-            }
-
-            // Update activity
-            const now = new Date().toISOString();
-            if (event.type === 'assistant' && event.message) {
-              const msg = event.message as { content?: Array<{ type: string; text?: string; name?: string }> };
-              if (msg.content) {
-                for (const block of msg.content) {
-                  if (block.type === 'text' && block.text) {
-                    taskActivity.set(pollKey, { timestamp: now, summary: block.text.slice(0, 200).replace(/\n/g, ' ') });
-                    const dmsg = addDiscussionMessage(discussion.id, 'assistant', block.text, undefined, participant.workspace_name, participant.id);
-                    lastSavedMessageId = dmsg.id;
-                    lastSavedMessageText = block.text;
-                    parseTaskRequests(discussion, block.text);
-                  } else if (block.type === 'tool_use') {
-                    taskActivity.set(pollKey, { timestamp: now, summary: `Using ${block.name || 'tool'}` });
-                  }
-                }
-              }
-            } else if (event.type === 'result') {
-              const fatal = extractFatalError(event);
-              const resultText = extractResultText(event);
-              if (!fatal && resultText && resultText !== lastSavedMessageText) {
-                const dmsg = addDiscussionMessage(discussion.id, 'assistant', resultText, event.total_cost_usd as number | undefined, participant.workspace_name, participant.id);
-                lastSavedMessageId = dmsg.id;
-                lastSavedMessageText = resultText;
-                parseTaskRequests(discussion, resultText);
-              } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
-                getDb().prepare('UPDATE discussion_messages SET cost = ? WHERE id = ?').run(event.total_cost_usd, lastSavedMessageId);
-              }
-              if (fatal) resultError = fatal;
-              resultSeen = true;
-            }
-          } catch (eventErr) {
-            console.error(`[participant-poller] Error processing event:`, (eventErr as Error).message?.slice(0, 200));
-          }
-        }
-      }
-
-      // Finalize on `result` event arrival — Claude has logically finished even
-      // if the OS process hasn't exited yet (e.g. lingering subprocess holds the
-      // stdout pipe open, blocking exit). Don't wait for the exit code.
-      if (resultSeen && !finalized) {
-        finalized = true;
-        console.log(`[participant-poller] Participant ${participant.id} finalized via result event`);
-        const proc = activeProcesses.get(pollKey);
-        if (proc) proc.kill();
-        stopPolling(pollKey);
-        taskActivity.delete(pollKey);
-        activeProcesses.delete(pollKey);
-
-        if (resultError) {
-          addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} session ended with error: ${resultError}`, undefined, undefined, participant.id);
-        } else if (lastSavedMessageText) {
-          parseMentions(discussion, lastSavedMessageText, participant.id);
-        }
-      } else if (exitPart !== 'RUNNING' && exitPart !== '' && !finalized) {
-        const exitCode = parseInt(exitPart, 10);
-        if (isNaN(exitCode)) {
-          console.warn(`[participant-poller] Participant ${participant.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
-          return;
-        }
-        finalized = true;
-        console.log(`[participant-poller] Participant ${participant.id} finished (exit: ${exitPart})`);
-        stopPolling(pollKey);
-        taskActivity.delete(pollKey);
-        activeProcesses.delete(pollKey);
-
-        if (exitCode === 0 && lastSavedMessageText) {
-          parseMentions(discussion, lastSavedMessageText, participant.id);
-        }
-
-        if (exitCode !== 0) {
-          addDiscussionMessage(discussion.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`, undefined, undefined, participant.id);
-        }
-      }
-    } catch (err) {
-      consecutiveErrors++;
-      console.log(`[participant-poller] Error (${consecutiveErrors}):`, (err as Error).message?.slice(0, 100));
-
-      if (consecutiveErrors > 20) {
-        console.log(`[participant-poller] Too many errors, stopping polling for participant ${participant.id}`);
-        stopPolling(pollKey);
-        taskActivity.delete(pollKey);
-        addDiscussionMessage(discussion.id, 'system', `Error: Lost connection to ${participant.workspace_name}`, undefined, undefined, participant.id);
-      }
-    } finally {
-      polling = false;
-    }
-  };
-
-  const interval = setInterval(poll, 5000);
-  activePollers.set(pollKey, interval);
-  poll();
+export async function triggerTaskParticipantCatchUp(taskId: string, participantId: string, nudge = TASK_CATCHUP_NUDGE): Promise<void> {
+  const task = getTask(taskId);
+  if (!task) return;
+  const participant = getTaskParticipant(participantId);
+  if (!participant || participant.status !== 'active') return;
+  if (isTaskParticipantRunning(participantId)) return;
+  const isResume = !!participant.claude_session_id;
+  await launchTaskParticipant(task, participant, nudge, isResume);
 }
 
 // ─── Task Participant Support ───────────────────────────────────────────
@@ -2983,6 +2243,7 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
                   const saved = addMessage(task.id, 'assistant', block.text, undefined, participant.workspace_name, participant.id);
                   lastSavedMessageId = saved.id; lastSavedMessageText = block.text;
                   parseTaskRequestsForTask(task, block.text);
+                  parseTaskMentions(task, block.text, participant.id);
                 } else if (block.type === 'tool_use') {
                   taskActivity.set(pollKey, { timestamp: now, summary: `Using ${block.name || 'tool'}` });
                 }
@@ -2994,6 +2255,7 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
                 const saved = addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined, participant.workspace_name, participant.id);
                 lastSavedMessageId = saved.id; lastSavedMessageText = resultText;
                 parseTaskRequestsForTask(task, resultText);
+                parseTaskMentions(task, resultText, participant.id);
               } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
                 updateMessageCost(lastSavedMessageId, event.total_cost_usd as number);
               }

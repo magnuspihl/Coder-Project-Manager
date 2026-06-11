@@ -12,8 +12,6 @@ import {
   deleteTask,
   restoreTask,
   createTask,
-  getOrCreateDiscussion,
-  getDiscussionStatus,
   checkoutTaskBranch,
   setActiveTask,
   getModels,
@@ -36,7 +34,6 @@ import { KOKORO_VOICES } from '../utils/kokoroTTS';
 import { playChime } from '../utils/chime';
 import { useDraft, useSessionState } from '../hooks/useDraft';
 import TaskDetailModal from '../components/TaskDetailModal';
-import DiscussionModal from '../components/DiscussionModal';
 
 function timeAgo(iso: string): string {
   const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -95,7 +92,6 @@ export default function WorkspacesPage() {
   const [taskCounts, setTaskCounts] = useState<Record<string, TaskCounts>>({});
   const [tokenTotals, setTokenTotals] = useState<Record<string, TokenTotals>>({});
   const [githubRepoUrls, setGithubRepoUrls] = useState<Record<string, string>>({});
-  const [latestDiscussionMessages, setLatestDiscussionMessages] = useState<Record<string, string>>({});
   const [claudeUsage, setClaudeUsage] = useState<Record<string, ClaudeUsage>>({});
   const [globalRateLimits, setGlobalRateLimits] = useState<Record<string, RateLimitUsage>>({});
   const [tasksByWorkspace, setTasksByWorkspace] = useState<Record<string, Task[]>>({});
@@ -117,12 +113,6 @@ export default function WorkspacesPage() {
   const [newTaskUploading, setNewTaskUploading] = useState(false);
   const newTaskFileInputRef = useRef<HTMLInputElement>(null);
   const [selectedTaskId, setSelectedTaskId] = useSessionState<string | null>('selectedTaskId', null);
-  const [discussionState, setDiscussionState] = useState<{ id: string; workspaceId: string; workspaceName: string } | null>(null);
-  const [chatPickerWs, setChatPickerWs] = useState<{ id: string; name: string } | null>(null);
-  const [chatModel, setChatModel] = useState('');
-  const [chatModels, setChatModels] = useState<ModelInfo[]>([]);
-  const [chatModelsLoading, setChatModelsLoading] = useState(false);
-  const [chatCreating, setChatCreating] = useState(false);
   const [settingsOpenWsId, setSettingsOpenWsId] = useState<string | null>(null);
   const [gitPushSettings, setGitPushSettings] = useState<Record<string, boolean>>({});
   const [previewUrlSettings, setPreviewUrlSettings] = useState<Record<string, string>>({});
@@ -152,12 +142,11 @@ export default function WorkspacesPage() {
 
   const loadData = async () => {
     try {
-      const { workspaces: ws, taskCounts: tc, tokenTotals: tt, githubRepoUrls: gh, latestDiscussionMessages: ldm, claudeUsage: cu, globalRateLimits: grl } = await getWorkspaces();
+      const { workspaces: ws, taskCounts: tc, tokenTotals: tt, githubRepoUrls: gh, claudeUsage: cu, globalRateLimits: grl } = await getWorkspaces();
       setIfChanged('workspaces', setWorkspaces, ws);
       setIfChanged('taskCounts', setTaskCounts, tc);
       setIfChanged('tokenTotals', setTokenTotals, tt || {});
       setIfChanged('githubRepoUrls', setGithubRepoUrls, gh || {});
-      setIfChanged('latestDiscussionMessages', setLatestDiscussionMessages, ldm || {});
       setIfChanged('claudeUsage', setClaudeUsage, cu || {});
       setIfChanged('globalRateLimits', setGlobalRateLimits, grl || {});
       setError('');
@@ -241,20 +230,8 @@ export default function WorkspacesPage() {
       const aHasAny = aCounts ? (aCounts.working + aCounts.queued + aCounts.awaiting_feedback + aCounts.failed + aCounts.completed + aCounts.cancelled) > 0 : false;
       const bHasAny = bCounts ? (bCounts.working + bCounts.queued + bCounts.awaiting_feedback + bCounts.failed + bCounts.completed + bCounts.cancelled) > 0 : false;
       if (aHasAny !== bHasAny) return aHasAny ? -1 : 1;
-      // Lanes without any tasks: sort by latest chat message desc (lanes without chats go last, alphabetical fallback)
-      if (!aHasAny && !bHasAny) {
-        const aMsg = latestDiscussionMessages[a.id];
-        const bMsg = latestDiscussionMessages[b.id];
-        if (aMsg && bMsg) {
-          if (aMsg !== bMsg) return aMsg > bMsg ? -1 : 1;
-        } else if (aMsg) {
-          return -1;
-        } else if (bMsg) {
-          return 1;
-        }
-      }
       return a.name.localeCompare(b.name);
-    }), [workspaces, taskCounts, latestDiscussionMessages]);
+    }), [workspaces, taskCounts]);
 
   // Pre-sort tasks per workspace so we don't re-sort on every render/keypress
   const sortedTasksByWorkspace = useMemo(() => {
@@ -528,68 +505,6 @@ export default function WorkspacesPage() {
     await restoreTask(deletedTaskId);
     setDeletedTaskId(null);
     await loadData();
-  };
-
-  const markChatSeen = (workspaceId: string) => {
-    try {
-      const seen = JSON.parse(localStorage.getItem('chatLastSeen') || '{}');
-      seen[workspaceId] = new Date().toISOString();
-      localStorage.setItem('chatLastSeen', JSON.stringify(seen));
-    } catch { /* ignore */ }
-  };
-
-  const getChatLastSeen = (workspaceId: string): string | null => {
-    try {
-      const seen = JSON.parse(localStorage.getItem('chatLastSeen') || '{}');
-      return seen[workspaceId] || null;
-    } catch { return null; }
-  };
-
-  const hasUnreadChat = (workspaceId: string): boolean => {
-    const latest = latestDiscussionMessages[workspaceId];
-    if (!latest) return false;
-    const lastSeen = getChatLastSeen(workspaceId);
-    if (!lastSeen) return true; // never opened → unread if any messages exist
-    return latest > lastSeen;
-  };
-
-  const handleOpenDiscussion = async (workspaceId: string, workspaceName: string) => {
-    try {
-      // Check if there's already an active discussion
-      const { hasActive } = await getDiscussionStatus(workspaceId);
-      if (hasActive) {
-        // Open existing discussion directly
-        const { discussion } = await getOrCreateDiscussion(workspaceId);
-        markChatSeen(workspaceId);
-        setDiscussionState({ id: discussion.id, workspaceId, workspaceName });
-      } else {
-        // No active discussion — show model picker before creating
-        setChatPickerWs({ id: workspaceId, name: workspaceName });
-        setChatModel('');
-        setChatModelsLoading(true);
-        getModels(workspaceId)
-          .then(({ models }) => setChatModels(models))
-          .catch(() => setChatModels([]))
-          .finally(() => setChatModelsLoading(false));
-      }
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to open discussion');
-    }
-  };
-
-  const handleCreateDiscussion = async () => {
-    if (!chatPickerWs) return;
-    setChatCreating(true);
-    try {
-      const { discussion } = await getOrCreateDiscussion(chatPickerWs.id, chatModel || undefined);
-      markChatSeen(chatPickerWs.id);
-      setDiscussionState({ id: discussion.id, workspaceId: chatPickerWs.id, workspaceName: chatPickerWs.name });
-      setChatPickerWs(null);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to create discussion');
-    } finally {
-      setChatCreating(false);
-    }
   };
 
   const handleToggleSettings = async (workspaceId: string) => {
@@ -1235,16 +1150,6 @@ export default function WorkspacesPage() {
             {isRunning && (
               <div className="flex gap-1.5 shrink-0 mt-0.5">
                 <button
-                  onClick={() => handleOpenDiscussion(ws.id, ws.name)}
-                  className="relative text-xs px-2 py-0.5 bg-purple-600 text-white rounded-full hover:bg-purple-700 transition-colors"
-                  title="Open discussion"
-                >
-                  Chat
-                  {hasUnreadChat(ws.id) && !discussionState && (
-                    <span className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-red-500 rounded-full border border-white dark:border-gray-900" />
-                  )}
-                </button>
-                <button
                   onClick={() => {
                     if (newTaskWorkspaceId === ws.id) return;
                     setNewTaskWorkspaceId(ws.id);
@@ -1520,69 +1425,6 @@ export default function WorkspacesPage() {
         />
       )}
 
-      {chatPickerWs && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
-          <div className="bg-white dark:bg-gray-950 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 w-full max-w-sm p-5 space-y-4">
-            <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100">
-              New Chat with {chatPickerWs.name}
-            </h3>
-            <select
-              value={chatModel}
-              onChange={(e) => setChatModel(e.target.value)}
-              className="w-full text-sm border border-gray-300 dark:border-gray-700 rounded-md p-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-1 focus:ring-purple-500"
-              disabled={chatCreating || chatModelsLoading}
-            >
-              <option value="">{chatModelsLoading ? 'Loading models...' : 'Default model'}</option>
-              {chatModels.some(m => m.provider === 'anthropic') && (
-                <optgroup label="Claude">
-                  {chatModels.filter(m => m.provider === 'anthropic').map((m) => (
-                    <option key={m.id} value={m.id}>{m.display_name}</option>
-                  ))}
-                </optgroup>
-              )}
-              {chatModels.some(m => m.provider === 'ollama-local') && (
-                <optgroup label="Ollama (local)">
-                  {chatModels.filter(m => m.provider === 'ollama-local').map((m) => (
-                    <option key={m.id} value={m.id}>{m.display_name}</option>
-                  ))}
-                </optgroup>
-              )}
-              {chatModels.some(m => m.provider === 'ollama-cloud') && (
-                <optgroup label="Ollama (cloud)">
-                  {chatModels.filter(m => m.provider === 'ollama-cloud').map((m) => (
-                    <option key={m.id} value={m.id}>{m.display_name}</option>
-                  ))}
-                </optgroup>
-              )}
-            </select>
-            <div className="flex gap-2 justify-end">
-              <button
-                onClick={() => setChatPickerWs(null)}
-                className="text-sm px-3 py-1.5 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleCreateDiscussion}
-                disabled={chatCreating}
-                className="text-sm px-4 py-1.5 bg-purple-600 text-white rounded-md hover:bg-purple-700 disabled:opacity-50"
-              >
-                {chatCreating ? 'Starting...' : 'Start Chat'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {discussionState && (
-        <DiscussionModal
-          discussionId={discussionState.id}
-          workspaceId={discussionState.workspaceId}
-          workspaceName={discussionState.workspaceName}
-          onClose={() => { markChatSeen(discussionState.workspaceId); setDiscussionState(null); }}
-          onTaskCreated={loadData}
-        />
-      )}
     </div>
   );
 }
