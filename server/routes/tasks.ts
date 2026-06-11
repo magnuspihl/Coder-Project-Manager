@@ -15,7 +15,6 @@ import {
   getTaskCostUsd,
   getTaskCostsByWorkspace,
   getWorkingTask,
-  setPendingComplete,
   resetTaskSession,
   addTaskParticipant,
   removeTaskParticipant,
@@ -32,7 +31,7 @@ import {
   setTaskRequestTarget,
 } from '../services/discussions.js';
 import { findUserWorkspaceById } from '../services/workspace-cache.js';
-import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange } from '../services/claude.js';
+import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, withWorkspaceLock } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, switchActiveTask, getLastActiveTaskId, removeTaskWorktree } from '../services/git.js';
@@ -214,12 +213,6 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
   // User reply resets the review loop so the next implementer turn gets a fresh review
   resetReviewLoopCount(task.id);
 
-  // User replied → cancel any pending completion: they're asking to continue.
-  if (task.pending_complete) {
-    setPendingComplete(task.id, false);
-    addMessage(task.id, 'system', 'Pending completion cancelled — reply received.', undefined, undefined, undefined, req.authSource, req.clientLabel);
-  }
-
   if (Array.isArray(attachmentIds) && attachmentIds.length > 0) {
     linkAttachmentsToTask(attachmentIds.filter((a: unknown) => typeof a === 'string'), task.id);
   }
@@ -262,23 +255,25 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
     return;
   }
 
-  // If another task is actively working on this workspace, defer completion
-  // until the queue is idle. Otherwise concurrent git ops (stash/checkout/
-  // commit) would corrupt the working agent's tree.
-  const working = getWorkingTask(task.workspace_id);
-  if (working && working.id !== task.id) {
-    if (!task.pending_complete) {
-      setPendingComplete(task.id, true);
-      addMessage(task.id, 'system', `Completion queued — will finalize after task "${working.title}" finishes on this workspace.`, undefined, undefined, undefined, req.authSource, req.clientLabel);
-    }
-    res.status(202).json({ task: getTask(task.id), queued: true });
+  // Completion runs git ops on the shared main checkout (merge-sync, post-merge
+  // pull) and the shared .git metadata (branch/worktree refs). Serialize these
+  // under the workspace lock so concurrent completions — or a completion racing
+  // a queued task's launch in processQueue — can't corrupt the shared tree. A
+  // task working in parallel lives in its own isolated worktree, so it does not
+  // need to block us.
+  const result = await withWorkspaceLock(task.workspace_id, async () => {
+    const current = getTask(task.id);
+    if (!current || current.status !== 'awaiting_feedback') return 'stale' as const;
+    const ok = await handleTaskCompletionGit(current);
+    if (ok) updateTaskStatus(current.id, 'completed');
+    return ok ? ('completed' as const) : ('blocked' as const);
+  });
+
+  if (result === 'stale') {
+    res.status(409).json({ error: 'Task is no longer awaiting feedback.', task: getTask(task.id) });
     return;
   }
-
-  // Handle git operations before marking complete — may block completion on
-  // uncommitted changes (remote disabled) or on any git failure.
-  const allowed = await handleTaskCompletionGit(task);
-  if (!allowed) {
+  if (result === 'blocked') {
     res.status(409).json({
       error: 'Cannot complete: git operation blocked. See task messages for the exact reason.',
       task: getTask(task.id),
@@ -286,10 +281,7 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
     return;
   }
 
-  setPendingComplete(task.id, false);
-  updateTaskStatus(task.id, 'completed');
-
-  // Let the queue processor start the next task
+  // Let the queue processor start the next task (acquires its own workspace lock).
   await processQueue(task.workspace_id);
 
   res.json({ task: getTask(task.id) });
@@ -377,12 +369,6 @@ router.post('/tasks/:taskId/retry', requireAuth, async (req: Request, res: Respo
   const continuationPrompt = 'Continue where you left off.';
   addMessage(task.id, 'user', continuationPrompt, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
 
-  // Retry → cancel pending completion; user is re-engaging.
-  if (task.pending_complete) {
-    setPendingComplete(task.id, false);
-    addMessage(task.id, 'system', 'Pending completion cancelled — retry requested.', undefined, undefined, undefined, req.authSource, req.clientLabel);
-  }
-
   // Queue and let processQueue handle concurrency — it will resume immediately
   // if a slot is available, or hold in queue until one opens up.
   updateTaskStatus(task.id, 'queued');
@@ -418,10 +404,6 @@ router.post('/tasks/:taskId/reset-session', requireAuth, async (req: Request, re
   resetTaskSession(task.id);
   addMessage(task.id, 'system', 'Session reset — starting a fresh Claude session. Prior messages remain visible here but are not in the agent\'s context.', undefined, undefined, undefined, req.authSource, req.clientLabel);
   addMessage(task.id, 'user', continuationPrompt, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
-
-  if (task.pending_complete) {
-    setPendingComplete(task.id, false);
-  }
 
   // If another task is working on this workspace, queue this one; the queue
   // will pick it up later. Otherwise transition straight to queued and kick
@@ -463,10 +445,6 @@ router.post('/tasks/:taskId/compact-session', requireAuth, async (req: Request, 
 
   addMessage(task.id, 'system', 'Compacting session — Claude will summarize prior turns to free up context.', undefined, undefined, undefined, req.authSource, req.clientLabel);
   addMessage(task.id, 'user', '/compact', undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
-
-  if (task.pending_complete) {
-    setPendingComplete(task.id, false);
-  }
 
   updateTaskStatus(task.id, 'queued');
   await processQueue(task.workspace_id);

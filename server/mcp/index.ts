@@ -12,7 +12,6 @@ import {
   updateTaskStatus,
   updateTaskTitle,
   deleteTask,
-  setPendingComplete,
   getWorkingTask,
   getTaskParticipants,
 } from '../services/tasks.js';
@@ -253,10 +252,6 @@ function buildServer(ctx: AuthCtx): McpServer {
         return errorResult(`Task is not awaiting feedback (current status: ${task.status})`);
       }
       addMessage(task.id, 'user', message, undefined, ctx.username, undefined, ctx.authSource, ctx.clientLabel);
-      if (task.pending_complete) {
-        setPendingComplete(task.id, false);
-        addMessage(task.id, 'system', 'Pending completion cancelled — reply received.', undefined, undefined, undefined, ctx.authSource, ctx.clientLabel);
-      }
       const working = getWorkingTask(task.workspace_id);
       if (working) {
         updateTaskStatus(task.id, 'queued');

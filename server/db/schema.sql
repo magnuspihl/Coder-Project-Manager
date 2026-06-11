@@ -25,7 +25,6 @@ CREATE TABLE IF NOT EXISTS tasks (
   verification_url TEXT,
   branch TEXT,
   model TEXT,
-  pending_complete INTEGER NOT NULL DEFAULT 0,
   source TEXT,
   client_label TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),

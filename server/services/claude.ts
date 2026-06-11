@@ -1,11 +1,11 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { createReadStream, createWriteStream } from 'fs';
 import { randomUUID } from 'crypto';
-import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, type Task, type TaskParticipant } from './tasks.js';
+import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, updateTaskParticipantProjectDir, getTaskParticipants, markSessionInitialized, createTaskTurn, getTaskTurns, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, type Task, type TaskParticipant } from './tasks.js';
 import { addDiscussionMessage, deleteCurrentDiscussionAssistantMessages, createTaskRequest, createTaskRequestFromTask, buildCatchUpContext, buildMentionInstruction, updateParticipantProjectDir, getParticipants as getDiscussionParticipants, getDiscussionMessages, type Discussion, type DiscussionParticipant } from './discussions.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
-import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, removeTaskWorktree, handleDiscussionLaunchGit, fetchGitHubToken, isRemoteAllowed } from './git.js';
+import { handleTaskLaunchGit, handleTaskResumeGit, removeTaskWorktree, handleDiscussionLaunchGit, fetchGitHubToken, isRemoteAllowed } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
 import { getAttachmentsByTask, type Attachment } from '../routes/uploads.js';
 import { writeCpmGuidelines } from './workspace-memory.js';
@@ -640,25 +640,6 @@ export async function withWorkspaceLock<T>(workspaceId: string, fn: () => Promis
  */
 export async function processQueue(workspaceId: string): Promise<void> {
   await withWorkspaceLock(workspaceId, async () => {
-    // Flush any tasks whose completion was deferred while a task was working.
-    let pending = getPendingCompletionTask(workspaceId);
-    while (pending) {
-      try {
-        const allowed = await handleTaskCompletionGit(pending);
-        if (allowed) {
-          setPendingComplete(pending.id, false);
-          updateTaskStatus(pending.id, 'completed');
-        } else {
-          setPendingComplete(pending.id, false);
-          addMessage(pending.id, 'system', 'Queued completion could not proceed — uncommitted changes and remote pushes are disabled. Resolve manually and try again.');
-        }
-      } catch (err: any) {
-        setPendingComplete(pending.id, false);
-        addMessage(pending.id, 'system', `Queued completion failed: ${err?.message || err}. Please retry.`);
-      }
-      pending = getPendingCompletionTask(workspaceId);
-    }
-
     // Launch queued tasks up to the concurrency limit
     const maxConcurrent = getMaxConcurrent(workspaceId);
     while (true) {

@@ -22,7 +22,6 @@ export interface Task {
   worktree_path: string | null;
   port_range_start: number | null;
   caveman: string | null;
-  pending_complete: number;
   session_initialized: number;
   total_input_tokens: number;
   total_output_tokens: number;
@@ -410,10 +409,6 @@ export function getMaxConcurrent(workspaceId: string): number {
   return row?.max_concurrent ?? 3;
 }
 
-export function setPendingComplete(taskId: string, value: boolean): void {
-  getDb().prepare('UPDATE tasks SET pending_complete = ? WHERE id = ?').run(value ? 1 : 0, taskId);
-}
-
 /**
  * Replace the task's claude_session_id with a new UUID and mark the session as
  * uninitialized. The next launch will use `--session-id` (creating a fresh
@@ -431,12 +426,6 @@ export function resetTaskSession(taskId: string): string {
 /** Mark the task's current claude_session_id as initialized — called once a launch has spawned. */
 export function markSessionInitialized(taskId: string): void {
   getDb().prepare('UPDATE tasks SET session_initialized = 1 WHERE id = ?').run(taskId);
-}
-
-export function getPendingCompletionTask(workspaceId: string): Task | undefined {
-  return getDb()
-    .prepare("SELECT * FROM tasks WHERE workspace_id = ? AND pending_complete = 1 AND deleted_at IS NULL ORDER BY position ASC LIMIT 1")
-    .get(workspaceId) as Task | undefined;
 }
 
 /**

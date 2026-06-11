@@ -1579,11 +1579,6 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
               )}
               {task.status === 'awaiting_feedback' && (
                 <div className="space-y-3">
-                  {!!task.pending_complete && (
-                    <div className="text-xs px-3 py-2 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-300">
-                      Completion is queued — will finalize once the working task on this workspace finishes. Replying below will cancel the pending completion.
-                    </div>
-                  )}
                   {/* Participant target selector */}
                   {participants.length > 0 && (
                     <div className="flex items-center gap-1.5 flex-wrap">
@@ -1829,11 +1824,10 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   <div className="flex items-center gap-2">
                     <button
                       onClick={handleComplete}
-                      disabled={completing || !!task.pending_complete}
+                      disabled={completing}
                       className="bg-green-600 text-white text-sm px-4 py-2 rounded-md hover:bg-green-700 disabled:opacity-50"
-                      title={task.pending_complete ? 'Completion queued — will finalize once the working task finishes' : undefined}
                     >
-                      {task.pending_complete ? 'Completion queued…' : completing ? 'Completing...' : 'Mark Complete (Alt+C)'}
+                      {completing ? 'Completing...' : 'Mark Complete (Alt+C)'}
                     </button>
                     <button
                       onClick={handleRetry}

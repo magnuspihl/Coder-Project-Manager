@@ -108,7 +108,6 @@ export interface Task {
   auto_review: number;
   review_loop_count: number;
   active_turn_role: 'implementer' | 'reviewer' | null;
-  pending_complete?: number;
   session_initialized?: number;
   total_input_tokens: number;
   total_output_tokens: number;
