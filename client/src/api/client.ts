@@ -225,6 +225,20 @@ export interface ModelInfo {
 export const getModels = (workspaceId: string) =>
   request<{ models: ModelInfo[] }>(`/api/workspaces/${workspaceId}/models`);
 
+export interface MemoryFile {
+  name: string;
+  content: string;
+}
+
+export const getWorkspaceMemory = (workspaceId: string) =>
+  request<{ files: MemoryFile[] }>(`/api/workspaces/${workspaceId}/memory`);
+
+export const updateWorkspaceMemoryFile = (workspaceId: string, filename: string, content: string) =>
+  request<{ ok: boolean }>(`/api/workspaces/${workspaceId}/memory/${encodeURIComponent(filename)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ content }),
+  });
+
 // Uploads
 // Tasks
 export const getTasks = (workspaceId: string) =>

@@ -327,14 +327,16 @@ Do NOT:
 
 You MAY run read-only commands: git diff, git log, git status, cat, grep, find, npm test / go test / pytest (read test results — do not write new test files).
 
-When you are done, include the following block as the LAST line of your response, with no trailing text:
+REQUIRED — your response MUST end with exactly this block as the very last line, with no text after it:
 
 REVIEW_DECISION: {"outcome":"pass","summary":"<one sentence>"}
    or
 REVIEW_DECISION: {"outcome":"fail","summary":"<one sentence>","issues":["<specific issue>","..."]}
 
-"pass" means: no significant issues; the implementer's work is ready for user review.
-"fail" means: specific actionable issues were found that the implementer should fix. List only genuine problems, not stylistic preferences.`;
+"pass" means: no significant issues found.
+"fail" means: specific actionable issues were found that the implementer should fix. List only genuine problems, not stylistic preferences.
+
+This signal is parsed by an automated system — omitting it breaks the pipeline. Do NOT skip it, do NOT ask for confirmation, do NOT add any text after it.`;
 }
 
 interface ReviewDecision {
@@ -722,6 +724,10 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   } else {
     await handleTaskLaunchGit(task);
   }
+
+  // Write CPM guidelines to workspace memory (fire-and-forget, non-fatal).
+  // Runs before every task so Tasks and Discussions share up-to-date guidelines.
+  writeCpmGuidelines(task.workspace_name, task.project_dir).catch(() => { /* non-fatal */ });
 
   // Allocate port range for new tasks
   if (!isResume && (task.port_range_start === null || task.port_range_start === undefined)) {
@@ -1576,9 +1582,14 @@ function finalizeReviewer(task: Task, turnId: string, allText: string): void {
   const decision = parseReviewDecision(allText);
 
   if (!decision) {
-    console.warn(`[auto-review] No REVIEW_DECISION found for task ${task.id} — treating as fail`);
+    console.warn(`[auto-review] No REVIEW_DECISION found for task ${task.id} — surfacing to user`);
     completeTaskTurn(turnId, 'fail', 'Reviewer did not produce a structured decision');
-    escalateToUser(task, ['Reviewer did not produce a structured decision — manual review needed.']);
+    addMessage(task.id, 'system',
+      'The reviewer completed its check but did not emit a structured verdict. See the reviewer\'s response above — proceed when ready or reply to ask for clarification.');
+    resetReviewLoopCount(task.id);
+    setActiveTaskTurnRole(task.id, null);
+    updateTaskStatus(task.id, 'awaiting_feedback');
+    processQueue(task.workspace_id).catch(() => {});
     return;
   }
 
@@ -2124,7 +2135,7 @@ export async function launchDiscussion(
         `mv -f ${shellEscape(outputFile)} ${shellEscape(outputFile + '.prev')} 2>/dev/null; ` +
         `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`
       ).catch(() => { /* Non-fatal */ }),
-      writeCpmGuidelines(discussion.workspace_name),
+      writeCpmGuidelines(discussion.workspace_name, discussion.project_dir),
     ]);
 
     // Spawn SSH
@@ -2491,7 +2502,7 @@ export async function launchParticipantDiscussion(
         `mv -f ${shellEscape(outputFile)} ${shellEscape(outputFile + '.prev')} 2>/dev/null; ` +
         `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`
       ).catch(() => { /* Non-fatal */ }),
-      writeCpmGuidelines(participant.workspace_name),
+      writeCpmGuidelines(participant.workspace_name, participant.project_dir),
     ]);
 
     // Spawn SSH
