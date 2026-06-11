@@ -24,7 +24,7 @@ import {
   getTaskTurns,
   resetReviewLoopCount,
 } from '../services/tasks.js';
-import { processQueue, resumeTask, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange } from '../services/claude.js';
+import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, switchActiveTask, getLastActiveTaskId, removeTaskWorktree } from '../services/git.js';
@@ -215,17 +215,10 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
     linkAttachmentsToTask(attachmentIds.filter((a: unknown) => typeof a === 'string'), task.id);
   }
 
-  // If another task is currently working on this workspace, queue the reply
-  // instead of resuming immediately — only one Claude session at a time.
-  const working = getWorkingTask(task.workspace_id);
-  if (working) {
-    updateTaskStatus(task.id, 'queued');
-    res.json({ task: getTask(task.id) });
-    return;
-  }
-
-  // No other task working — resume immediately
-  await resumeTask(task, message);
+  // Queue and let processQueue handle concurrency — it will resume immediately
+  // if a slot is available, or hold in queue until one opens up.
+  updateTaskStatus(task.id, 'queued');
+  await processQueue(task.workspace_id);
   res.json({ task: getTask(task.id) });
 });
 
@@ -381,18 +374,10 @@ router.post('/tasks/:taskId/retry', requireAuth, async (req: Request, res: Respo
     addMessage(task.id, 'system', 'Pending completion cancelled — retry requested.', undefined, undefined, undefined, req.authSource, req.clientLabel);
   }
 
-  // resumeTask guards on awaiting_feedback — transition before calling it
-  updateTaskStatus(task.id, 'awaiting_feedback');
-
-  // If another task is working on this workspace, queue instead of resuming immediately
-  const working = getWorkingTask(task.workspace_id);
-  if (working) {
-    updateTaskStatus(task.id, 'queued');
-    res.json({ task: getTask(task.id) });
-    return;
-  }
-
-  await resumeTask(task, continuationPrompt);
+  // Queue and let processQueue handle concurrency — it will resume immediately
+  // if a slot is available, or hold in queue until one opens up.
+  updateTaskStatus(task.id, 'queued');
+  await processQueue(task.workspace_id);
   res.json({ task: getTask(task.id) });
 });
 
