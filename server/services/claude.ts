@@ -692,9 +692,13 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   // VSCODE_PROXY_URI is baked with CPM's own workspace name. If the task targets a
   // different workspace, swap that segment so the preview URL points at the right host.
   const proxyUriForTask = (() => {
-    if (!proxyUri || !LOCAL_WORKSPACE_NAME) return proxyUri;
-    if (!task.workspace_name || task.workspace_name === LOCAL_WORKSPACE_NAME) return proxyUri;
-    return proxyUri.split(`--${LOCAL_WORKSPACE_NAME}--`).join(`--${task.workspace_name}--`);
+    if (!proxyUri || !LOCAL_WORKSPACE_NAME || !task.workspace_name) return proxyUri;
+    if (task.workspace_name.toLowerCase() === LOCAL_WORKSPACE_NAME.toLowerCase()) return proxyUri;
+    // Coder's wildcard host is case-insensitive and canonically lowercased, but
+    // CODER_WORKSPACE_NAME may be cased differently than the baked proxy segment,
+    // so match case-insensitively and emit the target name lowercased.
+    const escaped = LOCAL_WORKSPACE_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return proxyUri.replace(new RegExp(`--${escaped}--`, 'i'), `--${task.workspace_name.toLowerCase()}--`);
   })();
   const portStart = task.port_range_start ?? null;
   const portEnd = portStart !== null ? portStart + PORT_RANGE_SIZE - 1 : null;
