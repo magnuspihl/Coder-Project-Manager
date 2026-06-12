@@ -15,8 +15,15 @@ const ANTHROPIC_CACHE_TTL_MS = 60 * 60 * 1000;
 let ollamaCache: { models: ModelInfo[]; timestamp: number } | null = null;
 const OLLAMA_CACHE_TTL_MS = 5 * 60 * 1000; // Shorter — models can be pulled/removed
 
-// Fallback list when Anthropic API fetch fails
+// Fallback list when Anthropic API fetch fails.
+// NOTE: On Coder workspaces, Claude Code is authenticated through the managed
+// Coder/OAuth gateway, so there is usually no `~/.claude/.credentials` apiKey or
+// $ANTHROPIC_API_KEY for the live /v1/models fetch to use — meaning this list is
+// effectively the source of truth. Keep it current as new models ship.
+// Ordered newest-first so the latest model surfaces at the top of the dropdown.
 const FALLBACK_ANTHROPIC: ModelInfo[] = [
+  { id: 'claude-fable-5', display_name: 'Claude Fable 5', provider: 'anthropic' },
+  { id: 'claude-opus-4-8', display_name: 'Claude Opus 4.8', provider: 'anthropic' },
   { id: 'claude-opus-4-7', display_name: 'Claude Opus 4.7', provider: 'anthropic' },
   { id: 'claude-opus-4-6', display_name: 'Claude Opus 4.6', provider: 'anthropic' },
   { id: 'claude-sonnet-4-6', display_name: 'Claude Sonnet 4.6', provider: 'anthropic' },
