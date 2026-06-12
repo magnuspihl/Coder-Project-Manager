@@ -100,6 +100,21 @@ available via the Reviewer's Read tool.
 The Reviewer's working directory is the task's existing worktree. It inherits the same `coder ssh`
 invocation path. No new worktree is created.
 
+**Isolation from workspace memory.** The Reviewer is launched with `--setting-sources ''`, which
+skips the `claude` CLI's CLAUDE.md auto-discovery (both `~/.claude/CLAUDE.md` and the project
+`./CLAUDE.md`). Those files instruct a normal agent to report status via tooling, ask the user when
+blocked, and act as the project's builder — instructions that directly contradict the Reviewer's
+read-only, non-interactive contract. Without isolation the CLAUDE.md directives override the
+appended Reviewer prompt, so reviewers asked the user questions, requested edit access, and never
+emitted `REVIEW_DECISION`. Setting sources govern only settings.json + CLAUDE.md, not credentials,
+so OAuth/keychain auth is unaffected.
+
+**Read-only enforcement.** The Reviewer's `--allowedTools` grants `Read,Glob,Grep` plus a whitelist
+of read-only `Bash(<cmd>:*)` rules (git inspection, file readers, test runners). Bare `Bash` was
+removed because an allowed tool is auto-approved in headless `-p` mode, which let reviewers write
+files (e.g. edit `.gitignore`, `rm` artifacts). Write commands now fall outside the allowlist and
+are denied by the CLI's permission layer.
+
 ---
 
 ## 5. Reviewer System Prompt
@@ -152,15 +167,18 @@ message after the `result` event arrives in the stream. It looks for a line matc
 REVIEW_DECISION: {valid JSON}
 ```
 
-Parsing is done with a regex that extracts the JSON payload:
+Parsing (`parseReviewDecision`) is deliberately tolerant. It finds the **last** `REVIEW_DECISION`
+marker (the model sometimes mentions it before emitting the real one), tolerating markdown wrappers
+(`**bold**`, `` `code` ``, fenced blocks) and indentation, then extracts the first balanced JSON
+object after the marker — walking brace depth while respecting string literals, so the JSON may span
+multiple lines and contain `}` inside string values. An earlier anchored single-line regex
+(`/^REVIEW_DECISION:\s*(\{.+\})$/m`) was too strict: it required the marker at the start of a line
+and the JSON to be the entire rest of one line, so bolded, indented, fenced, pretty-printed, or
+trailing-text verdicts were silently treated as "no decision."
 
-```typescript
-const match = finalText.match(/^REVIEW_DECISION:\s*(\{.+\})$/m);
-```
-
-If no `REVIEW_DECISION` line is found (malformed output, Claude didn't follow instructions), the
-turn is treated as `fail` with summary `"Reviewer did not produce a decision — escalating to user"`.
-This counts toward the loop limit.
+If no parseable `REVIEW_DECISION` is found (the reviewer genuinely produced no verdict), the turn is
+treated as `fail` and a system message surfaces the reviewer's prose to the user, who can then
+proceed or reply. The review loop count is reset rather than incremented in this case.
 
 The parsed object is stored in `task_turns.review_outcome` and `task_turns.review_summary`.
 
@@ -274,9 +292,14 @@ Add a nullable FK to `task_turns`:
 ALTER TABLE messages ADD COLUMN turn_id TEXT REFERENCES task_turns(id);
 ```
 
-Messages written during a Reviewer turn are tagged with the Reviewer's `turn_id`. This allows the
-UI to group and label messages by turn. Existing messages (no `turn_id`) are treated as belonging
-to the first Implementer turn.
+Messages written during a turn are tagged with that turn's `turn_id`, so the UI can group and label
+them by persona. **Both** Implementer and Reviewer turns are recorded: each `launchTask` call (first
+run and every resume) creates an `implementer` turn, and its assistant messages carry that turn's
+id. Originally only Reviewer turns were created, so Implementer messages had a NULL `turn_id` and the
+UI could not distinguish the Developer from the Reviewer — when a reviewer (mis)asked the user a
+question, the user's reply was routed to the implementer session, which then answered in the
+reviewer's voice. Recording implementer turns restores correct per-persona attribution. Legacy
+messages with no `turn_id` still render as ungrouped assistant output.
 
 ---
 
