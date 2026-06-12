@@ -439,37 +439,10 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       return false;
     }
 
-    // PR
-    const freshTask = getTask(task.id) || task;
-    const prTitle = freshTask.title || `Task: ${freshTask.prompt.slice(0, 60)}`;
-    const prBody = `Automated PR for completed task.\n\n**Task:** ${freshTask.title}\n**Task ID:** ${freshTask.id}`;
     const defaultBranch = await getDefaultBranch(ws, dir);
-    let prUrl: string;
-    try {
-      const existingPr = await sshGh(ws, `cd ${shellEscape(dir)} && gh pr view ${shellEscape(branchName)} --json url --jq .url 2>/dev/null`);
-      if (existingPr.trim()) {
-        prUrl = existingPr.trim();
-        addMessage(task.id, 'system', `Existing pull request found: ${prUrl}`);
-      } else {
-        throw new Error('no existing PR');
-      }
-    } catch {
-      try {
-        prUrl = await sshGh(ws,
-          `cd ${shellEscape(dir)} && gh pr create --base ${shellEscape(defaultBranch)} --head ${shellEscape(branchName)} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`
-        );
-        addMessage(task.id, 'system', `Pull request created: ${prUrl}`);
-      } catch (prErr: any) {
-        addMessage(task.id, 'system',
-          `Cannot complete: PR creation failed for branch \`${branchName}\`: ${prErr.message}. ` +
-          `Resolve the issue and retry completion.`
-        );
-        return false;
-      }
-    }
 
-    // Sync local main with origin before merging — handles the case where origin/main
-    // has advanced (e.g. a PR was merged on GitHub before CPM performs its merge step).
+    // Sync local main with origin first — handles the case where origin/main has
+    // advanced (e.g. a PR was merged on GitHub before CPM performs its merge step).
     // Only applies in worktree mode where task.project_dir is the main checkout.
     if (task.worktree_path && task.project_dir) {
       try {
@@ -488,17 +461,92 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       }
     }
 
-    // Merge PR
+    // Nothing-to-merge guard. A reopened task that was previously completed already
+    // has its commit on origin/<default>. If the committed tip is already an
+    // ancestor of the remote default branch there is nothing left to merge, so
+    // complete instead of re-merging the stale (already-MERGED) PR — which would
+    // print "PR merged" yet leave the new commit stranded and fail verification.
+    if (branchTip) {
+      let alreadyLanded = false;
+      try {
+        await sshExec(ws,
+          `cd ${shellEscape(dir)} && git fetch origin ${shellEscape(defaultBranch)} && ` +
+          `git merge-base --is-ancestor ${shellEscape(branchTip)} origin/${shellEscape(defaultBranch)}`,
+          30000,
+        );
+        alreadyLanded = true;
+      } catch { /* tip not on origin/<default> yet → real work to merge */ }
+      if (alreadyLanded) {
+        addMessage(task.id, 'system',
+          `Changes on branch \`${branchName}\` are already present on \`origin/${defaultBranch}\` — nothing to merge. Marking complete.`
+        );
+        return true;
+      }
+    }
+
+    // Find an existing PR for this branch and inspect its state. A branch that was
+    // completed before has a MERGED PR; reusing it would re-merge the stale commits
+    // (printing "PR merged") while the new commit never lands. Only an OPEN PR is
+    // safe to reuse — for a MERGED/CLOSED one, open a FRESH PR for the new commit.
+    const freshTask = getTask(task.id) || task;
+    const prTitle = freshTask.title || `Task: ${freshTask.prompt.slice(0, 60)}`;
+    const prBody = `Automated PR for completed task.\n\n**Task:** ${freshTask.title}\n**Task ID:** ${freshTask.id}`;
+
+    let prUrl: string;
+    let mergeTarget: string; // PR number/URL — merge by identity, never by branch name, so a stale PR can't be re-targeted
+    let existingPr: { url?: string; state?: string; number?: number } | null = null;
+    try {
+      const raw = await sshGh(ws, `cd ${shellEscape(dir)} && gh pr view ${shellEscape(branchName)} --json url,state,number 2>/dev/null`);
+      if (raw.trim()) existingPr = JSON.parse(raw);
+    } catch { /* no PR associated with this branch yet */ }
+
+    if (existingPr && existingPr.state === 'OPEN' && existingPr.url) {
+      prUrl = existingPr.url;
+      mergeTarget = existingPr.number != null ? String(existingPr.number) : existingPr.url;
+      addMessage(task.id, 'system', `Existing open pull request found: ${prUrl}`);
+    } else {
+      if (existingPr && existingPr.url && (existingPr.state === 'MERGED' || existingPr.state === 'CLOSED')) {
+        addMessage(task.id, 'system',
+          `Previous pull request for branch \`${branchName}\` is ${existingPr.state.toLowerCase()} (${existingPr.url}); opening a fresh PR for the new commit.`
+        );
+      }
+      try {
+        prUrl = (await sshGh(ws,
+          `cd ${shellEscape(dir)} && gh pr create --base ${shellEscape(defaultBranch)} --head ${shellEscape(branchName)} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`
+        )).trim();
+        mergeTarget = prUrl;
+        addMessage(task.id, 'system', `Pull request created: ${prUrl}`);
+      } catch (prErr: any) {
+        const msg = String(prErr?.message || prErr);
+        // GitHub refuses a PR when the branch adds no commits over the base — the
+        // reopened task's changes are already on the default branch. Not a failure:
+        // there is simply nothing to merge.
+        if (/no commits between/i.test(msg)) {
+          addMessage(task.id, 'system',
+            `Nothing to merge — branch \`${branchName}\` adds no commits over \`${defaultBranch}\` (changes already on the default branch). Marking complete.`
+          );
+          return true;
+        }
+        addMessage(task.id, 'system',
+          `Cannot complete: PR creation failed for branch \`${branchName}\`: ${msg}. ` +
+          `Resolve the issue and retry completion.`
+        );
+        return false;
+      }
+    }
+
+    // Merge the PR by identity (number/URL), never by branch name, so a stale MERGED
+    // PR for the same branch can't be re-targeted.
     let mergeConfirmedByState = false;
     try {
-      await sshGh(ws, `cd ${shellEscape(dir)} && gh pr merge ${shellEscape(branchName)} --merge --delete-branch`);
+      await sshGh(ws, `cd ${shellEscape(dir)} && gh pr merge ${shellEscape(mergeTarget)} --merge --delete-branch`);
       addMessage(task.id, 'system', `PR merged and branch \`${branchName}\` deleted.`);
     } catch (mergeErr: any) {
       // Check if the PR was already merged on GitHub (e.g. by the user or auto-merge)
       let alreadyMerged = false;
       try {
         const prState = await sshGh(ws,
-          `cd ${shellEscape(dir)} && gh pr view ${shellEscape(branchName)} --json state --jq .state`
+          `cd ${shellEscape(dir)} && gh pr view ${shellEscape(mergeTarget)} --json state --jq .state`
         );
         alreadyMerged = prState.trim() === 'MERGED';
       } catch { /* ignore state-check errors */ }
