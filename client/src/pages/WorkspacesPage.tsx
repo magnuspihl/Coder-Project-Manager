@@ -12,7 +12,6 @@ import {
   deleteTask,
   restoreTask,
   createTask,
-  checkoutTaskBranch,
   getModels,
   getGitSettings,
   updateGitSettings,
@@ -41,12 +40,6 @@ function timeAgo(iso: string): string {
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes}m ago`;
   return `${Math.floor(minutes / 60)}h ago`;
-}
-
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-  return String(n);
 }
 
 const STATUS_ORDER: Record<string, number> = {
@@ -465,20 +458,6 @@ export default function WorkspacesPage() {
     await loadData();
   };
 
-  const [checkingOutTaskId, setCheckingOutTaskId] = useState<string | null>(null);
-  const handleCheckoutBranch = async (e: React.MouseEvent, taskId: string) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setCheckingOutTaskId(taskId);
-    try {
-      await checkoutTaskBranch(taskId);
-    } catch (err: any) {
-      alert(err.message || 'Failed to checkout branch');
-    } finally {
-      setCheckingOutTaskId(null);
-    }
-  };
-
   const handleUndo = async () => {
     if (!deletedTaskId) return;
     if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
@@ -670,43 +649,6 @@ export default function WorkspacesPage() {
           </span>
         </div>
       </div>
-      {task.git_branch && (
-        <div className="mt-1 flex items-center gap-1">
-          {task.github_repo_url ? (
-            <a
-              href={`${task.github_repo_url}/tree/${task.git_branch}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              onClick={(e) => e.stopPropagation()}
-              className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors font-mono"
-            >
-              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path d="M11.75 2.5a.75.75 0 0 1 0 1.5h-.75v4h.75a.75.75 0 0 1 0 1.5h-.75v.75a4.25 4.25 0 0 1-8.5 0V9.5H2a.75.75 0 0 1 0-1.5h.75V4H2a.75.75 0 0 1 0-1.5h3.5a.75.75 0 0 1 0 1.5H4.25v4h1.5V4H4.5a.75.75 0 0 1 0-1.5h3.5a.75.75 0 0 1 0 1.5H7.25v4h1.5v-4H8a.75.75 0 0 1 0-1.5ZM9.5 9.5h-4v.75a2.75 2.75 0 1 0 5.5 0V9.5h-.75Z" /></svg>
-              {task.git_branch}
-            </a>
-          ) : (
-            <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 font-mono">
-              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path d="M11.75 2.5a.75.75 0 0 1 0 1.5h-.75v4h.75a.75.75 0 0 1 0 1.5h-.75v.75a4.25 4.25 0 0 1-8.5 0V9.5H2a.75.75 0 0 1 0-1.5h.75V4H2a.75.75 0 0 1 0-1.5h3.5a.75.75 0 0 1 0 1.5H4.25v4h1.5V4H4.5a.75.75 0 0 1 0-1.5h3.5a.75.75 0 0 1 0 1.5H7.25v4h1.5v-4H8a.75.75 0 0 1 0-1.5ZM9.5 9.5h-4v.75a2.75 2.75 0 1 0 5.5 0V9.5h-.75Z" /></svg>
-              {task.git_branch}
-            </span>
-          )}
-          {task.status !== 'working' && (
-            <button
-              onClick={(e) => handleCheckoutBranch(e, task.id)}
-              disabled={checkingOutTaskId === task.id}
-              className="inline-flex items-center justify-center w-5 h-5 rounded text-gray-400 dark:text-gray-500 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors disabled:opacity-50"
-              title="Switch workspace to this branch"
-            >
-              {checkingOutTaskId === task.id ? (
-                <div className="animate-spin h-3 w-3 border border-current border-t-transparent rounded-full" />
-              ) : (
-                <svg xmlns="http://www.w3.org/2000/svg" className="w-3 h-3" viewBox="0 0 20 20" fill="currentColor">
-                  <path fillRule="evenodd" d="M10.293 3.293a1 1 0 011.414 0l6 6a1 1 0 010 1.414l-6 6a1 1 0 01-1.414-1.414L14.586 11H3a1 1 0 110-2h11.586l-4.293-4.293a1 1 0 010-1.414z" clipRule="evenodd" />
-                </svg>
-              )}
-            </button>
-          )}
-        </div>
-      )}
       {task.status === 'working' && task.activity && (
         <div className="mt-2 flex items-center gap-2 text-xs text-blue-600 dark:text-blue-400">
           <div className="animate-spin h-3 w-3 border-[1.5px] border-blue-600 dark:border-blue-400 border-t-transparent rounded-full" />
@@ -795,18 +737,13 @@ export default function WorkspacesPage() {
               className="text-gray-300 dark:text-gray-600 hover:text-red-500 dark:hover:text-red-400 p-1.5"
               title="Delete task"
             >
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
               </svg>
             </button>
           )}
         </div>
         <div className="flex items-center gap-2">
-          {(task.total_input_tokens > 0 || task.total_output_tokens > 0) && (
-            <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono" title={`In: ${task.total_input_tokens.toLocaleString()} | Out: ${task.total_output_tokens.toLocaleString()}`}>
-              {formatTokens(task.total_input_tokens + task.total_output_tokens)}t
-            </span>
-          )}
           {task.id === spaceTargetTaskId && !selectedTaskId && !newTaskWorkspaceId && (
             <span className="text-[10px] text-gray-400 dark:text-gray-600">
               <kbd className="px-1 py-0.5 rounded border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 text-gray-400 dark:text-gray-500 font-mono text-[10px]">Space</kbd> to open
@@ -821,7 +758,6 @@ export default function WorkspacesPage() {
     const agent = getAgentStatus(ws);
     const isRunning = ws.latest_build.status === 'running';
     const counts = taskCounts[ws.id];
-    const tokens = tokenTotals[ws.id];
     const tasks = tasksByWorkspace[ws.id] || [];
     const openPorts = getOpenPorts(ws);
     const apps = getApps(ws);
@@ -1090,17 +1026,6 @@ export default function WorkspacesPage() {
                   )}
                 </div>
               )}
-              <div
-                className="text-xs text-gray-400 dark:text-gray-500 mt-0.5 font-mono"
-                title={tokens ? `Input: ${tokens.total_input_tokens.toLocaleString()} | Output: ${tokens.total_output_tokens.toLocaleString()}` : 'No usage yet'}
-              >
-                {tokens && (tokens.total_input_tokens > 0 || tokens.total_output_tokens > 0) && (
-                  <span>{formatTokens(tokens.total_input_tokens + tokens.total_output_tokens)} tokens</span>
-                )}
-                <span className={tokens && (tokens.total_input_tokens > 0 || tokens.total_output_tokens > 0) ? 'ml-1.5' : ''}>
-                  ${tokens && tokens.total_cost_usd > 0 ? tokens.total_cost_usd.toFixed(2) : '0.00'}
-                </span>
-              </div>
             </div>
             {isRunning && (
               <div className="flex gap-1.5 shrink-0 mt-0.5">
