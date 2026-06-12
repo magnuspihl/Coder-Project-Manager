@@ -228,7 +228,7 @@ export const getModels = (workspaceId: string) =>
 // Uploads
 // Tasks
 export const getTasks = (workspaceId: string) =>
-  request<{ tasks: Task[]; activeTaskId: string | null }>(`/api/workspaces/${workspaceId}/tasks`);
+  request<{ tasks: Task[] }>(`/api/workspaces/${workspaceId}/tasks`);
 
 export const createTask = (workspaceId: string, prompt: string, model?: string, caveman?: string, attachmentIds?: string[], autoReview?: boolean) =>
   request<{ task: Task }>(`/api/workspaces/${workspaceId}/tasks`, {
@@ -247,7 +247,7 @@ export interface AttachmentInfo {
 }
 
 export const getTaskDetail = (taskId: string) =>
-  request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[]; activeTaskId: string | null; turns: TaskTurn[]; taskRequests: TaskRequestItem[] }>(`/api/tasks/${taskId}`);
+  request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[]; turns: TaskTurn[]; taskRequests: TaskRequestItem[] }>(`/api/tasks/${taskId}`);
 
 export const approveTaskRequestForTask = (taskId: string, requestId: string, targetWorkspaceId?: string | null) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/task-requests/${requestId}/approve`, {
@@ -321,9 +321,6 @@ export const compactTaskSession = (taskId: string) =>
 
 export const checkoutTaskBranch = (taskId: string) =>
   request<{ ok: boolean; message: string }>(`/api/tasks/${taskId}/checkout`, { method: 'POST' });
-
-export const setActiveTask = (taskId: string) =>
-  request<{ ok: boolean; message: string; activeTaskId: string }>(`/api/tasks/${taskId}/set-active`, { method: 'POST' });
 
 export const interruptTask = (taskId: string) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/interrupt`, { method: 'POST' });
