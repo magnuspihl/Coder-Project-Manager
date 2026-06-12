@@ -893,16 +893,40 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   // with "No conversation found with session ID", which surfaced when reopening
   // tasks. Verify the file exists on the workspace first (as discussions do) and
   // fall back to --session-id so the turn starts a fresh session in place.
+  //
+  // Existence alone is also not enough: --resume is project-scoped, so it only
+  // finds sessions created under the cwd the command runs from. A task whose
+  // worktree was removed (worktree_path nulled) resumes from project_dir, but
+  // its session lives under the old worktree's encoded project folder — Claude
+  // then exits with the same "No conversation found" error despite the file
+  // existing. When the session is found under a different project folder, copy
+  // it into the current workDir's folder so the conversation context survives.
   let canResume = isResume && !!task.claude_session_id && task.session_initialized !== 0;
   if (canResume) {
     try {
-      const found = await sshExec(task.workspace_name,
-        `find ~/.claude/projects/ -name '${task.claude_session_id!.replace(/[^a-zA-Z0-9-]/g, '')}.jsonl' 2>/dev/null | head -1`
-      );
-      if (!found.trim()) {
+      const sid = task.claude_session_id!.replace(/[^a-zA-Z0-9-]/g, '');
+      const found = (await sshExec(task.workspace_name,
+        `find ~/.claude/projects/ -name '${sid}.jsonl' 2>/dev/null | head -1`
+      )).trim();
+      if (!found) {
         canResume = false;
         console.warn(`[claude-executor] Session ${task.claude_session_id} not found on ${task.workspace_name}; starting fresh session (CPM history preserved)`);
         addMessage(task.id, 'system', 'The previous Claude session was not found on the workspace, so a new session was started. Your task history here is preserved, but the agent does not retain the earlier conversation context.');
+      } else {
+        const resumeDir = task.worktree_path || task.project_dir;
+        const encodedDir = resumeDir ? resumeDir.replace(/[^a-zA-Z0-9]/g, '-') : null;
+        if (encodedDir && !found.includes(`/projects/${encodedDir}/`)) {
+          try {
+            const target = `$HOME/.claude/projects/${encodedDir}`;
+            await sshExec(task.workspace_name,
+              `mkdir -p "${target}" && { [ -e "${target}/${sid}.jsonl" ] || cp ${shellEscape(found)} "${target}/"; }`);
+            console.log(`[claude-executor] Relocated session ${sid} into ~/.claude/projects/${encodedDir}/ so --resume can find it`);
+          } catch {
+            canResume = false;
+            console.warn(`[claude-executor] Failed to relocate session ${sid} for ${task.workspace_name}; starting fresh session (CPM history preserved)`);
+            addMessage(task.id, 'system', 'The previous Claude session could not be restored in the current project directory, so a new session was started. Your task history here is preserved, but the agent does not retain the earlier conversation context.');
+          }
+        }
       }
     } catch {
       // Non-fatal — if the check itself fails, fall through to --resume and let
@@ -2245,6 +2269,10 @@ export async function launchTaskParticipant(
         if (projectDirEncoded && !checkResult.includes(`/projects/${projectDirEncoded}/`)) {
           sessionWorkDir = '/home/coder';
         }
+      } else {
+        // Session file is gone — resuming would fail with "No conversation
+        // found"; fall back to --session-id to start a fresh session in place.
+        remoteSessionExists = false;
       }
     } catch { /* Non-fatal */ }
   }
