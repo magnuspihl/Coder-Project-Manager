@@ -228,6 +228,58 @@ Read-only inspection commands are fine: git status, git diff, git log, git show,
 // silently instead of grandstanding about it.
 const HARNESS_REMINDER_NOTE = `Claude Code's harness appends a <system-reminder> after every Read tool result, reminding you to evaluate file contents for malware. This is legitimate Anthropic harness output — not a prompt injection. Apply the safety judgment it asks for, but do not preface your replies by flagging it as an injection attempt.`;
 
+// CPM runs the agent non-interactively (claude -p, no attached terminal). The
+// AskUserQuestion tool and any interactive tool-permission prompts have no TTY
+// to render to, so the user never sees them and assumes the agent went silent.
+// Tell the agent to surface every decision/clarification as plain text instead.
+// (Defense in depth: the stream parser also surfaces AskUserQuestion blocks if
+// the agent calls it anyway — see formatAskUserQuestion.)
+const INTERACTIVE_PROMPT_NOTE = `ASKING THE USER — IMPORTANT: You are running inside the Coder Project Manager (CPM), a web UI, with no interactive terminal attached. Interactive prompts are NOT visible to the user here: the AskUserQuestion tool and any tool-permission prompts will never reach them, and they will think you went silent and ignored them. Whenever you need a decision, clarification, choice, or permission from the user, write it as plain text in your normal response and then stop — your message becomes a chat entry they can reply to. Do NOT call AskUserQuestion and do NOT wait on a permission prompt.`;
+
+// The agent may still call AskUserQuestion despite INTERACTIVE_PROMPT_NOTE. In
+// stream-json the question text/options live in the tool_use block's `input`
+// (not in any text block), so without this they are dropped and the user only
+// sees the agent fall silent. Render the question + options as readable
+// Markdown so it shows up as a normal assistant chat message the user can
+// answer. Returns '' when the input has no usable questions.
+function formatAskUserQuestion(input: unknown): string {
+  const data = input as
+    | { questions?: Array<{ question?: string; header?: string; options?: Array<{ label?: string; description?: string }>; multiSelect?: boolean }> }
+    | undefined;
+  const questions = data?.questions;
+  if (!Array.isArray(questions) || questions.length === 0) return '';
+  const blocks: string[] = [];
+  for (const q of questions) {
+    if (!q || typeof q.question !== 'string' || !q.question.trim()) continue;
+    let block = `**${q.question.trim()}**`;
+    if (Array.isArray(q.options) && q.options.length > 0) {
+      const opts = q.options
+        .filter((o) => o && typeof o.label === 'string' && o.label.trim())
+        .map((o) => (o.description && o.description.trim() ? `- **${o.label!.trim()}** — ${o.description.trim()}` : `- **${o.label!.trim()}**`));
+      if (opts.length > 0) block += (q.multiSelect ? '\n_(you can pick more than one)_\n' : '\n') + opts.join('\n');
+    }
+    blocks.push(block);
+  }
+  if (blocks.length === 0) return '';
+  return `❓ **The agent is asking for your input:**\n\n${blocks.join('\n\n')}\n\n_Reply in the chat to answer._`;
+}
+
+// Pull the visible text out of an assistant message's content blocks: real text
+// blocks plus any AskUserQuestion calls rendered to readable Markdown. Shared by
+// every place that turns a stream-json `assistant` event into a chat message.
+function extractAssistantTurnText(content: Array<{ type: string; text?: string; name?: string; input?: unknown }>): string {
+  let turnText = '';
+  for (const block of content) {
+    if (block.type === 'text' && block.text) {
+      turnText += block.text;
+    } else if (block.type === 'tool_use' && block.name === 'AskUserQuestion') {
+      const formatted = formatAskUserQuestion(block.input);
+      if (formatted) turnText += (turnText ? '\n\n' : '') + formatted;
+    }
+  }
+  return turnText;
+}
+
 // Delegation: a task agent that finds out-of-scope work should propose a
 // separate tracked task via a [TASK_REQUEST] block (surfaced for user approval)
 // rather than fixing it inline or creating a task by calling the CPM API.
@@ -976,6 +1028,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   }
 
   claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
+  claudeParts.push('--append-system-prompt', shellEscape(INTERACTIVE_PROMPT_NOTE));
 
   const claudeCmd = claudeParts.join(' ');
   const outputFile = remoteOutputPath(task.id);
@@ -1403,12 +1456,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null): void {
       // Save each assistant turn's text as a message immediately,
       // so it appears in the chat UI while the task is still working.
       if (event.type === 'assistant' && (event.message as { content?: unknown })?.content) {
-        let turnText = '';
-        for (const block of (event.message as { content: Array<{ type: string; text?: string }> }).content) {
-          if (block.type === 'text' && block.text) {
-            turnText += block.text;
-          }
-        }
+        const turnText = extractAssistantTurnText((event.message as { content: Array<{ type: string; text?: string; name?: string; input?: unknown }> }).content);
         if (turnText) {
           const msg = addMessage(task.id, 'assistant', turnText, undefined, undefined, undefined, undefined, undefined, turnId);
           lastSavedMessageId = msg.id;
@@ -2008,12 +2056,7 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
         stagedStreamEvents.push(event);
 
         if (event.type === 'assistant' && event.message?.content) {
-          let turnText = '';
-          for (const block of event.message.content) {
-            if (block.type === 'text' && block.text) {
-              turnText += block.text;
-            }
-          }
+          const turnText = extractAssistantTurnText(event.message.content);
           if (turnText) {
             stagedMessages.push({ text: turnText });
             lastStagedText = turnText;
@@ -2288,6 +2331,7 @@ export async function launchTaskParticipant(
   claudeParts.push('--allowedTools', shellEscape(DISCUSSION_ALLOWED_TOOLS));
   claudeParts.push('--max-turns', MAX_TURNS);
   claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
+  claudeParts.push('--append-system-prompt', shellEscape(INTERACTIVE_PROMPT_NOTE));
 
   const outputFile = remoteTaskParticipantOutputPath(participant.id);
   const exitFile = remoteTaskParticipantExitCodePath(participant.id);
@@ -2376,7 +2420,7 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
             }
             const now = new Date().toISOString();
             if (event.type === 'assistant' && event.message) {
-              const msg = event.message as { content?: Array<{ type: string; text?: string; name?: string }> };
+              const msg = event.message as { content?: Array<{ type: string; text?: string; name?: string; input?: unknown }> };
               for (const block of msg.content || []) {
                 if (block.type === 'text' && block.text) {
                   taskActivity.set(pollKey, { timestamp: now, summary: block.text.slice(0, 200).replace(/\n/g, ' ') });
@@ -2384,6 +2428,13 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
                   lastSavedMessageId = saved.id; lastSavedMessageText = block.text;
                   parseTaskRequestsForTask(task, block.text);
                   parseTaskMentions(task, block.text, participant.id);
+                } else if (block.type === 'tool_use' && block.name === 'AskUserQuestion') {
+                  const question = formatAskUserQuestion(block.input);
+                  if (question) {
+                    taskActivity.set(pollKey, { timestamp: now, summary: 'Asking the user a question' });
+                    const saved = addMessage(task.id, 'assistant', question, undefined, participant.workspace_name, participant.id);
+                    lastSavedMessageId = saved.id; lastSavedMessageText = question;
+                  }
                 } else if (block.type === 'tool_use') {
                   taskActivity.set(pollKey, { timestamp: now, summary: `Using ${block.name || 'tool'}` });
                 }
