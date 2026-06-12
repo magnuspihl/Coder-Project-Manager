@@ -4,7 +4,7 @@ import { randomUUID } from 'crypto';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, type Task, type TaskParticipant } from './tasks.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
-import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, removeTaskWorktree, fetchGitHubToken, isRemoteAllowed } from './git.js';
+import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, fetchGitHubToken, isRemoteAllowed } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
 import { getAttachmentsByTask, type Attachment } from '../routes/uploads.js';
 import { writeCpmGuidelines } from './workspace-memory.js';
@@ -39,6 +39,11 @@ export async function cleanupPortRange(task: Task): Promise<void> {
   if (task.port_range_start === null || task.port_range_start === undefined) return;
   const ports = Array.from({ length: PORT_RANGE_SIZE }, (_, i) => `${task.port_range_start! + i}/tcp`).join(' ');
   await sshExec(task.workspace_name, `fuser -k ${ports} 2>/dev/null || true`, 10000).catch(() => {});
+  // Release the port range back to the pool. The task keeps its worktree but its
+  // ports are now free for reallocation; if the task later resumes (retry/reopen)
+  // it will be assigned a fresh range. Avoids two tasks claiming the same ports.
+  getDb().prepare('UPDATE tasks SET port_range_start = NULL WHERE id = ?').run(task.id);
+  task.port_range_start = null;
 }
 
 // Track active SSH processes per task so we can kill them
@@ -649,9 +654,12 @@ export async function processQueue(workspaceId: string): Promise<void> {
         if (allowed) {
           setPendingComplete(pending.id, false);
           updateTaskStatus(pending.id, 'completed');
+          // Free the port range (shuts down the task's preview server). The worktree
+          // is kept until the task is deleted.
+          await cleanupPortRange(pending).catch(() => {});
         } else {
           setPendingComplete(pending.id, false);
-          addMessage(pending.id, 'system', 'Queued completion could not proceed — uncommitted changes and remote pushes are disabled. Resolve manually and try again.');
+          addMessage(pending.id, 'system', 'Queued completion could not proceed — see the task messages above for the specific reason, then retry.');
         }
       } catch (err: any) {
         setPendingComplete(pending.id, false);
@@ -697,9 +705,12 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   // skip all prepends/appends so the harness recognizes the command.
   const isSlashCommand = isResume && !!feedback && rawPrompt.startsWith('/') && !rawPrompt.includes('\n');
 
-  // Allocate port range for new tasks before building prompts/system messages —
-  // the coderUrlNote and portNote below both read task.port_range_start.
-  if (!isResume && (task.port_range_start === null || task.port_range_start === undefined)) {
+  // Allocate a port range before building prompts/system messages — the
+  // coderUrlNote and portNote below both read task.port_range_start. Allocate
+  // whenever the task has no range, including on resume: a reopened/retried task
+  // had its previous range released on completion/cancel/failure, so it needs a
+  // fresh one (its old range may now belong to another task).
+  if (task.port_range_start === null || task.port_range_start === undefined) {
     const allocated = allocatePortRange(task.workspace_id);
     if (allocated !== null) {
       getDb().prepare('UPDATE tasks SET port_range_start = ? WHERE id = ?').run(allocated, task.id);

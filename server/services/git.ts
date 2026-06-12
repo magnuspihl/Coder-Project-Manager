@@ -40,11 +40,24 @@ async function resolveProjectDir(task: Task): Promise<string | null> {
 }
 
 /**
- * Get the default branch name (main or master).
+ * Get the default branch name (main or master) as tracked on the remote.
  */
 async function getDefaultBranch(workspaceName: string, projectDir: string): Promise<string> {
   try {
     await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify origin/main`);
+    return 'main';
+  } catch {
+    return 'master';
+  }
+}
+
+/**
+ * Get the local default branch name (main or master). Used when remote git is
+ * disabled and origin refs may be stale or absent — the user manages git locally.
+ */
+async function getLocalDefaultBranch(workspaceName: string, projectDir: string): Promise<string> {
+  try {
+    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify main`);
     return 'main';
   } catch {
     return 'master';
@@ -157,19 +170,35 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
     }
 
     if (!await hasCommits(ws, dir)) return;
-    if (!isRemoteAllowed(task.workspace_id)) return;
 
+    // A worktree is always created — including when remote git is disabled — so
+    // that concurrent tasks on the same workspace stay isolated from each other
+    // and from the main checkout. The only difference for remote-disabled
+    // workspaces is the branch base and that completion never pushes/merges.
+    const remoteAllowed = isRemoteAllowed(task.workspace_id);
     const branchName = generateBranchName(task);
-    const defaultBranch = await getDefaultBranch(ws, dir);
     const worktreePath = `${CPM_WORKTREE_BASE}/task-${task.id}`;
 
-    await sshExec(ws,
-      `mkdir -p ${shellEscape(CPM_WORKTREE_BASE)} && ` +
-      `cd ${shellEscape(dir)} && ` +
-      `git fetch origin ${defaultBranch} 2>/dev/null || true && ` +
-      `git worktree add ${shellEscape(worktreePath)} -b ${shellEscape(branchName)} origin/${defaultBranch}`,
-      60000,
-    );
+    if (remoteAllowed) {
+      // Branch from the canonical origin tip so the worktree starts clean
+      // regardless of local state in the main checkout or other worktrees.
+      const defaultBranch = await getDefaultBranch(ws, dir);
+      await sshExec(ws,
+        `mkdir -p ${shellEscape(CPM_WORKTREE_BASE)} && cd ${shellEscape(dir)} && ` +
+        `git fetch origin ${defaultBranch} 2>/dev/null || true && ` +
+        `git worktree add ${shellEscape(worktreePath)} -b ${shellEscape(branchName)} origin/${defaultBranch}`,
+        60000,
+      );
+    } else {
+      // Remote disabled: the user manages git locally and origin may be stale or
+      // absent, so branch from the LOCAL default branch tip instead of origin.
+      const defaultBranch = await getLocalDefaultBranch(ws, dir);
+      await sshExec(ws,
+        `mkdir -p ${shellEscape(CPM_WORKTREE_BASE)} && cd ${shellEscape(dir)} && ` +
+        `git worktree add ${shellEscape(worktreePath)} -b ${shellEscape(branchName)} ${shellEscape(defaultBranch)}`,
+        60000,
+      );
+    }
 
     storeTaskBranch(task.id, branchName);
     getDb().prepare('UPDATE tasks SET worktree_path = ? WHERE id = ?').run(worktreePath, task.id);
@@ -197,30 +226,87 @@ export async function handleTaskResumeGit(_task: Task): Promise<void> {
 
 /**
  * Remove a task's worktree directory and branch.
- * Called on cancellation. On failure the task keeps its worktree for inspection.
+ *
+ * Returns true if the worktree is confirmed gone (or there was none), false if
+ * removal genuinely failed (e.g. a process still holds the directory open). On
+ * failure the worktree is kept for inspection, `worktree_path` is left set so the
+ * removal can be retried, and a warning is surfaced to the task.
+ *
+ * IMPORTANT: this no longer masks `git worktree remove` failures with `|| true`,
+ * so a preview server holding the worktree open is detected rather than silently
+ * leaking the directory. Callers should shut down preview servers
+ * (`cleanupPortRange`) BEFORE calling this.
  */
-export async function removeTaskWorktree(task: Task): Promise<void> {
-  if (!task.worktree_path) return;
+export async function removeTaskWorktree(task: Task): Promise<boolean> {
+  if (!task.worktree_path) return true;
   const ws = task.workspace_name;
   const dir = task.project_dir;
+  const wt = task.worktree_path;
+  const gitRoot = dir ? `cd ${shellEscape(dir)} && ` : '';
 
+  // Try to remove; on failure prune stale metadata and retry once.
+  let removed = false;
   try {
-    const gitRoot = dir ? `cd ${shellEscape(dir)} && ` : '';
-    await sshExec(ws,
-      `${gitRoot}git worktree remove ${shellEscape(task.worktree_path)} --force 2>/dev/null || true`,
-      15000,
-    );
-    if (task.git_branch && dir) {
-      await sshExec(ws,
-        `cd ${shellEscape(dir)} && git branch -D ${shellEscape(task.git_branch)} 2>/dev/null || true`,
-        10000,
-      );
+    await sshExec(ws, `${gitRoot}git worktree remove ${shellEscape(wt)} --force`, 15000);
+    removed = true;
+  } catch {
+    try {
+      await sshExec(ws, `${gitRoot}git worktree prune`, 10000).catch(() => {});
+      // If the directory is already gone, pruning the metadata alone resolves it.
+      const stillThere = (await sshExec(ws, `test -d ${shellEscape(wt)} && echo yes || echo no`).catch(() => 'no')).trim() === 'yes';
+      if (stillThere) {
+        await sshExec(ws, `${gitRoot}git worktree remove ${shellEscape(wt)} --force`, 15000);
+      }
+      removed = true;
+    } catch {
+      removed = false;
     }
-    getDb().prepare('UPDATE tasks SET worktree_path = NULL WHERE id = ?').run(task.id);
-    task.worktree_path = null;
-    console.log(`[git] Removed worktree for task ${task.id}`);
-  } catch (err: any) {
-    console.error(`[git] Failed to remove worktree for task ${task.id}:`, err.message);
+  }
+
+  if (!removed) {
+    addMessage(task.id, 'system',
+      `Warning: could not remove git worktree \`${wt}\` — a process may still be using it. ` +
+      `If it persists, remove it manually with \`git worktree remove ${wt} --force\`.`
+    );
+    console.error(`[git] Failed to remove worktree for task ${task.id}`);
+    return false;
+  }
+
+  // Delete the local branch (best-effort; `--delete-branch` on merge may already have removed it).
+  if (task.git_branch && dir) {
+    await sshExec(ws,
+      `cd ${shellEscape(dir)} && git branch -D ${shellEscape(task.git_branch)} 2>/dev/null || true`,
+      10000,
+    ).catch(() => {});
+  }
+  getDb().prepare('UPDATE tasks SET worktree_path = NULL WHERE id = ?').run(task.id);
+  task.worktree_path = null;
+  console.log(`[git] Removed worktree for task ${task.id}`);
+  return true;
+}
+
+/**
+ * Startup sweep: remove worktrees left behind by **deleted** tasks. Worktrees live
+ * for the entire task lifecycle (so any non-deleted task can be resumed) and are
+ * removed only on deletion — so the only task that should never still own a worktree
+ * is a deleted one. This catches deletions whose removal failed at the time (e.g. a
+ * preview server was still holding the directory).
+ *
+ * Worktree-dir only — does NOT kill ports, since a deleted task's old port range may
+ * already have been reallocated to a now-active task.
+ */
+export async function reconcileLeakedWorktrees(): Promise<void> {
+  const rows = getDb().prepare(
+    `SELECT * FROM tasks WHERE worktree_path IS NOT NULL AND deleted_at IS NOT NULL`
+  ).all() as Task[];
+  if (rows.length === 0) return;
+  console.log(`[git] Reconciling ${rows.length} worktree(s) left behind by deleted tasks`);
+  for (const task of rows) {
+    try {
+      await removeTaskWorktree(task);
+    } catch (err: any) {
+      console.error(`[git] Worktree reconcile failed for task ${task.id}:`, err?.message);
+    }
   }
 }
 
@@ -228,8 +314,12 @@ export async function removeTaskWorktree(task: Task): Promise<void> {
 
 /**
  * After a task is marked complete:
- * - Remote allowed: commit in worktree, push, open PR, merge, remove worktree, pull main.
+ * - Remote allowed: commit in worktree, push, open PR, merge, verify merge landed, pull main.
  * - Remote disabled: refuse if uncommitted changes; otherwise pass through.
+ *
+ * The worktree is intentionally NOT removed here — it persists for the entire task
+ * lifecycle so a completed task can be reopened and continued in the same worktree
+ * (re-completion runs a fresh push/PR/merge). Worktrees are removed only on deletion.
  *
  * Returns true if completion is allowed, false if blocked.
  */
@@ -250,12 +340,18 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
 
     if (!remoteAllowed) {
       if (hasChanges) {
-        addMessage(task.id, 'system', 'Cannot complete: uncommitted changes and remote pushes are disabled. Handle git manually before completing.');
+        const loc = task.git_branch
+          ? `on branch \`${task.git_branch}\` in the worktree \`${dir}\``
+          : `in \`${dir}\``;
+        addMessage(task.id, 'system',
+          `Cannot complete automatically — remote git operations are disabled for this workspace, so CPM will not commit, push, open a PR, or merge. You handle git manually here.\n\n` +
+          `Your changes are preserved ${loc} exactly as-is — nothing has been discarded, and the worktree is kept until you delete this task. ` +
+          `Commit and integrate them into your default branch yourself, then mark this task complete (or delete it once you're done).`
+        );
         return false;
       }
-      if (task.worktree_path) {
-        await removeTaskWorktree(task);
-      }
+      // Working tree is clean — any work has already been integrated manually.
+      // Leave the worktree in place; it is removed only on deletion.
       return true;
     }
 
@@ -299,7 +395,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
     }
 
     if (!hasChanges) {
-      if (task.worktree_path) await removeTaskWorktree(task);
+      // Nothing to commit — already complete. Worktree is kept (removed on deletion).
       return true;
     }
 
@@ -318,6 +414,13 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       addMessage(task.id, 'system', `Cannot complete: git commit failed: ${err.message}`);
       return false;
     }
+
+    // Capture the committed tip so we can later verify the merge actually landed,
+    // even after `gh pr merge --delete-branch` removes the branch ref.
+    let branchTip = '';
+    try {
+      branchTip = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse HEAD`)).trim();
+    } catch { /* validation is skipped if we couldn't capture the tip */ }
 
     // Store GitHub URL if not already done
     if (task.project_dir && !task.github_repo_url) {
@@ -386,6 +489,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
     }
 
     // Merge PR
+    let mergeConfirmedByState = false;
     try {
       await sshGh(ws, `cd ${shellEscape(dir)} && gh pr merge ${shellEscape(branchName)} --merge --delete-branch`);
       addMessage(task.id, 'system', `PR merged and branch \`${branchName}\` deleted.`);
@@ -401,6 +505,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
 
       if (alreadyMerged) {
         addMessage(task.id, 'system', `PR for branch \`${branchName}\` was already merged on GitHub.`);
+        mergeConfirmedByState = true;
       } else {
         addMessage(task.id, 'system',
           `Cannot complete: PR merge failed for \`${branchName}\`: ${mergeErr.message}. ` +
@@ -410,10 +515,35 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       }
     }
 
-    // Remove worktree now that merge is done
-    if (task.worktree_path) {
-      await removeTaskWorktree(task);
+    // Verify the merge actually landed on origin/<default>. `gh pr merge` exiting 0
+    // is normally sufficient, but this guards against partial/misreported merges so
+    // a task is never marked completed while its branch is still unmerged. With the
+    // `--merge` strategy the branch tip becomes a parent of the merge commit, so it
+    // must be an ancestor of the updated default branch.
+    //
+    // Skip when GitHub already reports the PR as MERGED (authoritative): a manual
+    // squash/rebase merge produces new commits, so the branch tip would legitimately
+    // not be an ancestor — checking it would be a false-negative block.
+    if (branchTip && !mergeConfirmedByState) {
+      try {
+        await sshExec(ws,
+          `cd ${shellEscape(dir)} && git fetch origin ${shellEscape(defaultBranch)} && ` +
+          `git merge-base --is-ancestor ${shellEscape(branchTip)} origin/${shellEscape(defaultBranch)}`,
+          30000,
+        );
+      } catch {
+        addMessage(task.id, 'system',
+          `Cannot complete: the merge could not be verified on \`origin/${defaultBranch}\` — commit \`${branchTip.slice(0, 8)}\` is not part of the remote default branch yet. ` +
+          `The worktree has been kept. Check the PR state on GitHub and retry completion.`
+        );
+        return false;
+      }
     }
+
+    // The worktree is intentionally kept — it is removed only when the task is
+    // deleted, so a completed task can be reopened and continued in the same
+    // worktree. The caller (complete route / deferred-completion handler) frees the
+    // port range after marking the task completed.
 
     // Pull main checkout to reflect the merge
     if (task.project_dir) {

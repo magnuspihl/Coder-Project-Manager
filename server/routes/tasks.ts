@@ -287,6 +287,11 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
   setPendingComplete(task.id, false);
   updateTaskStatus(task.id, 'completed');
 
+  // Free the port range (shuts down the task's preview server). The worktree is
+  // intentionally kept so the task can be reopened and continued; it is removed
+  // only when the task is deleted.
+  await cleanupPortRange(task).catch(() => {});
+
   // Let the queue processor start the next task
   await processQueue(task.workspace_id);
 
@@ -509,10 +514,9 @@ router.post('/tasks/:taskId/cancel', requireAuth, async (req: Request, res: Resp
 
   updateTaskStatus(task.id, 'cancelled');
 
-  if (task.worktree_path) {
-    removeTaskWorktree(task).catch(() => {});
-  }
-  cleanupPortRange(task).catch(() => {});
+  // Free the port range (shuts down any preview server). The worktree is kept so
+  // the task can be retried/resumed later; worktrees are removed only on deletion.
+  await cleanupPortRange(task).catch(() => {});
 
   await processQueue(task.workspace_id);
 
@@ -539,10 +543,12 @@ router.delete('/tasks/:taskId', requireAuth, async (req: Request, res: Response)
     }
   }
 
+  // Shut down preview servers first, then remove the worktree — a running server
+  // holding the worktree open would otherwise block its removal.
+  await cleanupPortRange(task).catch(() => {});
   if (task.worktree_path) {
-    removeTaskWorktree(task).catch(() => {});
+    await removeTaskWorktree(task).catch(() => {});
   }
-  cleanupPortRange(task).catch(() => {});
 
   deleteTask(task.id);
 
