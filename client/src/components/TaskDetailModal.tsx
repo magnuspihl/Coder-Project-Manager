@@ -12,8 +12,6 @@ import {
   interruptTask,
   cancelTask,
   deleteTask,
-  checkoutTaskBranch,
-  setActiveTask,
   addTaskParticipant,
   removeTaskParticipant,
   sendTaskParticipantMessage,
@@ -86,11 +84,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [sending, setSending] = useState(false);
   const [optimisticMessage, setOptimisticMessage] = useState<Message | null>(null);
   const [idCopied, setIdCopied] = useState(false);
-  const [checkingOut, setCheckingOut] = useState(false);
-  const [settingActive, setSettingActive] = useState(false);
-  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [completing, setCompleting] = useState(false);
   const [resetSessionOpen, setResetSessionOpen] = useState(false);
+  const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
   const [resetSessionPrompt, setResetSessionPrompt] = useState('');
   const [resettingSession, setResettingSession] = useState(false);
   const [compactingSession, setCompactingSession] = useState(false);
@@ -202,8 +198,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
   const loadData = async () => {
     try {
-      const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments, activeTaskId: newActiveTaskId, turns: newTurns, taskRequests: newTaskRequests } = await getTaskDetail(taskId);
-      setActiveTaskId(newActiveTaskId);
+      const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments, turns: newTurns, taskRequests: newTaskRequests } = await getTaskDetail(taskId);
       setTaskRequests(newTaskRequests || []);
       if (prevStatusRef.current && prevStatusRef.current !== 'awaiting_feedback' && newTask.status === 'awaiting_feedback') {
         playChime();
@@ -760,32 +755,6 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     closeAndNotify();
   };
 
-  const handleCheckout = async () => {
-    if (!task?.git_branch) return;
-    setCheckingOut(true);
-    try {
-      await checkoutTaskBranch(taskId);
-      await loadData();
-    } catch (err: any) {
-      alert(err?.message || 'Failed to switch branch');
-    } finally {
-      setCheckingOut(false);
-    }
-  };
-
-  const handleSetActive = async () => {
-    setSettingActive(true);
-    try {
-      const { activeTaskId: newActive } = await setActiveTask(taskId);
-      setActiveTaskId(newActive);
-      await loadData();
-    } catch (err: any) {
-      alert(err?.message || 'Failed to set active task');
-    } finally {
-      setSettingActive(false);
-    }
-  };
-
   const handleInterrupt = async () => {
     await interruptTask(taskId);
     if (onTaskChanged) onTaskChanged();
@@ -1091,29 +1060,6 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   <span className={`text-xs px-2 py-0.5 rounded-full ${STATUS_COLORS[task.status] || ''}`}>
                     {task.status.replace('_', ' ')}
                   </span>
-                  {activeTaskId === task.id ? (
-                    <span
-                      className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-900/20 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800"
-                      title="This task's changes are currently in the workspace"
-                    >
-                      <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" /></svg>
-                      active
-                    </span>
-                  ) : (task.status !== 'working' && task.status !== 'completed') && (
-                    <button
-                      onClick={handleSetActive}
-                      disabled={settingActive}
-                      className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:text-emerald-700 dark:hover:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 hover:border-emerald-200 dark:hover:border-emerald-800 transition-colors disabled:opacity-50"
-                      title="Restore this task's stash and make its changes visible in the workspace"
-                    >
-                      {settingActive ? (
-                        <div className="w-3 h-3 border border-current border-t-transparent rounded-full animate-spin" />
-                      ) : (
-                        <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M13 5l7 7-7 7M5 5l7 7-7 7" /></svg>
-                      )}
-                      set active
-                    </button>
-                  )}
                   <span className="text-xs text-gray-400 dark:text-gray-500">{task.workspace_name}</span>
                   {task.model && (
                     <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
@@ -1133,7 +1079,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                       setTimeout(() => setIdCopied(false), 1500);
                     }}
                     title={task.id}
-                    className="text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 font-mono transition-colors"
+                    className="hidden sm:inline-block text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 font-mono transition-colors"
                   >
                     {idCopied ? 'Copied!' : 'ID'}
                   </button>
@@ -1144,50 +1090,34 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   )}
                   {(task.total_input_tokens > 0 || task.total_output_tokens > 0) && (
                     <span
-                      className="text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 font-mono"
+                      className="hidden sm:inline-block text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 font-mono"
                       title={`Input: ${task.total_input_tokens.toLocaleString()} | Output: ${task.total_output_tokens.toLocaleString()}`}
                     >
                       {formatTokens(task.total_input_tokens + task.total_output_tokens)} tokens
                     </span>
                   )}
                   {typeof task.total_cost_usd === 'number' && task.total_cost_usd > 0 && (
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 font-mono">
+                    <span className="hidden sm:inline-block text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 font-mono">
                       ${task.total_cost_usd.toFixed(2)}
                     </span>
                   )}
                   {task.git_branch && (
-                    <span className="inline-flex items-center gap-0">
-                      {task.github_repo_url ? (
-                        <a
-                          href={`${task.github_repo_url}/tree/${task.git_branch}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-l bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors font-mono"
-                        >
-                          <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path fillRule="evenodd" d="M11.75 2.5a.75.75 0 0 1 .75.75v7.5a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.75Zm-8.5 0a.75.75 0 0 1 .75.75v3.402c.458-.204.96-.319 1.489-.319A4.265 4.265 0 0 1 9.49 9.39V3.25a.75.75 0 0 1 1.5 0v7.5a.75.75 0 0 1-1.5 0v-.156a2.765 2.765 0 0 0-3.999-2.473A2.766 2.766 0 0 0 4 10.75v.001a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.751Z" clipRule="evenodd" /></svg>
-                          {task.git_branch}
-                        </a>
-                      ) : (
-                        <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-l bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 font-mono">
-                          <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path fillRule="evenodd" d="M11.75 2.5a.75.75 0 0 1 .75.75v7.5a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.75Zm-8.5 0a.75.75 0 0 1 .75.75v3.402c.458-.204.96-.319 1.489-.319A4.265 4.265 0 0 1 9.49 9.39V3.25a.75.75 0 0 1 1.5 0v7.5a.75.75 0 0 1-1.5 0v-.156a2.765 2.765 0 0 0-3.999-2.473A2.766 2.766 0 0 0 4 10.75v.001a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.751Z" clipRule="evenodd" /></svg>
-                          {task.git_branch}
-                        </span>
-                      )}
-                      {task.status !== 'working' && (
-                        <button
-                          onClick={handleCheckout}
-                          disabled={checkingOut}
-                          className="text-xs px-1.5 py-0.5 rounded-r bg-gray-100 dark:bg-gray-800 text-gray-400 dark:text-gray-500 hover:text-green-600 dark:hover:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/20 transition-colors border-l border-gray-200 dark:border-gray-700 disabled:opacity-50"
-                          title="Switch workspace to this branch"
-                        >
-                          {checkingOut ? (
-                            <div className="w-3 h-3 border border-current border-t-transparent rounded-full animate-spin" />
-                          ) : (
-                            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" /></svg>
-                          )}
-                        </button>
-                      )}
-                    </span>
+                    task.github_repo_url ? (
+                      <a
+                        href={`${task.github_repo_url}/tree/${task.git_branch}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="hidden sm:inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors font-mono"
+                      >
+                        <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path fillRule="evenodd" d="M11.75 2.5a.75.75 0 0 1 .75.75v7.5a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.75Zm-8.5 0a.75.75 0 0 1 .75.75v3.402c.458-.204.96-.319 1.489-.319A4.265 4.265 0 0 1 9.49 9.39V3.25a.75.75 0 0 1 1.5 0v7.5a.75.75 0 0 1-1.5 0v-.156a2.765 2.765 0 0 0-3.999-2.473A2.766 2.766 0 0 0 4 10.75v.001a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.751Z" clipRule="evenodd" /></svg>
+                        {task.git_branch}
+                      </a>
+                    ) : (
+                      <span className="hidden sm:inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 font-mono">
+                        <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path fillRule="evenodd" d="M11.75 2.5a.75.75 0 0 1 .75.75v7.5a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.75Zm-8.5 0a.75.75 0 0 1 .75.75v3.402c.458-.204.96-.319 1.489-.319A4.265 4.265 0 0 1 9.49 9.39V3.25a.75.75 0 0 1 1.5 0v7.5a.75.75 0 0 1-1.5 0v-.156a2.765 2.765 0 0 0-3.999-2.473A2.766 2.766 0 0 0 4 10.75v.001a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.751Z" clipRule="evenodd" /></svg>
+                        {task.git_branch}
+                      </span>
+                    )
                   )}
                   {task.verification_url && (
                     <a
@@ -1206,6 +1136,17 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                 </div>
               </div>
               <PreviewToggleButton state={preview} />
+              {(task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled' || task.status === 'awaiting_feedback') && (
+                <button
+                  onClick={handleDelete}
+                  className="text-gray-400 hover:text-red-600 dark:hover:text-red-400 p-1"
+                  title="Delete task"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                  </svg>
+                </button>
+              )}
               <button
                 onClick={closeModal}
                 className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 p-1"
@@ -1762,19 +1703,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                           type="button"
                           onClick={() => fileInputRef.current?.click()}
                           disabled={uploading || anyParticipantRunning}
-                          className="text-xs px-2.5 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md text-gray-500 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:border-blue-300 dark:hover:border-blue-600 transition-colors disabled:opacity-50"
+                          className="p-2 border border-gray-300 dark:border-gray-600 rounded-md text-gray-500 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:border-blue-300 dark:hover:border-blue-600 transition-colors disabled:opacity-50"
                           title="Attach files"
                         >
                           {uploading ? (
-                            <span className="flex items-center gap-1">
-                              <div className="w-3 h-3 border border-current border-t-transparent rounded-full animate-spin" />
-                              Uploading...
-                            </span>
+                            <div className="w-5 h-5 border border-current border-t-transparent rounded-full animate-spin" />
                           ) : (
-                            <span className="flex items-center gap-1">
-                              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
-                              Attach Files
-                            </span>
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
                           )}
                         </button>
                         <div className="flex-1" />
@@ -1785,7 +1720,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                           </span>
                         )}
                         {voiceDebug && (
-                          <span className={`text-xs truncate max-w-[180px] ${
+                          <span className={`hidden sm:inline-block text-xs truncate max-w-[180px] ${
                             isTranscribing ? 'text-amber-500 dark:text-amber-400 animate-pulse'
                             : isListening ? 'text-purple-500 dark:text-purple-400 animate-pulse'
                             : 'text-gray-400 dark:text-gray-500'
@@ -1852,37 +1787,50 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                       className="bg-green-600 text-white text-sm px-4 py-2 rounded-md hover:bg-green-700 disabled:opacity-50"
                       title={task.pending_complete ? 'Completion queued — will finalize once the working task finishes' : undefined}
                     >
-                      {task.pending_complete ? 'Completion queued…' : completing ? 'Completing...' : 'Mark Complete (Alt+C)'}
+                      {task.pending_complete ? 'Completion queued…' : completing ? 'Completing...' : (
+                        <>Complete<span className="hidden sm:inline"> (Alt+C)</span></>
+                      )}
                     </button>
-                    <button
-                      onClick={handleRetry}
-                      className="bg-gray-600 text-white text-sm px-4 py-2 rounded-md hover:bg-gray-700"
-                    >
-                      Retry
-                    </button>
-                    <button
-                      onClick={handleCompactSession}
-                      disabled={compactingSession}
-                      className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 px-2 disabled:opacity-50"
-                      title="Ask Claude Code to summarize prior turns and free up context — preserves the session"
-                    >
-                      {compactingSession ? 'Compacting...' : 'Compact session'}
-                    </button>
-                    <button
-                      onClick={() => setResetSessionOpen(o => !o)}
-                      className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 px-2"
-                      title="Start a fresh Claude session for this task — drops in-session memory but keeps the task and its prior messages"
-                    >
-                      Reset session
-                    </button>
-                    {/* Invite button when no participants yet */}
+                    {/* Session maintenance — rarely used, tucked into a dropdown */}
+                    <div className="relative">
+                      <button
+                        type="button"
+                        onClick={() => setSessionMenuOpen(o => !o)}
+                        className="inline-flex items-center gap-1 text-xs px-2 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:border-gray-400 dark:hover:border-gray-500 transition-colors"
+                        title="Session maintenance"
+                      >
+                        Session
+                        <svg className={`w-3 h-3 transition-transform ${sessionMenuOpen ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>
+                      </button>
+                      {sessionMenuOpen && (
+                        <div className="absolute bottom-full left-0 mb-1 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl z-50 min-w-[180px] overflow-hidden">
+                          <button
+                            onClick={() => { setSessionMenuOpen(false); handleCompactSession(); }}
+                            disabled={compactingSession}
+                            className="w-full text-left text-xs px-3 py-2 hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300 disabled:opacity-50 border-b border-gray-100 dark:border-gray-800"
+                            title="Ask Claude Code to summarize prior turns and free up context — preserves the session"
+                          >
+                            {compactingSession ? 'Compacting…' : 'Compact session'}
+                          </button>
+                          <button
+                            onClick={() => { setSessionMenuOpen(false); setResetSessionOpen(o => !o); }}
+                            className="w-full text-left text-xs px-3 py-2 hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300"
+                            title="Start a fresh Claude session for this task — drops in-session memory but keeps the task and its prior messages"
+                          >
+                            Reset session
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                    {/* Invite advisor (icon) when no participants yet */}
                     {participants.length === 0 && (
                       <div className="relative">
                         <button
                           onClick={handleOpenInviteMenu}
-                          className="text-xs text-green-500 dark:text-green-400 hover:text-green-700 dark:hover:text-green-300 ml-2"
+                          className="p-2 border border-gray-300 dark:border-gray-600 rounded-md text-gray-500 dark:text-gray-400 hover:text-green-600 dark:hover:text-green-400 hover:border-green-300 dark:hover:border-green-600 transition-colors"
+                          title="Invite an advisor"
                         >
-                          + Invite Advisor
+                          <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z" /></svg>
                         </button>
                         {showInviteMenu && (
                           <div className="absolute bottom-full left-0 mb-1 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl z-50 min-w-[200px] max-h-[200px] overflow-y-auto">
@@ -2038,14 +1986,6 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                 </div>
               )}
 
-              {(task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled' || task.status === 'awaiting_feedback') && (
-                <button
-                  onClick={handleDelete}
-                  className="text-sm text-red-500 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 mt-2"
-                >
-                  Delete Task
-                </button>
-              )}
             </div>
           </>
         )}

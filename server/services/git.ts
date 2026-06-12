@@ -575,24 +575,6 @@ export async function handleTaskReopenGit(_task: Task): Promise<void> {
 }
 
 /**
- * Get the last active task ID for a workspace (now always returns null).
- * Kept for route compatibility; parallel tasks don't have a single "active" one.
- */
-export function getLastActiveTaskId(_workspaceId: string): string | null {
-  return null;
-}
-
-/**
- * Switch active task — not meaningful with worktrees; returns a note.
- */
-export async function switchActiveTask(task: Task): Promise<string> {
-  if (task.worktree_path) {
-    return `Task is isolated in worktree \`${task.worktree_path}\`. No stash switching needed.`;
-  }
-  return 'Task does not have an assigned worktree.';
-}
-
-/**
  * Manually switch a workspace to a task's branch.
  * With worktrees the branch is already isolated; just reports the status.
  */
