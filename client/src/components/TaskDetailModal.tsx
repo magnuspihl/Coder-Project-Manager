@@ -1021,10 +1021,10 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     <div
       ref={overlayRef}
       onClick={handleOverlayClick}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-0 sm:p-4"
     >
-      <div className={`flex items-stretch gap-3 w-full ${preview.previewEffective ? '' : 'max-w-3xl'} max-h-[90vh]`}>
-      <div className="bg-white dark:bg-gray-950 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 w-full max-w-3xl shrink-0 max-h-[90vh] flex flex-col">
+      <div className={`flex items-stretch gap-3 w-full h-full sm:h-auto ${preview.previewEffective ? '' : 'max-w-3xl'} max-h-full sm:max-h-[90vh]`}>
+      <div className="bg-white dark:bg-gray-950 rounded-none sm:rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 w-full max-w-3xl shrink-0 h-full sm:h-auto max-h-full sm:max-h-[90vh] flex flex-col">
         {loading ? (
           <div className="p-8 text-center text-gray-500 dark:text-gray-400">Loading task...</div>
         ) : !task ? (
@@ -1062,7 +1062,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   </span>
                   <span className="text-xs text-gray-400 dark:text-gray-500">{task.workspace_name}</span>
                   {task.model && (
-                    <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
+                    <span className={`hidden sm:inline-block text-xs px-1.5 py-0.5 rounded font-medium ${
                       task.model.startsWith('ollama/')
                         ? 'bg-green-50 dark:bg-green-900/20 text-green-600 dark:text-green-400'
                         : 'bg-purple-50 dark:bg-purple-900/20 text-purple-600 dark:text-purple-400'
@@ -1644,7 +1644,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                           rows={3}
                           autoFocus
                           disabled={sending || anyParticipantRunning}
-                          className="w-full px-3 py-2 border border-teal-300 dark:border-teal-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-teal-500 resize-y disabled:opacity-50"
+                          className="w-full px-3 py-2 border border-teal-300 dark:border-teal-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-teal-500 resize-y disabled:opacity-50 sm:min-h-[11rem]"
                         />
                         {mentionDropdown}
                       </div>
@@ -1676,7 +1676,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                           rows={3}
                           autoFocus
                           disabled={anyParticipantRunning}
-                          className="w-full px-3 py-2 border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y disabled:opacity-50"
+                          className="w-full px-3 py-2 border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y disabled:opacity-50 sm:min-h-[11rem]"
                         />
                         {mentionDropdown}
                       </div>
@@ -1796,7 +1796,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                       <button
                         type="button"
                         onClick={() => setSessionMenuOpen(o => !o)}
-                        className="inline-flex items-center gap-1 text-xs px-2 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:border-gray-400 dark:hover:border-gray-500 transition-colors"
+                        className="inline-flex items-center gap-1 text-sm px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:border-gray-400 dark:hover:border-gray-500 transition-colors"
                         title="Session maintenance"
                       >
                         Session

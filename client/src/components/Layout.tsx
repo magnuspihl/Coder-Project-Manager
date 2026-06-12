@@ -37,7 +37,8 @@ export default function Layout({
     <div className="h-screen flex flex-col overflow-hidden">
       <header className="flex-shrink-0 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 px-6 py-3 flex items-center justify-between">
         <span className="text-lg font-semibold text-gray-900 dark:text-gray-100">
-          Coder Project Manager
+          <span className="sm:hidden">CPM</span>
+          <span className="hidden sm:inline">Coder Project Manager</span>
         </span>
         <div className="flex items-center gap-4">
           {restartError && (
@@ -56,7 +57,7 @@ export default function Layout({
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
             </svg>
-            {restarting ? 'Restarting...' : 'Restart CPM'}
+            {restarting ? 'Restarting...' : 'Restart'}
           </button>
           <div className="flex items-center bg-gray-100 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-0.5">
             {([
