@@ -16,6 +16,7 @@ import { handleMcpRequest, handleMcpMethodNotAllowed } from './mcp/index.js';
 // Initialize database on import
 import './db/index.js';
 import { reconnectWorkingTasks } from './services/claude.js';
+import { reconcileLeakedWorktrees } from './services/git.js';
 
 // Prevent unhandled promise rejections from crashing the server
 process.on('unhandledRejection', (reason) => {
@@ -48,5 +49,10 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`Coder Project Manager running on http://localhost:${PORT}`);
   reconnectWorkingTasks().catch(err => {
     console.error('[recovery] Unhandled error during task reconnect:', (err as Error).message?.slice(0, 200));
+  });
+  // Clean up any worktrees left behind by tasks that already reached a terminal
+  // state (e.g. a preview server blocked removal at completion time).
+  reconcileLeakedWorktrees().catch(err => {
+    console.error('[recovery] Unhandled error during worktree reconcile:', (err as Error).message?.slice(0, 200));
   });
 });
