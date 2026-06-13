@@ -12,6 +12,12 @@ import { writeCpmGuidelines } from './workspace-memory.js';
 const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
 const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || '200';
+// The reviewer is read-only but still needs room to explore: reading the diff,
+// grepping, opening several files, and running the test suite each consume a
+// turn. The old cap of 20 routinely cut reviewers off mid-analysis before they
+// emitted REVIEW_DECISION, surfacing the confusing "did not emit a structured
+// verdict" message. Give it generous headroom (still bounded to cap cost).
+const REVIEWER_MAX_TURNS = process.env.CLAUDE_REVIEWER_MAX_TURNS || '100';
 const ALLOWED_TOOLS = process.env.CLAUDE_ALLOWED_TOOLS || 'Read,Edit,Write,Bash,Glob,Grep';
 const DISCUSSION_ALLOWED_TOOLS = 'Read,Edit,Write,MultiEdit,Bash,Glob,Grep,mcp__coder__coder_report_task';
 
@@ -1688,10 +1694,41 @@ async function launchReviewerOnTask(task: Task): Promise<void> {
 
   const reviewerPrompt = `Original task:\n${task.prompt}\n\nChanges made by the implementer:\n${gitDiff}`;
 
+  await executeReviewer(task, turn.id, reviewerSessionId, {
+    prompt: reviewerPrompt,
+    maxTurns: REVIEWER_MAX_TURNS,
+    resume: false,
+    isWrapUp: false,
+  });
+}
+
+interface ExecuteReviewerOpts {
+  prompt: string;
+  maxTurns: string;
+  /** Resume the existing reviewer session (`--resume`) instead of starting a fresh one (`--session-id`). */
+  resume: boolean;
+  /** True when this is the one-shot "emit your verdict" recovery run; prevents the recovery from recursing. */
+  isWrapUp: boolean;
+}
+
+/**
+ * Spawn a (detached) reviewer `claude` process and begin polling its output.
+ * Shared by the initial review and the turn-limit recovery resume so both use
+ * identical isolation, tool, and model flags. The caller owns the task turn —
+ * this only runs the process and wires up polling.
+ */
+async function executeReviewer(
+  task: Task,
+  turnId: string,
+  reviewerSessionId: string,
+  opts: ExecuteReviewerOpts,
+): Promise<void> {
   const claudeParts: string[] = [];
   claudeParts.push('claude');
-  claudeParts.push('-p', shellEscape(reviewerPrompt));
-  claudeParts.push('--session-id', shellEscape(reviewerSessionId));
+  claudeParts.push('-p', shellEscape(opts.prompt));
+  // A fresh run pins the session id; a recovery run resumes that same session so
+  // the reviewer still has all the context it gathered before it ran out of turns.
+  claudeParts.push(opts.resume ? '--resume' : '--session-id', shellEscape(reviewerSessionId));
   claudeParts.push('--output-format', 'stream-json');
   claudeParts.push('--verbose');
   claudeParts.push('--allowedTools', shellEscape(REVIEWER_ALLOWED_TOOLS));
@@ -1705,7 +1742,7 @@ async function launchReviewerOnTask(task: Task): Promise<void> {
   // setting sources skips CLAUDE.md discovery (auth/keychain is unaffected — it
   // is not a "setting source"), so the reviewer obeys only the prompt below.
   claudeParts.push('--setting-sources', shellEscape(''));
-  claudeParts.push('--max-turns', '20');
+  claudeParts.push('--max-turns', opts.maxTurns);
   if (task.model && !task.model.startsWith('ollama/')) {
     claudeParts.push('--model', shellEscape(task.model));
   }
@@ -1725,7 +1762,7 @@ async function launchReviewerOnTask(task: Task): Promise<void> {
   remoteCmd += `${claudeCmd} > ${shellEscape(outputFile)} 2>&1; `;
   remoteCmd += `echo $? > ${shellEscape(exitFile)}`;
 
-  console.log(`[auto-review] Launching reviewer for task ${task.id} (turn ${turn.turn_number})`);
+  console.log(`[auto-review] ${opts.resume ? 'Resuming' : 'Launching'} reviewer for task ${task.id}`);
 
   try {
     const sshProcess = isLocalWorkspace(task.workspace_name)
@@ -1737,18 +1774,18 @@ async function launchReviewerOnTask(task: Task): Promise<void> {
         });
 
     sshProcess.unref();
-    startReviewerPolling(task, turn.id, reviewerSessionId);
+    startReviewerPolling(task, turnId, reviewerSessionId, opts.isWrapUp);
   } catch (err) {
     const errorMsg = (err as Error).message || 'Failed to launch reviewer';
     console.error('[auto-review] Launch failed:', errorMsg);
-    completeTaskTurn(turn.id, 'fail', `Reviewer launch failed: ${errorMsg}`);
+    completeTaskTurn(turnId, 'fail', `Reviewer launch failed: ${errorMsg}`);
     setActiveTaskTurnRole(task.id, null);
     updateTaskStatus(task.id, 'awaiting_feedback');
     processQueue(task.workspace_id).catch(() => {});
   }
 }
 
-function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: string): void {
+function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: string, isWrapUp = false): void {
   const pollKey = `review:${task.id}`;
   stopPolling(pollKey);
 
@@ -1757,6 +1794,11 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
   let polling = false;
   let finalized = false;
   let allAssistantText = '';
+  // The stream-json `result` event carries a subtype. A successful run is
+  // `success`; a run the CLI aborted because it ran out of turns is
+  // `error_max_turns`. We track it so finalize can tell "the reviewer chose not
+  // to emit a verdict" apart from "the reviewer was cut off before it could."
+  let resultSubtype: string | null = null;
 
   const poll = async () => {
     if (polling) return;
@@ -1795,6 +1837,7 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
             const block = event as { name?: string };
             appendStreamLog(task.id, 'tool_use', `[Reviewer] ${block.name || 'tool'}`);
           } else if (event.type === 'result') {
+            if (typeof event.subtype === 'string') resultSubtype = event.subtype;
             const resultText = extractResultText(event);
             if (resultText && resultText !== allAssistantText.slice(-resultText.length)) {
               allAssistantText += resultText;
@@ -1810,7 +1853,24 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
       if (done && !finalized) {
         finalized = true;
         stopPolling(pollKey);
-        finalizeReviewer(task, turnId, allAssistantText);
+        // Flush any trailing line that never got a newline terminator. The final
+        // assistant message — which is where REVIEW_DECISION lives — can arrive
+        // as the last buffered line; without this it would be dropped and a
+        // valid verdict misread as "no decision."
+        if (partialLine.trim()) {
+          try {
+            const event = JSON.parse(partialLine) as { type: string; [key: string]: unknown };
+            if (event.type === 'assistant' && (event.message as { content?: unknown })?.content) {
+              for (const block of (event.message as { content: Array<{ type: string; text?: string }> }).content) {
+                if (block.type === 'text' && block.text) allAssistantText += block.text;
+              }
+            } else if (event.type === 'result') {
+              if (typeof event.subtype === 'string') resultSubtype = event.subtype;
+              allAssistantText += extractResultText(event);
+            }
+          } catch { /* not a complete JSON event — nothing to recover */ }
+        }
+        finalizeReviewer(task, turnId, reviewerSessionId, allAssistantText, resultSubtype, isWrapUp);
       }
     } catch (err) {
       console.error(`[auto-review] Poll error for task ${task.id}:`, (err as Error).message?.slice(0, 100));
@@ -1824,17 +1884,59 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
   poll();
 }
 
-function finalizeReviewer(task: Task, turnId: string, allText: string): void {
+function finalizeReviewer(
+  task: Task,
+  turnId: string,
+  reviewerSessionId: string,
+  allText: string,
+  resultSubtype?: string | null,
+  isWrapUp = false,
+): void {
   const current = getTask(task.id);
   if (!current) return;
 
   const decision = parseReviewDecision(allText);
 
   if (!decision) {
-    console.warn(`[auto-review] No REVIEW_DECISION found for task ${task.id} — surfacing to user`);
-    completeTaskTurn(turnId, 'fail', 'Reviewer did not produce a structured decision');
-    addMessage(task.id, 'system',
-      "The reviewer completed its check but did not emit a structured verdict. See the reviewer's response above — proceed when ready or reply to ask for clarification.");
+    // Distinguish a genuine no-verdict from a turn-limit cutoff. The latter is
+    // the common cause of a "cut off" reviewer: the CLI aborted the session
+    // (subtype `error_max_turns`) before the reviewer reached its verdict.
+    const cutOff = typeof resultSubtype === 'string' && resultSubtype.includes('max_turns');
+
+    // Recovery: the reviewer did the analysis but ran out of turns before
+    // writing its verdict. Resume the SAME session once (so it keeps all the
+    // context it gathered) and ask only for the REVIEW_DECISION block — no
+    // further investigation. `isWrapUp` guards against recursion if even this
+    // one-shot recovery is somehow cut off again.
+    if (cutOff && !isWrapUp) {
+      console.warn(`[auto-review] Reviewer for task ${task.id} hit turn limit without a verdict — resuming once for the decision`);
+      appendStreamLog(task.id, 'reviewer_output', '[Reviewer] hit turn limit — asking for final verdict');
+      const wrapUpPrompt = `You ran out of turns before emitting your verdict. Do NOT investigate further or run any tools. Based only on what you have already reviewed, output your final answer now: exactly one REVIEW_DECISION block (the pass/fail JSON from your instructions) and nothing else.`;
+      executeReviewer(task, turnId, reviewerSessionId, {
+        prompt: wrapUpPrompt,
+        maxTurns: '5',
+        resume: true,
+        isWrapUp: true,
+      }).catch(err => {
+        console.error(`[auto-review] Reviewer verdict-recovery failed for task ${task.id}:`, (err as Error).message?.slice(0, 200));
+        completeTaskTurn(turnId, 'fail', 'Reviewer hit its turn limit before emitting a decision');
+        addMessage(task.id, 'system',
+          `The reviewer ran out of turns (limit ${REVIEWER_MAX_TURNS}) before finishing its check, so it could not emit a verdict. You can raise CLAUDE_REVIEWER_MAX_TURNS, reply to send it back, or mark the task complete.`);
+        resetReviewLoopCount(task.id);
+        setActiveTaskTurnRole(task.id, null);
+        updateTaskStatus(task.id, 'awaiting_feedback');
+        processQueue(task.workspace_id).catch(() => {});
+      });
+      return;
+    }
+
+    console.warn(`[auto-review] No REVIEW_DECISION found for task ${task.id}${cutOff ? ' (cut off at turn limit)' : ''} — surfacing to user`);
+    completeTaskTurn(turnId, 'fail', cutOff
+      ? 'Reviewer hit its turn limit before emitting a decision'
+      : 'Reviewer did not produce a structured decision');
+    addMessage(task.id, 'system', cutOff
+      ? `The reviewer ran out of turns (limit ${REVIEWER_MAX_TURNS}) before finishing its check, so it could not emit a verdict. You can raise CLAUDE_REVIEWER_MAX_TURNS, reply to send it back, or mark the task complete.`
+      : "The reviewer completed its check but did not emit a structured verdict. See the reviewer's response above — proceed when ready or reply to ask for clarification.");
     resetReviewLoopCount(task.id);
     setActiveTaskTurnRole(task.id, null);
     updateTaskStatus(task.id, 'awaiting_feedback');

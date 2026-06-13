@@ -115,6 +115,21 @@ removed because an allowed tool is auto-approved in headless `-p` mode, which le
 files (e.g. edit `.gitignore`, `rm` artifacts). Write commands now fall outside the allowlist and
 are denied by the CLI's permission layer.
 
+**Turn budget.** The Reviewer runs with `--max-turns` set from `CLAUDE_REVIEWER_MAX_TURNS`
+(default **100**). A red-team review reading the diff, grepping, opening several files, and running
+the test suite each consume turns. The previous cap of 20 routinely cut reviewers off mid-analysis
+*before* they emitted `REVIEW_DECISION`, which surfaced the confusing "did not emit a structured
+verdict" message and a visibly truncated reviewer response. When the CLI does abort on the turn
+limit, the `result` event's subtype is `error_max_turns`; finalize detects this and surfaces an
+explicit "ran out of turns" message (with the limit) instead of the generic no-verdict text.
+
+**Verdict recovery.** When the reviewer is cut off at the turn limit *without* a verdict, finalize
+does not immediately escalate. It resumes the **same** reviewer session once (`--resume`, so all the
+context it already gathered is retained) with a short prompt asking only for the `REVIEW_DECISION`
+block and no further investigation (a tight `--max-turns 5`). The recovery is one-shot: an `isWrapUp`
+flag threaded through polling prevents it from recursing if that resume is itself cut off, in which
+case the explicit "ran out of turns" message is surfaced to the user as before.
+
 ---
 
 ## 5. Reviewer System Prompt
@@ -176,9 +191,14 @@ multiple lines and contain `}` inside string values. An earlier anchored single-
 and the JSON to be the entire rest of one line, so bolded, indented, fenced, pretty-printed, or
 trailing-text verdicts were silently treated as "no decision."
 
-If no parseable `REVIEW_DECISION` is found (the reviewer genuinely produced no verdict), the turn is
-treated as `fail` and a system message surfaces the reviewer's prose to the user, who can then
-proceed or reply. The review loop count is reset rather than incremented in this case.
+If no parseable `REVIEW_DECISION` is found, the turn is treated as `fail` and a system message
+surfaces the reviewer's prose to the user, who can then proceed or reply. The review loop count is
+reset rather than incremented in this case. The message wording depends on *why* the verdict is
+missing: if the `result` subtype was `error_max_turns` the reviewer was cut off and the message says
+so (and points at `CLAUDE_REVIEWER_MAX_TURNS`); otherwise it reports a genuine no-verdict. Before
+parsing, finalize also flushes any trailing buffered line that lacked a newline terminator — the
+final assistant message (where `REVIEW_DECISION` lives) can arrive that way, and dropping it would
+misread a valid verdict as "no decision."
 
 The parsed object is stored in `task_turns.review_outcome` and `task_turns.review_summary`.
 
