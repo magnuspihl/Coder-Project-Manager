@@ -7,6 +7,7 @@ import { getWorkspaceUsages, getGlobalRateLimits } from '../services/claude.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { getModelsForWorkspace } from '../services/models.js';
 import { setWorkspacesForUser } from '../services/workspace-cache.js';
+import { readWorkspaceMemory, writeWorkspaceMemoryFile } from '../services/workspace-memory.js';
 
 const router = Router();
 
@@ -181,6 +182,41 @@ router.get('/:workspaceId/models', requireAuth, async (req: Request, res: Respon
     res.json({ models });
   } catch {
     res.status(500).json({ error: 'Failed to fetch models' });
+  }
+});
+
+// Memory — view and edit the agent's cross-task memory files for a workspace
+
+router.get('/:workspaceId/memory', requireAuth, async (req: Request, res: Response) => {
+  const workspace = await withTokenRefresh(req, res, (token) => getWorkspace(token, req.params.workspaceId), 'Failed to fetch workspace');
+  if (!workspace) return;
+  try {
+    const row = getDb()
+      .prepare(`SELECT project_dir FROM tasks WHERE workspace_id = ? AND project_dir IS NOT NULL AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1`)
+      .get(req.params.workspaceId) as { project_dir: string } | undefined;
+    const files = await readWorkspaceMemory(workspace.name, row?.project_dir);
+    res.json({ files });
+  } catch {
+    res.status(500).json({ error: 'Failed to read workspace memory' });
+  }
+});
+
+router.put('/:workspaceId/memory/:filename', requireAuth, async (req: Request, res: Response) => {
+  const workspace = await withTokenRefresh(req, res, (token) => getWorkspace(token, req.params.workspaceId), 'Failed to fetch workspace');
+  if (!workspace) return;
+  const { content } = req.body as { content: unknown };
+  if (typeof content !== 'string') {
+    res.status(400).json({ error: 'content must be a string' });
+    return;
+  }
+  try {
+    const row = getDb()
+      .prepare(`SELECT project_dir FROM tasks WHERE workspace_id = ? AND project_dir IS NOT NULL AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1`)
+      .get(req.params.workspaceId) as { project_dir: string } | undefined;
+    await writeWorkspaceMemoryFile(workspace.name, req.params.filename, content, row?.project_dir);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message || 'Failed to write memory file' });
   }
 });
 
