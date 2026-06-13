@@ -1,4 +1,4 @@
-import { spawn } from 'child_process';
+import { spawn, execFile } from 'child_process';
 
 const CODER_URL = process.env.CODER_URL || '';
 
@@ -143,5 +143,132 @@ export async function writeCpmGuidelines(workspaceName: string): Promise<void> {
     });
 
     proc.stdin?.end(GUIDELINES_CONTENT);
+  });
+}
+
+/**
+ * Emit a bash snippet that sets MEMDIR to the workspace's Claude memory dir.
+ * If projectDir is provided it is used directly (the authoritative path).
+ * Otherwise falls back to guessing /home/coder/<workspaceName>, then /home/coder.
+ */
+function memDirScript(workspaceName: string, projectDir?: string | null): string {
+  if (projectDir) {
+    const encoded = encodeWorkingDir(projectDir);
+    return `MEMDIR="$HOME/.claude/projects/${encoded}/memory"\n`;
+  }
+  const primaryDir = `/home/coder/${workspaceName}`;
+  const fallbackDir = '/home/coder';
+  const primaryEncoded = encodeWorkingDir(primaryDir);
+  const fallbackEncoded = encodeWorkingDir(fallbackDir);
+  return (
+    `if [ -d ${shellEscape(primaryDir)} ]; then\n` +
+    `  MEMDIR="$HOME/.claude/projects/${primaryEncoded}/memory"\n` +
+    `else\n` +
+    `  MEMDIR="$HOME/.claude/projects/${fallbackEncoded}/memory"\n` +
+    `fi\n`
+  );
+}
+
+export interface MemoryFile {
+  name: string;
+  content: string;
+}
+
+const FILE_BEGIN = '===BEGIN:';
+const FILE_END = '===END:';
+
+/**
+ * SSH-read all .md files from the workspace's Claude memory directory.
+ * Returns an empty array if the workspace is unreachable or the directory
+ * doesn't exist yet.
+ */
+export async function readWorkspaceMemory(workspaceName: string, projectDir?: string | null): Promise<MemoryFile[]> {
+  if (!/^[a-zA-Z0-9_-]+$/.test(workspaceName)) return [];
+
+  const script =
+    `set -e\n` +
+    memDirScript(workspaceName, projectDir) +
+    `if [ ! -d "$MEMDIR" ]; then exit 0; fi\n` +
+    `cd "$MEMDIR"\n` +
+    `for f in $(ls *.md 2>/dev/null | sort); do\n` +
+    `  printf '${FILE_BEGIN}%s===\\n' "$f"\n` +
+    `  cat "$f"\n` +
+    `  printf '\\n${FILE_END}%s===\\n' "$f"\n` +
+    `done\n`;
+
+  return new Promise<MemoryFile[]>((resolve) => {
+    execFile('coder', ['ssh', workspaceName, '--', script], {
+      env: { ...process.env, CODER_URL },
+      timeout: 15000,
+      maxBuffer: 1024 * 1024, // 1 MB — memory files should be well under this
+    }, (err, stdout) => {
+      if (err) {
+        resolve([]);
+        return;
+      }
+      const files: MemoryFile[] = [];
+      const lines = stdout.split('\n');
+      let current: { name: string; lines: string[] } | null = null;
+      for (const line of lines) {
+        if (line.startsWith(FILE_BEGIN) && line.endsWith('===')) {
+          current = { name: line.slice(FILE_BEGIN.length, -3), lines: [] };
+        } else if (line.startsWith(FILE_END) && line.endsWith('===')) {
+          if (current) {
+            // Trim trailing blank line added by printf
+            const content = current.lines.join('\n').replace(/\n$/, '');
+            files.push({ name: current.name, content });
+            current = null;
+          }
+        } else if (current) {
+          current.lines.push(line);
+        }
+      }
+      resolve(files);
+    });
+  });
+}
+
+/**
+ * SSH-write a single memory file on the workspace. The filename must end in
+ * .md and must not contain path separators.
+ */
+export async function writeWorkspaceMemoryFile(
+  workspaceName: string,
+  filename: string,
+  content: string,
+  projectDir?: string | null,
+): Promise<void> {
+  if (!/^[a-zA-Z0-9_-]+$/.test(workspaceName)) throw new Error('unsafe workspace name');
+  if (!/^[a-zA-Z0-9_.-]+\.md$/.test(filename) || filename.includes('/')) {
+    throw new Error('invalid memory filename');
+  }
+
+  const script =
+    memDirScript(workspaceName, projectDir) +
+    `mkdir -p "$MEMDIR"\n` +
+    `cat > "$MEMDIR/${filename}"\n`;
+
+  return new Promise<void>((resolve, reject) => {
+    const proc = spawn('coder', ['ssh', workspaceName, '--', script], {
+      env: { ...process.env, CODER_URL },
+      stdio: ['pipe', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    proc.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });
+    proc.stdin?.on('error', () => { /* EPIPE — ignore */ });
+
+    const timeout = setTimeout(() => { proc.kill(); reject(new Error('SSH timeout')); }, 15000);
+
+    proc.on('close', (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) reject(new Error(`SSH exit ${code}: ${stderr.slice(0, 200)}`));
+      else resolve();
+    });
+    proc.on('error', (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+
+    proc.stdin?.end(content);
   });
 }

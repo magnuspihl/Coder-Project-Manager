@@ -20,8 +20,11 @@ import {
   getWorkspaceVoiceSettings,
   updateWorkspaceVoiceSettings,
   uploadFiles,
+  getWorkspaceMemory,
+  updateWorkspaceMemoryFile,
   type Workspace,
   type ModelInfo,
+  type MemoryFile,
   type Task,
   type TaskCounts,
   type TokenTotals,
@@ -105,6 +108,11 @@ export default function WorkspacesPage() {
   const newTaskFileInputRef = useRef<HTMLInputElement>(null);
   const [selectedTaskId, setSelectedTaskId] = useSessionState<string | null>('selectedTaskId', null);
   const [settingsOpenWsId, setSettingsOpenWsId] = useState<string | null>(null);
+  const [memoryOpenWsId, setMemoryOpenWsId] = useState<string | null>(null);
+  const [memoryByWs, setMemoryByWs] = useState<Record<string, MemoryFile[]>>({});
+  const [memoryLoadingWsId, setMemoryLoadingWsId] = useState<string | null>(null);
+  const [memoryEditingFile, setMemoryEditingFile] = useState<{ wsId: string; filename: string; draft: string } | null>(null);
+  const [memorySavingFile, setMemorySavingFile] = useState<string | null>(null);
   const [gitPushSettings, setGitPushSettings] = useState<Record<string, boolean>>({});
   const [previewUrlSettings, setPreviewUrlSettings] = useState<Record<string, string>>({});
   const [previewUrlDrafts, setPreviewUrlDrafts] = useState<Record<string, string>>({});
@@ -520,6 +528,42 @@ export default function WorkspacesPage() {
     }
   };
 
+  const handleToggleMemory = async (workspaceId: string) => {
+    if (memoryOpenWsId === workspaceId) {
+      setMemoryOpenWsId(null);
+      setMemoryEditingFile(null);
+      return;
+    }
+    setMemoryOpenWsId(workspaceId);
+    setMemoryEditingFile(null);
+    if (!(workspaceId in memoryByWs)) {
+      setMemoryLoadingWsId(workspaceId);
+      try {
+        const { files } = await getWorkspaceMemory(workspaceId);
+        setMemoryByWs(prev => ({ ...prev, [workspaceId]: files }));
+      } catch { /* show empty state */ }
+      setMemoryLoadingWsId(null);
+    }
+  };
+
+  const handleSaveMemoryFile = async (workspaceId: string, filename: string, content: string) => {
+    setMemorySavingFile(filename);
+    try {
+      await updateWorkspaceMemoryFile(workspaceId, filename, content);
+      setMemoryByWs(prev => ({
+        ...prev,
+        [workspaceId]: (prev[workspaceId] ?? []).map(f =>
+          f.name === filename ? { ...f, content } : f
+        ),
+      }));
+      setMemoryEditingFile(null);
+    } catch (err) {
+      alert((err as Error).message || 'Failed to save');
+    } finally {
+      setMemorySavingFile(null);
+    }
+  };
+
   const handleAddVoice = async (workspaceId: string, voiceId: string) => {
     const current = wsVoiceSettings[workspaceId] ?? [];
     if (current.includes(voiceId)) return;
@@ -803,6 +847,17 @@ export default function WorkspacesPage() {
               ) : null}
               {isRunning && (
                 <button
+                  onClick={() => handleToggleMemory(ws.id)}
+                  className={`p-0.5 transition-colors ${memoryOpenWsId === ws.id ? 'text-purple-500 dark:text-purple-400' : 'text-gray-300 dark:text-gray-600 hover:text-gray-500 dark:hover:text-gray-400'}`}
+                  title="Workspace memory"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
+                    <path d="M9 4.804A7.968 7.968 0 005.5 4c-1.255 0-2.443.29-3.5.804v10A7.969 7.969 0 015.5 14c1.669 0 3.218.51 4.5 1.385A7.962 7.962 0 0114.5 14c1.255 0 2.443.29 3.5.804v-10A7.968 7.968 0 0014.5 4c-1.255 0-2.443.29-3.5.804V12a1 1 0 11-2 0V4.804z" />
+                  </svg>
+                </button>
+              )}
+              {isRunning && (
+                <button
                   onClick={() => handleToggleSettings(ws.id)}
                   className={`p-0.5 transition-colors ${settingsOpenWsId === ws.id ? 'text-blue-500 dark:text-blue-400' : 'text-gray-300 dark:text-gray-600 hover:text-gray-500 dark:hover:text-gray-400'}`}
                   title="Workspace settings"
@@ -814,6 +869,82 @@ export default function WorkspacesPage() {
               )}
             </div>
           </div>
+          {memoryOpenWsId === ws.id && (() => {
+            const files = memoryByWs[ws.id] ?? [];
+            const isLoading = memoryLoadingWsId === ws.id;
+            const userFiles = files.filter(f => f.name !== 'cpm_guidelines.md' && f.name !== 'cpm_session_guidelines.md');
+            return (
+              <div className="flex flex-col gap-2 px-2 py-2 bg-purple-50 dark:bg-purple-950/20 border border-purple-200 dark:border-purple-800/40 rounded text-xs mb-1">
+                <div className="flex items-center justify-between">
+                  <span className="font-medium text-purple-700 dark:text-purple-300 flex items-center gap-1">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
+                      <path d="M9 4.804A7.968 7.968 0 005.5 4c-1.255 0-2.443.29-3.5.804v10A7.969 7.969 0 015.5 14c1.669 0 3.218.51 4.5 1.385A7.962 7.962 0 0114.5 14c1.255 0 2.443.29 3.5.804v-10A7.968 7.968 0 0014.5 4c-1.255 0-2.443.29-3.5.804V12a1 1 0 11-2 0V4.804z" />
+                    </svg>
+                    Workspace Memory
+                  </span>
+                  <button
+                    onClick={() => {
+                      setMemoryByWs(prev => { const n = { ...prev }; delete n[ws.id]; return n; });
+                      setMemoryLoadingWsId(ws.id);
+                      getWorkspaceMemory(ws.id)
+                        .then(({ files: f }) => setMemoryByWs(prev => ({ ...prev, [ws.id]: f })))
+                        .catch(() => {})
+                        .finally(() => setMemoryLoadingWsId(null));
+                    }}
+                    className="text-purple-400 hover:text-purple-600 dark:hover:text-purple-300 text-[10px]"
+                    title="Refresh"
+                  >↻</button>
+                </div>
+                {isLoading && (
+                  <span className="text-gray-400 dark:text-gray-500 italic">Loading…</span>
+                )}
+                {!isLoading && userFiles.length === 0 && (
+                  <span className="text-gray-400 dark:text-gray-500 italic">
+                    No memory yet. Claude will add notes here as tasks and discussions run.
+                  </span>
+                )}
+                {!isLoading && userFiles.map(file => {
+                  const isEditing = memoryEditingFile?.wsId === ws.id && memoryEditingFile?.filename === file.name;
+                  const isSaving = memorySavingFile === file.name;
+                  return (
+                    <div key={file.name} className="flex flex-col gap-1">
+                      <div className="flex items-center justify-between">
+                        <span className="font-mono text-[10px] text-purple-500 dark:text-purple-400">{file.name}</span>
+                        {!isEditing ? (
+                          <button
+                            onClick={() => setMemoryEditingFile({ wsId: ws.id, filename: file.name, draft: file.content })}
+                            className="text-[10px] text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                          >Edit</button>
+                        ) : (
+                          <div className="flex items-center gap-1">
+                            <button
+                              onClick={() => handleSaveMemoryFile(ws.id, file.name, memoryEditingFile!.draft)}
+                              disabled={isSaving}
+                              className="text-[10px] px-1.5 py-0.5 rounded bg-purple-600 text-white hover:bg-purple-700 disabled:opacity-50"
+                            >{isSaving ? 'Saving…' : 'Save'}</button>
+                            <button
+                              onClick={() => setMemoryEditingFile(null)}
+                              className="text-[10px] text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                            >Cancel</button>
+                          </div>
+                        )}
+                      </div>
+                      {isEditing ? (
+                        <textarea
+                          value={memoryEditingFile!.draft}
+                          onChange={e => setMemoryEditingFile(prev => prev ? { ...prev, draft: e.target.value } : null)}
+                          className="w-full text-[11px] font-mono px-1.5 py-1 rounded border border-purple-300 dark:border-purple-700 bg-white dark:bg-gray-900 text-gray-700 dark:text-gray-200 focus:outline-none focus:border-purple-500 resize-y"
+                          rows={10}
+                        />
+                      ) : (
+                        <pre className="text-[10px] text-gray-600 dark:text-gray-400 whitespace-pre-wrap break-words max-h-48 overflow-y-auto bg-white/50 dark:bg-gray-900/30 rounded p-1.5 border border-purple-100 dark:border-purple-900/40 leading-relaxed">{file.content || <em className="italic opacity-60">empty</em>}</pre>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
           {settingsOpenWsId === ws.id && (
             <div className="flex flex-col gap-2 px-2 py-2 bg-gray-100 dark:bg-gray-800 rounded text-xs mb-1">
               <label className="flex items-center gap-1.5 cursor-pointer select-none">
