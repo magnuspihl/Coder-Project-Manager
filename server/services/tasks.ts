@@ -19,6 +19,7 @@ export interface Task {
   ssh_pid: number | null;
   git_branch: string | null;
   github_repo_url: string | null;
+  git_provider: string | null;
   worktree_path: string | null;
   port_range_start: number | null;
   caveman: string | null;

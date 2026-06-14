@@ -59,10 +59,13 @@ changes for the lifetime of a task.
 
 1. Inside the worktree: `git add -A && git commit -m "..."`
 2. `git push -u origin task/{slug}-{shortid}`
-3. `gh pr create` (or reuse existing)
-4. `gh pr merge --merge --delete-branch`
-5. `git worktree remove ~/.cpm/worktrees/task-{uuid} --force`
-6. Task status → `completed`, `worktree_path` → `NULL`
+3. Open + complete a PR via the detected git host:
+   - **GitHub** (default / fallback): `gh pr create` (or reuse existing) → `gh pr merge --merge --delete-branch`
+   - **Azure DevOps**: driven over the REST API with `curl` (no `az` CLI needed — nothing to install). Create the PR (or reuse the active one), then `PATCH status=completed` with `completionOptions.deleteSourceBranch` + `mergeStrategy=noFastForward`, and poll the PR status until ADO reports it `completed` (completion is async). Authenticates via HTTP Basic using the workspace's `ADO_PAT` (the same token that pre-authenticates git over HTTPS); the auth header is built remotely so the PAT never leaves the workspace.
+4. `git worktree remove ~/.cpm/worktrees/task-{uuid} --force`
+5. Task status → `completed`, `worktree_path` → `NULL`
+
+The provider is detected from `git config remote.origin.url` and stored on the task as `git_provider` (`github` / `azure` / `unknown`). Anything that isn't recognised as Azure DevOps falls through to the `gh` flow, preserving the prior unconditional behaviour (e.g. GitHub Enterprise).
 
 The main checkout does not need to be touched. It stays on its branch. The `git pull` step that
 currently follows merge is removed — the main checkout is managed separately (see Section 6).
