@@ -1104,7 +1104,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   {task.git_branch && (
                     task.github_repo_url ? (
                       <a
-                        href={`${task.github_repo_url}/tree/${task.git_branch}`}
+                        href={task.git_provider === 'azure'
+                          ? `${task.github_repo_url}?version=GB${encodeURIComponent(task.git_branch)}`
+                          : `${task.github_repo_url}/tree/${task.git_branch}`}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="hidden sm:inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors font-mono"

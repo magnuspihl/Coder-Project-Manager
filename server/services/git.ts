@@ -31,6 +31,68 @@ async function sshGh(workspaceName: string, command: string, timeout = 30000): P
   return sshExec(workspaceName, command, timeout);
 }
 
+interface AdoResponse {
+  /** HTTP status code, or 0 if the request couldn't be made. */
+  status: number;
+  /** Response body (trimmed). */
+  body: string;
+  /** True when `curl` is not installed in the workspace. */
+  curlMissing?: boolean;
+}
+
+/**
+ * Call the Azure DevOps REST API from inside a workspace using `curl`.
+ *
+ * Authenticates with HTTP Basic using the workspace's `ADO_PAT` (the same token
+ * that pre-authenticates git over HTTPS) — so no extra CLI or extension needs to
+ * be installed. The PAT never leaves the workspace: the auth header is built on
+ * the remote side from `$ADO_PAT`.
+ *
+ * A JSON `body` is sent by base64-encoding it here and decoding it to a temp file
+ * on the remote, which sidesteps all shell-quoting issues with arbitrary titles
+ * and descriptions. `curl -sS` returns exit 0 for HTTP 4xx/5xx (so we can read
+ * the error body); the HTTP status is appended via `-w` and parsed back out.
+ */
+async function adoApi(ws: string, method: string, url: string, body?: unknown): Promise<AdoResponse> {
+  const authCmd = `AUTH="Authorization: Basic $(printf ':%s' "$ADO_PAT" | base64 | tr -d '\\n')"`;
+  const common = `-sS -H "$AUTH" -H "Accept: application/json"`;
+  let cmd: string;
+  if (body !== undefined) {
+    const b64 = Buffer.from(JSON.stringify(body)).toString('base64');
+    cmd =
+      `${authCmd} && TMP=$(mktemp) && printf %s ${shellEscape(b64)} | base64 -d > "$TMP" && ` +
+      `curl ${common} -H "Content-Type: application/json" -X ${method} --data @"$TMP" ${shellEscape(url)} -w '\\nHTTP_STATUS:%{http_code}'; ` +
+      `rm -f "$TMP"`;
+  } else {
+    cmd = `${authCmd} && curl ${common} -X ${method} ${shellEscape(url)} -w '\\nHTTP_STATUS:%{http_code}'`;
+  }
+
+  let out: string;
+  try {
+    out = await sshExec(ws, cmd, 60000);
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (/curl: (command )?not found|not recognized|No such file/i.test(msg)) {
+      return { status: 0, body: '', curlMissing: true };
+    }
+    throw e;
+  }
+
+  const marker = 'HTTP_STATUS:';
+  const idx = out.lastIndexOf(marker);
+  if (idx === -1) return { status: 0, body: out.trim() };
+  const status = parseInt(out.slice(idx + marker.length).trim(), 10) || 0;
+  return { status, body: out.slice(0, idx).trim() };
+}
+
+/**
+ * True when an Azure DevOps response indicates an auth failure — typically an
+ * expired/invalid PAT (ADO answers with 401/403, or 203 + a sign-in page).
+ */
+function isAdoAuthError(res: AdoResponse): boolean {
+  return res.status === 401 || res.status === 403 || res.status === 203;
+}
+
 /**
  * Resolve project_dir for a task — use stored value or auto-detect.
  */
@@ -84,33 +146,82 @@ function storeTaskBranch(taskId: string, branch: string): void {
   getDb().prepare('UPDATE tasks SET git_branch = ? WHERE id = ?').run(branch, taskId);
 }
 
+export type GitProvider = 'github' | 'azure' | 'unknown';
+
+export interface GitRemoteInfo {
+  provider: GitProvider;
+  /** Browsable web URL for the repository (null for unknown providers). */
+  webUrl: string | null;
+  /** Azure DevOps coordinates, present only when provider === 'azure'. */
+  azure?: { orgUrl: string; project: string; repo: string };
+}
+
 /**
- * Detect the GitHub repository URL from a workspace's git remote.
- * Converts SSH URLs (git@github.com:user/repo.git) to HTTPS URLs.
- * Returns null if not a GitHub repo or detection fails.
+ * Parse an Azure DevOps remote URL into {orgUrl, project, repo}.
+ * Handles the modern dev.azure.com form (with or without the `{org}@` userinfo),
+ * the SSH form (git@ssh.dev.azure.com:v3/...), and the legacy
+ * `{org}.visualstudio.com` form (with or without a `DefaultCollection` segment).
+ * Returns null if the URL is not an Azure DevOps remote.
  */
-async function detectGitHubRepoUrl(workspaceName: string, projectDir: string): Promise<string | null> {
+export function parseAzureRemote(remoteUrl: string): { orgUrl: string; project: string; repo: string } | null {
+  const dec = (s: string) => { try { return decodeURIComponent(s); } catch { return s; } };
+
+  // https://dev.azure.com/{org}/{project}/_git/{repo}   (optional `{org}@` userinfo)
+  let m = remoteUrl.match(/https?:\/\/(?:[^@/]+@)?dev\.azure\.com\/([^/]+)\/([^/]+)\/_git\/(.+?)(?:\.git)?\/?$/i);
+  if (m) {
+    return { orgUrl: `https://dev.azure.com/${m[1]}`, project: dec(m[2]), repo: dec(m[3]) };
+  }
+
+  // git@ssh.dev.azure.com:v3/{org}/{project}/{repo}
+  m = remoteUrl.match(/git@ssh\.dev\.azure\.com:v3\/([^/]+)\/([^/]+)\/(.+?)(?:\.git)?\/?$/i);
+  if (m) {
+    return { orgUrl: `https://dev.azure.com/${m[1]}`, project: dec(m[2]), repo: dec(m[3]) };
+  }
+
+  // https://{org}.visualstudio.com/[DefaultCollection/]{project}/_git/{repo}
+  m = remoteUrl.match(/https?:\/\/(?:[^@/]+@)?([^.]+)\.visualstudio\.com\/(?:DefaultCollection\/)?([^/]+)\/_git\/(.+?)(?:\.git)?\/?$/i);
+  if (m) {
+    return { orgUrl: `https://dev.azure.com/${m[1]}`, project: dec(m[2]), repo: dec(m[3]) };
+  }
+
+  return null;
+}
+
+/**
+ * Detect the git hosting provider and a browsable web URL from a workspace's
+ * git remote. Supports GitHub and Azure DevOps; returns provider 'unknown' with
+ * a null webUrl for anything else, and null if detection fails entirely.
+ */
+async function detectGitRemote(workspaceName: string, projectDir: string): Promise<GitRemoteInfo | null> {
   try {
     const remoteUrl = await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git config --get remote.origin.url`);
     if (!remoteUrl) return null;
+    const url = remoteUrl.trim();
 
-    const sshMatch = remoteUrl.match(/git@github\.com:(.+?)(?:\.git)?$/);
-    if (sshMatch) return `https://github.com/${sshMatch[1]}`;
+    // GitHub (ssh + https)
+    const sshMatch = url.match(/git@github\.com:(.+?)(?:\.git)?$/);
+    if (sshMatch) return { provider: 'github', webUrl: `https://github.com/${sshMatch[1]}` };
+    const httpsMatch = url.match(/https:\/\/github\.com\/(.+?)(?:\.git)?$/);
+    if (httpsMatch) return { provider: 'github', webUrl: `https://github.com/${httpsMatch[1]}` };
 
-    const httpsMatch = remoteUrl.match(/https:\/\/github\.com\/(.+?)(?:\.git)?$/);
-    if (httpsMatch) return `https://github.com/${httpsMatch[1]}`;
+    // Azure DevOps
+    const azure = parseAzureRemote(url);
+    if (azure) {
+      const webUrl = `${azure.orgUrl}/${encodeURIComponent(azure.project)}/_git/${encodeURIComponent(azure.repo)}`;
+      return { provider: 'azure', webUrl, azure };
+    }
 
-    return null;
+    return { provider: 'unknown', webUrl: null };
   } catch {
     return null;
   }
 }
 
 /**
- * Store the GitHub repo URL on a task in the database.
+ * Store the repo web URL and provider on a task in the database.
  */
-function storeTaskRepoUrl(taskId: string, url: string): void {
-  getDb().prepare('UPDATE tasks SET github_repo_url = ? WHERE id = ?').run(url, taskId);
+function storeTaskRepo(taskId: string, url: string | null, provider: GitProvider): void {
+  getDb().prepare('UPDATE tasks SET github_repo_url = ?, git_provider = ? WHERE id = ?').run(url, provider, taskId);
 }
 
 /**
@@ -162,11 +273,12 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
   try {
     if (!await hasGitRepo(ws, dir)) return;
 
-    // Store GitHub URL for UI linking
-    const repoUrl = await detectGitHubRepoUrl(ws, dir);
-    if (repoUrl) {
-      storeTaskRepoUrl(task.id, repoUrl);
-      task.github_repo_url = repoUrl;
+    // Store repo URL + provider for UI linking and provider-aware completion
+    const remote = await detectGitRemote(ws, dir);
+    if (remote) {
+      storeTaskRepo(task.id, remote.webUrl, remote.provider);
+      task.github_repo_url = remote.webUrl;
+      task.git_provider = remote.provider;
     }
 
     if (!await hasCommits(ws, dir)) return;
@@ -422,10 +534,12 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       branchTip = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse HEAD`)).trim();
     } catch { /* validation is skipped if we couldn't capture the tip */ }
 
-    // Store GitHub URL if not already done
-    if (task.project_dir && !task.github_repo_url) {
-      const repoUrl = await detectGitHubRepoUrl(ws, task.project_dir);
-      if (repoUrl) storeTaskRepoUrl(task.id, repoUrl);
+    // Detect the git host so the PR flow can be routed to the right provider
+    // (and store the repo URL + provider for UI linking if not already done).
+    const remote = await detectGitRemote(ws, dir);
+    const provider: GitProvider = remote?.provider ?? (task.git_provider as GitProvider | null) ?? 'unknown';
+    if (remote) {
+      storeTaskRepo(task.id, remote.webUrl ?? task.github_repo_url, remote.provider);
     }
 
     // Push
@@ -484,84 +598,34 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       }
     }
 
-    // Find an existing PR for this branch and inspect its state. A branch that was
-    // completed before has a MERGED PR; reusing it would re-merge the stale commits
-    // (printing "PR merged") while the new commit never lands. Only an OPEN PR is
-    // safe to reuse — for a MERGED/CLOSED one, open a FRESH PR for the new commit.
+    // Open (or reuse) and complete the PR through the detected provider. Each
+    // helper finds/creates the PR, merges it, surfaces its own status/error
+    // messages, and reports whether the git-ancestor merge verification below
+    // should run. A branch completed before has a closed/merged PR; the helpers
+    // open a fresh PR for the new commit rather than re-merging stale ones.
     const freshTask = getTask(task.id) || task;
     const prTitle = freshTask.title || `Task: ${freshTask.prompt.slice(0, 60)}`;
     const prBody = `Automated PR for completed task.\n\n**Task:** ${freshTask.title}\n**Task ID:** ${freshTask.id}`;
 
-    let prUrl: string;
-    let mergeTarget: string; // PR number/URL — merge by identity, never by branch name, so a stale PR can't be re-targeted
-    let existingPr: { url?: string; state?: string; number?: number } | null = null;
-    try {
-      const raw = await sshGh(ws, `cd ${shellEscape(dir)} && gh pr view ${shellEscape(branchName)} --json url,state,number 2>/dev/null`);
-      if (raw.trim()) existingPr = JSON.parse(raw);
-    } catch { /* no PR associated with this branch yet */ }
-
-    if (existingPr && existingPr.state === 'OPEN' && existingPr.url) {
-      prUrl = existingPr.url;
-      mergeTarget = existingPr.number != null ? String(existingPr.number) : existingPr.url;
-      addMessage(task.id, 'system', `Existing open pull request found: ${prUrl}`);
+    let outcome: PrOutcome;
+    if (provider === 'azure') {
+      if (!remote?.azure) {
+        addMessage(task.id, 'system',
+          `Cannot complete: changes were pushed to branch \`${branchName}\`, but the Azure DevOps organization/project/repository could not be parsed from the git remote. ` +
+          `Open and complete the PR manually, then mark this task complete.`
+        );
+        return false;
+      }
+      outcome = await completePrAzure(ws, task.id, branchName, defaultBranch, prTitle, prBody, branchTip, remote.azure);
     } else {
-      if (existingPr && existingPr.url && (existingPr.state === 'MERGED' || existingPr.state === 'CLOSED')) {
-        addMessage(task.id, 'system',
-          `Previous pull request for branch \`${branchName}\` is ${existingPr.state.toLowerCase()} (${existingPr.url}); opening a fresh PR for the new commit.`
-        );
-      }
-      try {
-        prUrl = (await sshGh(ws,
-          `cd ${shellEscape(dir)} && gh pr create --base ${shellEscape(defaultBranch)} --head ${shellEscape(branchName)} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`
-        )).trim();
-        mergeTarget = prUrl;
-        addMessage(task.id, 'system', `Pull request created: ${prUrl}`);
-      } catch (prErr: any) {
-        const msg = String(prErr?.message || prErr);
-        // GitHub refuses a PR when the branch adds no commits over the base — the
-        // reopened task's changes are already on the default branch. Not a failure:
-        // there is simply nothing to merge.
-        if (/no commits between/i.test(msg)) {
-          addMessage(task.id, 'system',
-            `Nothing to merge — branch \`${branchName}\` adds no commits over \`${defaultBranch}\` (changes already on the default branch). Marking complete.`
-          );
-          return true;
-        }
-        addMessage(task.id, 'system',
-          `Cannot complete: PR creation failed for branch \`${branchName}\`: ${msg}. ` +
-          `Resolve the issue and retry completion.`
-        );
-        return false;
-      }
+      // GitHub and anything else (e.g. GitHub Enterprise) go through the `gh` CLI,
+      // matching the prior behaviour where `gh` was used unconditionally.
+      outcome = await completePrGitHub(ws, dir, task.id, branchName, defaultBranch, prTitle, prBody);
     }
 
-    // Merge the PR by identity (number/URL), never by branch name, so a stale MERGED
-    // PR for the same branch can't be re-targeted.
-    let mergeConfirmedByState = false;
-    try {
-      await sshGh(ws, `cd ${shellEscape(dir)} && gh pr merge ${shellEscape(mergeTarget)} --merge --delete-branch`);
-      addMessage(task.id, 'system', `PR merged and branch \`${branchName}\` deleted.`);
-    } catch (mergeErr: any) {
-      // Check if the PR was already merged on GitHub (e.g. by the user or auto-merge)
-      let alreadyMerged = false;
-      try {
-        const prState = await sshGh(ws,
-          `cd ${shellEscape(dir)} && gh pr view ${shellEscape(mergeTarget)} --json state --jq .state`
-        );
-        alreadyMerged = prState.trim() === 'MERGED';
-      } catch { /* ignore state-check errors */ }
-
-      if (alreadyMerged) {
-        addMessage(task.id, 'system', `PR for branch \`${branchName}\` was already merged on GitHub.`);
-        mergeConfirmedByState = true;
-      } else {
-        addMessage(task.id, 'system',
-          `Cannot complete: PR merge failed for \`${branchName}\`: ${mergeErr.message}. ` +
-          `Resolve any conflicts on the PR and retry completion.`
-        );
-        return false;
-      }
-    }
+    if (outcome.kind === 'blocked') return false;
+    if (outcome.kind === 'nothing-to-merge') return true;
+    const verifyMergeWithGit = outcome.verifyByGit;
 
     // Verify the merge actually landed on origin/<default>. `gh pr merge` exiting 0
     // is normally sufficient, but this guards against partial/misreported merges so
@@ -569,10 +633,11 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
     // `--merge` strategy the branch tip becomes a parent of the merge commit, so it
     // must be an ancestor of the updated default branch.
     //
-    // Skip when GitHub already reports the PR as MERGED (authoritative): a manual
-    // squash/rebase merge produces new commits, so the branch tip would legitimately
-    // not be an ancestor — checking it would be a false-negative block.
-    if (branchTip && !mergeConfirmedByState) {
+    // Skip when the provider authoritatively reports the PR as merged/completed: a
+    // squash/rebase merge (GitHub) or a non-merge completion strategy (Azure DevOps)
+    // produces new commits, so the branch tip would legitimately not be an ancestor —
+    // checking it would be a false-negative block.
+    if (branchTip && verifyMergeWithGit) {
       try {
         await sshExec(ws,
           `cd ${shellEscape(dir)} && git fetch origin ${shellEscape(defaultBranch)} && ` +
@@ -582,7 +647,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       } catch {
         addMessage(task.id, 'system',
           `Cannot complete: the merge could not be verified on \`origin/${defaultBranch}\` — commit \`${branchTip.slice(0, 8)}\` is not part of the remote default branch yet. ` +
-          `The worktree has been kept. Check the PR state on GitHub and retry completion.`
+          `The worktree has been kept. Check the PR state and retry completion.`
         );
         return false;
       }
@@ -611,6 +676,233 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
     addMessage(task.id, 'system', `Error: ${reason}`);
     return false;
   }
+}
+
+// ─── Provider-specific PR completion ─────────────────────────────────────────
+
+/**
+ * Result of a provider's open-PR-and-merge step:
+ * - `completed`: the PR was merged/completed. `verifyByGit` says whether the
+ *   caller should verify the merge landed via a git-ancestor check (true) or
+ *   trust the provider's authoritative state (false).
+ * - `nothing-to-merge`: the branch adds no commits over the base — mark complete.
+ * - `blocked`: completion could not proceed; an explanatory message was already
+ *   added to the task and completion should be refused.
+ */
+type PrOutcome =
+  | { kind: 'completed'; verifyByGit: boolean }
+  | { kind: 'nothing-to-merge' }
+  | { kind: 'blocked' };
+
+/**
+ * GitHub PR flow via the `gh` CLI: reuse an OPEN PR or open a fresh one, then
+ * merge it by identity (number/URL, never branch name, so a stale MERGED PR for
+ * the same branch can't be re-targeted).
+ */
+async function completePrGitHub(
+  ws: string, dir: string, taskId: string, branchName: string,
+  defaultBranch: string, prTitle: string, prBody: string,
+): Promise<PrOutcome> {
+  let mergeTarget: string;
+  let existingPr: { url?: string; state?: string; number?: number } | null = null;
+  try {
+    const raw = await sshGh(ws, `cd ${shellEscape(dir)} && gh pr view ${shellEscape(branchName)} --json url,state,number 2>/dev/null`);
+    if (raw.trim()) existingPr = JSON.parse(raw);
+  } catch { /* no PR associated with this branch yet */ }
+
+  if (existingPr && existingPr.state === 'OPEN' && existingPr.url) {
+    mergeTarget = existingPr.number != null ? String(existingPr.number) : existingPr.url;
+    addMessage(taskId, 'system', `Existing open pull request found: ${existingPr.url}`);
+  } else {
+    if (existingPr && existingPr.url && (existingPr.state === 'MERGED' || existingPr.state === 'CLOSED')) {
+      addMessage(taskId, 'system',
+        `Previous pull request for branch \`${branchName}\` is ${existingPr.state.toLowerCase()} (${existingPr.url}); opening a fresh PR for the new commit.`
+      );
+    }
+    try {
+      const prUrl = (await sshGh(ws,
+        `cd ${shellEscape(dir)} && gh pr create --base ${shellEscape(defaultBranch)} --head ${shellEscape(branchName)} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`
+      )).trim();
+      mergeTarget = prUrl;
+      addMessage(taskId, 'system', `Pull request created: ${prUrl}`);
+    } catch (prErr: any) {
+      const msg = String(prErr?.message || prErr);
+      // GitHub refuses a PR when the branch adds no commits over the base — the
+      // reopened task's changes are already on the default branch.
+      if (/no commits between/i.test(msg)) {
+        addMessage(taskId, 'system',
+          `Nothing to merge — branch \`${branchName}\` adds no commits over \`${defaultBranch}\` (changes already on the default branch). Marking complete.`
+        );
+        return { kind: 'nothing-to-merge' };
+      }
+      addMessage(taskId, 'system',
+        `Cannot complete: PR creation failed for branch \`${branchName}\`: ${msg}. Resolve the issue and retry completion.`
+      );
+      return { kind: 'blocked' };
+    }
+  }
+
+  try {
+    await sshGh(ws, `cd ${shellEscape(dir)} && gh pr merge ${shellEscape(mergeTarget)} --merge --delete-branch`);
+    addMessage(taskId, 'system', `PR merged and branch \`${branchName}\` deleted.`);
+    return { kind: 'completed', verifyByGit: true };
+  } catch (mergeErr: any) {
+    // Check if the PR was already merged on GitHub (e.g. by the user or auto-merge).
+    let alreadyMerged = false;
+    try {
+      const prState = await sshGh(ws,
+        `cd ${shellEscape(dir)} && gh pr view ${shellEscape(mergeTarget)} --json state --jq .state`
+      );
+      alreadyMerged = prState.trim() === 'MERGED';
+    } catch { /* ignore state-check errors */ }
+
+    if (alreadyMerged) {
+      addMessage(taskId, 'system', `PR for branch \`${branchName}\` was already merged on GitHub.`);
+      return { kind: 'completed', verifyByGit: false };
+    }
+    addMessage(taskId, 'system',
+      `Cannot complete: PR merge failed for \`${branchName}\`: ${mergeErr.message}. Resolve any conflicts on the PR and retry completion.`
+    );
+    return { kind: 'blocked' };
+  }
+}
+
+/**
+ * Azure DevOps PR flow via the REST API (using `curl` + the workspace `ADO_PAT`):
+ * reuse an active PR or create one, set it to "completed" (which merges and
+ * deletes the source branch), then poll the PR status until ADO reports the
+ * completion landed (completion is processed asynchronously server-side).
+ *
+ * Deliberately uses the REST API rather than the `az` CLI so that nothing needs
+ * to be installed in the workspace — `curl` is universally available and the PAT
+ * that already pre-authenticates git over HTTPS is reused for API auth.
+ */
+async function completePrAzure(
+  ws: string, taskId: string, branchName: string,
+  defaultBranch: string, prTitle: string, prBody: string,
+  branchTip: string, azure: { orgUrl: string; project: string; repo: string },
+): Promise<PrOutcome> {
+  const apiVer = 'api-version=7.1';
+  const reposBase =
+    `${azure.orgUrl}/${encodeURIComponent(azure.project)}/_apis/git/repositories/${encodeURIComponent(azure.repo)}`;
+  const prWebUrl = (id: number | string) =>
+    `${azure.orgUrl}/${encodeURIComponent(azure.project)}/_git/${encodeURIComponent(azure.repo)}/pullrequest/${id}`;
+  const sourceRef = `refs/heads/${branchName}`;
+  const targetRef = `refs/heads/${defaultBranch}`;
+
+  const curlMissingMsg =
+    `Cannot complete: \`curl\` is not available in this workspace, so CPM cannot reach the Azure DevOps REST API to open the pull request. ` +
+    `Open and complete the PR for branch \`${branchName}\` manually, then mark this task complete.`;
+  const authErrMsg =
+    `Cannot complete: Azure DevOps rejected the request (auth error). The workspace \`ADO_PAT\` is likely missing or expired — ` +
+    `regenerate it at dev.azure.com/{org}/_usersSettings/tokens and update the workspace parameter, then retry completion.`;
+
+  const findActivePr = async (): Promise<number | null> => {
+    const url =
+      `${reposBase}/pullrequests?searchCriteria.sourceRefName=${encodeURIComponent(sourceRef)}` +
+      `&searchCriteria.targetRefName=${encodeURIComponent(targetRef)}&searchCriteria.status=active&${apiVer}`;
+    const res = await adoApi(ws, 'GET', url);
+    if (res.curlMissing) { addMessage(taskId, 'system', curlMissingMsg); return null; }
+    if (isAdoAuthError(res)) { addMessage(taskId, 'system', authErrMsg); return null; }
+    if (res.status >= 200 && res.status < 300) {
+      try {
+        const data = JSON.parse(res.body);
+        if (Array.isArray(data.value) && data.value.length > 0 && data.value[0].pullRequestId != null) {
+          return data.value[0].pullRequestId as number;
+        }
+      } catch { /* fall through */ }
+    }
+    return null;
+  };
+
+  // Reuse an existing active PR for this source→target branch if present.
+  let prId: number | null = await findActivePr();
+
+  if (prId != null) {
+    addMessage(taskId, 'system', `Existing active pull request found: ${prWebUrl(prId)}`);
+  } else {
+    const res = await adoApi(ws, 'POST', `${reposBase}/pullrequests?${apiVer}`, {
+      sourceRefName: sourceRef,
+      targetRefName: targetRef,
+      title: prTitle,
+      description: prBody,
+    });
+    if (res.curlMissing) { addMessage(taskId, 'system', curlMissingMsg); return { kind: 'blocked' }; }
+    if (isAdoAuthError(res)) { addMessage(taskId, 'system', authErrMsg); return { kind: 'blocked' }; }
+    if (res.status >= 200 && res.status < 300) {
+      try { prId = JSON.parse(res.body).pullRequestId; } catch { /* handled below */ }
+      if (prId != null) addMessage(taskId, 'system', `Pull request created: ${prWebUrl(prId)}`);
+    } else if (/TF401179|active pull request.*already exists/i.test(res.body)) {
+      // A PR for this branch pair already exists — recover by looking it up.
+      prId = await findActivePr();
+      if (prId != null) addMessage(taskId, 'system', `Existing active pull request found: ${prWebUrl(prId)}`);
+    }
+    if (prId == null) {
+      addMessage(taskId, 'system',
+        `Cannot complete: PR creation failed for branch \`${branchName}\` (HTTP ${res.status}): ${truncate(res.body, 300)}. Resolve the issue and retry completion.`
+      );
+      return { kind: 'blocked' };
+    }
+  }
+
+  // Complete the PR: merge it and delete the source branch. `lastMergeSourceCommit`
+  // must match the PR's current source tip, so prefer the value ADO reports and fall
+  // back to the commit we just pushed. Completion is queued and processed
+  // asynchronously, so the poll below waits for the authoritative status.
+  let mergeSourceCommit = branchTip;
+  const showUrl = `${reposBase}/pullrequests/${prId}?${apiVer}`;
+  const showRes = await adoApi(ws, 'GET', showUrl);
+  if (showRes.status >= 200 && showRes.status < 300) {
+    try {
+      const commit = JSON.parse(showRes.body)?.lastMergeSourceCommit?.commitId;
+      if (commit) mergeSourceCommit = commit;
+    } catch { /* keep branchTip */ }
+  }
+
+  const patchBody: Record<string, unknown> = {
+    status: 'completed',
+    completionOptions: { deleteSourceBranch: true, mergeStrategy: 'noFastForward' },
+  };
+  if (mergeSourceCommit) patchBody.lastMergeSourceCommit = { commitId: mergeSourceCommit };
+
+  const patchRes = await adoApi(ws, 'PATCH', `${reposBase}/pullrequests/${prId}?${apiVer}`, patchBody);
+  let patchErr = '';
+  if (patchRes.curlMissing) { addMessage(taskId, 'system', curlMissingMsg); return { kind: 'blocked' }; }
+  if (isAdoAuthError(patchRes)) { addMessage(taskId, 'system', authErrMsg); return { kind: 'blocked' }; }
+  if (!(patchRes.status >= 200 && patchRes.status < 300)) {
+    patchErr = `HTTP ${patchRes.status}: ${truncate(patchRes.body, 300)}`;
+  }
+
+  // Poll until ADO finishes the merge.
+  let finalStatus = '';
+  for (let i = 0; i < 15; i++) {
+    const res = await adoApi(ws, 'GET', showUrl);
+    if (res.status >= 200 && res.status < 300) {
+      try { finalStatus = JSON.parse(res.body).status || ''; } catch { /* retry */ }
+    }
+    if (finalStatus === 'completed' || finalStatus === 'abandoned') break;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  if (finalStatus === 'completed') {
+    addMessage(taskId, 'system', `PR completed and branch \`${branchName}\` merged: ${prWebUrl(prId)}`);
+    // ADO's merge strategy may rewrite commits, so trust the authoritative status
+    // instead of a git-ancestor check.
+    return { kind: 'completed', verifyByGit: false };
+  }
+
+  addMessage(taskId, 'system',
+    `Cannot complete: the Azure DevOps PR for \`${branchName}\` could not be completed` +
+    `${finalStatus ? ` (status: ${finalStatus})` : ''}${patchErr ? ` — ${patchErr}` : ''}. ` +
+    `It may require approvals or have merge conflicts / branch policies — resolve them on the PR (${prWebUrl(prId)}) and retry completion.`
+  );
+  return { kind: 'blocked' };
+}
+
+/** Truncate a string for inclusion in a user-facing status message. */
+function truncate(s: string, max: number): string {
+  const t = s.trim();
+  return t.length > max ? `${t.slice(0, max)}…` : t;
 }
 
 // ─── Legacy stubs — kept for routes compatibility ────────────────────────────
