@@ -426,16 +426,32 @@ Do NOT:
 
 You MAY run read-only commands: git diff, git log, git status, cat, grep, find, npm test / go test / pytest (read test results — do not write new test files).
 
-REQUIRED — your response MUST end with exactly this block as the very last line, with no text after it:
+══════════════════════════════════════════════════════════════════
+OUTPUT CONTRACT — THIS IS THE ENTIRE POINT OF YOUR RUN
+══════════════════════════════════════════════════════════════════
+The ONLY part of your output that matters is a single line that begins with REVIEW_DECISION:. An automated parser reads that line and discards everything else. If you do not emit it, the whole task stalls and your review is wasted.
+
+Your response MUST end with exactly one of these, as the very last line, with NOTHING after it:
 
 REVIEW_DECISION: {"outcome":"pass","summary":"<one sentence>"}
    or
 REVIEW_DECISION: {"outcome":"fail","summary":"<one sentence>","issues":["<specific issue>","..."]}
 
 "pass" means: no significant issues found.
-"fail" means: specific actionable issues were found. The pipeline will forward your issues list to the implementer — you do not need to do anything else.
+"fail" means: specific actionable issues were found. The pipeline forwards your issues list to the implementer — you do not need to do anything else.
 
-This signal is parsed by an automated system — omitting it breaks the pipeline. Do NOT skip it, do NOT ask for confirmation, do NOT add any text after it.`;
+Concrete example of a complete, correct ending:
+
+    Overall the change is sound; the only gap is an unchecked array index.
+
+    REVIEW_DECISION: {"outcome":"fail","summary":"Off-by-one read can panic on empty input","issues":["parseRow() indexes cols[1] without checking length — empty line crashes"]}
+
+DO NOT, under any circumstances:
+- End with a question like "Want me to fix this?" or "Should I proceed?" — there is no human to answer; it stalls the task.
+- End with a prose "Verdict:" / "Summary:" paragraph INSTEAD of the REVIEW_DECISION line. A prose verdict is NOT a verdict — only the literal REVIEW_DECISION: {json} line counts.
+- Wrap the line so it never appears, or stop before emitting it.
+
+Before you finish, check: is the literal text "REVIEW_DECISION:" present as your final line? If not, add it now. This is non-negotiable.`;
 }
 
 interface ReviewDecision {
@@ -1513,21 +1529,31 @@ function startFilePolling(task: Task, implementerTurnId?: string | null): void {
 
       consecutiveErrors = 0;
 
-      if (jsonPart.trim() || partialLine) {
-        // Prepend any buffered partial line from the previous poll
-        const fullData = partialLine + jsonPart;
+      if (jsonPart.trim()) {
+        // Do NOT prepend the previous poll's partialLine. `pollOutputAndExit`
+        // runs `tail -n +${linesRead+1}`, and linesRead is only advanced for
+        // fully-consumed lines — the trailing partial line is popped WITHOUT
+        // advancing it. So the next `tail` already re-reads that line from its
+        // start, in full. Prepending the saved copy duplicated its bytes
+        // (`<partial><same line in full>`), which made JSON.parse throw and the
+        // event get silently dropped in `catch`. Large events (the final
+        // message carrying REVIEW_DECISION) straddle a poll boundary most
+        // often, so they were the prime casualties. jsonPart alone is complete.
+        const fullData = jsonPart;
         partialLine = '';
 
         const allLines = fullData.split('\n');
 
-        // The last element might be a partial line if the file is still being
-        // written.  Buffer it for the next poll instead of skipping it.
-        // A complete file always ends with '\n', so the last element after
-        // split is '' (empty).  If it's non-empty, it's an incomplete line.
-        const lastElement = allLines[allLines.length - 1];
-        if (lastElement && lastElement.trim()) {
-          partialLine = allLines.pop()!;
-        }
+        // Always drop the final split element — it is NEVER a consumed line.
+        // After split('\n') it is either '' (the remainder after a terminating
+        // newline) or a not-yet-terminated partial line to be re-read next
+        // poll. The old code only popped it when non-empty, so a clean-boundary
+        // chunk ("…\n") left a trailing '' in allLines; the loop below then did
+        // linesRead++ for that '' before the empty-line `continue`, advancing
+        // linesRead one past the real line count. The next `tail -n
+        // +${linesRead+1}` then skipped a real line and silently dropped its
+        // event — typically the post-idle-gap message carrying REVIEW_DECISION.
+        partialLine = allLines.pop() ?? '';
 
         if (!wiped) {
           // Staging check: don't wipe existing DB state until we have ≥1
@@ -1540,8 +1566,9 @@ function startFilePolling(task: Task, implementerTurnId?: string | null): void {
             try { JSON.parse(line); hasValidEvent = true; break; } catch { continue; }
           }
           if (!hasValidEvent) {
-            // Restore buffer; do NOT advance linesRead; do NOT wipe.
-            partialLine = fullData;
+            // Do NOT advance linesRead and do NOT wipe — leaving linesRead put
+            // means the next `tail` re-reads this same content in full, so we
+            // retry without losing or duplicating anything.
           } else {
             // Atomic wipe + reparse: rolls back if any insert throws.
             db.transaction(() => {
@@ -1808,14 +1835,23 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
       const exitFile = remoteReviewerExitCodePath(task.id);
       const { jsonPart, exitPart } = await pollOutputAndExit(task.workspace_name, outputFile, exitFile, linesRead);
 
-      if (jsonPart.trim() || partialLine) {
-        const fullData = partialLine + jsonPart;
+      if (jsonPart.trim()) {
+        // No prepend — see startFilePolling: `tail` re-reads the not-yet-
+        // consumed partial line in full each poll (linesRead isn't advanced for
+        // it), so prepending the saved copy duplicated bytes and corrupted the
+        // JSON, dropping the final message that carries REVIEW_DECISION. That
+        // was the actual cause of "did not emit a structured verdict" on every
+        // completion. partialLine is still set below purely so the done-flush
+        // can recover a final line that lacks a trailing newline.
+        const fullData = jsonPart;
         partialLine = '';
         const allLines = fullData.split('\n');
-        const lastElement = allLines[allLines.length - 1];
-        if (lastElement && lastElement.trim()) {
-          partialLine = allLines.pop()!;
-        }
+        // Always drop the final split element — see startFilePolling. The old
+        // conditional pop left a trailing '' (clean-boundary chunk) in allLines,
+        // and the loop's `linesRead++` counted it, over-advancing linesRead so
+        // the next `tail` skipped the next real line. That dropped the final
+        // REVIEW_DECISION-bearing message whenever a poll landed on a boundary.
+        partialLine = allLines.pop() ?? '';
 
         for (const line of allLines) {
           linesRead++;
@@ -1903,15 +1939,16 @@ function finalizeReviewer(
     // (subtype `error_max_turns`) before the reviewer reached its verdict.
     const cutOff = typeof resultSubtype === 'string' && resultSubtype.includes('max_turns');
 
-    // Recovery: the reviewer did the analysis but ran out of turns before
-    // writing its verdict. Resume the SAME session once (so it keeps all the
-    // context it gathered) and ask only for the REVIEW_DECISION block — no
-    // further investigation. `isWrapUp` guards against recursion if even this
-    // one-shot recovery is somehow cut off again.
-    if (cutOff && !isWrapUp) {
-      console.warn(`[auto-review] Reviewer for task ${task.id} hit turn limit without a verdict — resuming once for the decision`);
-      appendStreamLog(task.id, 'reviewer_output', '[Reviewer] hit turn limit — asking for final verdict');
-      const wrapUpPrompt = `You ran out of turns before emitting your verdict. Do NOT investigate further or run any tools. Based only on what you have already reviewed, output your final answer now: exactly one REVIEW_DECISION block (the pass/fail JSON from your instructions) and nothing else.`;
+    // Recovery: the reviewer produced no parseable verdict. In practice this is
+    // the common case — the model writes a thorough prose review and simply
+    // never appends the REVIEW_DECISION block (or it ran out of turns before
+    // doing so). Resume the SAME session once (so it keeps all the context it
+    // gathered) and demand ONLY the block — no further investigation, no prose.
+    // `isWrapUp` guards against recursion if the recovery itself produces none.
+    if (!isWrapUp) {
+      console.warn(`[auto-review] Reviewer for task ${task.id} emitted no verdict${cutOff ? ' (hit turn limit)' : ''} — resuming once for the decision`);
+      appendStreamLog(task.id, 'reviewer_output', '[Reviewer] no verdict emitted — asking for final decision');
+      const wrapUpPrompt = `You finished your review but did not output the required REVIEW_DECISION block — without it the automated pipeline cannot proceed. Do NOT investigate further, run any tools, ask any questions, or add commentary. Based only on what you have already reviewed, output your final answer now: exactly one REVIEW_DECISION block (the pass/fail JSON from your instructions) as your entire response and nothing else.`;
       executeReviewer(task, turnId, reviewerSessionId, {
         prompt: wrapUpPrompt,
         maxTurns: '5',
@@ -1919,9 +1956,9 @@ function finalizeReviewer(
         isWrapUp: true,
       }).catch(err => {
         console.error(`[auto-review] Reviewer verdict-recovery failed for task ${task.id}:`, (err as Error).message?.slice(0, 200));
-        completeTaskTurn(turnId, 'fail', 'Reviewer hit its turn limit before emitting a decision');
+        completeTaskTurn(turnId, 'fail', 'Reviewer did not produce a structured decision');
         addMessage(task.id, 'system',
-          `The reviewer ran out of turns (limit ${REVIEWER_MAX_TURNS}) before finishing its check, so it could not emit a verdict. You can raise CLAUDE_REVIEWER_MAX_TURNS, reply to send it back, or mark the task complete.`);
+          "The reviewer completed its check but did not emit a structured verdict. See the reviewer's response above — proceed when ready or reply to ask for clarification.");
         resetReviewLoopCount(task.id);
         setActiveTaskTurnRole(task.id, null);
         updateTaskStatus(task.id, 'awaiting_feedback');
@@ -2505,11 +2542,18 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
       );
       consecutiveErrors = 0;
 
-      if (jsonPart.trim() || partialLine) {
-        const fullData = partialLine + jsonPart;
+      if (jsonPart.trim()) {
+        // No prepend — see startFilePolling: `tail` already re-reads the
+        // unconsumed partial line in full each poll, so prepending the saved
+        // copy duplicated bytes and silently dropped events via JSON.parse.
+        const fullData = jsonPart;
         partialLine = '';
         const allLines = fullData.split('\n');
-        if (allLines[allLines.length - 1]?.trim()) partialLine = allLines.pop()!;
+        // Always drop the final split element — see startFilePolling. The old
+        // conditional pop left a trailing '' in allLines on a clean-boundary
+        // chunk, and `linesRead++` counted it, over-advancing linesRead so the
+        // next `tail` skipped a real line and dropped its event.
+        partialLine = allLines.pop() ?? '';
         for (const line of allLines) {
           linesRead++;
           if (!line.trim()) continue;
