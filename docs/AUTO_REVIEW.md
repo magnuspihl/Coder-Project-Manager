@@ -115,6 +115,34 @@ removed because an allowed tool is auto-approved in headless `-p` mode, which le
 files (e.g. edit `.gitignore`, `rm` artifacts). Write commands now fall outside the allowlist and
 are denied by the CLI's permission layer.
 
+**Stream reassembly (the actual root cause of the missing-verdict bug).** The reviewer's output is
+streamed off the workspace by polling its log file every 3s with `tail -n +${linesRead+1}`
+(`pollOutputAndExit`). `linesRead` is advanced only for **fully-consumed** lines; the trailing line
+that is still being written is popped off *without* advancing it, so the next poll's `tail` already
+re-reads that line from its start, in full. The poll loops, however, also prepended their own saved
+copy of it (`const fullData = partialLine + jsonPart`) — duplicating the line's bytes
+(`<partial><same line in full>`), which made `JSON.parse` throw so the event was silently dropped in
+`catch`. It only triggers when a poll lands mid-write of a line, so **large** events are the prime
+victims — and a reviewer's whole review plus its trailing `REVIEW_DECISION` arrives as one big final
+message that routinely straddles a poll boundary. Net effect: even a perfectly-emitted verdict was
+dropped, producing *both* the "did not emit a structured verdict" message **and** the "cut off"
+appearance. The fix removes the prepend in all three pollers that shared this bug (reviewer,
+implementer `startFilePolling`, chat-participant `startTaskParticipantPolling`); `tail`'s re-read is
+the single source of truth, and the trailing partial line is still skipped (never `JSON.parse`d or
+counted) until a later poll sees it complete. The prompt-hardening and verdict-recovery below are
+complementary backstops for genuine prose-only endings, not the primary fix.
+
+A *second* defect lived in the same line-counting logic and is fixed alongside it: the trailing
+`split('\n')` element used to be popped **only when non-empty** (`if (lastElement && lastElement.trim())`).
+When a poll's chunk ended on a clean newline (`"…\n"` — the common state during the idle gaps while
+the reviewer is thinking or running a tool), the trailing `""` was left in `allLines` and the loop did
+`linesRead++` for it before the empty-line `continue`, advancing `linesRead` one past the real line
+count. The next `tail -n +${linesRead+1}` then skipped a real line — usually the first message
+emitted *after* the gap, which is exactly where the final `REVIEW_DECISION` lands. The done-flush
+can't recover it (it only reparses the last poll's `partialLine`, not a line skipped mid-stream). The
+fix pops the final element **unconditionally** (`partialLine = allLines.pop() ?? ''`) in all three
+pollers — that element is never a consumed line, so it must never be counted.
+
 **Turn budget.** The Reviewer runs with `--max-turns` set from `CLAUDE_REVIEWER_MAX_TURNS`
 (default **100**). A red-team review reading the diff, grepping, opening several files, and running
 the test suite each consume turns. The previous cap of 20 routinely cut reviewers off mid-analysis
@@ -123,12 +151,20 @@ verdict" message and a visibly truncated reviewer response. When the CLI does ab
 limit, the `result` event's subtype is `error_max_turns`; finalize detects this and surfaces an
 explicit "ran out of turns" message (with the limit) instead of the generic no-verdict text.
 
-**Verdict recovery.** When the reviewer is cut off at the turn limit *without* a verdict, finalize
-does not immediately escalate. It resumes the **same** reviewer session once (`--resume`, so all the
-context it already gathered is retained) with a short prompt asking only for the `REVIEW_DECISION`
-block and no further investigation (a tight `--max-turns 5`). The recovery is one-shot: an `isWrapUp`
-flag threaded through polling prevents it from recursing if that resume is itself cut off, in which
-case the explicit "ran out of turns" message is surfaced to the user as before.
+**Verdict recovery.** Whenever a review finishes with **no parseable `REVIEW_DECISION`** — whether
+because the model wrote a prose review and never appended the block (the common case in practice) or
+because it was cut off at the turn limit — finalize does not immediately escalate. It resumes the
+**same** reviewer session once (`--resume`, so all the context it already gathered is retained) with
+a short prompt demanding *only* the `REVIEW_DECISION` block: no further investigation, no questions,
+no commentary (a tight `--max-turns 5`). The recovery is one-shot: an `isWrapUp` flag threaded
+through polling prevents it from recursing if the resume itself yields no verdict, in which case the
+"did not emit a structured verdict" / "ran out of turns" message is surfaced to the user as before.
+
+**Why both a hardened prompt and recovery.** The reviewer system prompt leads with an explicit
+"OUTPUT CONTRACT" section (a worked example, plus a checklist to confirm the literal `REVIEW_DECISION:`
+line is present) so the *first* pass emits the block inline most of the time. The recovery resume is
+the backstop for the cases where the model still ends with prose or a "Want me to fix this?" question
+despite the contract — so a missing verdict no longer dead-ends on the user.
 
 ---
 
