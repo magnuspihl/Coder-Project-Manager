@@ -391,6 +391,14 @@ function remoteReviewerExitCodePath(taskId: string): string {
 // safety net if the flag is ever lost (e.g. a restart mid-turn).
 const noReviewDeclared = new Set<string>();
 
+// Task ids whose reviewer turn was interrupted by the user. A reviewer poll can
+// be mid-flight when interruptTask() stops it, so finalizeReviewer must check
+// this set and bail rather than route the (now-stale) verdict — otherwise the
+// finalizer would override the awaiting_feedback state the interrupt set, e.g.
+// by re-launching the implementer on a "fail". Stays set until the next
+// reviewer launches (launchReviewerOnTask), which clears it.
+const interruptedReviews = new Set<string>();
+
 // Detect and strip the implementer's NO_REVIEW_NEEDED opt-out marker. When found,
 // records it for onImplementerTurnComplete and returns the text with the marker
 // line removed so it never reaches the user-visible chat message.
@@ -1355,16 +1363,69 @@ export function cancelTask(taskId: string): void {
  */
 export function interruptTask(taskId: string): void {
   const db = getDb();
-  const partial = db.prepare("SELECT id, workspace_name, ssh_pid, claude_session_id FROM tasks WHERE id = ? AND status = 'working'")
-    .get(taskId) as { id: string; workspace_name: string; ssh_pid: number | null; claude_session_id: string | null } | undefined;
+  const partial = db.prepare("SELECT id, workspace_name, ssh_pid, claude_session_id, active_turn_role FROM tasks WHERE id = ? AND status = 'working'")
+    .get(taskId) as { id: string; workspace_name: string; ssh_pid: number | null; claude_session_id: string | null; active_turn_role: string | null } | undefined;
 
-  if (partial) {
-    killTaskProcess(partial.id, partial.ssh_pid, partial.workspace_name, partial.claude_session_id);
-    addMessage(partial.id, 'system',
-      'Task was interrupted by user. Note: token usage and cost for the in-flight turn may not be fully reflected — Claude only reports final totals at the end of a turn.'
-    );
-    updateTaskStatus(partial.id, 'awaiting_feedback');
+  if (!partial) return;
+
+  // Reviewer phase: the auto-reviewer runs as a detached process polled under a
+  // separate `review:<id>` key, with its own session id on the open turn — none
+  // of which killTaskProcess (scoped to the implementer's pid/session) would
+  // touch. Stop the reviewer specifically and hand control back to the user
+  // instead of letting its verdict route the task (e.g. into a failed state).
+  if (partial.active_turn_role === 'reviewer') {
+    interruptReviewer(partial.id, partial.workspace_name);
+    return;
   }
+
+  killTaskProcess(partial.id, partial.ssh_pid, partial.workspace_name, partial.claude_session_id);
+  addMessage(partial.id, 'system',
+    'Task was interrupted by user. Note: token usage and cost for the in-flight turn may not be fully reflected — Claude only reports final totals at the end of a turn.'
+  );
+  updateTaskStatus(partial.id, 'awaiting_feedback');
+}
+
+/**
+ * Stop an in-flight auto-reviewer and transition the task to awaiting_feedback.
+ * Unlike a turn-limit cutoff or a missing verdict, a user interrupt must NOT
+ * land the task in a failed state — the user is explicitly taking over.
+ */
+function interruptReviewer(taskId: string, workspaceName: string): void {
+  // Guard first so any reviewer poll already mid-flight bails in finalizeReviewer
+  // rather than routing a verdict after we set awaiting_feedback below.
+  interruptedReviews.add(taskId);
+
+  const pollKey = `review:${taskId}`;
+  stopPolling(pollKey);
+  taskActivity.delete(pollKey);
+  taskActivity.delete(taskId);
+
+  // Kill the detached remote reviewer process. It's scoped by the reviewer's
+  // own session id (recorded on the open turn), not the task's implementer
+  // session, so pkill on that pattern is the only thing that stops it.
+  const openTurn = getLatestTaskTurn(taskId);
+  const reviewerSessionId = openTurn && openTurn.role === 'reviewer' && !openTurn.completed_at
+    ? openTurn.claude_session_id
+    : null;
+  if (reviewerSessionId) {
+    const pattern = reviewerSessionId.replace(/[^a-zA-Z0-9-]/g, '');
+    if (pattern.length >= 8) {
+      sshExec(workspaceName, `pkill -f ${pattern} || true`, 10000)
+        .catch(err => console.error(`[kill] Remote reviewer pkill failed for task ${taskId}:`, (err as Error).message?.slice(0, 120)));
+    }
+    completeTaskTurn(openTurn!.id);
+  }
+
+  addMessage(taskId, 'system',
+    'Reviewer was interrupted by user. The automated review did not finish — reply to continue, or mark the task complete.'
+  );
+  resetReviewLoopCount(taskId);
+  setActiveTaskTurnRole(taskId, null);
+  updateTaskStatus(taskId, 'awaiting_feedback');
+  // Keep the guard set until the next reviewer launches (cleared in
+  // launchReviewerOnTask). Deleting it here would race a reviewer poll already
+  // mid-flight: interruptReviewer runs to completion in one synchronous tick, so
+  // the poll would resume from its await and find the flag gone.
 }
 
 /** Kill the SSH process for a task and clean up tracking state. */
@@ -1829,6 +1890,9 @@ async function onImplementerTurnComplete(task: Task): Promise<void> {
  * REVIEW_DECISION line that the server parses to determine next action.
  */
 async function launchReviewerOnTask(task: Task): Promise<void> {
+  // Fresh reviewer turn — clear any stale interrupt guard from a prior pass so
+  // this run's verdict is allowed to route.
+  interruptedReviews.delete(task.id);
   const reviewerSessionId = randomUUID();
   const turn = createTaskTurn({
     taskId: task.id,
@@ -2041,6 +2105,15 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
         }
       }
 
+      // User interrupted this reviewer — interruptReviewer already settled the
+      // task to awaiting_feedback. Bail without finalizing so we don't route a
+      // stale verdict over that state.
+      if (interruptedReviews.has(task.id)) {
+        finalized = true;
+        stopPolling(pollKey);
+        return;
+      }
+
       const done = exitPart !== 'RUNNING' && exitPart !== '';
       if (done && !finalized) {
         finalized = true;
@@ -2100,6 +2173,10 @@ function finalizeReviewer(
 ): void {
   const current = getTask(task.id);
   if (!current) return;
+
+  // The user interrupted the reviewer between this poll being scheduled and now.
+  // interruptReviewer has already settled the task — don't route the verdict.
+  if (interruptedReviews.has(task.id)) return;
 
   const decision = parseReviewDecision(allText);
 
