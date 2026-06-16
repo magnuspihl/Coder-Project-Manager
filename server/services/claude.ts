@@ -396,6 +396,21 @@ async function getGitDiff(worktreePath: string, workspaceName: string): Promise<
   }
 }
 
+// The machine-readable verdict contract, restated in plain text. This is
+// embedded in the reviewer's USER prompt (the `-p` content), not only the
+// appended system prompt, so it survives `--resume` and `--setting-sources ''`.
+// The appended system prompt is not reliably re-attached to a resumed session,
+// which is why the verdict-recovery resume used to elicit "I don't have a
+// REVIEW_DECISION format in my instructions" — the schema was gone. Keeping the
+// contract in the conversation itself makes the verdict reproducible regardless
+// of how the system prompt was (or wasn't) delivered.
+const REVIEW_DECISION_FORMAT = `Output exactly one of these two lines as the very last line of your response, with nothing after it:
+
+REVIEW_DECISION: {"outcome":"pass","summary":"<one sentence>"}
+REVIEW_DECISION: {"outcome":"fail","summary":"<one sentence>","issues":["<specific issue>","..."]}
+
+"pass" = no significant issues found. "fail" = specific actionable issues were found; list each one in "issues". Output only the raw JSON after the marker — no markdown, no code fences, no commentary after it.`;
+
 function buildReviewerSystemPrompt(): string {
   return `MANDATORY REVIEW RULES — RED TEAM MODE:
 
@@ -460,26 +475,30 @@ interface ReviewDecision {
   issues?: string[];
 }
 
-function parseReviewDecision(text: string): ReviewDecision | null {
-  // Tolerant parsing: the model often wraps the marker in markdown (**bold**,
-  // `code`, fenced blocks), indents it, or pretty-prints the JSON across
-  // multiple lines. The old anchored single-line regex (`^…$/m`) missed all of
-  // those and treated a perfectly good verdict as "no decision". Instead, find
-  // the LAST `REVIEW_DECISION` marker (the model may discuss it before emitting
-  // the real one) and extract the first balanced JSON object after it.
-  const markerRe = /REVIEW_DECISION\b\s*:?[ \t]*/gi;
-  let markerEnd = -1;
-  let m: RegExpExecArray | null;
-  while ((m = markerRe.exec(text)) !== null) {
-    markerEnd = m.index + m[0].length;
-  }
-  if (markerEnd === -1) return null;
+// The literal placeholder tokens from the verdict template / worked example in
+// the reviewer system prompt and REVIEW_DECISION_FORMAT. A weak (or rushed)
+// model can echo the example line verbatim — e.g.
+// `REVIEW_DECISION: {"outcome":"pass","summary":"<one sentence>"}` — which must
+// NOT be accepted as a real verdict: doing so would silently route the task on a
+// fabricated pass/fail the reviewer never actually reached. We reject a decision
+// whose summary is a placeholder, and strip placeholder entries from `issues`.
+const PLACEHOLDER_SUMMARIES = new Set(['<one sentence>', '<summary>']);
+const PLACEHOLDER_ISSUES = new Set(['<specific issue>', '<issue>', '...']);
 
-  const braceStart = text.indexOf('{', markerEnd);
+function isPlaceholderSummary(summary: string): boolean {
+  return PLACEHOLDER_SUMMARIES.has(summary.trim());
+}
+
+/**
+ * Extract and validate the balanced JSON object that begins at the first `{`
+ * at or after `from`. Returns the decision or null if no valid object is found.
+ * The brace walk respects JSON string literals so a `}` inside a summary/issue
+ * value doesn't terminate the object early.
+ */
+function extractDecisionAt(text: string, from: number): ReviewDecision | null {
+  const braceStart = text.indexOf('{', from);
   if (braceStart === -1) return null;
 
-  // Walk the string tracking brace depth, respecting JSON string literals so a
-  // `}` inside a summary/issue value doesn't terminate the object early.
   let depth = 0;
   let end = -1;
   let inStr = false;
@@ -504,16 +523,52 @@ function parseReviewDecision(text: string): ReviewDecision | null {
   try {
     const parsed = JSON.parse(text.slice(braceStart, end + 1));
     if (parsed.outcome !== 'pass' && parsed.outcome !== 'fail') return null;
-    return {
-      outcome: parsed.outcome,
-      summary: typeof parsed.summary === 'string' ? parsed.summary : '',
-      issues: Array.isArray(parsed.issues)
-        ? parsed.issues.filter((x: unknown): x is string => typeof x === 'string')
-        : undefined,
-    };
+    const summary = typeof parsed.summary === 'string' ? parsed.summary : '';
+    // Reject an echoed template (e.g. summary still "<one sentence>") — see
+    // PLACEHOLDER_SUMMARIES. Returning null lets parseReviewDecision fall back to
+    // an earlier (real) marker, or trigger verdict recovery if there is none.
+    if (isPlaceholderSummary(summary)) return null;
+    // Drop placeholder issue entries the model copied from the example without
+    // filling in (e.g. "<specific issue>", "..."), keeping only real issues. An
+    // empty list collapses to undefined so downstream routing falls back to the
+    // summary rather than surfacing an empty "issues found" list.
+    const realIssues = Array.isArray(parsed.issues)
+      ? parsed.issues.filter((x: unknown): x is string =>
+          typeof x === 'string' && !PLACEHOLDER_ISSUES.has(x.trim()))
+      : [];
+    return { outcome: parsed.outcome, summary, issues: realIssues.length ? realIssues : undefined };
   } catch {
     return null;
   }
+}
+
+function parseReviewDecision(text: string): ReviewDecision | null {
+  // Tolerant parsing: the model often wraps the marker in markdown (**bold**,
+  // `code`, fenced blocks), indents it, or pretty-prints the JSON across
+  // multiple lines. The old anchored single-line regex (`^…$/m`) missed all of
+  // those and treated a perfectly good verdict as "no decision".
+  //
+  // We collect every `REVIEW_DECISION` marker and try them from LAST to first,
+  // returning the first that yields a valid verdict object. Trying the last
+  // marker first preserves the "the model may discuss the token before emitting
+  // the real verdict" behaviour. Falling back to earlier markers fixes a real
+  // misparse in THIS codebase: when the reviewer reviews its own pipeline, a
+  // genuine verdict can contain the literal token inside an issue string, e.g.
+  // `…"issues":["the reviewer never emits REVIEW_DECISION: when cut off"]`. The
+  // last marker then lands *inside* the JSON; anchoring to it alone would find
+  // no `{` (or a stray later brace) and drop an otherwise-valid verdict.
+  const markerRe = /REVIEW_DECISION\b\s*:?[ \t]*/gi;
+  const markerEnds: number[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = markerRe.exec(text)) !== null) {
+    markerEnds.push(m.index + m[0].length);
+  }
+
+  for (let i = markerEnds.length - 1; i >= 0; i--) {
+    const decision = extractDecisionAt(text, markerEnds[i]);
+    if (decision) return decision;
+  }
+  return null;
 }
 
 // Stream log per task — persisted to database
@@ -1584,6 +1639,20 @@ function startFilePolling(task: Task, implementerTurnId?: string | null): void {
         }
       }
 
+      // Flush the trailing un-terminated line once the run is done. The final
+      // line — typically the `result` event carrying fatal-error / cost / token
+      // info — can arrive WITHOUT a trailing newline, so it gets popped into
+      // `partialLine` and is otherwise never processed: `resultSeen` stays false
+      // and finalize falls through to the exit-code branch, silently dropping
+      // the result event (the same class of "lost final message" bug the reviewer
+      // poller's flush fixed). Guard on `wiped` so we never bypass the staging
+      // wipe, and re-run the shared `processLine` so result handling is identical.
+      const streamDone = exitPart !== 'RUNNING' && exitPart !== '';
+      if (streamDone && wiped && !finalized && partialLine.trim()) {
+        processLine(partialLine);
+        partialLine = '';
+      }
+
       // Finalize on `result` event arrival — Claude has logically finished even
       // if the OS process hasn't exited yet (e.g. lingering subprocess holds the
       // stdout pipe open, blocking exit). Don't wait for the exit code.
@@ -1719,7 +1788,7 @@ async function launchReviewerOnTask(task: Task): Promise<void> {
 
   const gitDiff = await getGitDiff(task.worktree_path!, task.workspace_name);
 
-  const reviewerPrompt = `Original task:\n${task.prompt}\n\nChanges made by the implementer:\n${gitDiff}`;
+  const reviewerPrompt = `Original task:\n${task.prompt}\n\nChanges made by the implementer:\n${gitDiff}\n\n---\nReview the change adversarially, then emit your verdict. ${REVIEW_DECISION_FORMAT}`;
 
   await executeReviewer(task, turn.id, reviewerSessionId, {
     prompt: reviewerPrompt,
@@ -1770,8 +1839,18 @@ async function executeReviewer(
   // is not a "setting source"), so the reviewer obeys only the prompt below.
   claudeParts.push('--setting-sources', shellEscape(''));
   claudeParts.push('--max-turns', opts.maxTurns);
-  if (task.model && !task.model.startsWith('ollama/')) {
-    claudeParts.push('--model', shellEscape(task.model));
+  // Match the implementer's model handling. Ollama models are prefixed
+  // `ollama/`; the CLI needs the bare model name plus the Anthropic endpoint
+  // pointed at Ollama (exported in the remote command below). The previous code
+  // skipped `--model` entirely for Ollama tasks AND never set the endpoint, so
+  // the reviewer silently ran against the default Anthropic API with whatever
+  // ambient credentials existed — the wrong model, or an auth error producing
+  // an empty review and a spurious "no verdict" escalation. The doc (§11) says
+  // the reviewer uses the same model as the implementer; this restores that.
+  const isOllama = task.model?.startsWith('ollama/');
+  const actualModel = isOllama ? task.model!.slice('ollama/'.length) : task.model;
+  if (actualModel) {
+    claudeParts.push('--model', shellEscape(actualModel));
   }
   claudeParts.push('--append-system-prompt', shellEscape(buildReviewerSystemPrompt()));
   claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
@@ -1781,6 +1860,9 @@ async function executeReviewer(
   const exitFile = remoteReviewerExitCodePath(task.id);
 
   let remoteCmd = 'export PATH="$HOME/.local/bin:$PATH" && ';
+  if (isOllama) {
+    remoteCmd += `export ANTHROPIC_BASE_URL="${OLLAMA_BASE_URL}" ANTHROPIC_API_KEY="" ANTHROPIC_AUTH_TOKEN=ollama && `;
+  }
   const workDir = task.worktree_path || task.project_dir;
   if (workDir) {
     remoteCmd += `cd ${shellEscape(workDir)} && `;
@@ -1792,6 +1874,26 @@ async function executeReviewer(
   console.log(`[auto-review] ${opts.resume ? 'Resuming' : 'Launching'} reviewer for task ${task.id}`);
 
   try {
+    // Archive the previous reviewer run's output/exit files in a SEPARATE,
+    // AWAITED step before spawning — mirroring the implementer (launchTask).
+    // The remote command's own `rm -f` is in-band and only runs once the
+    // detached `coder ssh` has connected (seconds later), but polling starts
+    // synchronously below. Without this pre-clean, the first poll could `cat` a
+    // STALE `-review.exit` left by a prior reviewer pass (or the prior loop
+    // iteration), see a non-RUNNING exit code, and finalize immediately against
+    // the previous turn's leftover output — routing on a stale verdict or, once
+    // the in-band `rm` lands, on empty text (a spurious "no verdict"). Awaiting
+    // the cleanup before polling closes the race. Archive to `.prev` rather than
+    // delete so the prior pass stays available for forensics.
+    try {
+      await sshExec(task.workspace_name,
+        `mv -f ${shellEscape(outputFile)} ${shellEscape(outputFile + '.prev')} 2>/dev/null; ` +
+        `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`,
+      );
+    } catch {
+      // Non-fatal — the remote command's in-band `rm -f` is a second layer.
+    }
+
     const sshProcess = isLocalWorkspace(task.workspace_name)
       ? spawn('bash', ['-c', remoteCmd], { env: { ...process.env }, stdio: 'ignore', detached: true })
       : spawn('coder', ['ssh', task.workspace_name, '--', remoteCmd], {
@@ -1897,12 +1999,26 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
           try {
             const event = JSON.parse(partialLine) as { type: string; [key: string]: unknown };
             if (event.type === 'assistant' && (event.message as { content?: unknown })?.content) {
+              let turnText = '';
               for (const block of (event.message as { content: Array<{ type: string; text?: string }> }).content) {
-                if (block.type === 'text' && block.text) allAssistantText += block.text;
+                if (block.type === 'text' && block.text) turnText += block.text;
+              }
+              // Mirror the in-loop path: persist the flushed text as a message so
+              // the reviewer's final output (incl. the verdict line) is visible in
+              // the conversation, not just used for routing.
+              if (turnText) {
+                allAssistantText += turnText;
+                addMessage(task.id, 'assistant', turnText, undefined, undefined, undefined, undefined, undefined, turnId);
               }
             } else if (event.type === 'result') {
               if (typeof event.subtype === 'string') resultSubtype = event.subtype;
-              allAssistantText += extractResultText(event);
+              const resultText = extractResultText(event);
+              // Dedup against text already captured (the in-loop path may have
+              // recorded the same final assistant text) so we don't double-append.
+              if (resultText && resultText !== allAssistantText.slice(-resultText.length)) {
+                allAssistantText += resultText;
+                addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined, undefined, undefined, undefined, undefined, turnId);
+              }
             }
           } catch { /* not a complete JSON event — nothing to recover */ }
         }
@@ -1948,7 +2064,7 @@ function finalizeReviewer(
     if (!isWrapUp) {
       console.warn(`[auto-review] Reviewer for task ${task.id} emitted no verdict${cutOff ? ' (hit turn limit)' : ''} — resuming once for the decision`);
       appendStreamLog(task.id, 'reviewer_output', '[Reviewer] no verdict emitted — asking for final decision');
-      const wrapUpPrompt = `You finished your review but did not output the required REVIEW_DECISION block — without it the automated pipeline cannot proceed. Do NOT investigate further, run any tools, ask any questions, or add commentary. Based only on what you have already reviewed, output your final answer now: exactly one REVIEW_DECISION block (the pass/fail JSON from your instructions) as your entire response and nothing else.`;
+      const wrapUpPrompt = `You finished your review but did not output the required REVIEW_DECISION line — without it the automated pipeline cannot proceed. Do NOT investigate further, run any tools, ask any questions, or add commentary. Based only on what you have already reviewed, output your verdict now as your entire response and nothing else.\n\n${REVIEW_DECISION_FORMAT}`;
       executeReviewer(task, turnId, reviewerSessionId, {
         prompt: wrapUpPrompt,
         maxTurns: '5',
@@ -2531,6 +2647,60 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
   let finalized = false, resultSeen = false;
   let resultError: string | null = null;
 
+  // Per-line processor — shared by the incremental loop and the done-flush so
+  // BOTH handle every event shape identically (text, AskUserQuestion, other
+  // tool_use, rate_limit_event, result). The flush previously open-coded a
+  // narrower subset, dropping a final AskUserQuestion or rate-limit line that
+  // arrived without a trailing newline. It does NOT touch linesRead — the caller
+  // owns line counting (the loop increments; the flushed partial line was never
+  // counted and must not be).
+  const processParticipantLine = (line: string): void => {
+    if (!line.trim()) return;
+    let event: { type: string; [key: string]: unknown };
+    try { event = JSON.parse(line); } catch { return; }
+    try {
+      if (event.type === 'rate_limit_event') {
+        const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string } | undefined;
+        if (info) updateWorkspaceUsage(participant.workspace_name, info);
+      }
+      const now = new Date().toISOString();
+      if (event.type === 'assistant' && event.message) {
+        const msg = event.message as { content?: Array<{ type: string; text?: string; name?: string; input?: unknown }> };
+        for (const block of msg.content || []) {
+          if (block.type === 'text' && block.text) {
+            taskActivity.set(pollKey, { timestamp: now, summary: block.text.slice(0, 200).replace(/\n/g, ' ') });
+            const saved = addMessage(task.id, 'assistant', block.text, undefined, participant.workspace_name, participant.id);
+            lastSavedMessageId = saved.id; lastSavedMessageText = block.text;
+            parseTaskRequestsForTask(task, block.text);
+            parseTaskMentions(task, block.text, participant.id);
+          } else if (block.type === 'tool_use' && block.name === 'AskUserQuestion') {
+            const question = formatAskUserQuestion(block.input);
+            if (question) {
+              taskActivity.set(pollKey, { timestamp: now, summary: 'Asking the user a question' });
+              const saved = addMessage(task.id, 'assistant', question, undefined, participant.workspace_name, participant.id);
+              lastSavedMessageId = saved.id; lastSavedMessageText = question;
+            }
+          } else if (block.type === 'tool_use') {
+            taskActivity.set(pollKey, { timestamp: now, summary: `Using ${block.name || 'tool'}` });
+          }
+        }
+      } else if (event.type === 'result') {
+        const fatal = extractFatalError(event);
+        const resultText = extractResultText(event);
+        if (!fatal && resultText && resultText !== lastSavedMessageText) {
+          const saved = addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined, participant.workspace_name, participant.id);
+          lastSavedMessageId = saved.id; lastSavedMessageText = resultText;
+          parseTaskRequestsForTask(task, resultText);
+          parseTaskMentions(task, resultText, participant.id);
+        } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
+          updateMessageCost(lastSavedMessageId, event.total_cost_usd as number);
+        }
+        if (fatal) resultError = fatal;
+        resultSeen = true;
+      }
+    } catch { /* skip */ }
+  };
+
   const poll = async () => {
     if (polling) return;
     polling = true;
@@ -2556,52 +2726,22 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
         partialLine = allLines.pop() ?? '';
         for (const line of allLines) {
           linesRead++;
-          if (!line.trim()) continue;
-          let event: { type: string; [key: string]: unknown };
-          try { event = JSON.parse(line); } catch { continue; }
-          try {
-            if (event.type === 'rate_limit_event') {
-              const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string } | undefined;
-              if (info) updateWorkspaceUsage(participant.workspace_name, info);
-            }
-            const now = new Date().toISOString();
-            if (event.type === 'assistant' && event.message) {
-              const msg = event.message as { content?: Array<{ type: string; text?: string; name?: string; input?: unknown }> };
-              for (const block of msg.content || []) {
-                if (block.type === 'text' && block.text) {
-                  taskActivity.set(pollKey, { timestamp: now, summary: block.text.slice(0, 200).replace(/\n/g, ' ') });
-                  const saved = addMessage(task.id, 'assistant', block.text, undefined, participant.workspace_name, participant.id);
-                  lastSavedMessageId = saved.id; lastSavedMessageText = block.text;
-                  parseTaskRequestsForTask(task, block.text);
-                  parseTaskMentions(task, block.text, participant.id);
-                } else if (block.type === 'tool_use' && block.name === 'AskUserQuestion') {
-                  const question = formatAskUserQuestion(block.input);
-                  if (question) {
-                    taskActivity.set(pollKey, { timestamp: now, summary: 'Asking the user a question' });
-                    const saved = addMessage(task.id, 'assistant', question, undefined, participant.workspace_name, participant.id);
-                    lastSavedMessageId = saved.id; lastSavedMessageText = question;
-                  }
-                } else if (block.type === 'tool_use') {
-                  taskActivity.set(pollKey, { timestamp: now, summary: `Using ${block.name || 'tool'}` });
-                }
-              }
-            } else if (event.type === 'result') {
-              const fatal = extractFatalError(event);
-              const resultText = extractResultText(event);
-              if (!fatal && resultText && resultText !== lastSavedMessageText) {
-                const saved = addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined, participant.workspace_name, participant.id);
-                lastSavedMessageId = saved.id; lastSavedMessageText = resultText;
-                parseTaskRequestsForTask(task, resultText);
-                parseTaskMentions(task, resultText, participant.id);
-              } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
-                updateMessageCost(lastSavedMessageId, event.total_cost_usd as number);
-              }
-              if (fatal) resultError = fatal;
-              resultSeen = true;
-            }
-          } catch { /* skip */ }
+          processParticipantLine(line);
         }
       }
+      // Flush the trailing un-terminated final line once the run is done — the
+      // final line (the `result` event carrying fatal-error / cost, or a last
+      // assistant text / AskUserQuestion) can arrive without a trailing newline,
+      // landing in `partialLine` where it would otherwise be dropped and finalize
+      // would fall through to the exit-code branch. Reuse the shared processor so
+      // every event shape is handled identically. Same fix as the implementer and
+      // reviewer pollers.
+      const streamDone = exitPart !== 'RUNNING' && exitPart !== '';
+      if (streamDone && !finalized && partialLine.trim()) {
+        processParticipantLine(partialLine);
+        partialLine = '';
+      }
+
       // Finalize on `result` event arrival — Claude has logically finished even
       // if the OS process hasn't exited yet (e.g. lingering subprocess holds the
       // stdout pipe open, blocking exit). Don't wait for the exit code.
