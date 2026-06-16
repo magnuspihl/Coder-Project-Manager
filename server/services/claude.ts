@@ -298,6 +298,21 @@ If you discover work that is out of scope for this task (a separate bug, a follo
 
 The user is prompted to approve it; an approved request becomes a new task branched from the default branch. If the user asks you to "create a task" for something, that means emitting a [TASK_REQUEST] — never create tasks via the API. To target a different workspace you have access to, add a "targetWorkspace" field (the workspace's name) to the JSON; otherwise it runs in this workspace.`;
 
+// Auto-review opt-out: when a turn produces code changes, an automated reviewer
+// inspects them before the task finishes. Many turns are NOT code changes worth
+// reviewing — answering a question, giving a diagnosis, or only investigating —
+// yet they can still leave the worktree dirty (build output, a touched lockfile,
+// a scratch file), which trips the diff-based gate and launches a pointless
+// reviewer. We let the implementer declare intent: emitting NO_REVIEW_NEEDED on
+// its own line skips the reviewer regardless of incidental worktree noise.
+const NO_REVIEW_MARKER = 'NO_REVIEW_NEEDED';
+const NO_REVIEW_PROMPT = `AUTO-REVIEW OPT-OUT:
+After your turn, an automated code reviewer inspects any changes you made before the task finishes. This is wasteful when your turn was not a code change worth reviewing. If you did NOT make code changes that warrant review — e.g. you answered a question, gave a diagnosis or recommendation, only investigated/explored, or made a trivial non-functional change — end your final response with this exact line, on its own, with nothing after it:
+
+${NO_REVIEW_MARKER}
+
+This skips the reviewer and hands control straight back to the user. Do NOT emit it if you wrote or modified code that should be checked. The marker is stripped before your message is shown to the user.`;
+
 // Caveman mode prompt — reduces output token usage by forcing terse communication
 function buildCavemanPrompt(intensity: string): string {
   const level = intensity || 'full';
@@ -367,6 +382,23 @@ function remoteReviewerOutputPath(taskId: string): string {
 
 function remoteReviewerExitCodePath(taskId: string): string {
   return `/tmp/cpm-task-${taskId}-review.exit`;
+}
+
+// Task IDs whose latest implementer turn emitted the NO_REVIEW_NEEDED marker.
+// Populated as the implementer's output streams in, consumed (and cleared) when
+// the turn completes. In-memory is sufficient: the producing and consuming code
+// run in the same process within one turn, and the diff-based gate remains the
+// safety net if the flag is ever lost (e.g. a restart mid-turn).
+const noReviewDeclared = new Set<string>();
+
+// Detect and strip the implementer's NO_REVIEW_NEEDED opt-out marker. When found,
+// records it for onImplementerTurnComplete and returns the text with the marker
+// line removed so it never reaches the user-visible chat message.
+function stripNoReviewMarker(taskId: string, text: string): string {
+  const re = new RegExp(`^[ \\t]*${NO_REVIEW_MARKER}[ \\t]*$`, 'm');
+  if (!re.test(text)) return text;
+  noReviewDeclared.add(taskId);
+  return text.replace(re, '').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 async function worktreeHasChanges(worktreePath: string, workspaceName: string): Promise<boolean> {
@@ -1104,6 +1136,13 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     claudeParts.push('--append-system-prompt', shellEscape(TASK_DELEGATION_PROMPT));
   }
 
+  // Let the implementer opt out of the reviewer when its turn isn't a
+  // review-worthy code change (question/diagnosis/advisory). Only relevant when
+  // auto-review is actually on for this task.
+  if (!isSlashCommand && task.auto_review) {
+    claudeParts.push('--append-system-prompt', shellEscape(NO_REVIEW_PROMPT));
+  }
+
   claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
   claudeParts.push('--append-system-prompt', shellEscape(INTERACTIVE_PROMPT_NOTE));
 
@@ -1162,6 +1201,8 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
 
     updateTaskStatus(task.id, 'working');
     setActiveTaskTurnRole(task.id, 'implementer');
+    // Clear any opt-out flag from a prior turn before this one starts streaming.
+    noReviewDeclared.delete(task.id);
     // Record this implementer run as a turn so its messages carry a turn_id.
     // Reviewer turns were always recorded, but implementer turns were not — so
     // implementer messages had a NULL turn_id and the UI couldn't attribute
@@ -1533,7 +1574,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null): void {
       // Save each assistant turn's text as a message immediately,
       // so it appears in the chat UI while the task is still working.
       if (event.type === 'assistant' && (event.message as { content?: unknown })?.content) {
-        const turnText = extractAssistantTurnText((event.message as { content: Array<{ type: string; text?: string; name?: string; input?: unknown }> }).content);
+        const turnText = stripNoReviewMarker(task.id, extractAssistantTurnText((event.message as { content: Array<{ type: string; text?: string; name?: string; input?: unknown }> }).content));
         if (turnText) {
           const msg = addMessage(task.id, 'assistant', turnText, undefined, undefined, undefined, undefined, undefined, turnId);
           lastSavedMessageId = msg.id;
@@ -1545,7 +1586,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null): void {
 
       if (event.type === 'result') {
         const fatal = extractFatalError(event);
-        const resultText = extractResultText(event);
+        const resultText = stripNoReviewMarker(task.id, extractResultText(event));
         // For non-error results, save the result text as an assistant message
         // (when distinct from the last). For errors, skip — finalizeTask will
         // write a structured system message instead of leaking the raw error
@@ -1739,6 +1780,19 @@ async function onImplementerTurnComplete(task: Task): Promise<void> {
 
   // No auto-review: check the flag, and also skip if no worktree (pre-worktrees task)
   if (!current.auto_review || !current.worktree_path) {
+    setActiveTaskTurnRole(task.id, null);
+    updateTaskStatus(task.id, 'awaiting_feedback');
+    processQueue(task.workspace_id).catch(() => {});
+    return;
+  }
+
+  // The implementer declared this turn isn't a review-worthy change (it answered
+  // a question, gave a diagnosis, or only investigated). Honor it even if the
+  // worktree is dirty from incidental noise — but NOT mid review-loop, where the
+  // implementer is meant to be fixing flagged issues rather than opting out.
+  const declaredNoReview = noReviewDeclared.delete(task.id);
+  if (declaredNoReview && current.review_loop_count === 0) {
+    appendStreamLog(task.id, 'reviewer_skip', 'Implementer signalled NO_REVIEW_NEEDED — skipping review');
     setActiveTaskTurnRole(task.id, null);
     updateTaskStatus(task.id, 'awaiting_feedback');
     processQueue(task.workspace_id).catch(() => {});
@@ -2311,7 +2365,7 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
         stagedStreamEvents.push(event);
 
         if (event.type === 'assistant' && event.message?.content) {
-          const turnText = extractAssistantTurnText(event.message.content);
+          const turnText = stripNoReviewMarker(task.id, extractAssistantTurnText(event.message.content));
           if (turnText) {
             stagedMessages.push({ text: turnText });
             lastStagedText = turnText;
@@ -2319,7 +2373,7 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
         }
         if (event.type === 'result') {
           const fatal = extractFatalError(event);
-          const resultText = extractResultText(event);
+          const resultText = stripNoReviewMarker(task.id, extractResultText(event));
           const cost = typeof event.total_cost_usd === 'number' ? event.total_cost_usd as number : undefined;
           // Skip staging the result text as an assistant message when it's a
           // fatal error — finalizeTask will surface it as a system error instead.
