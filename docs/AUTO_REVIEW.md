@@ -91,6 +91,10 @@ Changes made by the implementer:
 
 Untracked files added:
 {git ls-files --others --exclude-standard}
+
+---
+Review the change adversarially, then emit your verdict.
+{REVIEW_DECISION_FORMAT — the literal verdict contract, see "self-contained" note below}
 ```
 
 If the diff exceeds ~8 000 tokens (estimated by character count), it is truncated to the first
@@ -143,6 +147,23 @@ can't recover it (it only reparses the last poll's `partialLine`, not a line ski
 fix pops the final element **unconditionally** (`partialLine = allLines.pop() ?? ''`) in all three
 pollers — that element is never a consumed line, so it must never be counted.
 
+A *third* facet: the **done-flush** (reparse the trailing `partialLine` once the run is finished) is
+now present in **all three** pollers, not just the reviewer. The final line — usually the `result`
+event carrying the fatal-error / cost / token info — can arrive **without a trailing newline**, so it
+is popped into `partialLine` and otherwise never processed. In the implementer and chat-participant
+pollers this previously meant `resultSeen` never flipped, finalize fell through to the exit-code
+branch, and the `result` event was silently dropped (a context-window error on the final event could
+even be misread as a clean exit). Each poller now flushes the trailing line when the stream is done:
+the implementer reuses its shared `processLine` (guarded on `wiped` so it never bypasses the staging
+wipe); the participant poller likewise extracts a shared `processParticipantLine` used by **both** the
+incremental loop and the flush, so every event shape (text, `AskUserQuestion`, other `tool_use`,
+`rate_limit_event`, `result`) is handled identically — the earlier inline flush open-coded a narrower
+subset and would drop a final `AskUserQuestion` or rate-limit line that arrived without a newline. The
+reviewer's flush additionally **persists** the
+flushed text via `addMessage` and **dedups** the `result` text against what the in-loop path already
+captured, so the final review (incl. the verdict line) is visible in the conversation and never
+double-appended.
+
 **Turn budget.** The Reviewer runs with `--max-turns` set from `CLAUDE_REVIEWER_MAX_TURNS`
 (default **100**). A red-team review reading the diff, grepping, opening several files, and running
 the test suite each consume turns. The previous cap of 20 routinely cut reviewers off mid-analysis
@@ -159,6 +180,20 @@ a short prompt demanding *only* the `REVIEW_DECISION` block: no further investig
 no commentary (a tight `--max-turns 5`). The recovery is one-shot: an `isWrapUp` flag threaded
 through polling prevents it from recursing if the resume itself yields no verdict, in which case the
 "did not emit a structured verdict" / "ran out of turns" message is surfaced to the user as before.
+
+**The verdict contract must be self-contained.** The recovery prompt restates the exact
+`REVIEW_DECISION` format inline (`REVIEW_DECISION_FORMAT`) rather than referring to "the JSON from
+your instructions." The appended system prompt is **not reliably re-attached to a `--resume`d
+session**, and the reviewer is additionally launched with `--setting-sources ''` (which strips
+CLAUDE.md and other instruction sources). A resumed session therefore frequently no longer carries
+the verdict schema, and a prompt that merely says "emit the JSON from your instructions" elicits the
+exact failure observed in the field: *"I don't have a REVIEW_DECISION format in my instructions —
+there's no such schema defined anywhere in this session."* The model is correct to refuse to
+fabricate one. The fix embeds the literal format in the **conversation** — it is appended to the
+initial reviewer prompt (the `-p` content) and repeated verbatim in the recovery prompt — so the
+verdict is reproducible regardless of whether the system prompt was delivered. The appended system
+prompt's OUTPUT CONTRACT section remains as a first-pass nudge; the in-conversation copy is the
+durable source of truth.
 
 **Why both a hardened prompt and recovery.** The reviewer system prompt leads with an explicit
 "OUTPUT CONTRACT" section (a worked example, plus a checklist to confirm the literal `REVIEW_DECISION:`
@@ -218,14 +253,31 @@ message after the `result` event arrives in the stream. It looks for a line matc
 REVIEW_DECISION: {valid JSON}
 ```
 
-Parsing (`parseReviewDecision`) is deliberately tolerant. It finds the **last** `REVIEW_DECISION`
-marker (the model sometimes mentions it before emitting the real one), tolerating markdown wrappers
-(`**bold**`, `` `code` ``, fenced blocks) and indentation, then extracts the first balanced JSON
-object after the marker — walking brace depth while respecting string literals, so the JSON may span
-multiple lines and contain `}` inside string values. An earlier anchored single-line regex
+Parsing (`parseReviewDecision`) is deliberately tolerant. It collects **every** `REVIEW_DECISION`
+marker and tries them from **last to first**, returning the first that yields a valid verdict object.
+For each marker it extracts the first balanced JSON object after it — walking brace depth while
+respecting string literals, so the JSON may span multiple lines and contain `}` inside string values
+— tolerating markdown wrappers (`**bold**`, `` `code` ``, fenced blocks) and indentation. Trying the
+**last** marker first preserves the "the model sometimes mentions the token before emitting the real
+verdict" behaviour; the **fallback to earlier markers** fixes a real misparse when the reviewer
+reviews *this* pipeline: a genuine verdict can contain the literal token inside an issue string
+(e.g. `…"issues":["the reviewer never emits REVIEW_DECISION: when cut off"]`). The last marker then
+lands *inside* the JSON, where anchoring to it alone would find no `{` (or a stray later brace) and
+silently drop an otherwise-valid verdict. An even earlier anchored single-line regex
 (`/^REVIEW_DECISION:\s*(\{.+\})$/m`) was too strict: it required the marker at the start of a line
 and the JSON to be the entire rest of one line, so bolded, indented, fenced, pretty-printed, or
 trailing-text verdicts were silently treated as "no decision."
+
+**Placeholder rejection.** Because the reviewer prompt now embeds the verdict contract with a worked
+example, a weak or rushed model can echo the example line verbatim —
+`REVIEW_DECISION: {"outcome":"pass","summary":"<one sentence>"}`. Accepting that as a real verdict
+would **silently route the task on a fabricated pass/fail**. `extractDecisionAt` therefore rejects any
+verdict whose `summary` is a known placeholder (`<one sentence>`, `<summary>`) by returning null — so
+`parseReviewDecision` falls back to an earlier real marker if one exists, or returns null (triggering
+verdict recovery) if the echo was all there was. Placeholder *issue* entries (`<specific issue>`,
+`...`) are stripped from the `issues` list, and an issues list that collapses to empty becomes
+`undefined` so routing falls back to the summary. A real summary that merely contains angle brackets
+(e.g. "mishandles `<html>` tags") is **not** rejected — only the exact template tokens are.
 
 If no parseable `REVIEW_DECISION` is found, the turn is treated as `fail` and a system message
 surfaces the reviewer's prose to the user, who can then proceed or reply. The review loop count is
@@ -372,12 +424,24 @@ New function `launchReviewer(task: Task, issues: string[] | null)`:
 5. Invoke Claude with:
    - `--session-id {new_uuid}` (not `--resume`)
    - `--allowedTools "Read,Glob,Grep,Bash"`
-   - `--append-system-prompt {reviewer_system_prompt}`
-   - `--model {task.model}` if set — Reviewer uses the same model as the Implementer
+   - `--append-system-prompt {reviewer_system_prompt}` (plus the verdict contract embedded in the
+     `-p` prompt itself — see Section 4's "self-contained" note)
+   - `--model {actualModel}` if set — Reviewer uses the **same model as the Implementer**, including
+     Ollama models: the `ollama/` prefix is stripped for `--model` and `ANTHROPIC_BASE_URL` /
+     `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are exported in the remote command exactly as the
+     implementer does. (Previously the reviewer skipped `--model` for Ollama and never set the
+     endpoint, so it ran against the default Anthropic API — wrong model, or an auth error producing
+     an empty review and a spurious "no verdict" escalation.)
    - Caveman mode is NOT applied — verbosity is useful in review output
-6. Stream output to client via WebSocket, tagged with `role: "reviewer"` in the event payload
-7. On `result` event, parse `REVIEW_DECISION` from final assistant text
-8. Act on outcome (transition task or start new Implementer turn)
+6. **Before spawning**, archive the previous reviewer run's output/exit files (`mv -f … .prev`) in a
+   **separate, awaited** SSH step — mirroring the implementer. The remote command's own in-band
+   `rm -f` only runs once the detached `coder ssh` connects (seconds later), but polling starts
+   synchronously; without the pre-clean the first poll could `cat` a **stale** `-review.exit` from a
+   prior pass and finalize immediately against the previous turn's leftover output (routing on a
+   stale verdict, or on empty text once the in-band `rm` lands). Awaiting the archive closes the race.
+7. Stream output to client via WebSocket, tagged with `role: "reviewer"` in the event payload
+8. On `result` event, parse `REVIEW_DECISION` from final assistant text
+9. Act on outcome (transition task or start new Implementer turn)
 
 New function `buildReviewerPrompt()`: returns the static reviewer system prompt from Section 5.
 
