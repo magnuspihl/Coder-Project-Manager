@@ -111,6 +111,10 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [uploadedAttachmentIds, setUploadedAttachmentIds] = useState<string[]>([]);
   const [uploading, setUploading] = useState(false);
+  // Reviewer turns render collapsed: just a pass/fail summary by default. The
+  // full reviewer prose is hidden behind a per-turn "details" toggle.
+  const [expandedReviews, setExpandedReviews] = useState<Set<string>>(new Set());
+  const [applyingFixes, setApplyingFixes] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastParticipantsJsonRef = useRef('');
 
@@ -701,6 +705,45 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reply, uploadedAttachmentIds, sending, taskId]);
 
+  const parseIssues = (turn: TaskTurn): string[] => {
+    if (!turn.review_issues) return [];
+    try {
+      const parsed = JSON.parse(turn.review_issues);
+      return Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === 'string') : [];
+    } catch {
+      return [];
+    }
+  };
+
+  const toggleReviewDetails = (turnId: string) => {
+    setExpandedReviews(prev => {
+      const next = new Set(prev);
+      if (next.has(turnId)) next.delete(turnId);
+      else next.add(turnId);
+      return next;
+    });
+  };
+
+  // "Apply suggested fixes" — resume the implementer with the reviewer's issues.
+  // Replying resets the review loop, so the new turn gets a fresh review.
+  const handleApplyFixes = async (turn: TaskTurn) => {
+    if (applyingFixes || sending) return;
+    const issues = parseIssues(turn);
+    const body = issues.length > 0
+      ? `Please apply fixes for the issues the reviewer found:\n\n${issues.map((s, i) => `${i + 1}. ${s}`).join('\n')}`
+      : `Please apply the fixes the reviewer suggested${turn.review_summary ? `: ${turn.review_summary}` : '.'}`;
+    setApplyingFixes(true);
+    try {
+      await replyToTask(taskId, body);
+      onTaskChanged?.();
+      await loadData();
+    } catch (err: any) {
+      alert(err?.message || 'Failed to apply fixes');
+    } finally {
+      setApplyingFixes(false);
+    }
+  };
+
   const handleComplete = async () => {
     setCompleting(true);
     try {
@@ -1017,6 +1060,113 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     if (e.target === overlayRef.current) closeModal();
   };
 
+  // Renders a reviewer turn as a compact pass/fail summary instead of the full
+  // verbose review prose. On pass it's a single line; on fail it lists the
+  // actionable issues and offers an "Apply suggested fixes" button. The raw
+  // reviewer output is available behind a "details" toggle.
+  const renderReviewerCard = (turn: TaskTurn, fullReview: string) => {
+    const expanded = expandedReviews.has(turn.id);
+    const issues = parseIssues(turn);
+
+    // The verdict (review_outcome) stays null until the turn completes, but the
+    // reviewer's messages persist live mid-run — so while it's still reviewing,
+    // show a neutral "Reviewing…" state rather than a premature pass/fail card.
+    if (turn.review_outcome == null) {
+      return (
+        <div className="flex items-center gap-2 py-1">
+          <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
+          <span className="flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full border text-purple-700 dark:text-purple-300 bg-purple-50 dark:bg-purple-900/30 border-purple-200 dark:border-purple-800">
+            <span className="animate-spin h-3 w-3 border-2 border-purple-600 dark:border-purple-400 border-t-transparent rounded-full" />
+            Reviewing…
+          </span>
+          <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
+        </div>
+      );
+    }
+
+    if (turn.review_outcome === 'pass') {
+      return (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 py-1">
+            <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
+            <span className="flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full border text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800">
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
+              Review passed
+            </span>
+            {fullReview && (
+              <button
+                onClick={() => toggleReviewDetails(turn.id)}
+                className="text-[11px] text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 underline"
+              >
+                {expanded ? 'Hide details' : 'Details'}
+              </button>
+            )}
+            <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
+          </div>
+          {expanded && fullReview && (
+            <div className="rounded-lg p-4 bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 mr-8">
+              <Markdown content={fullReview} />
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // Fail (or a missing/garbled verdict, which the server records as a fail).
+    // Only the latest reviewer turn can apply fixes — earlier failed turns are
+    // superseded and their issues are stale.
+    const latestReviewerTurnId = turns.reduce<TaskTurn | null>(
+      (acc, t) => (t.role === 'reviewer' && (!acc || t.turn_number > acc.turn_number) ? t : acc),
+      null,
+    )?.id ?? null;
+    const canApply = task?.status === 'awaiting_feedback' && turn.id === latestReviewerTurnId;
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center gap-2 py-1">
+          <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
+          <span className="flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full border text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/30 border-amber-200 dark:border-amber-800">
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" /></svg>
+            Review found issues
+          </span>
+          <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
+        </div>
+        <div className="rounded-lg p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 mr-8">
+          {issues.length > 0 ? (
+            <ul className="list-disc list-outside ml-4 space-y-1 text-sm text-amber-900 dark:text-amber-200">
+              {issues.map((iss, i) => <li key={i}>{iss}</li>)}
+            </ul>
+          ) : (
+            <p className="text-sm text-amber-900 dark:text-amber-200">{turn.review_summary || 'The reviewer reported issues.'}</p>
+          )}
+          <div className="flex items-center gap-3 mt-3 flex-wrap">
+            {canApply && (
+              <button
+                onClick={() => handleApplyFixes(turn)}
+                disabled={applyingFixes || sending}
+                className="text-xs font-medium px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-50 transition-colors"
+              >
+                {applyingFixes ? 'Applying…' : 'Apply suggested fixes'}
+              </button>
+            )}
+            {fullReview && (
+              <button
+                onClick={() => toggleReviewDetails(turn.id)}
+                className="text-[11px] text-amber-700/70 dark:text-amber-300/70 hover:text-amber-800 dark:hover:text-amber-200 underline"
+              >
+                {expanded ? 'Hide full review' : 'Show full review'}
+              </button>
+            )}
+          </div>
+          {expanded && fullReview && (
+            <div className="mt-3 pt-3 border-t border-amber-200 dark:border-amber-800">
+              <Markdown content={fullReview} />
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div
       ref={overlayRef}
@@ -1165,6 +1315,15 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
               {/* Conversation */}
               {(() => {
                 const turnMap = new Map(turns.map(t => [t.id, t]));
+                // Concatenate each reviewer turn's prose so it can be revealed
+                // behind the per-turn "details" toggle on its summary card.
+                const reviewerContentByTurn = new Map<string, string>();
+                for (const m of messages) {
+                  if (m.role === 'assistant' && m.turn_id && turnMap.get(m.turn_id)?.role === 'reviewer') {
+                    const prev = reviewerContentByTurn.get(m.turn_id);
+                    reviewerContentByTurn.set(m.turn_id, prev ? `${prev}\n\n${m.content}` : m.content);
+                  }
+                }
                 let lastTurnId: string | null | undefined = undefined;
                 return messages.map((msg) => {
                   const isParticipantMsg = msg.role === 'assistant' && msg.participant_id;
@@ -1180,33 +1339,26 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   const turn = msg.turn_id ? turnMap.get(msg.turn_id) : undefined;
                   const isReviewerMsg = turn?.role === 'reviewer';
 
+                  // Reviewer turns collapse into a single compact summary card
+                  // (rendered once, at the turn boundary). Skip the verbose
+                  // per-message bubbles entirely.
+                  if (isReviewerMsg && turn) {
+                    if (!turnChanged) return null;
+                    return (
+                      <React.Fragment key={msg.id}>
+                        {renderReviewerCard(turn, reviewerContentByTurn.get(turn.id) || '')}
+                      </React.Fragment>
+                    );
+                  }
+
                   return (
                     <React.Fragment key={msg.id}>
                       {turnChanged && turn && (
                         <div className="flex items-center gap-2 py-1">
                           <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
-                          <span className={`flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full border ${
-                            turn.role === 'reviewer'
-                              ? turn.review_outcome === 'pass'
-                                ? 'text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800'
-                                : turn.review_outcome === 'fail'
-                                ? 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/30 border-amber-200 dark:border-amber-800'
-                                : 'text-purple-700 dark:text-purple-300 bg-purple-50 dark:bg-purple-900/30 border-purple-200 dark:border-purple-800'
-                              : 'text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700'
-                          }`}>
-                            {turn.role === 'reviewer' ? (
-                              <>
-                                <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z" /></svg>
-                                Reviewer
-                                {turn.review_outcome === 'pass' && <span className="text-green-600 dark:text-green-400">· Passed ✓</span>}
-                                {turn.review_outcome === 'fail' && <span className="text-amber-600 dark:text-amber-400">· Issues found</span>}
-                              </>
-                            ) : (
-                              <>
-                                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z"/></svg>
-                                Implementer{turn.turn_number > 1 ? ` · Turn ${Math.ceil(turn.turn_number / 2)}` : ''}
-                              </>
-                            )}
+                          <span className="flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full border text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-800 border-gray-200 dark:border-gray-700">
+                            <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z"/></svg>
+                            Implementer{turn.turn_number > 1 ? ` · Turn ${Math.ceil(turn.turn_number / 2)}` : ''}
                           </span>
                           <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
                         </div>
