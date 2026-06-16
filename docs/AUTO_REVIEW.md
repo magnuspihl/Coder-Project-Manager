@@ -465,6 +465,24 @@ async function onImplementerComplete(task: Task) {
 New helper `worktreeHasChanges(worktreePath, workspaceName): Promise<boolean>`:
 Runs `git -C {worktree_path} status --porcelain` via SSH. Returns `true` if output is non-empty.
 
+#### Implementer opt-out (`NO_REVIEW_NEEDED`)
+
+The diff gate alone is insufficient: a question/diagnosis/advisory turn can still
+leave the worktree dirty (build output, a touched lockfile, a scratch file),
+which trips `worktreeHasChanges` and launches a pointless reviewer. So the
+implementer can declare intent directly.
+
+When auto-review is on, the implementer's system prompt (`NO_REVIEW_PROMPT`,
+appended via `--append-system-prompt`) tells it to end its final response with a
+bare `NO_REVIEW_NEEDED` line when the turn isn't a review-worthy code change. The
+implementer poller detects and strips that marker (`stripNoReviewMarker`) before
+the message is shown to the user, recording the task id in an in-memory
+`noReviewDeclared` set. `onImplementerComplete` consumes the flag and skips the
+reviewer — but only when `review_loop_count === 0`, so a mid-loop implementer
+that's supposed to be fixing flagged issues can't opt out of its own re-review.
+The diff gate remains the safety net if the flag is ever lost (e.g. a restart
+mid-turn).
+
 ### `tasks.ts`
 
 - `createTask` gains `autoReview?: boolean` parameter (defaults to `true`)
