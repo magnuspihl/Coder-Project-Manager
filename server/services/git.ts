@@ -507,8 +507,56 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
     }
 
     if (!hasChanges) {
-      // Nothing to commit — already complete. Worktree is kept (removed on deletion).
-      return true;
+      // Working tree is clean — but this might mean the agent committed everything
+      // itself (leaving unpushed commits) or a prior completion attempt pushed but
+      // didn't finish the PR. Check before returning early.
+
+      let unpushedCount = 0;
+      let hasUpstream = false;
+      try {
+        // @{u}..HEAD counts commits on this branch not yet on its remote tracking ref.
+        const countStr = await sshExec(ws,
+          `cd ${shellEscape(dir)} && git rev-list @{u}..HEAD --count`
+        );
+        unpushedCount = parseInt(countStr.trim(), 10) || 0;
+        hasUpstream = true;
+      } catch {
+        // No upstream tracking branch yet — branch hasn't been pushed.
+        // Count local-only commits to detect agent-committed but not-pushed work.
+        try {
+          const countStr = await sshExec(ws,
+            `cd ${shellEscape(dir)} && git rev-list --count HEAD --not --remotes 2>/dev/null`
+          );
+          unpushedCount = parseInt(countStr.trim(), 10) || 0;
+        } catch { /* ignore */ }
+      }
+
+      if (unpushedCount > 0) {
+        addMessage(task.id, 'system',
+          `Found ${unpushedCount} unpushed commit${unpushedCount === 1 ? '' : 's'} — pushing and completing PR.`
+        );
+        // Fall through to push + PR flow
+      } else if (hasUpstream) {
+        // Branch is in sync with its remote. Check for an open PR that was created
+        // in a prior attempt but not yet merged.
+        let hasOpenPr = false;
+        try {
+          const state = await sshGh(ws,
+            `cd ${shellEscape(dir)} && gh pr view ${shellEscape(branchName)} --json state --jq .state 2>/dev/null`
+          );
+          hasOpenPr = state.trim() === 'OPEN';
+        } catch { /* no gh CLI or no PR for this branch */ }
+
+        if (!hasOpenPr) {
+          // Nothing uncommitted, nothing unpushed, no open PR. Worktree kept (removed on deletion).
+          return true;
+        }
+        // Fall through to complete the open PR
+      } else {
+        // No upstream branch and no local-only commits — nothing to do.
+        // Worktree is kept (removed on deletion).
+        return true;
+      }
     }
 
     // Commit
