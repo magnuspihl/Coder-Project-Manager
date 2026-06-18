@@ -15,7 +15,7 @@ import { handleMcpRequest, handleMcpMethodNotAllowed } from './mcp/index.js';
 
 // Initialize database on import
 import './db/index.js';
-import { reconnectWorkingTasks } from './services/claude.js';
+import { reconnectWorkingTasks, startRateLimitRetryPoller } from './services/claude.js';
 import { reconcileLeakedWorktrees } from './services/git.js';
 
 // Prevent unhandled promise rejections from crashing the server
@@ -55,4 +55,7 @@ app.listen(PORT, '0.0.0.0', () => {
   reconcileLeakedWorktrees().catch(err => {
     console.error('[recovery] Unhandled error during worktree reconcile:', (err as Error).message?.slice(0, 200));
   });
+  // Periodically re-queue tasks that failed on a usage/token limit once their
+  // reset window has passed, so the user doesn't have to retry them by hand.
+  startRateLimitRetryPoller();
 });

@@ -1574,6 +1574,69 @@ export async function reconnectWorkingTasks(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Auto-retry of rate-limited tasks
+//
+// Token-limit failures are recorded with failed_reason = `rate_limited:<resetsAt>`
+// (see startFilePolling / processRemainingOutput). Once that reset timestamp
+// passes, the usage window has refreshed and the task can run again — so rather
+// than make the user click Retry on every rate-limited task, we re-queue them
+// automatically. Only `rate_limited:` failures qualify; other failed states are
+// left alone for the user to inspect.
+// ---------------------------------------------------------------------------
+
+// Small buffer past resetsAt before retrying, so we don't fire on the exact
+// boundary and immediately re-hit the limit (clocks/propagation can lag a touch).
+const RATE_LIMIT_RETRY_GRACE_MS = 5_000;
+const RATE_LIMIT_RETRY_INTERVAL_MS = 30_000;
+
+export async function autoRetryRateLimitedTasks(): Promise<void> {
+  const db = getDb();
+  const now = Date.now();
+
+  const rows = db.prepare(
+    "SELECT * FROM tasks WHERE status = 'failed' AND failed_reason LIKE 'rate_limited:%' AND deleted_at IS NULL"
+  ).all() as Task[];
+
+  // Group re-queued tasks by workspace so we run processQueue once per workspace.
+  const touchedWorkspaces = new Set<string>();
+
+  for (const task of rows) {
+    const resetsAt = parseInt(task.failed_reason!.slice('rate_limited:'.length), 10);
+    if (isNaN(resetsAt)) continue;
+    if (resetsAt * 1000 + RATE_LIMIT_RETRY_GRACE_MS > now) continue; // window not refreshed yet
+
+    console.log(`[rate-limit-retry] Auto-retrying task ${task.id} — usage window refreshed`);
+    // Mirror the manual retry path: a continuation user message resumes the
+    // existing session (processQueue picks up the last user message), or runs
+    // the original prompt if the task never produced a session.
+    addMessage(task.id, 'system', 'Usage limit window refreshed — automatically retrying this task.');
+    addMessage(task.id, 'user', 'Continue where you left off.');
+    updateTaskStatus(task.id, 'queued');
+    touchedWorkspaces.add(task.workspace_id);
+  }
+
+  for (const workspaceId of touchedWorkspaces) {
+    await processQueue(workspaceId).catch(err => {
+      console.log(`[rate-limit-retry] Failed to process queue:`, (err as Error).message?.slice(0, 100));
+    });
+  }
+}
+
+let rateLimitRetryTimer: NodeJS.Timeout | null = null;
+
+export function startRateLimitRetryPoller(): void {
+  if (rateLimitRetryTimer) return;
+  rateLimitRetryTimer = setInterval(() => {
+    autoRetryRateLimitedTasks().catch(err => {
+      console.error('[rate-limit-retry] Poller error:', (err as Error).message?.slice(0, 200));
+    });
+  }, RATE_LIMIT_RETRY_INTERVAL_MS);
+  // Don't keep the event loop alive solely for this timer.
+  rateLimitRetryTimer.unref?.();
+  console.log('[rate-limit-retry] Auto-retry poller started');
+}
+
 /**
  * Poll a remote output file for a reconnected task.
  * Used when the SSH process survived a server restart but we lost the stdout pipe.

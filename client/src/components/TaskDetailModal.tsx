@@ -2027,6 +2027,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                       }}
                       onResume={handleRetry}
                       resumeLabel="Retry"
+                      autoRetry
                     />
                   ) : task.failed_reason?.startsWith('context_window_exceeded:') ? (
                     <div className="space-y-2">
