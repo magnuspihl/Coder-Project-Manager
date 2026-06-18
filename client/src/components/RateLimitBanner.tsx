@@ -15,9 +15,11 @@ interface RateLimitBannerProps {
   rateLimit: RateLimitInfo;
   onResume?: () => void;
   resumeLabel?: string;
+  /** When true, show that the task will be retried automatically once the limit resets. */
+  autoRetry?: boolean;
 }
 
-export default function RateLimitBanner({ rateLimit, onResume, resumeLabel = 'Resume' }: RateLimitBannerProps) {
+export default function RateLimitBanner({ rateLimit, onResume, resumeLabel = 'Resume', autoRetry = false }: RateLimitBannerProps) {
   const [secondsLeft, setSecondsLeft] = useState(() =>
     Math.max(0, Math.floor(rateLimit.resetsAt - Date.now() / 1000))
   );
@@ -46,7 +48,7 @@ export default function RateLimitBanner({ rateLimit, onResume, resumeLabel = 'Re
       </div>
       <p className="text-sm text-gray-700 dark:text-gray-300 mb-2">
         {expired ? (
-          'Rate limit has expired — ready to resume.'
+          autoRetry ? 'Usage limit has reset — retrying automatically…' : 'Rate limit has expired — ready to resume.'
         ) : (
           <>
             Resets in <span className="font-mono font-medium">{formatCountdown(secondsLeft)}</span>
@@ -56,6 +58,11 @@ export default function RateLimitBanner({ rateLimit, onResume, resumeLabel = 'Re
           </>
         )}
       </p>
+      {autoRetry && !expired && (
+        <p className="text-xs text-amber-600 dark:text-amber-400 mb-2">
+          This task will retry automatically when the limit resets — no action needed.
+        </p>
+      )}
       {onResume && (
         <button
           onClick={onResume}
