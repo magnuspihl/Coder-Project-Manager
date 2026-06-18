@@ -509,54 +509,37 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
     if (!hasChanges) {
       // Working tree is clean — but this might mean the agent committed everything
       // itself (leaving unpushed commits) or a prior completion attempt pushed but
-      // didn't finish the PR. Check before returning early.
-
-      let unpushedCount = 0;
-      let hasUpstream = false;
+      // didn't finish the PR. The only safe, provider-agnostic signal for "nothing
+      // left to do" is whether the branch tip is already on the default branch.
+      //
+      // NOTE: this used to gate on `gh pr view` (GitHub-only). On Azure DevOps that
+      // query always failed, so the function silently returned `true` and marked the
+      // task completed even when an Azure PR was still open and unmerged. The git
+      // ancestry check below works identically for every provider.
+      const defaultBranch = await getDefaultBranch(ws, dir);
+      let landed = false;
       try {
-        // @{u}..HEAD counts commits on this branch not yet on its remote tracking ref.
-        const countStr = await sshExec(ws,
-          `cd ${shellEscape(dir)} && git rev-list @{u}..HEAD --count`
+        await sshExec(ws,
+          `cd ${shellEscape(dir)} && git fetch origin ${shellEscape(defaultBranch)} && ` +
+          `git merge-base --is-ancestor HEAD origin/${shellEscape(defaultBranch)}`,
+          30000,
         );
-        unpushedCount = parseInt(countStr.trim(), 10) || 0;
-        hasUpstream = true;
-      } catch {
-        // No upstream tracking branch yet — branch hasn't been pushed.
-        // Count local-only commits to detect agent-committed but not-pushed work.
-        try {
-          const countStr = await sshExec(ws,
-            `cd ${shellEscape(dir)} && git rev-list --count HEAD --not --remotes 2>/dev/null`
-          );
-          unpushedCount = parseInt(countStr.trim(), 10) || 0;
-        } catch { /* ignore */ }
-      }
+        landed = true;
+      } catch { /* HEAD is not on origin/<default> yet → there is unmerged work */ }
 
-      if (unpushedCount > 0) {
-        addMessage(task.id, 'system',
-          `Found ${unpushedCount} unpushed commit${unpushedCount === 1 ? '' : 's'} — pushing and completing PR.`
-        );
-        // Fall through to push + PR flow
-      } else if (hasUpstream) {
-        // Branch is in sync with its remote. Check for an open PR that was created
-        // in a prior attempt but not yet merged.
-        let hasOpenPr = false;
-        try {
-          const state = await sshGh(ws,
-            `cd ${shellEscape(dir)} && gh pr view ${shellEscape(branchName)} --json state --jq .state 2>/dev/null`
-          );
-          hasOpenPr = state.trim() === 'OPEN';
-        } catch { /* no gh CLI or no PR for this branch */ }
-
-        if (!hasOpenPr) {
-          // Nothing uncommitted, nothing unpushed, no open PR. Worktree kept (removed on deletion).
-          return true;
-        }
-        // Fall through to complete the open PR
-      } else {
-        // No upstream branch and no local-only commits — nothing to do.
-        // Worktree is kept (removed on deletion).
+      if (landed) {
+        // The committed work is already integrated into the default branch — there
+        // is genuinely nothing left to push or merge. Worktree kept (removed on deletion).
         return true;
       }
+
+      // Commits exist that are not yet on the default branch — either committed but
+      // not pushed, or pushed but the PR was never merged. Fall through to the push +
+      // open/complete-PR flow, which (unlike a silent early return) will surface and
+      // block on any PR failure for the task's actual provider.
+      addMessage(task.id, 'system',
+        `Found committed work not yet on \`${defaultBranch}\` — pushing and completing the pull request.`
+      );
     }
 
     // Commit

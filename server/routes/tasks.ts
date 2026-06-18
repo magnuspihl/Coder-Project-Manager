@@ -30,7 +30,7 @@ import {
   setTaskRequestTarget,
 } from '../services/tasks.js';
 import { findUserWorkspaceById } from '../services/workspace-cache.js';
-import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp } from '../services/claude.js';
+import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, removeTaskWorktree } from '../services/git.js';
@@ -252,46 +252,79 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
 
   // Only awaiting_feedback tasks can be completed. Running git ops on a
   // working task would corrupt Claude's tree; completing queued/failed/
-  // cancelled tasks is semantically meaningless.
-  if (task.status !== 'awaiting_feedback') {
+  // cancelled tasks is semantically meaningless. (Re-checked under the lock
+  // below — this is just a cheap early-out.)
+  if (task.status !== 'awaiting_feedback' && task.status !== 'completed') {
     res.status(400).json({ error: `Only tasks awaiting feedback can be completed (current status: ${task.status}).` });
     return;
   }
 
-  // If another task is actively working on this workspace, defer completion
-  // until the queue is idle. Otherwise concurrent git ops (stash/checkout/
-  // commit) would corrupt the working agent's tree.
-  const working = getWorkingTask(task.workspace_id);
-  if (working && working.id !== task.id) {
-    if (!task.pending_complete) {
-      setPendingComplete(task.id, true);
-      addMessage(task.id, 'system', `Completion queued — will finalize after task "${working.title}" finishes on this workspace.`, undefined, undefined, undefined, req.authSource, req.clientLabel);
+  // Run the git completion and the status transition atomically under the
+  // per-workspace lock. The lock is the same one processQueue's deferred-
+  // completion path takes, so a manual complete can no longer race the queued
+  // completion (or a second complete click) and mark the task completed via a
+  // silent early-return while another attempt is still merging the PR.
+  const outcome = await withWorkspaceLock(task.workspace_id, async (): Promise<
+    | { code: 200; completed?: boolean }
+    | { code: 202 }
+    | { code: 400 | 404 | 409; error: string }
+  > => {
+    // Re-read inside the lock — a concurrent completion may have advanced the task.
+    const fresh = getTask(task.id);
+    if (!fresh) return { code: 404, error: 'Task not found' };
+
+    // Already completed by a concurrent/earlier request — treat as idempotent success.
+    if (fresh.status === 'completed') return { code: 200 };
+
+    if (fresh.status !== 'awaiting_feedback') {
+      return { code: 400, error: `Only tasks awaiting feedback can be completed (current status: ${fresh.status}).` };
     }
+
+    // If another task is actively working on this workspace, defer completion
+    // until the queue is idle. Otherwise concurrent git ops (stash/checkout/
+    // commit) would corrupt the working agent's tree.
+    const working = getWorkingTask(fresh.workspace_id);
+    if (working && working.id !== fresh.id) {
+      if (!fresh.pending_complete) {
+        setPendingComplete(fresh.id, true);
+        addMessage(fresh.id, 'system', `Completion queued — will finalize after task "${working.title}" finishes on this workspace.`, undefined, undefined, undefined, req.authSource, req.clientLabel);
+      }
+      return { code: 202 };
+    }
+
+    // Handle git operations before marking complete — may block completion on
+    // uncommitted changes (remote disabled) or on any git failure.
+    const allowed = await handleTaskCompletionGit(fresh);
+    if (!allowed) {
+      return { code: 409, error: 'Cannot complete: git operation blocked. See task messages for the exact reason.' };
+    }
+
+    setPendingComplete(fresh.id, false);
+    updateTaskStatus(fresh.id, 'completed');
+    return { code: 200, completed: true };
+  });
+
+  if (outcome.code === 200 && outcome.completed) {
+    // Free the port range (shuts down the task's preview server). The worktree is
+    // intentionally kept so the task can be reopened and continued; it is removed
+    // only when the task is deleted. Done outside the lock — processQueue (below)
+    // re-acquires it, so neither may run while the lock is held.
+    await cleanupPortRange(task).catch(() => {});
+    await processQueue(task.workspace_id);
+  }
+
+  if (outcome.code === 202) {
     res.status(202).json({ task: getTask(task.id), queued: true });
     return;
   }
-
-  // Handle git operations before marking complete — may block completion on
-  // uncommitted changes (remote disabled) or on any git failure.
-  const allowed = await handleTaskCompletionGit(task);
-  if (!allowed) {
-    res.status(409).json({
-      error: 'Cannot complete: git operation blocked. See task messages for the exact reason.',
-      task: getTask(task.id),
-    });
+  if (outcome.code === 409) {
+    res.status(409).json({ error: outcome.error, task: getTask(task.id) });
     return;
   }
-
-  setPendingComplete(task.id, false);
-  updateTaskStatus(task.id, 'completed');
-
-  // Free the port range (shuts down the task's preview server). The worktree is
-  // intentionally kept so the task can be reopened and continued; it is removed
-  // only when the task is deleted.
-  await cleanupPortRange(task).catch(() => {});
-
-  // Let the queue processor start the next task
-  await processQueue(task.workspace_id);
+  if (outcome.code !== 200) {
+    res.status(outcome.code).json({ error: outcome.error });
+    return;
+  }
 
   res.json({ task: getTask(task.id) });
 });
