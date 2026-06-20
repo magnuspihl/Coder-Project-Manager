@@ -519,11 +519,29 @@ export function getMessageCount(taskId: string): number {
 }
 
 /**
- * Delete assistant messages from the current session (after the last user message).
- * Used when re-processing output from scratch (e.g., on reconnect) to avoid duplicates.
+ * Delete assistant messages from the current turn, used when re-processing
+ * output from scratch (e.g., on reconnect) to avoid duplicate assistant messages.
+ *
+ * When `turnId` is provided, only that turn's assistant messages are deleted.
+ * This is the correct scope: every launch (first run, user reply, and auto-review
+ * retry) creates a fresh implementer turn whose messages all carry that turn_id,
+ * so re-parsing the turn's output file only ever needs to clear that turn.
+ * Scoping by turn_id is essential for auto-review retries — those resume the
+ * implementer WITHOUT inserting a `user` message, so the legacy "after the last
+ * user message" boundary would wrongly delete the prior turn's completion message
+ * and the reviewer's messages too.
+ *
+ * Falls back to the "after the last user message" boundary for legacy tasks whose
+ * turns predate implementer turn recording (turn_id is NULL on those messages).
  */
-export function deleteCurrentSessionAssistantMessages(taskId: string): void {
+export function deleteCurrentSessionAssistantMessages(taskId: string, turnId?: string | null): void {
   const db = getDb();
+  if (turnId) {
+    db.prepare(
+      "DELETE FROM messages WHERE task_id = ? AND role = 'assistant' AND turn_id = ?"
+    ).run(taskId, turnId);
+    return;
+  }
   const messages = getMessages(taskId);
   const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
   if (lastUserMsg) {

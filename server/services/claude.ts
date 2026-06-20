@@ -1793,7 +1793,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null): void {
             // Atomic wipe + reparse: rolls back if any insert throws.
             db.transaction(() => {
               db.prepare('DELETE FROM stream_log WHERE task_id = ?').run(task.id);
-              deleteCurrentSessionAssistantMessages(task.id);
+              deleteCurrentSessionAssistantMessages(task.id, turnId);
               for (const line of allLines) processLine(line);
             })();
             wiped = true;
@@ -2547,7 +2547,7 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
     const db = getDb();
     const turnId = activeImplementerTurnId(task.id);
     db.transaction(() => {
-      deleteCurrentSessionAssistantMessages(task.id);
+      deleteCurrentSessionAssistantMessages(task.id, turnId);
       for (const m of stagedMessages) {
         addMessage(task.id, 'assistant', m.text, m.cost, undefined, undefined, undefined, undefined, turnId);
       }
