@@ -53,9 +53,16 @@ A discussion is a conversation, not an implementation session. If the conversati
 /**
  * Encode an absolute working-directory path the same way Claude Code does
  * when scoping project memory (e.g. /home/coder/my-project → -home-coder-my-project).
+ *
+ * Claude Code replaces EVERY non-alphanumeric character with a dash, not just
+ * slashes. Paths containing dots or other punctuation (e.g.
+ * /home/coder/TaleSpire.AutoHide → -home-coder-TaleSpire-AutoHide, or a git
+ * worktree path like /home/coder/.cpm/worktrees/task-x →
+ * -home-coder--cpm-worktrees-task-x) must encode the same way, otherwise we
+ * read/write the wrong project folder and memory appears empty.
  */
 export function encodeWorkingDir(workingDir: string): string {
-  return '-' + workingDir.replace(/^\//, '').replace(/\//g, '-');
+  return workingDir.replace(/[^a-zA-Z0-9]/g, '-');
 }
 
 /**
@@ -207,7 +214,11 @@ export async function readWorkspaceMemory(workspaceName: string, projectDir?: st
         return;
       }
       const files: MemoryFile[] = [];
-      const lines = stdout.split('\n');
+      // `coder ssh` runs the remote command under a PTY, so output arrives with
+      // CRLF line endings. Strip the trailing \r from each line, otherwise the
+      // ===BEGIN/END=== markers end in "\r" and never match — making every
+      // workspace's memory look empty even when files exist.
+      const lines = stdout.split('\n').map((line) => (line.endsWith('\r') ? line.slice(0, -1) : line));
       let current: { name: string; lines: string[] } | null = null;
       for (const line of lines) {
         if (line.startsWith(FILE_BEGIN) && line.endsWith('===')) {
