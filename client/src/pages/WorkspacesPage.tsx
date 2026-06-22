@@ -524,6 +524,17 @@ export default function WorkspacesPage() {
           }
         }
       } catch { /* ElevenLabs unavailable */ }
+      try {
+        const resp = await fetch('/api/tts/qwen/voices', { credentials: 'include' });
+        if (resp.ok) {
+          const data = await resp.json() as { enabled: boolean; voices: Array<{ id: string; name: string; description?: string }> };
+          if (data.enabled) {
+            for (const v of data.voices) {
+              voices.push({ id: `qwen:${v.id}`, name: v.description ? `${v.name} — ${v.description}` : v.name });
+            }
+          }
+        }
+      } catch { /* Qwen TTS unavailable */ }
       setAvailableVoices(voices);
     }
   };
@@ -1029,13 +1040,20 @@ export default function WorkspacesPage() {
                         .map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
                     </optgroup>
                   )}
+                  {availableVoices.filter(v => v.id.startsWith('qwen:') && !(wsVoiceSettings[ws.id] ?? []).includes(v.id)).length > 0 && (
+                    <optgroup label="Qwen3-TTS (self-hosted)">
+                      {availableVoices
+                        .filter(v => v.id.startsWith('qwen:') && !(wsVoiceSettings[ws.id] ?? []).includes(v.id))
+                        .map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                    </optgroup>
+                  )}
                 </select>
                 {(() => {
                   const defaultId = wsDefaultVoices[ws.id] ?? null;
                   const fallbackName = defaultId
                     ? (availableVoices.find(v => v.id === defaultId)?.name
                         ?? KOKORO_VOICES.find(v => `kokoro:${v.id}` === defaultId)?.name
-                        ?? defaultId.replace(/^(kokoro:|el:|br:)/, ''))
+                        ?? defaultId.replace(/^(kokoro:|el:|qwen:|br:)/, ''))
                     : null;
                   const hasVoices = (wsVoiceSettings[ws.id] ?? []).length > 0;
                   if (!fallbackName) return null;

@@ -162,7 +162,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     });
   }, []);
 
-  const { voices: ttsVoices, speakAs: ttsSpeakAs, stopSpeaking: ttsStop, speakingId: ttsSpeakingId, kokoroLoading, kokoroProgress } = useTTSVoice();
+  const { voices: ttsVoices, speakAs: ttsSpeakAs, stopSpeaking: ttsStop, speakingId: ttsSpeakingId, warmupQwen, kokoroLoading, kokoroProgress } = useTTSVoice();
   const [wsVoiceSettings, setWsVoiceSettings] = useState<Record<string, string[]>>({});
   const wsVoiceSettingsRef = useRef(wsVoiceSettings);
   wsVoiceSettingsRef.current = wsVoiceSettings;
@@ -1011,6 +1011,12 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task?.workspace_id, participants.length]);
+
+  // Warm the self-hosted Qwen model when voice features turn on, so the first
+  // spoken reply isn't delayed by an on-demand model load on the GPU box.
+  useEffect(() => {
+    if (voiceModeActive || conversationMode) warmupQwen();
+  }, [voiceModeActive, conversationMode, warmupQwen]);
 
   // Auto-speak last assistant message and/or auto-re-listen when agent finishes
   useEffect(() => {

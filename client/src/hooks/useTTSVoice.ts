@@ -7,7 +7,7 @@ const STORAGE_PROVIDER_KEY = 'tts:provider';
 export interface TTSVoice {
   id: string;
   name: string;
-  provider: 'elevenlabs' | 'browser' | 'kokoro';
+  provider: 'elevenlabs' | 'browser' | 'kokoro' | 'qwen';
   accent?: string;
   category?: string;
   isCustom?: boolean;
@@ -47,9 +47,9 @@ export function useTTSVoice() {
     catch { return DEFAULT_VOICE_ID; }
   });
 
-  const [provider, setProvider] = useState<'elevenlabs' | 'browser' | 'kokoro'>(() => {
+  const [provider, setProvider] = useState<'elevenlabs' | 'browser' | 'kokoro' | 'qwen'>(() => {
     try {
-      return (localStorage.getItem(STORAGE_PROVIDER_KEY) as 'elevenlabs' | 'browser' | 'kokoro') || 'kokoro';
+      return (localStorage.getItem(STORAGE_PROVIDER_KEY) as 'elevenlabs' | 'browser' | 'kokoro' | 'qwen') || 'kokoro';
     } catch { return 'kokoro'; }
   });
 
@@ -94,6 +94,25 @@ export function useTTSVoice() {
         // ElevenLabs unavailable
       }
 
+      try {
+        const resp = await fetch('/api/tts/qwen/voices', { credentials: 'include' });
+        if (resp.ok) {
+          const data: { voices: Array<{ id: string; name: string; description?: string }>; enabled: boolean } = await resp.json();
+          if (data.enabled && data.voices.length > 0) {
+            for (const v of data.voices) {
+              extra.push({
+                id: `qwen:${v.id}`,
+                name: v.description ? `${v.name} — ${v.description}` : v.name,
+                provider: 'qwen',
+                description: v.description,
+              });
+            }
+          }
+        }
+      } catch {
+        // Qwen TTS unavailable
+      }
+
       if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
         const loadBrowser = () => {
           const bv = speechSynthesis.getVoices();
@@ -125,7 +144,7 @@ export function useTTSVoice() {
 
   const selectVoice = useCallback((id: string) => {
     setSelectedId(id);
-    const prov = id.startsWith('el:') ? 'elevenlabs' : id.startsWith('kokoro:') ? 'kokoro' : 'browser';
+    const prov = id.startsWith('el:') ? 'elevenlabs' : id.startsWith('kokoro:') ? 'kokoro' : id.startsWith('qwen:') ? 'qwen' : 'browser';
     setProvider(prov);
     try { localStorage.setItem(STORAGE_KEY, id); } catch {}
     try { localStorage.setItem(STORAGE_PROVIDER_KEY, prov); } catch {}
@@ -241,6 +260,33 @@ export function useTTSVoice() {
       return;
     }
 
+    if (id.startsWith('qwen:')) {
+      const voiceId = id.replace(/^qwen:/, '');
+      setSpeakingId(msgId || 'anon');
+      try {
+        const resp = await fetch('/api/tts/qwen/speak', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: text.slice(0, 5000), voiceId }),
+        });
+        if (!resp.ok) throw new Error(`Qwen TTS failed: ${resp.status}`);
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        audioRef.current = audio;
+        await new Promise<void>((resolve, reject) => {
+          audio.onended = () => { setSpeakingId(null); URL.revokeObjectURL(url); audioRef.current = null; resolve(); };
+          audio.onerror = () => { setSpeakingId(null); URL.revokeObjectURL(url); audioRef.current = null; reject(new Error('Audio playback error')); };
+          audio.play().catch(reject);
+        });
+      } catch (err) {
+        setSpeakingId(null);
+        throw err;
+      }
+      return;
+    }
+
     // Browser TTS — best-effort, no error propagation (can't reliably detect voice absence)
     const uri = id.replace(/^br:/, '');
     const utter = new SpeechSynthesisUtterance(text);
@@ -290,5 +336,12 @@ export function useTTSVoice() {
     setKokoroLoading(false);
   }, [stopCurrent]);
 
-  return { voices, selectedId, provider, selectVoice, speak, speakAs, stopSpeaking, speakingId, kokoroLoading, kokoroProgress, kokoroError };
+  // Pre-load the self-hosted Qwen model so the first utterance isn't slow.
+  // No-op unless a Qwen voice is actually available. Best-effort, fire-and-forget.
+  const warmupQwen = useCallback(() => {
+    if (!voices.some(v => v.provider === 'qwen')) return;
+    fetch('/api/tts/qwen/warmup', { method: 'POST', credentials: 'include' }).catch(() => {});
+  }, [voices]);
+
+  return { voices, selectedId, provider, selectVoice, speak, speakAs, stopSpeaking, warmupQwen, speakingId, kokoroLoading, kokoroProgress, kokoroError };
 }
