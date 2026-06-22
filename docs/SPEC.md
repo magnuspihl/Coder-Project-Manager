@@ -528,6 +528,27 @@ The app is configured via environment variables:
 | `DATABASE_PATH` | No | Path to SQLite database file (default: `./data/cpm.db`) |
 | `CLAUDE_MAX_TURNS` | No | Max agentic turns per Claude execution (default: 200) |
 | `CLAUDE_ALLOWED_TOOLS` | No | Comma-separated list of tools Claude can use (default: `Read,Edit,Write,Bash,Glob,Grep`) |
+| `CPM_MEMORY_MCP_URLS` | No | Per-user long-term memory store (Mem0/OpenMemory) exposed to agents as an MCP server. See below. |
+
+### Per-user memory store (`CPM_MEMORY_MCP_URLS`)
+
+When set, CPM registers a user's Mem0/OpenMemory endpoint as an MCP server
+(`openmemory`) on every task and advisory-agent session that user owns, and
+appends a system prompt telling the agent to recall from and save to it. The
+store is **user-specific** — the value maps each Coder username to their own
+endpoint, so no user's memories leak to another. Users without an entry get no
+memory MCP (agents fall back to local memory files only).
+
+The value is a JSON object mapping Coder username → endpoint. Each endpoint is
+either the SSE URL string, or `{ "url": "...", "type": "sse" | "http" }` when
+the transport isn't SSE:
+
+```
+CPM_MEMORY_MCP_URLS={"magnus":"http://192.168.1.199:8765/mcp/openmemory/sse/magnus"}
+```
+
+The workspaces running the agents must be able to reach the endpoint over the
+network. Changing this requires a CPM server restart.
 
 ---
 
