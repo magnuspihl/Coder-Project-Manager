@@ -8,7 +8,7 @@ import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, fetc
 import { getOllamaBaseUrl } from './models.js';
 import { getAttachmentsByTask, type Attachment } from '../routes/uploads.js';
 import { writeCpmGuidelines } from './workspace-memory.js';
-import { buildMemoryMcpConfig, MEMORY_MCP_ALLOWED_TOOL, MEMORY_USAGE_PROMPT } from './memory-mcp.js';
+import { buildMemoryMcpConfig, MEMORY_MCP_ALLOWED_TOOL, buildMemoryUsagePrompt } from './memory-mcp.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
@@ -1112,7 +1112,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   // Per-user long-term memory store (Mem0/OpenMemory) exposed as an MCP server.
   // Only present when the task owner has a configured endpoint; slash commands
   // run bare. Allowing mcp__openmemory auto-approves its tools in headless mode.
-  const memoryMcpConfig = isSlashCommand ? null : buildMemoryMcpConfig(task.user_id);
+  const memoryMcpConfig = isSlashCommand ? null : buildMemoryMcpConfig(task.user_id, task.workspace_name);
 
   claudeParts.push('--output-format', 'stream-json');
   claudeParts.push('--verbose');
@@ -1162,7 +1162,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   }
 
   if (memoryMcpConfig) {
-    claudeParts.push('--append-system-prompt', shellEscape(MEMORY_USAGE_PROMPT));
+    claudeParts.push('--append-system-prompt', shellEscape(buildMemoryUsagePrompt(task.user_id, task.workspace_name)));
   }
 
   claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
@@ -2790,7 +2790,7 @@ export async function launchTaskParticipant(
   } else if (participant.claude_session_id) {
     claudeParts.push('--session-id', shellEscape(participant.claude_session_id));
   }
-  const memoryMcpConfig = buildMemoryMcpConfig(task.user_id);
+  const memoryMcpConfig = buildMemoryMcpConfig(task.user_id, participant.workspace_name);
   claudeParts.push('--output-format', 'stream-json', '--verbose');
   const participantAllowedTools = memoryMcpConfig ? `${DISCUSSION_ALLOWED_TOOLS},${MEMORY_MCP_ALLOWED_TOOL}` : DISCUSSION_ALLOWED_TOOLS;
   claudeParts.push('--allowedTools', shellEscape(participantAllowedTools));
@@ -2799,7 +2799,7 @@ export async function launchTaskParticipant(
   }
   claudeParts.push('--max-turns', MAX_TURNS);
   if (memoryMcpConfig) {
-    claudeParts.push('--append-system-prompt', shellEscape(MEMORY_USAGE_PROMPT));
+    claudeParts.push('--append-system-prompt', shellEscape(buildMemoryUsagePrompt(task.user_id, participant.workspace_name)));
   }
   claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
   claudeParts.push('--append-system-prompt', shellEscape(INTERACTIVE_PROMPT_NOTE));
