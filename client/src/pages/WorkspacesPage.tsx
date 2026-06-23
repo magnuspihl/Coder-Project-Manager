@@ -45,6 +45,9 @@ function timeAgo(iso: string): string {
   return `${Math.floor(minutes / 60)}h ago`;
 }
 
+// Coder build statuses that mean the workspace is spinning up (not yet usable, not stopped)
+const STARTING_STATUSES = ['starting', 'pending'];
+
 const STATUS_ORDER: Record<string, number> = {
   failed: 0,
   cancelled: 1,
@@ -238,8 +241,17 @@ export default function WorkspacesPage() {
     return result;
   }, [tasksByWorkspace]);
 
+  // Workspaces that are spinning up — shown alongside running ones with a spinner
+  const startingWorkspaces = useMemo(() =>
+    workspaces
+      .filter((ws) => STARTING_STATUSES.includes(ws.latest_build.status))
+      .sort((a, b) => a.name.localeCompare(b.name)),
+    [workspaces]
+  );
+
   const stoppedWorkspaces = useMemo(() =>
-    workspaces.filter((ws) => ws.latest_build.status !== 'running'),
+    workspaces.filter((ws) =>
+      ws.latest_build.status !== 'running' && !STARTING_STATUSES.includes(ws.latest_build.status)),
     [workspaces]
   );
 
@@ -812,6 +824,7 @@ export default function WorkspacesPage() {
   const renderWorkspaceColumn = (ws: Workspace) => {
     const agent = getAgentStatus(ws);
     const isRunning = ws.latest_build.status === 'running';
+    const isStarting = STARTING_STATUSES.includes(ws.latest_build.status);
     const counts = taskCounts[ws.id];
     const tasks = tasksByWorkspace[ws.id] || [];
     const openPorts = getOpenPorts(ws);
@@ -823,7 +836,7 @@ export default function WorkspacesPage() {
         key={ws.id}
         data-ws-id={ws.id}
         className={`flex-shrink-0 w-80 flex flex-col rounded-lg border ${
-          isRunning
+          isRunning || isStarting
             ? 'bg-gray-50 dark:bg-gray-900/50 border-gray-200 dark:border-gray-800'
             : 'bg-gray-50/50 dark:bg-gray-900/30 border-gray-200 dark:border-gray-800 opacity-60'
         }`}
@@ -835,6 +848,12 @@ export default function WorkspacesPage() {
               {ws.name}
             </span>
             <div className="flex items-center gap-1.5">
+              {isStarting && (
+                <span className="flex items-center gap-1 text-xs text-blue-600 dark:text-blue-400" title={`Workspace is ${ws.latest_build.status}`}>
+                  <span className="animate-spin h-3 w-3 border-[1.5px] border-blue-600 dark:border-blue-400 border-t-transparent rounded-full" />
+                  Starting…
+                </span>
+              )}
               {isRunning ? (
                 <button
                   onClick={(e) => handleStop(e, ws.id, ws.name)}
@@ -1322,7 +1341,12 @@ export default function WorkspacesPage() {
 
         {/* Task list */}
         <div className="flex-1 overflow-y-auto p-3 space-y-2 min-h-0">
-          {!isRunning ? (
+          {isStarting ? (
+            <p className="text-xs text-blue-600 dark:text-blue-400 px-1 flex items-center gap-1.5">
+              <span className="animate-spin h-3 w-3 border-[1.5px] border-blue-600 dark:border-blue-400 border-t-transparent rounded-full" />
+              Starting up — tasks can run once it's ready
+            </p>
+          ) : !isRunning ? (
             <p className="text-xs text-amber-600 dark:text-amber-400 px-1">Workspace must be running to execute tasks</p>
           ) : tasks.length === 0 ? (
             <p className="text-xs text-gray-400 dark:text-gray-500 px-1">No tasks</p>
@@ -1422,6 +1446,7 @@ export default function WorkspacesPage() {
       ) : (
         <div ref={laneContainerRef} className="flex gap-4 overflow-x-auto pb-4 flex-1 min-h-0">
           {runningWorkspaces.map(renderWorkspaceColumn)}
+          {startingWorkspaces.map(renderWorkspaceColumn)}
           {showStopped && stoppedWorkspaces.map(renderWorkspaceColumn)}
         </div>
       )}
