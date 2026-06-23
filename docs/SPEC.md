@@ -528,27 +528,62 @@ The app is configured via environment variables:
 | `DATABASE_PATH` | No | Path to SQLite database file (default: `./data/cpm.db`) |
 | `CLAUDE_MAX_TURNS` | No | Max agentic turns per Claude execution (default: 200) |
 | `CLAUDE_ALLOWED_TOOLS` | No | Comma-separated list of tools Claude can use (default: `Read,Edit,Write,Bash,Glob,Grep`) |
-| `CPM_MEMORY_MCP_URLS` | No | Per-user long-term memory store (Mem0/OpenMemory) exposed to agents as an MCP server. See below. |
+| `CPM_MEMORY_MCP_URL_TEMPLATE` | No | URL with `{username}` / `{workspace}` placeholders; auto-derives each user's memory endpoint. See below. |
+| `CPM_MEMORY_MCP_URLS` | No | Explicit per-user memory endpoint map (overrides the template). See below. |
 
-### Per-user memory store (`CPM_MEMORY_MCP_URLS`)
+### Per-user memory store
 
-When set, CPM registers a user's Mem0/OpenMemory endpoint as an MCP server
-(`openmemory`) on every task and advisory-agent session that user owns, and
-appends a system prompt telling the agent to recall from and save to it. The
-store is **user-specific** — the value maps each Coder username to their own
-endpoint, so no user's memories leak to another. Users without an entry get no
-memory MCP (agents fall back to local memory files only).
+When configured, CPM registers a user's Mem0/OpenMemory endpoint as an MCP
+server (`openmemory`) on every task and advisory-agent session that user owns,
+and appends a system prompt telling the agent to recall from and save to it. The
+store is **user-specific** — each Coder user resolves to their own endpoint, so
+no user's memories leak to another. Users with no endpoint get no memory MCP
+(agents fall back to local memory files only).
 
-The value is a JSON object mapping Coder username → endpoint. Each endpoint is
-either the SSE URL string, or `{ "url": "...", "type": "sse" | "http" }` when
-the transport isn't SSE:
+There are two configuration sources, checked in order:
 
-```
-CPM_MEMORY_MCP_URLS={"magnus":"http://192.168.1.199:8765/mcp/openmemory/sse/magnus"}
-```
+Both sources support two placeholders: `{username}` (the task owner's Coder
+username) and `{workspace}` (the target workspace name). `{workspace}` is what
+lets each workspace write under its own OpenMemory **app** — the `/mcp/<app>/`
+path segment — so memories are partitioned per app, e.g. `cpm-{workspace}`.
+
+1. **`CPM_MEMORY_MCP_URL_TEMPLATE`** — a single URL containing `{username}`
+   (and optionally `{workspace}`). A user's endpoint is derived by substituting
+   those values. Use this when everyone shares one Mem0 server:
+
+   ```
+   CPM_MEMORY_MCP_URL_TEMPLATE=http://192.168.1.199:8765/mcp/cpm-{workspace}/sse/{username}
+   ```
+
+   For user `magnus` on workspace `coder-project-manager` this resolves to
+   `http://192.168.1.199:8765/mcp/cpm-coder-project-manager/sse/magnus`.
+
+2. **`CPM_MEMORY_MCP_URLS`** — a JSON object mapping Coder username → endpoint,
+   for users on a different server or to opt a specific user in/out. An explicit
+   entry always wins over the template. Each value is the URL string (it may use
+   the same placeholders), or `{ "url": "...", "type": "sse" | "http" }` when the
+   transport isn't SSE:
+
+   ```
+   CPM_MEMORY_MCP_URLS={"magnus":"http://192.168.1.199:8765/mcp/cpm-{workspace}/sse/magnus"}
+   ```
 
 The workspaces running the agents must be able to reach the endpoint over the
-network. Changing this requires a CPM server restart.
+network. Changing either variable requires a CPM server restart.
+
+**Agent behaviour.** When a memory endpoint is configured, agents get a system
+prompt — parameterized by the resolving Coder user so its identity references
+are correct per user (the store is user-scoped). It instructs the agent to
+recall on start, save durable knowledge as it goes, write **curated** entries
+with `infer=false` (the agent authors the final memory in the standard's
+frontmatter+body format, rather than letting the server re-extract raw text),
+attribute writes to the `cpm-<workspace>` source/app, search-then-supersede to
+avoid duplicates, and never store secrets. Magnus's personal *Shared Memory
+Standard* (the `type` taxonomy and classification rules) is embedded only for its
+owner; other users get the generic prompt without it. Because CPM agents write
+curated, the store's `custom_instructions` (which govern *inferred* extraction)
+don't affect CPM's writes — they're an operator-managed setting for other tools
+that write in inferred mode.
 
 ---
 
