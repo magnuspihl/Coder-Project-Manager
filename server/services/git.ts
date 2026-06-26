@@ -28,22 +28,44 @@ export function fetchGitHubToken(): Promise<string | null> {
 }
 
 /**
+ * Strip terminal escape sequences (ANSI/CSI colour, OSC queries, cursor reports)
+ * from a captured string. `coder ssh` allocates a PTY, so `gh` thinks it is on a
+ * terminal and decorates its output — colourised `--json`, an OSC-11 background
+ * query (`ESC ] 11 ; ? ESC \`), a DSR cursor query (`ESC [ 6 n`), spinner frames.
+ * Over a PTY stderr is merged into stdout, so that decoration lands in what we
+ * capture and breaks `JSON.parse` / corrupts a PR identifier. The non-interactive
+ * env below normally suppresses it; this is the belt-and-suspenders guarantee
+ * that no stray escape from any `gh`/shell version can ever survive into a parse.
+ */
+function stripAnsi(s: string): string {
+  // ESC is \u001b. Strip OSC sequences (ESC ] … terminated by BEL or ST) first,
+  // then CSI/other ESC-introduced sequences (colour, cursor moves, DSR), then any
+  // lone ESC. gh output we consume is plain ASCII (JSON, URLs, numbers, status
+  // text), so removing control escapes is always safe here.
+  return s
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?/g, "")
+    .replace(/\u001b[@-_][0-?]*[ -/]*[@-~]?/g, "")
+    .replace(/\u001b/g, "");
+}
+
+/**
  * Run a gh CLI command in a remote workspace with GH_TOKEN set.
  *
- * `coder ssh` allocates a PTY, so `gh` believes it is attached to a terminal and
- * renders an interactive progress spinner plus terminal-probe escape sequences
- * (OSC background-colour query, cursor reports, ANSI colour). Over a PTY stderr
- * and stdout are merged, so that decoration lands in the captured stdout and
- * corrupts anything we parse out of it — most damagingly the PR identifier from
- * `gh pr create`, which then got passed as garbage to `gh pr merge` and failed
- * every automated merge. Forcing a non-interactive, dumb-terminal environment
- * makes `gh` emit clean, plain output (no spinner, no colour, no OSC probes).
+ * The non-interactive vars must be `export`ed (not used as a `VAR=val cmd`
+ * prefix): the command typically starts with `cd <dir> && gh …`, so a bare
+ * prefix would attach the vars to `cd` and leave `gh` running with the PTY's
+ * `TERM=xterm-256color` — which is exactly how polluted output kept reaching
+ * `gh pr view`/`gh pr merge`. Exporting applies them to the whole shell, and
+ * `stripAnsi` scrubs anything that still slips through.
  */
 const GH_NONINTERACTIVE_ENV = 'TERM=dumb NO_COLOR=1 CLICOLOR=0 GH_PROMPT_DISABLED=1 GH_PAGER=cat';
 async function sshGh(workspaceName: string, command: string, timeout = 30000, userId?: string | null): Promise<string> {
   const token = await fetchGitHubToken();
-  const prefix = token ? `export GH_TOKEN=${shellEscape(token)} && ` : '';
-  return sshExec(workspaceName, `${prefix}${GH_NONINTERACTIVE_ENV} ${command}`, timeout, userId);
+  const assignments = token
+    ? `GH_TOKEN=${shellEscape(token)} ${GH_NONINTERACTIVE_ENV}`
+    : GH_NONINTERACTIVE_ENV;
+  const out = await sshExec(workspaceName, `export ${assignments} && ${command}`, timeout, userId);
+  return stripAnsi(out);
 }
 
 // Alias so task-scoped functions can shadow `sshGh` with a token-injecting
