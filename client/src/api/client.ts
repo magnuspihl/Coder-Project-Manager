@@ -325,6 +325,9 @@ export const reopenTask = (taskId: string) =>
 export const retryTask = (taskId: string) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/retry`, { method: 'POST' });
 
+export const reviewTask = (taskId: string) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}/review`, { method: 'POST' });
+
 export const resetTaskSession = (taskId: string, continuationPrompt: string) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/reset-session`, {
     method: 'POST',

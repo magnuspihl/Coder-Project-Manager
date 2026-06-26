@@ -30,7 +30,7 @@ import {
   setTaskRequestTarget,
 } from '../services/tasks.js';
 import { findUserWorkspaceById } from '../services/workspace-cache.js';
-import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock } from '../services/claude.js';
+import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, removeTaskWorktree } from '../services/git.js';
@@ -347,6 +347,40 @@ router.post('/tasks/:taskId/reopen', requireAuth, async (req: Request, res: Resp
   handleTaskReopenGit(task).catch(() => {});
 
   res.json({ task: getTask(task.id) });
+});
+
+// Manually trigger the red-team reviewer on a task awaiting feedback.
+router.post('/tasks/:taskId/review', requireAuth, async (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  if (task.status !== 'awaiting_feedback') {
+    res.status(400).json({ error: `Only tasks awaiting feedback can be reviewed (current status: ${task.status}).` });
+    return;
+  }
+  if (!task.worktree_path) {
+    res.status(400).json({ error: 'This task has no worktree, so there is nothing to review.' });
+    return;
+  }
+  // A review runs git/SSH against the worktree — refuse if another task is
+  // actively working this workspace (would race the working agent's tree).
+  const working = getWorkingTask(task.workspace_id);
+  if (working && working.id !== task.id) {
+    res.status(409).json({ error: 'Cannot review while another task is running on this workspace.' });
+    return;
+  }
+  try {
+    const launched = await triggerManualReview(task);
+    if (!launched) {
+      res.status(400).json({ error: 'No changes to review — the task\'s working tree is clean.' });
+      return;
+    }
+    res.json({ task: getTask(task.id) });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to launch reviewer' });
+  }
 });
 
 // Switch workspace to a task's branch

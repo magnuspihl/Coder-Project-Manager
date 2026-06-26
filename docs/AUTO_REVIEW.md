@@ -13,6 +13,12 @@ human call is needed. This document should be read alongside `SPEC.md` and `WORK
 - The Reviewer runs as a fresh, read-only Claude session — no shared context with the Implementer
 - Up to 2 Reviewer passes per Implementer turn; if still failing, the task escalates to the user
 - Tasks can opt out at creation time; review is skipped automatically when the worktree is clean
+- The Reviewer can also be triggered manually on an `awaiting_feedback` task — via the **Review**
+  button next to **Complete** in the task detail UI, the `POST /api/tasks/:taskId/review` route, or
+  the `review` MCP tool. A manual review resets the loop counter, then routes its verdict through the
+  same `finalizeReviewer` path as auto-review (pass → `awaiting_feedback`; fail → back to the
+  Implementer, capped by the loop limit). It is rejected if the worktree is clean or another task is
+  running on the workspace.
 
 **What stays the same:**
 - All task states (`queued`, `working`, `awaiting_feedback`, `completed`, `failed`, `cancelled`)
