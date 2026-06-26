@@ -375,7 +375,7 @@ const REVIEWER_ALLOWED_TOOLS = [
   'Bash(npm test:*)', 'Bash(npm run test:*)', 'Bash(npm run lint:*)', 'Bash(npx tsc:*)',
   'Bash(go test:*)', 'Bash(go vet:*)', 'Bash(pytest:*)', 'Bash(cargo test:*)',
 ].join(',');
-const MAX_REVIEW_LOOPS = parseInt(process.env.CPM_REVIEW_MAX_LOOPS || '2', 10);
+export const MAX_REVIEW_LOOPS = parseInt(process.env.CPM_REVIEW_MAX_LOOPS || '2', 10);
 
 function remoteReviewerOutputPath(taskId: string): string {
   return `/tmp/cpm-task-${taskId}-review.jsonl`;
@@ -435,6 +435,83 @@ async function getGitDiff(worktreePath: string, workspaceName: string): Promise<
   } catch {
     return '(could not retrieve diff)';
   }
+}
+
+/**
+ * Full diff of a task's branch + working tree against the repo's default
+ * branch (main/master). Unlike getGitDiff (which only shows uncommitted work
+ * for the reviewer prompt), this resolves the merge-base with the default
+ * branch so it captures BOTH committed-on-branch and uncommitted changes —
+ * i.e. everything the branch would contribute if merged. Used by the MCP
+ * get_task_diff tool. Requires the workspace to be running (uses SSH).
+ */
+export async function getTaskBranchDiff(task: Task): Promise<{ base_ref: string | null; stat: string; diff: string; truncated: boolean }> {
+  const workDir = task.worktree_path || task.project_dir;
+  if (!workDir) {
+    return { base_ref: null, stat: '', diff: '(task has no working directory)', truncated: false };
+  }
+  const wt = shellEscape(workDir);
+
+  // Resolve a base ref: prefer the remote default branch, then local. The loop
+  // echoes the first ref that resolves, so the caller learns what it diffed against.
+  const baseRef = await sshExec(task.workspace_name,
+    `for r in origin/main main origin/master master; do ` +
+    `git -C ${wt} rev-parse --verify --quiet "$r" >/dev/null 2>&1 && { echo "$r"; break; }; done`,
+    10000,
+  ).then(s => s.trim()).catch(() => '');
+
+  try {
+    // Diff the working tree (committed + uncommitted, tracked) against the
+    // merge-base with the default branch. Falling back to HEAD keeps it working
+    // for a brand-new repo with no default branch yet.
+    const baseExpr = baseRef
+      ? `base=$(git -C ${wt} merge-base ${shellEscape(baseRef)} HEAD 2>/dev/null || echo ${shellEscape(baseRef)})`
+      : `base=HEAD`;
+    const diff = await sshExec(task.workspace_name, `${baseExpr}; git -C ${wt} diff "$base" 2>/dev/null`, 20000);
+    const stat = await sshExec(task.workspace_name, `${baseExpr}; git -C ${wt} diff --stat "$base" 2>/dev/null`, 15000);
+    const untracked = await sshExec(task.workspace_name, `git -C ${wt} ls-files --others --exclude-standard 2>/dev/null`, 10000);
+
+    const parts: string[] = [];
+    if (diff.trim()) parts.push(diff.trim());
+    if (untracked.trim()) parts.push(`Untracked files (not yet added):\n${untracked.trim()}`);
+    let combined = parts.join('\n\n');
+    let truncated = false;
+    // Cap the unified diff so a huge branch can't blow the MCP client's context.
+    const LIMIT = 100000;
+    if (combined.length > LIMIT) {
+      combined = combined.slice(0, LIMIT) + '\n\n[diff truncated — see the --stat summary for the full file list]';
+      truncated = true;
+    }
+    return {
+      base_ref: baseRef || null,
+      stat: stat.trim(),
+      diff: combined || '(no changes relative to the default branch)',
+      truncated,
+    };
+  } catch (err) {
+    return { base_ref: baseRef || null, stat: '', diff: `(could not retrieve diff: ${(err as Error).message})`, truncated: false };
+  }
+}
+
+/**
+ * Manually launch the red-team reviewer on an awaiting-feedback task. Mirrors
+ * the auto-review path: the verdict routes through finalizeReviewer, so a
+ * "fail" sends issues back to the implementer (subject to MAX_REVIEW_LOOPS) and
+ * a "pass" returns to awaiting_feedback. The review loop counter is reset first
+ * so a manual review always gets the full retry budget.
+ *
+ * Returns false (without launching) if the task has no worktree or its working
+ * tree has no changes to review — the caller surfaces that to the user.
+ */
+export async function triggerManualReview(task: Task): Promise<boolean> {
+  if (!task.worktree_path) return false;
+  const hasChanges = await worktreeHasChanges(task.worktree_path, task.workspace_name);
+  if (!hasChanges) return false;
+  resetReviewLoopCount(task.id);
+  addMessage(task.id, 'system', 'Manual review requested — launching the reviewer.');
+  updateTaskStatus(task.id, 'working');
+  await launchReviewerOnTask(task);
+  return true;
 }
 
 // The machine-readable verdict contract, restated in plain text. This is

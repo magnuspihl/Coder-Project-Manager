@@ -6,6 +6,7 @@ import {
   completeTask,
   reopenTask,
   retryTask,
+  reviewTask,
   resetTaskSession,
   compactTaskSession,
   updateTaskTitle,
@@ -85,6 +86,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [optimisticMessage, setOptimisticMessage] = useState<Message | null>(null);
   const [idCopied, setIdCopied] = useState(false);
   const [completing, setCompleting] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
   const [resetSessionOpen, setResetSessionOpen] = useState(false);
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
   const [resetSessionPrompt, setResetSessionPrompt] = useState('');
@@ -763,6 +765,19 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const handleRetry = async () => {
     await retryTask(taskId);
     closeAndNotify();
+  };
+
+  const handleReview = async () => {
+    setReviewing(true);
+    try {
+      await reviewTask(taskId);
+      // Reviewer is now running — reload so the modal reflects the working state.
+      await loadData();
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : 'Failed to start review');
+    } finally {
+      setReviewing(false);
+    }
   };
 
   const handleResetSession = async () => {
@@ -1951,6 +1966,19 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         <>Complete<span className="hidden sm:inline"> (Alt+C)</span></>
                       )}
                     </button>
+                    {/* Manually trigger the red-team reviewer. Hidden when this
+                        task has no worktree (nothing to review). */}
+                    {!!task.worktree_path && (
+                      <button
+                        onClick={handleReview}
+                        disabled={reviewing || completing || !!task.pending_complete}
+                        className="inline-flex items-center gap-1.5 text-sm px-4 py-2 rounded-md border border-purple-300 dark:border-purple-700 text-purple-700 dark:text-purple-300 hover:bg-purple-50 dark:hover:bg-purple-900/20 disabled:opacity-50"
+                        title="Run the red-team reviewer on this task's changes"
+                      >
+                        <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z"/></svg>
+                        {reviewing ? 'Starting review…' : 'Review'}
+                      </button>
+                    )}
                     {/* Session maintenance — rarely used, tucked into a dropdown */}
                     <div className="relative">
                       <button

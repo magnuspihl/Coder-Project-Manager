@@ -7,6 +7,7 @@ import {
   listTasks,
   getTask,
   getMessages,
+  getMessageCount,
   createTask,
   addMessage,
   updateTaskStatus,
@@ -15,6 +16,10 @@ import {
   setPendingComplete,
   getWorkingTask,
   getTaskParticipants,
+  getTaskTurns,
+  type Message,
+  type TaskTurn,
+  type TaskParticipant,
 } from '../services/tasks.js';
 import {
   processQueue,
@@ -23,7 +28,13 @@ import {
   interruptTask,
   isTaskParticipantRunning,
   stopTaskParticipant,
+  cleanupPortRange,
+  withWorkspaceLock,
+  triggerManualReview,
+  getTaskBranchDiff,
+  MAX_REVIEW_LOOPS,
 } from '../services/claude.js';
+import { handleTaskCompletionGit } from '../services/git.js';
 import { listWorkspaces, getWorkspace, stopWorkspace, startWorkspace, CoderAuthError } from '../services/coder.js';
 
 type AuthCtx = {
@@ -47,6 +58,35 @@ function errorResult(message: string) {
     isError: true,
     content: [{ type: 'text' as const, text: message }],
   };
+}
+
+/**
+ * Resolve who actually authored a message. Both the implementer and the
+ * read-only reviewer are persisted with role 'assistant', so callers can't tell
+ * them apart from `role` alone — the distinction lives on the message's turn.
+ * Returns a stable author label and surfaces the turn role explicitly.
+ */
+function attributeMessages(
+  messages: Message[],
+  turns: TaskTurn[],
+  participants: TaskParticipant[],
+): Array<Message & { author: string; turn_role: 'implementer' | 'reviewer' | null }> {
+  const turnRole = new Map(turns.map(t => [t.id, t.role]));
+  const participantName = new Map(participants.map(p => [p.id, p.workspace_name]));
+  return messages.map(m => {
+    const role = m.turn_id ? turnRole.get(m.turn_id) ?? null : null;
+    let author: string;
+    if (m.role === 'assistant') {
+      if (m.participant_id) author = `participant:${participantName.get(m.participant_id) ?? m.participant_id}`;
+      else if (role === 'reviewer') author = 'reviewer';
+      else author = 'implementer';
+    } else if (m.role === 'user') {
+      author = 'user';
+    } else {
+      author = m.role; // system, etc.
+    }
+    return { ...m, author, turn_role: role };
+  });
 }
 
 function buildServer(ctx: AuthCtx): McpServer {
@@ -102,7 +142,7 @@ function buildServer(ctx: AuthCtx): McpServer {
   server.registerTool(
     'list_tasks',
     {
-      description: 'List tasks for a workspace, ordered by queue position. Returns ID, title, status, prompt, and provenance.',
+      description: 'List tasks for a workspace, ordered by queue position. Returns ID, title, status, prompt, provenance, timestamps, and review-loop progress.',
       inputSchema: { workspace_id: z.string().describe('Coder workspace ID') },
       annotations: { readOnlyHint: true },
     },
@@ -117,6 +157,12 @@ function buildServer(ctx: AuthCtx): McpServer {
         claude_session_id: t.claude_session_id,
         source: t.source,
         client_label: t.client_label,
+        // Auto-review loop progress. review_loop_count is how many failed
+        // reviewer passes have routed back to the implementer so far;
+        // max_review_loop_count is the cap after which the reviewer stops
+        // looping and returns control to the user.
+        review_loop_count: t.review_loop_count,
+        max_review_loop_count: MAX_REVIEW_LOOPS,
         created_at: t.created_at,
         updated_at: t.updated_at,
         completed_at: t.completed_at,
@@ -130,19 +176,54 @@ function buildServer(ctx: AuthCtx): McpServer {
   server.registerTool(
     'get_task',
     {
-      description: 'Get a task with its full message history.',
+      description: 'Get a task with its message history. When message_limit is set, returns the most recent N messages (in chronological order), not the oldest. Each message includes an "author" field ("implementer", "reviewer", "user", "system", or "participant:<workspace>") and "turn_role", since the implementer and the read-only reviewer are both stored with role "assistant".',
       inputSchema: {
         task_id: z.string().describe('Task ID'),
-        message_limit: z.number().int().positive().max(500).optional().describe('Max number of messages to return (newest first if provided)'),
+        message_limit: z.number().int().positive().max(500).optional().describe('If set, return only the most recent N messages (newest, in chronological order). Omit for the full history.'),
       },
       annotations: { readOnlyHint: true },
     },
     async ({ task_id, message_limit }) => {
       const task = getTask(task_id);
       if (!task) return errorResult('Task not found');
-      const messages = getMessages(task_id, message_limit);
+      // getMessages(limit) returns the OLDEST N (ORDER BY created_at ASC LIMIT).
+      // The caller wants the most recent N, so offset to the tail of the list;
+      // they come back in chronological order, which reads naturally.
+      let messages: Message[];
+      if (message_limit) {
+        const total = getMessageCount(task_id);
+        const offset = Math.max(0, total - message_limit);
+        messages = getMessages(task_id, message_limit, offset);
+      } else {
+        messages = getMessages(task_id);
+      }
       const participants = getTaskParticipants(task_id);
-      return jsonResult({ task, messages, participants });
+      const turns = getTaskTurns(task_id);
+      return jsonResult({
+        task,
+        messages: attributeMessages(messages, turns, participants),
+        turns,
+        participants,
+      });
+    },
+  );
+
+  server.registerTool(
+    'get_task_diff',
+    {
+      description: 'Get the code changes a task has made: a unified diff of the task\'s branch and working tree against the repository\'s default branch (main/master), plus a --stat summary and any untracked files. Requires the workspace to be running. Large diffs are truncated (see the truncated flag).',
+      inputSchema: { task_id: z.string().describe('Task ID') },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ task_id }) => {
+      const task = getTask(task_id);
+      if (!task) return errorResult('Task not found');
+      try {
+        const result = await getTaskBranchDiff(task);
+        return jsonResult({ task_id, ...result });
+      } catch (err) {
+        return errorResult(`Failed to get task diff: ${(err as Error).message}`);
+      }
     },
   );
 
@@ -215,6 +296,108 @@ function buildServer(ctx: AuthCtx): McpServer {
       }
       await resumeTask(task, message);
       return jsonResult({ ok: true, task: getTask(task.id) });
+    },
+  );
+
+  server.registerTool(
+    'complete_task',
+    {
+      description: 'Mark a task awaiting feedback as completed. Runs the task\'s git completion (commit/merge) before finalizing. If another task is working on the same workspace, completion is deferred until the queue is idle and the task is flagged pending-complete. Completing an already-completed task is a no-op.',
+      inputSchema: { task_id: z.string().describe('Task ID') },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ task_id }) => {
+      const task = getTask(task_id);
+      if (!task) return errorResult('Task not found');
+
+      // Cheap early-out; re-checked under the lock below.
+      if (task.status !== 'awaiting_feedback' && task.status !== 'completed') {
+        return errorResult(`Only tasks awaiting feedback can be completed (current status: ${task.status}).`);
+      }
+
+      // Run git completion and the status transition atomically under the
+      // per-workspace lock so a manual complete cannot race the queued
+      // deferred-completion path (or a second complete) — mirrors the REST
+      // POST /tasks/:id/complete handler.
+      const outcome = await withWorkspaceLock(task.workspace_id, async (): Promise<
+        | { code: 200; completed?: boolean }
+        | { code: 202 }
+        | { code: 400 | 404 | 409; error: string }
+      > => {
+        const fresh = getTask(task.id);
+        if (!fresh) return { code: 404, error: 'Task not found' };
+        if (fresh.status === 'completed') return { code: 200 };
+        if (fresh.status !== 'awaiting_feedback') {
+          return { code: 400, error: `Only tasks awaiting feedback can be completed (current status: ${fresh.status}).` };
+        }
+
+        // Defer if another task is working this workspace — concurrent git ops
+        // would corrupt the working agent's tree.
+        const working = getWorkingTask(fresh.workspace_id);
+        if (working && working.id !== fresh.id) {
+          if (!fresh.pending_complete) {
+            setPendingComplete(fresh.id, true);
+            addMessage(fresh.id, 'system', `Completion queued — will finalize after task "${working.title}" finishes on this workspace.`, undefined, undefined, undefined, ctx.authSource, ctx.clientLabel);
+          }
+          return { code: 202 };
+        }
+
+        const allowed = await handleTaskCompletionGit(fresh);
+        if (!allowed) {
+          return { code: 409, error: 'Cannot complete: git operation blocked. See task messages for the exact reason.' };
+        }
+
+        setPendingComplete(fresh.id, false);
+        updateTaskStatus(fresh.id, 'completed');
+        return { code: 200, completed: true };
+      });
+
+      if (outcome.code === 200 && outcome.completed) {
+        // Free the port range; keep the worktree (removed only on delete).
+        // Outside the lock — processQueue re-acquires it.
+        await cleanupPortRange(task).catch(() => {});
+        await processQueue(task.workspace_id);
+      }
+
+      if (outcome.code === 202) {
+        return jsonResult({ ok: true, queued: true, task: getTask(task.id) });
+      }
+      if (outcome.code !== 200) {
+        return errorResult(outcome.error);
+      }
+      return jsonResult({ ok: true, task: getTask(task.id) });
+    },
+  );
+
+  server.registerTool(
+    'review',
+    {
+      description: 'Trigger the red-team reviewer on a task awaiting feedback. The reviewer inspects the task\'s diff and emits a verdict: on "pass" the task returns to awaiting_feedback; on "fail" the issues are routed back to the implementer to fix (up to max_review_loop_count passes). The task moves to "working" while the reviewer runs. Fails if the worktree is clean (nothing to review) or another task is running on the workspace.',
+      inputSchema: { task_id: z.string().describe('Task ID') },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    async ({ task_id }) => {
+      const task = getTask(task_id);
+      if (!task) return errorResult('Task not found');
+      if (task.status !== 'awaiting_feedback') {
+        return errorResult(`Only tasks awaiting feedback can be reviewed (current status: ${task.status}).`);
+      }
+      if (!task.worktree_path) {
+        return errorResult('This task has no worktree, so there is nothing to review.');
+      }
+      const working = getWorkingTask(task.workspace_id);
+      if (working && working.id !== task.id) {
+        return errorResult('Cannot review while another task is running on this workspace.');
+      }
+      try {
+        const launched = await triggerManualReview(task);
+        if (!launched) {
+          return errorResult('No changes to review — the task\'s working tree is clean.');
+        }
+        return jsonResult({ ok: true, task: getTask(task.id) });
+      } catch (err) {
+        return errorResult(`Failed to launch reviewer: ${(err as Error).message}`);
+      }
     },
   );
 
