@@ -29,13 +29,21 @@ export function fetchGitHubToken(): Promise<string | null> {
 
 /**
  * Run a gh CLI command in a remote workspace with GH_TOKEN set.
+ *
+ * `coder ssh` allocates a PTY, so `gh` believes it is attached to a terminal and
+ * renders an interactive progress spinner plus terminal-probe escape sequences
+ * (OSC background-colour query, cursor reports, ANSI colour). Over a PTY stderr
+ * and stdout are merged, so that decoration lands in the captured stdout and
+ * corrupts anything we parse out of it — most damagingly the PR identifier from
+ * `gh pr create`, which then got passed as garbage to `gh pr merge` and failed
+ * every automated merge. Forcing a non-interactive, dumb-terminal environment
+ * makes `gh` emit clean, plain output (no spinner, no colour, no OSC probes).
  */
+const GH_NONINTERACTIVE_ENV = 'TERM=dumb NO_COLOR=1 CLICOLOR=0 GH_PROMPT_DISABLED=1 GH_PAGER=cat';
 async function sshGh(workspaceName: string, command: string, timeout = 30000, userId?: string | null): Promise<string> {
   const token = await fetchGitHubToken();
-  if (token) {
-    return sshExec(workspaceName, `export GH_TOKEN=${shellEscape(token)} && ${command}`, timeout, userId);
-  }
-  return sshExec(workspaceName, command, timeout, userId);
+  const prefix = token ? `export GH_TOKEN=${shellEscape(token)} && ` : '';
+  return sshExec(workspaceName, `${prefix}${GH_NONINTERACTIVE_ENV} ${command}`, timeout, userId);
 }
 
 // Alias so task-scoped functions can shadow `sshGh` with a token-injecting
@@ -774,11 +782,20 @@ async function completePrGitHub(
       );
     }
     try {
-      const prUrl = (await sshGh(ws,
+      // Run the create but DON'T trust its stdout as the merge target. Even with
+      // the non-interactive env above, `gh pr create` is the one command that
+      // prints a progress line ("Creating pull request for …"); re-querying the
+      // PR by branch via `--json` gives a clean, structured identifier that can
+      // never carry stray decoration into the subsequent `gh pr merge`.
+      await sshGh(ws,
         `cd ${shellEscape(dir)} && gh pr create --base ${shellEscape(defaultBranch)} --head ${shellEscape(branchName)} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`
-      )).trim();
-      mergeTarget = prUrl;
-      addMessage(taskId, 'system', `Pull request created: ${prUrl}`);
+      );
+      const created = JSON.parse(
+        (await sshGh(ws, `cd ${shellEscape(dir)} && gh pr view ${shellEscape(branchName)} --json url,number 2>/dev/null`)).trim()
+      ) as { url?: string; number?: number };
+      mergeTarget = created.number != null ? String(created.number) : (created.url ?? '');
+      if (!mergeTarget) throw new Error('PR was created but its number/URL could not be read back.');
+      addMessage(taskId, 'system', `Pull request created: ${created.url ?? `#${mergeTarget}`}`);
     } catch (prErr: any) {
       const msg = String(prErr?.message || prErr);
       // GitHub refuses a PR when the branch adds no commits over the base — the
