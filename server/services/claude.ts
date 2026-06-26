@@ -9,6 +9,7 @@ import { getOllamaBaseUrl } from './models.js';
 import { getAttachmentsByTask, type Attachment } from '../routes/uploads.js';
 import { writeCpmGuidelines } from './workspace-memory.js';
 import { buildMemoryMcpConfig, MEMORY_MCP_ALLOWED_TOOL, buildMemoryUsagePrompt } from './memory-mcp.js';
+import { getValidCoderTokenForUser, forceRefreshCoderTokenForUser } from './sessions.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
@@ -45,7 +46,7 @@ function allocatePortRange(_workspaceId: string): number | null {
 export async function cleanupPortRange(task: Task): Promise<void> {
   if (task.port_range_start === null || task.port_range_start === undefined) return;
   const ports = Array.from({ length: PORT_RANGE_SIZE }, (_, i) => `${task.port_range_start! + i}/tcp`).join(' ');
-  await sshExec(task.workspace_name, `fuser -k ${ports} 2>/dev/null || true`, 10000).catch(() => {});
+  await sshExec(task.workspace_name, `fuser -k ${ports} 2>/dev/null || true`, 10000, task.user_id).catch(() => {});
   // Release the port range back to the pool. The task keeps its worktree but its
   // ports are now free for reallocation; if the task later resumes (retry/reopen)
   // it will be assigned a fresh range. Avoids two tasks claiming the same ports.
@@ -410,19 +411,19 @@ function stripNoReviewMarker(taskId: string, text: string): string {
   return text.replace(re, '').replace(/\n{3,}/g, '\n\n').trim();
 }
 
-async function worktreeHasChanges(worktreePath: string, workspaceName: string): Promise<boolean> {
+async function worktreeHasChanges(worktreePath: string, workspaceName: string, userId?: string | null): Promise<boolean> {
   try {
-    const out = await sshExec(workspaceName, `git -C ${shellEscape(worktreePath)} status --porcelain 2>/dev/null`, 10000);
+    const out = await sshExec(workspaceName, `git -C ${shellEscape(worktreePath)} status --porcelain 2>/dev/null`, 10000, userId);
     return out.trim().length > 0;
   } catch {
     return false;
   }
 }
 
-async function getGitDiff(worktreePath: string, workspaceName: string): Promise<string> {
+async function getGitDiff(worktreePath: string, workspaceName: string, userId?: string | null): Promise<string> {
   try {
-    const diff = await sshExec(workspaceName, `git -C ${shellEscape(worktreePath)} diff HEAD 2>/dev/null`, 15000);
-    const untracked = await sshExec(workspaceName, `git -C ${shellEscape(worktreePath)} ls-files --others --exclude-standard 2>/dev/null`, 10000);
+    const diff = await sshExec(workspaceName, `git -C ${shellEscape(worktreePath)} diff HEAD 2>/dev/null`, 15000, userId);
+    const untracked = await sshExec(workspaceName, `git -C ${shellEscape(worktreePath)} ls-files --others --exclude-standard 2>/dev/null`, 10000, userId);
     const parts: string[] = [];
     if (diff.trim()) parts.push(diff.trim());
     if (untracked.trim()) parts.push(`Untracked files:\n${untracked.trim()}`);
@@ -457,7 +458,7 @@ export async function getTaskBranchDiff(task: Task): Promise<{ base_ref: string 
   const baseRef = await sshExec(task.workspace_name,
     `for r in origin/main main origin/master master; do ` +
     `git -C ${wt} rev-parse --verify --quiet "$r" >/dev/null 2>&1 && { echo "$r"; break; }; done`,
-    10000,
+    10000, task.user_id,
   ).then(s => s.trim()).catch(() => '');
 
   try {
@@ -467,9 +468,9 @@ export async function getTaskBranchDiff(task: Task): Promise<{ base_ref: string 
     const baseExpr = baseRef
       ? `base=$(git -C ${wt} merge-base ${shellEscape(baseRef)} HEAD 2>/dev/null || echo ${shellEscape(baseRef)})`
       : `base=HEAD`;
-    const diff = await sshExec(task.workspace_name, `${baseExpr}; git -C ${wt} diff "$base" 2>/dev/null`, 20000);
-    const stat = await sshExec(task.workspace_name, `${baseExpr}; git -C ${wt} diff --stat "$base" 2>/dev/null`, 15000);
-    const untracked = await sshExec(task.workspace_name, `git -C ${wt} ls-files --others --exclude-standard 2>/dev/null`, 10000);
+    const diff = await sshExec(task.workspace_name, `${baseExpr}; git -C ${wt} diff "$base" 2>/dev/null`, 20000, task.user_id);
+    const stat = await sshExec(task.workspace_name, `${baseExpr}; git -C ${wt} diff --stat "$base" 2>/dev/null`, 15000, task.user_id);
+    const untracked = await sshExec(task.workspace_name, `git -C ${wt} ls-files --others --exclude-standard 2>/dev/null`, 10000, task.user_id);
 
     const parts: string[] = [];
     if (diff.trim()) parts.push(diff.trim());
@@ -505,7 +506,7 @@ export async function getTaskBranchDiff(task: Task): Promise<{ base_ref: string 
  */
 export async function triggerManualReview(task: Task): Promise<boolean> {
   if (!task.worktree_path) return false;
-  const hasChanges = await worktreeHasChanges(task.worktree_path, task.workspace_name);
+  const hasChanges = await worktreeHasChanges(task.worktree_path, task.workspace_name, task.user_id);
   if (!hasChanges) return false;
   resetReviewLoopCount(task.id);
   addMessage(task.id, 'system', 'Manual review requested — launching the reviewer.');
@@ -752,19 +753,68 @@ function localExec(command: string, timeout = 15000): Promise<string> {
  * Run a command via coder ssh, returning stdout.
  * When the target workspace is the local workspace, runs the command locally instead.
  */
-export function sshExec(workspaceName: string, command: string, timeout = 15000): Promise<string> {
+export async function sshExec(
+  workspaceName: string,
+  command: string,
+  timeout = 15000,
+  userId?: string | null,
+): Promise<string> {
   if (isLocalWorkspace(workspaceName)) {
     return localExec(command, timeout);
   }
-  return new Promise((resolve, reject) => {
-    execFile('coder', ['ssh', workspaceName, '--', command], {
-      timeout,
-      env: { ...process.env, CODER_URL },
-    }, (err, stdout) => {
-      if (err) reject(err);
-      else resolve(stdout?.trim() || '');
+
+  const run = (env: NodeJS.ProcessEnv) =>
+    new Promise<{ err: (Error & { stderr?: string }) | null; stdout: string; stderr: string }>((resolve) => {
+      execFile('coder', ['ssh', workspaceName, '--', command], { timeout, env }, (err, stdout, stderr) => {
+        resolve({ err: err as (Error & { stderr?: string }) | null, stdout: stdout || '', stderr: stderr || '' });
+      });
     });
-  });
+
+  let env = await buildCoderEnv(userId);
+  let { err, stdout, stderr } = await run(env);
+
+  // Reactive recovery: if the call was rejected for auth/connection reasons and
+  // we have a user whose OAuth token we can refresh, force a refresh once and
+  // retry. Proactive refresh in buildCoderEnv handles ordinary expiry; this
+  // covers the case where the token lapsed (or was rotated) between calls.
+  if (err && userId && isCoderAuthFailure(stderr)) {
+    const refreshed = await forceRefreshCoderTokenForUser(userId).catch(() => null);
+    if (refreshed) {
+      env = { ...env, CODER_SESSION_TOKEN: refreshed };
+      ({ err, stdout, stderr } = await run(env));
+    }
+  }
+
+  if (err) throw err; // execFile already appends stderr to err.message
+  return stdout.trim();
+}
+
+/**
+ * Build the environment for a `coder` child process. When a userId is given we
+ * override CODER_SESSION_TOKEN with that user's refreshable OAuth token from the
+ * session store; otherwise we leave the ambient (build-time) token in place so
+ * callers without a user context keep working.
+ */
+async function buildCoderEnv(userId?: string | null, extra?: NodeJS.ProcessEnv): Promise<NodeJS.ProcessEnv> {
+  const env: NodeJS.ProcessEnv = { ...process.env, CODER_URL, ...(extra || {}) };
+  if (userId) {
+    try {
+      const token = await getValidCoderTokenForUser(userId);
+      if (token) env.CODER_SESSION_TOKEN = token;
+    } catch (err) {
+      console.warn('[claude] Could not resolve user Coder token; using ambient token:', (err as Error).message);
+    }
+  }
+  return env;
+}
+
+/** Heuristic: does this coder-CLI stderr indicate an authentication failure? */
+function isCoderAuthFailure(stderr: string): boolean {
+  if (!stderr) return false;
+  const s = stderr.toLowerCase();
+  return s.includes('openid') || s.includes('oidc') || s.includes('401') ||
+    s.includes('unauthorized') || s.includes('re-authenticat') ||
+    s.includes('coder login') || s.includes('invalid session') || s.includes('expired token');
 }
 
 /**
@@ -783,13 +833,14 @@ async function pollOutputAndExit(
   exitFile: string,
   linesRead: number,
   timeout = 20000,
+  userId?: string | null,
 ): Promise<{ jsonPart: string; exitPart: string }> {
   const marker = `---CPM-EXIT-${randomUUID()}---`;
   const command =
     `tail -n +${linesRead + 1} ${shellEscape(outputFile)} 2>/dev/null; ` +
     `echo ${shellEscape(marker)}; ` +
     `cat ${shellEscape(exitFile)} 2>/dev/null || echo 'RUNNING'`;
-  const output = await sshExec(workspaceName, command, timeout);
+  const output = await sshExec(workspaceName, command, timeout, userId);
   // Use lastIndexOf as a belt-and-suspenders guard: even in the pathological
   // case where Claude's output echoed the exact nonce, the real marker is
   // always appended after the tail, so the last occurrence wins.
@@ -811,13 +862,15 @@ async function transferFilesToWorkspace(
   workspaceName: string,
   attachments: Attachment[],
   remoteDir: string,
+  userId?: string | null,
 ): Promise<Map<string, string>> {
   const pathMap = new Map<string, string>();
   if (attachments.length === 0) return pathMap;
 
   // Create the remote directory
-  await sshExec(workspaceName, `mkdir -p ${shellEscape(remoteDir)}`, 10000);
+  await sshExec(workspaceName, `mkdir -p ${shellEscape(remoteDir)}`, 10000, userId);
 
+  const spawnEnv = await buildCoderEnv(userId);
   for (const att of attachments) {
     const remotePath = `${remoteDir}/${att.original_name}`;
     try {
@@ -840,7 +893,7 @@ async function transferFilesToWorkspace(
             'ssh', workspaceName, '--',
             `head -c ${att.size} > ${shellEscape(remotePath)}`,
           ], {
-            env: { ...process.env, CODER_URL },
+            env: spawnEnv,
             stdio: ['pipe', 'ignore', 'pipe'],
           });
           // Belt-and-suspenders timeout in case SSH itself hangs (network /
@@ -885,14 +938,15 @@ function remoteExitCodePath(taskId: string): string {
 /**
  * Auto-detect the primary project directory in a workspace.
  */
-export async function detectProjectDir(workspaceName: string): Promise<string | null> {
+export async function detectProjectDir(workspaceName: string, userId?: string | null): Promise<string | null> {
   if (projectDirCache.has(workspaceName)) {
     return projectDirCache.get(workspaceName)!;
   }
 
   try {
     const output = await sshExec(workspaceName,
-      'find /home/coder -maxdepth 2 -name .git -type d 2>/dev/null'
+      'find /home/coder -maxdepth 2 -name .git -type d 2>/dev/null',
+      15000, userId,
     );
 
     if (!output) {
@@ -1091,7 +1145,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
 
   // Auto-detect project directory if not already set
   if (!task.project_dir) {
-    const detected = await detectProjectDir(task.workspace_name);
+    const detected = await detectProjectDir(task.workspace_name, task.user_id);
     if (detected) {
       task.project_dir = detected;
       getDb().prepare('UPDATE tasks SET project_dir = ? WHERE id = ?').run(detected, task.id);
@@ -1110,7 +1164,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   if (attachments.length > 0) {
     const remoteAttachDir = `/tmp/cpm-attachments-${task.id}`;
     try {
-      const pathMap = await transferFilesToWorkspace(task.workspace_name, attachments, remoteAttachDir);
+      const pathMap = await transferFilesToWorkspace(task.workspace_name, attachments, remoteAttachDir, task.user_id);
       if (pathMap.size > 0) {
         const fileList = Array.from(pathMap.values())
           .map(p => `- ${p}`)
@@ -1153,7 +1207,8 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     try {
       const sid = task.claude_session_id!.replace(/[^a-zA-Z0-9-]/g, '');
       const found = (await sshExec(task.workspace_name,
-        `find ~/.claude/projects/ -name '${sid}.jsonl' 2>/dev/null | head -1`
+        `find ~/.claude/projects/ -name '${sid}.jsonl' 2>/dev/null | head -1`,
+        15000, task.user_id,
       )).trim();
       if (!found) {
         canResume = false;
@@ -1166,7 +1221,8 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
           try {
             const target = `$HOME/.claude/projects/${encodedDir}`;
             await sshExec(task.workspace_name,
-              `mkdir -p "${target}" && { [ -e "${target}/${sid}.jsonl" ] || cp ${shellEscape(found)} "${target}/"; }`);
+              `mkdir -p "${target}" && { [ -e "${target}/${sid}.jsonl" ] || cp ${shellEscape(found)} "${target}/"; }`,
+              15000, task.user_id);
             console.log(`[claude-executor] Relocated session ${sid} into ~/.claude/projects/${encodedDir}/ so --resume can find it`);
           } catch {
             canResume = false;
@@ -1322,6 +1378,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
       await sshExec(task.workspace_name,
         `mv -f ${shellEscape(outputFile)} ${shellEscape(outputFile + '.prev')} 2>/dev/null; ` +
         `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`,
+        15000, task.user_id,
       );
     } catch {
       // Non-fatal — the remote command will also overwrite
@@ -1336,7 +1393,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
           detached: true,
         })
       : spawn('coder', ['ssh', task.workspace_name, '--', remoteCmd], {
-          env: { ...process.env, CODER_URL },
+          env: await buildCoderEnv(task.user_id),
           stdio: 'ignore',
           detached: true,
         });
@@ -1441,10 +1498,10 @@ function processEvent(taskId: string, event: { type: string; [key: string]: unkn
 
 export function cancelTask(taskId: string): void {
   const db = getDb();
-  const task = db.prepare("SELECT id, workspace_name, ssh_pid, claude_session_id FROM tasks WHERE id = ?")
-    .get(taskId) as { id: string; workspace_name: string; ssh_pid: number | null; claude_session_id: string | null } | undefined;
+  const task = db.prepare("SELECT id, workspace_name, ssh_pid, claude_session_id, user_id FROM tasks WHERE id = ?")
+    .get(taskId) as { id: string; workspace_name: string; ssh_pid: number | null; claude_session_id: string | null; user_id: string } | undefined;
   if (task) {
-    killTaskProcess(task.id, task.ssh_pid, task.workspace_name, task.claude_session_id);
+    killTaskProcess(task.id, task.ssh_pid, task.workspace_name, task.claude_session_id, task.user_id);
   }
 }
 
@@ -1454,8 +1511,8 @@ export function cancelTask(taskId: string): void {
  */
 export function interruptTask(taskId: string): void {
   const db = getDb();
-  const partial = db.prepare("SELECT id, workspace_name, ssh_pid, claude_session_id, active_turn_role FROM tasks WHERE id = ? AND status = 'working'")
-    .get(taskId) as { id: string; workspace_name: string; ssh_pid: number | null; claude_session_id: string | null; active_turn_role: string | null } | undefined;
+  const partial = db.prepare("SELECT id, workspace_name, ssh_pid, claude_session_id, active_turn_role, user_id FROM tasks WHERE id = ? AND status = 'working'")
+    .get(taskId) as { id: string; workspace_name: string; ssh_pid: number | null; claude_session_id: string | null; active_turn_role: string | null; user_id: string } | undefined;
 
   if (!partial) return;
 
@@ -1465,11 +1522,11 @@ export function interruptTask(taskId: string): void {
   // touch. Stop the reviewer specifically and hand control back to the user
   // instead of letting its verdict route the task (e.g. into a failed state).
   if (partial.active_turn_role === 'reviewer') {
-    interruptReviewer(partial.id, partial.workspace_name);
+    interruptReviewer(partial.id, partial.workspace_name, partial.user_id);
     return;
   }
 
-  killTaskProcess(partial.id, partial.ssh_pid, partial.workspace_name, partial.claude_session_id);
+  killTaskProcess(partial.id, partial.ssh_pid, partial.workspace_name, partial.claude_session_id, partial.user_id);
   addMessage(partial.id, 'system',
     'Task was interrupted by user. Note: token usage and cost for the in-flight turn may not be fully reflected — Claude only reports final totals at the end of a turn.'
   );
@@ -1481,7 +1538,7 @@ export function interruptTask(taskId: string): void {
  * Unlike a turn-limit cutoff or a missing verdict, a user interrupt must NOT
  * land the task in a failed state — the user is explicitly taking over.
  */
-function interruptReviewer(taskId: string, workspaceName: string): void {
+function interruptReviewer(taskId: string, workspaceName: string, userId?: string | null): void {
   // Guard first so any reviewer poll already mid-flight bails in finalizeReviewer
   // rather than routing a verdict after we set awaiting_feedback below.
   interruptedReviews.add(taskId);
@@ -1501,7 +1558,7 @@ function interruptReviewer(taskId: string, workspaceName: string): void {
   if (reviewerSessionId) {
     const pattern = reviewerSessionId.replace(/[^a-zA-Z0-9-]/g, '');
     if (pattern.length >= 8) {
-      sshExec(workspaceName, `pkill -f ${pattern} || true`, 10000)
+      sshExec(workspaceName, `pkill -f ${pattern} || true`, 10000, userId)
         .catch(err => console.error(`[kill] Remote reviewer pkill failed for task ${taskId}:`, (err as Error).message?.slice(0, 120)));
     }
     completeTaskTurn(openTurn!.id);
@@ -1525,6 +1582,7 @@ function killTaskProcess(
   sshPid: number | null,
   workspaceName?: string,
   claudeSessionId?: string | null,
+  userId?: string | null,
 ): void {
   const db = getDb();
   const proc = activeProcesses.get(taskId);
@@ -1544,7 +1602,7 @@ function killTaskProcess(
   if (workspaceName && claudeSessionId) {
     const pattern = claudeSessionId.replace(/[^a-zA-Z0-9-]/g, '');
     if (pattern.length >= 8) {
-      sshExec(workspaceName, `pkill -f ${pattern} || true`, 10000)
+      sshExec(workspaceName, `pkill -f ${pattern} || true`, 10000, userId)
         .catch(err => console.error(`[kill] Remote pkill failed for task ${taskId}:`, (err as Error).message?.slice(0, 120)));
     }
   }
@@ -1596,6 +1654,7 @@ export async function reconnectWorkingTasks(): Promise<void> {
           const exitFile = remoteExitCodePath(task.id);
           const exitCheck = await sshExec(task.workspace_name,
             `cat ${shellEscape(exitFile)} 2>/dev/null || echo 'NO_EXIT'`,
+            15000, task.user_id,
           );
 
           if (exitCheck !== 'NO_EXIT') {
@@ -1835,7 +1894,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null): void {
       const exitFile = remoteExitCodePath(task.id);
 
       const { jsonPart, exitPart } = await pollOutputAndExit(
-        task.workspace_name, outputFile, exitFile, linesRead,
+        task.workspace_name, outputFile, exitFile, linesRead, undefined, task.user_id,
       );
 
       consecutiveErrors = 0;
@@ -2014,7 +2073,7 @@ async function onImplementerTurnComplete(task: Task): Promise<void> {
     return;
   }
 
-  const hasChanges = await worktreeHasChanges(current.worktree_path, current.workspace_name);
+  const hasChanges = await worktreeHasChanges(current.worktree_path, current.workspace_name, current.user_id);
 
   if (!hasChanges) {
     // Worktree clean — skip review (discussion/speccing turn or stuck loop)
@@ -2058,7 +2117,7 @@ async function launchReviewerOnTask(task: Task): Promise<void> {
   setActiveTaskTurnRole(task.id, 'reviewer');
   appendStreamLog(task.id, 'reviewer_start', `Reviewer turn ${turn.turn_number} starting`);
 
-  const gitDiff = await getGitDiff(task.worktree_path!, task.workspace_name);
+  const gitDiff = await getGitDiff(task.worktree_path!, task.workspace_name, task.user_id);
 
   const reviewerPrompt = `Original task:\n${task.prompt}\n\nChanges made by the implementer:\n${gitDiff}\n\n---\nReview the change adversarially, then emit your verdict. ${REVIEW_DECISION_FORMAT}`;
 
@@ -2161,6 +2220,7 @@ async function executeReviewer(
       await sshExec(task.workspace_name,
         `mv -f ${shellEscape(outputFile)} ${shellEscape(outputFile + '.prev')} 2>/dev/null; ` +
         `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`,
+        15000, task.user_id,
       );
     } catch {
       // Non-fatal — the remote command's in-band `rm -f` is a second layer.
@@ -2169,7 +2229,7 @@ async function executeReviewer(
     const sshProcess = isLocalWorkspace(task.workspace_name)
       ? spawn('bash', ['-c', remoteCmd], { env: { ...process.env }, stdio: 'ignore', detached: true })
       : spawn('coder', ['ssh', task.workspace_name, '--', remoteCmd], {
-          env: { ...process.env, CODER_URL },
+          env: await buildCoderEnv(task.user_id),
           stdio: 'ignore',
           detached: true,
         });
@@ -2207,7 +2267,7 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
     try {
       const outputFile = remoteReviewerOutputPath(task.id);
       const exitFile = remoteReviewerExitCodePath(task.id);
-      const { jsonPart, exitPart } = await pollOutputAndExit(task.workspace_name, outputFile, exitFile, linesRead);
+      const { jsonPart, exitPart } = await pollOutputAndExit(task.workspace_name, outputFile, exitFile, linesRead, undefined, task.user_id);
 
       if (jsonPart.trim()) {
         // No prepend — see startFilePolling: `tail` re-reads the not-yet-
@@ -2573,7 +2633,7 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
     const outputFile = remoteOutputPath(task.id);
     const output = await sshExec(task.workspace_name,
       `cat ${shellEscape(outputFile)} 2>/dev/null`,
-      30000,
+      30000, task.user_id,
     );
 
     if (!output) return { resultSeen, resultError };
@@ -2830,7 +2890,7 @@ export async function launchTaskParticipant(
   }
 
   if (!participant.project_dir) {
-    const detected = await detectProjectDir(participant.workspace_name);
+    const detected = await detectProjectDir(participant.workspace_name, task.user_id);
     if (detected) {
       participant.project_dir = detected;
       updateTaskParticipantProjectDir(participant.id, detected);
@@ -2842,7 +2902,8 @@ export async function launchTaskParticipant(
   if (participant.claude_session_id) {
     try {
       const checkResult = await sshExec(participant.workspace_name,
-        `find ~/.claude/projects/ -name '${participant.claude_session_id}.jsonl' 2>/dev/null | head -1`
+        `find ~/.claude/projects/ -name '${participant.claude_session_id}.jsonl' 2>/dev/null | head -1`,
+        15000, task.user_id,
       );
       if (checkResult.trim()) {
         remoteSessionExists = true;
@@ -2898,12 +2959,13 @@ export async function launchTaskParticipant(
     try {
       await sshExec(participant.workspace_name,
         `mv -f ${shellEscape(outputFile)} ${shellEscape(outputFile + '.prev')} 2>/dev/null; ` +
-        `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`);
+        `mv -f ${shellEscape(exitFile)} ${shellEscape(exitFile + '.prev')} 2>/dev/null; true`,
+        15000, task.user_id);
     } catch { /* */ }
 
     const ghToken = await fetchGitHubToken().catch(() => null);
     const sshProcess = spawn('coder', ['ssh', participant.workspace_name, '--', remoteCmd], {
-      env: { ...process.env, CODER_URL, ...(ghToken ? { GH_TOKEN: ghToken } : {}) },
+      env: await buildCoderEnv(task.user_id, ghToken ? { GH_TOKEN: ghToken } : undefined),
       stdio: 'ignore',
       detached: true,
     });
@@ -3001,7 +3063,7 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
       const outputFile = remoteTaskParticipantOutputPath(participant.id);
       const exitFile = remoteTaskParticipantExitCodePath(participant.id);
       const { jsonPart, exitPart } = await pollOutputAndExit(
-        participant.workspace_name, outputFile, exitFile, linesRead,
+        participant.workspace_name, outputFile, exitFile, linesRead, undefined, task.user_id,
       );
       consecutiveErrors = 0;
 

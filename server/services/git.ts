@@ -3,6 +3,13 @@ import { addMessage, getTask, type Task } from './tasks.js';
 import { getDb } from '../db/index.js';
 import { execFile } from 'child_process';
 
+// Alias to the real SSH executor. Task-scoped functions below shadow `sshExec`
+// with a local wrapper that injects the task owner's refreshable Coder token
+// (so background git ops use the user's OAuth credential, not the frozen,
+// build-time CODER_SESSION_TOKEN that lapses with the OIDC session). That local
+// wrapper delegates here to avoid referencing the shadowed name.
+const coderSsh = sshExec;
+
 const CPM_WORKTREE_BASE = process.env.CPM_WORKTREE_BASE || '/home/coder/.cpm/worktrees';
 
 /**
@@ -23,13 +30,17 @@ export function fetchGitHubToken(): Promise<string | null> {
 /**
  * Run a gh CLI command in a remote workspace with GH_TOKEN set.
  */
-async function sshGh(workspaceName: string, command: string, timeout = 30000): Promise<string> {
+async function sshGh(workspaceName: string, command: string, timeout = 30000, userId?: string | null): Promise<string> {
   const token = await fetchGitHubToken();
   if (token) {
-    return sshExec(workspaceName, `export GH_TOKEN=${shellEscape(token)} && ${command}`, timeout);
+    return sshExec(workspaceName, `export GH_TOKEN=${shellEscape(token)} && ${command}`, timeout, userId);
   }
-  return sshExec(workspaceName, command, timeout);
+  return sshExec(workspaceName, command, timeout, userId);
 }
+
+// Alias so task-scoped functions can shadow `sshGh` with a token-injecting
+// wrapper that still delegates to the real implementation here.
+const coderSshGh = sshGh;
 
 interface AdoResponse {
   /** HTTP status code, or 0 if the request couldn't be made. */
@@ -53,7 +64,7 @@ interface AdoResponse {
  * and descriptions. `curl -sS` returns exit 0 for HTTP 4xx/5xx (so we can read
  * the error body); the HTTP status is appended via `-w` and parsed back out.
  */
-async function adoApi(ws: string, method: string, url: string, body?: unknown): Promise<AdoResponse> {
+async function adoApi(ws: string, method: string, url: string, body?: unknown, userId?: string | null): Promise<AdoResponse> {
   const authCmd = `AUTH="Authorization: Basic $(printf ':%s' "$ADO_PAT" | base64 | tr -d '\\n')"`;
   const common = `-sS -H "$AUTH" -H "Accept: application/json"`;
   let cmd: string;
@@ -69,7 +80,7 @@ async function adoApi(ws: string, method: string, url: string, body?: unknown): 
 
   let out: string;
   try {
-    out = await sshExec(ws, cmd, 60000);
+    out = await sshExec(ws, cmd, 60000, userId);
   } catch (e: any) {
     const msg = String(e?.message || e);
     if (/curl: (command )?not found|not recognized|No such file/i.test(msg)) {
@@ -85,6 +96,9 @@ async function adoApi(ws: string, method: string, url: string, body?: unknown): 
   return { status, body: out.slice(0, idx).trim() };
 }
 
+// Alias so the Azure PR flow can shadow `adoApi` with a token-injecting wrapper.
+const coderAdoApi = adoApi;
+
 /**
  * True when an Azure DevOps response indicates an auth failure — typically an
  * expired/invalid PAT (ADO answers with 401/403, or 203 + a sign-in page).
@@ -98,15 +112,15 @@ function isAdoAuthError(res: AdoResponse): boolean {
  */
 async function resolveProjectDir(task: Task): Promise<string | null> {
   if (task.project_dir) return task.project_dir;
-  return detectProjectDir(task.workspace_name);
+  return detectProjectDir(task.workspace_name, task.user_id);
 }
 
 /**
  * Get the default branch name (main or master) as tracked on the remote.
  */
-async function getDefaultBranch(workspaceName: string, projectDir: string): Promise<string> {
+async function getDefaultBranch(workspaceName: string, projectDir: string, userId?: string | null): Promise<string> {
   try {
-    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify origin/main`);
+    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify origin/main`, 15000, userId);
     return 'main';
   } catch {
     return 'master';
@@ -117,9 +131,9 @@ async function getDefaultBranch(workspaceName: string, projectDir: string): Prom
  * Get the local default branch name (main or master). Used when remote git is
  * disabled and origin refs may be stale or absent — the user manages git locally.
  */
-async function getLocalDefaultBranch(workspaceName: string, projectDir: string): Promise<string> {
+async function getLocalDefaultBranch(workspaceName: string, projectDir: string, userId?: string | null): Promise<string> {
   try {
-    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify main`);
+    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify main`, 15000, userId);
     return 'main';
   } catch {
     return 'master';
@@ -192,9 +206,9 @@ export function parseAzureRemote(remoteUrl: string): { orgUrl: string; project: 
  * git remote. Supports GitHub and Azure DevOps; returns provider 'unknown' with
  * a null webUrl for anything else, and null if detection fails entirely.
  */
-async function detectGitRemote(workspaceName: string, projectDir: string): Promise<GitRemoteInfo | null> {
+async function detectGitRemote(workspaceName: string, projectDir: string, userId?: string | null): Promise<GitRemoteInfo | null> {
   try {
-    const remoteUrl = await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git config --get remote.origin.url`);
+    const remoteUrl = await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git config --get remote.origin.url`, 15000, userId);
     if (!remoteUrl) return null;
     const url = remoteUrl.trim();
 
@@ -227,9 +241,9 @@ function storeTaskRepo(taskId: string, url: string | null, provider: GitProvider
 /**
  * Check if a workspace has a git repository at the given path.
  */
-async function hasGitRepo(workspaceName: string, projectDir: string): Promise<boolean> {
+async function hasGitRepo(workspaceName: string, projectDir: string, userId?: string | null): Promise<boolean> {
   try {
-    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --is-inside-work-tree`);
+    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --is-inside-work-tree`, 15000, userId);
     return true;
   } catch {
     return false;
@@ -239,9 +253,9 @@ async function hasGitRepo(workspaceName: string, projectDir: string): Promise<bo
 /**
  * Check if the repository has at least one commit.
  */
-async function hasCommits(workspaceName: string, projectDir: string): Promise<boolean> {
+async function hasCommits(workspaceName: string, projectDir: string, userId?: string | null): Promise<boolean> {
   try {
-    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify HEAD`);
+    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify HEAD`, 15000, userId);
     return true;
   } catch {
     return false;
@@ -269,19 +283,22 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
   if (!dir) return;
 
   const ws = task.workspace_name;
+  const userId = task.user_id;
+  // Inject the task owner's refreshable token into every SSH call below.
+  const sshExec = (w: string, cmd: string, timeout?: number) => coderSsh(w, cmd, timeout, userId);
 
   try {
-    if (!await hasGitRepo(ws, dir)) return;
+    if (!await hasGitRepo(ws, dir, userId)) return;
 
     // Store repo URL + provider for UI linking and provider-aware completion
-    const remote = await detectGitRemote(ws, dir);
+    const remote = await detectGitRemote(ws, dir, userId);
     if (remote) {
       storeTaskRepo(task.id, remote.webUrl, remote.provider);
       task.github_repo_url = remote.webUrl;
       task.git_provider = remote.provider;
     }
 
-    if (!await hasCommits(ws, dir)) return;
+    if (!await hasCommits(ws, dir, userId)) return;
 
     // A worktree is always created — including when remote git is disabled — so
     // that concurrent tasks on the same workspace stay isolated from each other
@@ -294,7 +311,7 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
     if (remoteAllowed) {
       // Branch from the canonical origin tip so the worktree starts clean
       // regardless of local state in the main checkout or other worktrees.
-      const defaultBranch = await getDefaultBranch(ws, dir);
+      const defaultBranch = await getDefaultBranch(ws, dir, userId);
       await sshExec(ws,
         `mkdir -p ${shellEscape(CPM_WORKTREE_BASE)} && cd ${shellEscape(dir)} && ` +
         `git fetch origin ${defaultBranch} 2>/dev/null || true && ` +
@@ -304,7 +321,7 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
     } else {
       // Remote disabled: the user manages git locally and origin may be stale or
       // absent, so branch from the LOCAL default branch tip instead of origin.
-      const defaultBranch = await getLocalDefaultBranch(ws, dir);
+      const defaultBranch = await getLocalDefaultBranch(ws, dir, userId);
       await sshExec(ws,
         `mkdir -p ${shellEscape(CPM_WORKTREE_BASE)} && cd ${shellEscape(dir)} && ` +
         `git worktree add ${shellEscape(worktreePath)} -b ${shellEscape(branchName)} ${shellEscape(defaultBranch)}`,
@@ -352,6 +369,8 @@ export async function handleTaskResumeGit(_task: Task): Promise<void> {
 export async function removeTaskWorktree(task: Task): Promise<boolean> {
   if (!task.worktree_path) return true;
   const ws = task.workspace_name;
+  const userId = task.user_id;
+  const sshExec = (w: string, cmd: string, timeout?: number) => coderSsh(w, cmd, timeout, userId);
   const dir = task.project_dir;
   const wt = task.worktree_path;
   const gitRoot = dir ? `cd ${shellEscape(dir)} && ` : '';
@@ -441,10 +460,12 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
   if (!dir) return true;
 
   const ws = task.workspace_name;
+  const userId = task.user_id;
+  const sshExec = (w: string, cmd: string, timeout?: number) => coderSsh(w, cmd, timeout, userId);
 
   try {
-    if (!await hasGitRepo(ws, dir)) return true;
-    if (!await hasCommits(ws, dir)) return true;
+    if (!await hasGitRepo(ws, dir, userId)) return true;
+    if (!await hasCommits(ws, dir, userId)) return true;
 
     const remoteAllowed = isRemoteAllowed(task.workspace_id);
     const status = await sshExec(ws, `cd ${shellEscape(dir)} && git status --porcelain`);
@@ -486,7 +507,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       }
     } else {
       // Legacy non-worktree path: check we're on default branch and create task branch
-      const defaultBranch = await getDefaultBranch(ws, dir);
+      const defaultBranch = await getDefaultBranch(ws, dir, userId);
       const currentBranch = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse --abbrev-ref HEAD`)).trim();
       if (currentBranch !== defaultBranch) {
         addMessage(task.id, 'system',
@@ -516,7 +537,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       // query always failed, so the function silently returned `true` and marked the
       // task completed even when an Azure PR was still open and unmerged. The git
       // ancestry check below works identically for every provider.
-      const defaultBranch = await getDefaultBranch(ws, dir);
+      const defaultBranch = await getDefaultBranch(ws, dir, userId);
       let landed = false;
       try {
         await sshExec(ws,
@@ -567,7 +588,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
 
     // Detect the git host so the PR flow can be routed to the right provider
     // (and store the repo URL + provider for UI linking if not already done).
-    const remote = await detectGitRemote(ws, dir);
+    const remote = await detectGitRemote(ws, dir, userId);
     const provider: GitProvider = remote?.provider ?? (task.git_provider as GitProvider | null) ?? 'unknown';
     if (remote) {
       storeTaskRepo(task.id, remote.webUrl ?? task.github_repo_url, remote.provider);
@@ -584,7 +605,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       return false;
     }
 
-    const defaultBranch = await getDefaultBranch(ws, dir);
+    const defaultBranch = await getDefaultBranch(ws, dir, userId);
 
     // Sync local main with origin first — handles the case where origin/main has
     // advanced (e.g. a PR was merged on GitHub before CPM performs its merge step).
@@ -647,11 +668,11 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
         );
         return false;
       }
-      outcome = await completePrAzure(ws, task.id, branchName, defaultBranch, prTitle, prBody, branchTip, remote.azure);
+      outcome = await completePrAzure(ws, task.id, branchName, defaultBranch, prTitle, prBody, branchTip, remote.azure, userId);
     } else {
       // GitHub and anything else (e.g. GitHub Enterprise) go through the `gh` CLI,
       // matching the prior behaviour where `gh` was used unconditionally.
-      outcome = await completePrGitHub(ws, dir, task.id, branchName, defaultBranch, prTitle, prBody);
+      outcome = await completePrGitHub(ws, dir, task.id, branchName, defaultBranch, prTitle, prBody, userId);
     }
 
     if (outcome.kind === 'blocked') return false;
@@ -732,8 +753,10 @@ type PrOutcome =
  */
 async function completePrGitHub(
   ws: string, dir: string, taskId: string, branchName: string,
-  defaultBranch: string, prTitle: string, prBody: string,
+  defaultBranch: string, prTitle: string, prBody: string, userId?: string | null,
 ): Promise<PrOutcome> {
+  // Shadow sshGh to inject the task owner's token (see coderSsh note above).
+  const sshGh = (w: string, cmd: string, timeout?: number) => coderSshGh(w, cmd, timeout, userId);
   let mergeTarget: string;
   let existingPr: { url?: string; state?: string; number?: number } | null = null;
   try {
@@ -812,7 +835,10 @@ async function completePrAzure(
   ws: string, taskId: string, branchName: string,
   defaultBranch: string, prTitle: string, prBody: string,
   branchTip: string, azure: { orgUrl: string; project: string; repo: string },
+  userId?: string | null,
 ): Promise<PrOutcome> {
+  // Shadow adoApi to inject the task owner's token (see coderSsh note above).
+  const adoApi = (w: string, method: string, url: string, body?: unknown) => coderAdoApi(w, method, url, body, userId);
   const apiVer = 'api-version=7.1';
   const reposBase =
     `${azure.orgUrl}/${encodeURIComponent(azure.project)}/_apis/git/repositories/${encodeURIComponent(azure.repo)}`;
@@ -957,6 +983,8 @@ export async function checkoutTaskBranch(task: Task): Promise<string> {
   const dir = task.project_dir;
   if (!dir) throw new Error('No project directory for this task');
   const ws = task.workspace_name;
+  const userId = task.user_id;
+  const sshExec = (w: string, cmd: string, timeout?: number) => coderSsh(w, cmd, timeout, userId);
   const currentBranch = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse --abbrev-ref HEAD`)).trim();
   if (currentBranch === task.git_branch) {
     return `Already on branch \`${task.git_branch}\``;

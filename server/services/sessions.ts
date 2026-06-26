@@ -155,3 +155,73 @@ export async function refreshAccessToken(session: Session): Promise<string | nul
     return null;
   }
 }
+
+// How long before expiry we proactively refresh. The OAuth access token is
+// short-lived; refreshing a couple of minutes early means long-running
+// background work (SSH pollers) never hands a token to `coder` that lapses
+// mid-call.
+const TOKEN_REFRESH_BUFFER_MS = 2 * 60 * 1000;
+
+// Collapse concurrent refreshes for the same user into one in-flight request.
+// Background pollers fire every few seconds across many tasks owned by the same
+// user; without this they would stampede Coder's token endpoint the moment a
+// token crosses the refresh threshold.
+const refreshInFlight = new Map<string, Promise<string | null>>();
+
+function latestSessionForUser(userId: string): Session | undefined {
+  const db = getDb();
+  return db.prepare(
+    `SELECT * FROM sessions WHERE user_id = ? AND coder_access_token IS NOT NULL
+     ORDER BY created_at DESC LIMIT 1`,
+  ).get(userId) as Session | undefined;
+}
+
+function dedupedRefresh(userId: string, session: Session): Promise<string | null> {
+  let inflight = refreshInFlight.get(userId);
+  if (!inflight) {
+    inflight = refreshAccessToken(session).finally(() => refreshInFlight.delete(userId));
+    refreshInFlight.set(userId, inflight);
+  }
+  return inflight;
+}
+
+/**
+ * Resolve a usable Coder access token for a user from their stored OAuth
+ * session, refreshing proactively when it is at/near expiry. Returns null when
+ * the user has no stored session (e.g. API-token clients) so callers can fall
+ * back to the ambient workspace token.
+ *
+ * This is the credential source for background `coder ssh` work, which has no
+ * HTTP request context and therefore can't use the request-path token-refresh
+ * helpers. It's what keeps a long-lived deployment from depending on the
+ * frozen, build-time CODER_SESSION_TOKEN that lapses with the OIDC session.
+ */
+export async function getValidCoderTokenForUser(userId: string): Promise<string | null> {
+  const session = latestSessionForUser(userId);
+  if (!session) return null;
+
+  const nearExpiry = !!session.token_expires_at &&
+    new Date(session.token_expires_at).getTime() - Date.now() < TOKEN_REFRESH_BUFFER_MS;
+
+  if (nearExpiry && session.coder_refresh_token) {
+    const refreshed = await dedupedRefresh(userId, session);
+    // On refresh failure keep returning the existing token — it may still have
+    // a few seconds of life, and the caller's own retry path can react to a
+    // hard auth rejection.
+    return refreshed || session.coder_access_token || null;
+  }
+
+  return session.coder_access_token || null;
+}
+
+/**
+ * Force a token refresh regardless of expiry, for the reactive path when a
+ * `coder` call has already been rejected for auth. Returns the new token or
+ * null when refresh isn't possible (no refresh token, or the refresh token
+ * itself has expired — at which point the user must re-authenticate).
+ */
+export async function forceRefreshCoderTokenForUser(userId: string): Promise<string | null> {
+  const session = latestSessionForUser(userId);
+  if (!session || !session.coder_refresh_token) return null;
+  return (await dedupedRefresh(userId, session)) || null;
+}
