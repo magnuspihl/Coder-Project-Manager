@@ -433,7 +433,9 @@ export async function removeTaskWorktree(task: Task): Promise<boolean> {
     return false;
   }
 
-  // Delete the local branch (best-effort; `--delete-branch` on merge may already have removed it).
+  // Delete the local branch (best-effort). This is the sole place the task branch
+  // is removed: the merge step intentionally keeps it (the worktree owns it), and
+  // by now the worktree is gone, so `git branch -D` no longer hits "used by worktree".
   if (task.git_branch && dir) {
     await sshExec(ws,
       `cd ${shellEscape(dir)} && git branch -D ${shellEscape(task.git_branch)} 2>/dev/null || true`,
@@ -609,8 +611,8 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       return false;
     }
 
-    // Capture the committed tip so we can later verify the merge actually landed,
-    // even after `gh pr merge --delete-branch` removes the branch ref.
+    // Capture the committed tip so we can later verify the merge actually landed
+    // (used by the post-merge ancestor check on origin/<default>).
     let branchTip = '';
     try {
       branchTip = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse HEAD`)).trim();
@@ -836,25 +838,42 @@ async function completePrGitHub(
   }
 
   try {
-    await sshGh(ws, `cd ${shellEscape(dir)} && gh pr merge ${shellEscape(mergeTarget)} --merge --delete-branch`);
-    addMessage(taskId, 'system', `PR merged and branch \`${branchName}\` deleted.`);
+    // Merge only — deliberately NO `--delete-branch`. In worktree mode the task
+    // branch is checked out in the worktree, so gh's post-merge local cleanup
+    // (`git checkout <default>` + `git branch -D <branch>`) always fails with
+    // "branch is used by worktree" / "'<default>' is already used by worktree",
+    // making gh exit non-zero even though the merge to origin already succeeded.
+    // That false failure is what kept blocking completion. The local branch is
+    // intentionally kept (the worktree owns it for the task's lifetime and is
+    // removed only when the task is deleted); the remote branch is cleaned up
+    // best-effort below and never blocks completion.
+    await sshGh(ws, `cd ${shellEscape(dir)} && gh pr merge ${shellEscape(mergeTarget)} --merge`);
+    await sshGh(ws, `cd ${shellEscape(dir)} && git push origin --delete ${shellEscape(branchName)}`)
+      .catch(() => { /* remote branch may be auto-deleted on merge, or kept by policy — either is fine */ });
+    addMessage(taskId, 'system', `PR merged into \`${defaultBranch}\`.`);
     return { kind: 'completed', verifyByGit: true };
   } catch (mergeErr: any) {
-    // Check if the PR was already merged on GitHub (e.g. by the user or auto-merge).
-    let alreadyMerged = false;
+    // The real gh error is written to the PTY (stdout) and lost from err.message,
+    // so re-query the PR to learn whether it actually merged and, if not, why it
+    // is blocked (conflicts, pending checks, branch protection).
+    let state = '', mergeable = '', mergeStateStatus = '';
     try {
-      const prState = await sshGh(ws,
-        `cd ${shellEscape(dir)} && gh pr view ${shellEscape(mergeTarget)} --json state --jq .state`
-      );
-      alreadyMerged = prState.trim() === 'MERGED';
+      const info = JSON.parse((await sshGh(ws,
+        `cd ${shellEscape(dir)} && gh pr view ${shellEscape(mergeTarget)} --json state,mergeable,mergeStateStatus`
+      )).trim()) as { state?: string; mergeable?: string; mergeStateStatus?: string };
+      state = info.state ?? ''; mergeable = info.mergeable ?? ''; mergeStateStatus = info.mergeStateStatus ?? '';
     } catch { /* ignore state-check errors */ }
 
-    if (alreadyMerged) {
+    if (state === 'MERGED') {
       addMessage(taskId, 'system', `PR for branch \`${branchName}\` was already merged on GitHub.`);
       return { kind: 'completed', verifyByGit: false };
     }
+    const detail = (mergeable || mergeStateStatus)
+      ? ` (PR state: ${state || 'unknown'}, mergeable: ${mergeable || 'unknown'}, status: ${mergeStateStatus || 'unknown'})`
+      : '';
     addMessage(taskId, 'system',
-      `Cannot complete: PR merge failed for \`${branchName}\`: ${mergeErr.message}. Resolve any conflicts on the PR and retry completion.`
+      `Cannot complete: PR merge failed for \`${branchName}\`${detail}: ${mergeErr.message}. ` +
+      `Resolve any conflicts / required checks / branch-protection rules on the PR and retry completion.`
     );
     return { kind: 'blocked' };
   }
