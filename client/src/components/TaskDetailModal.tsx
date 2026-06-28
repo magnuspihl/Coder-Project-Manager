@@ -117,6 +117,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   // full reviewer prose is hidden behind a per-turn "details" toggle.
   const [expandedReviews, setExpandedReviews] = useState<Set<string>>(new Set());
   const [applyingFixes, setApplyingFixes] = useState(false);
+  const [resolvingGitIssues, setResolvingGitIssues] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastParticipantsJsonRef = useRef('');
 
@@ -743,6 +744,22 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       alert(err?.message || 'Failed to apply fixes');
     } finally {
       setApplyingFixes(false);
+    }
+  };
+
+  const handleResolveGitIssues = async () => {
+    if (resolvingGitIssues || sending) return;
+    setResolvingGitIssues(true);
+    try {
+      await replyToTask(taskId,
+        'The git operations failed when completing this task. Please review the error messages above and resolve any git issues (push conflicts, merge errors, branch protection issues, uncommitted changes, etc.), then we can retry completion.',
+      );
+      onTaskChanged?.();
+      await loadData();
+    } catch (err: any) {
+      alert(err?.message || 'Failed to send request');
+    } finally {
+      setResolvingGitIssues(false);
     }
   };
 
@@ -2097,6 +2114,33 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                           </button>
                         </div>
                       ) : null}
+                    </div>
+                  ) : task.failed_reason === 'git_error' ? (
+                    <div className="space-y-2">
+                      <div className="text-sm text-orange-700 dark:text-orange-300 bg-orange-50 dark:bg-orange-900/20 border border-orange-300 dark:border-orange-700 p-3 rounded-md">
+                        <div className="font-medium mb-1">Git operation failed</div>
+                        <div className="text-xs">
+                          The git operations failed when completing this task — see the conversation above for details.
+                          Ask the agent to resolve the issues, or fix them manually and retry completion.
+                        </div>
+                      </div>
+                      <div className="flex gap-2 flex-wrap">
+                        <button
+                          onClick={handleResolveGitIssues}
+                          disabled={resolvingGitIssues || sending}
+                          className="bg-orange-600 text-white text-sm px-4 py-2 rounded-md hover:bg-orange-700 disabled:opacity-50 transition-colors"
+                        >
+                          {resolvingGitIssues ? 'Asking agent…' : 'Ask agent to resolve git issues'}
+                        </button>
+                        <button
+                          onClick={handleComplete}
+                          disabled={completing}
+                          className="text-sm text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 px-3 py-2 disabled:opacity-50"
+                          title="Retry the completion step — use this after manually resolving git issues"
+                        >
+                          {completing ? 'Retrying…' : 'Retry completion'}
+                        </button>
+                      </div>
                     </div>
                   ) : (
                     <>

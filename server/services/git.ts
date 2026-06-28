@@ -484,9 +484,11 @@ export async function reconcileLeakedWorktrees(): Promise<void> {
  * lifecycle so a completed task can be reopened and continued in the same worktree
  * (re-completion runs a fresh push/PR/merge). Worktrees are removed only on deletion.
  *
- * Returns true if completion is allowed, false if blocked.
+ * Returns true if completion is allowed, false if intentionally blocked (e.g. remote-disabled
+ * workspace with uncommitted changes — user must commit manually), or 'git_error' if an actual
+ * git operation failed (push, PR, merge, etc.) and the task should be marked failed.
  */
-export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
+export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> {
   // Use worktree path if available, else fall back to project_dir
   const dir = task.worktree_path || await resolveProjectDir(task);
   if (!dir) return true;
@@ -535,7 +537,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
         addMessage(task.id, 'system',
           `Cannot complete: worktree is on branch \`${currentBranch}\` instead of expected \`${branchName}\`.`
         );
-        return false;
+        return 'git_error';
       }
     } else {
       // Legacy non-worktree path: check we're on default branch and create task branch
@@ -546,7 +548,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
           `Cannot complete: workspace is on branch \`${currentBranch}\` instead of \`${defaultBranch}\`. ` +
           `The agent appears to have switched branches mid-task. Please reconcile manually before completing.`
         );
-        return false;
+        return 'git_error';
       }
       if (!hasChanges) return true;
       try {
@@ -555,7 +557,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
         addMessage(task.id, 'system',
           `Cannot complete: could not create branch \`${branchName}\`: ${err.message}.`
         );
-        return false;
+        return 'git_error';
       }
     }
 
@@ -608,7 +610,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       }
     } catch (err: any) {
       addMessage(task.id, 'system', `Cannot complete: git commit failed: ${err.message}`);
-      return false;
+      return 'git_error';
     }
 
     // Capture the committed tip so we can later verify the merge actually landed
@@ -634,7 +636,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
         `Cannot complete: changes committed on branch \`${branchName}\` but push failed: ${pushErr.message}. ` +
         `Resolve the push issue and retry completion.`
       );
-      return false;
+      return 'git_error';
     }
 
     const defaultBranch = await getDefaultBranch(ws, dir, userId);
@@ -655,7 +657,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
           `Cannot complete: local \`${defaultBranch}\` has diverged from origin/${defaultBranch} and cannot be fast-forwarded: ${syncErr.message}. ` +
           `Reconcile the branch manually then retry completion.`
         );
-        return false;
+        return 'git_error';
       }
     }
 
@@ -698,7 +700,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
           `Cannot complete: changes were pushed to branch \`${branchName}\`, but the Azure DevOps organization/project/repository could not be parsed from the git remote. ` +
           `Open and complete the PR manually, then mark this task complete.`
         );
-        return false;
+        return 'git_error';
       }
       outcome = await completePrAzure(ws, task.id, branchName, defaultBranch, prTitle, prBody, branchTip, remote.azure, userId);
     } else {
@@ -707,7 +709,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
       outcome = await completePrGitHub(ws, dir, task.id, branchName, defaultBranch, prTitle, prBody, userId);
     }
 
-    if (outcome.kind === 'blocked') return false;
+    if (outcome.kind === 'blocked') return 'git_error';
     if (outcome.kind === 'nothing-to-merge') return true;
     const verifyMergeWithGit = outcome.verifyByGit;
 
@@ -733,7 +735,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
           `Cannot complete: the merge could not be verified on \`origin/${defaultBranch}\` — commit \`${branchTip.slice(0, 8)}\` is not part of the remote default branch yet. ` +
           `The worktree has been kept. Check the PR state and retry completion.`
         );
-        return false;
+        return 'git_error';
       }
     }
 
@@ -758,7 +760,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean> {
   } catch (err: any) {
     const reason = `Git completion failed: ${err.message || err}`;
     addMessage(task.id, 'system', `Error: ${reason}`);
-    return false;
+    return 'git_error';
   }
 }
 

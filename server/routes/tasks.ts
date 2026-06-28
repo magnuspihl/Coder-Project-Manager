@@ -194,7 +194,8 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
     res.status(404).json({ error: 'Task not found' });
     return;
   }
-  if (task.status !== 'awaiting_feedback') {
+  const isGitError = task.status === 'failed' && task.failed_reason === 'git_error';
+  if (task.status !== 'awaiting_feedback' && !isGitError) {
     res.status(400).json({ error: 'Task is not awaiting feedback' });
     return;
   }
@@ -254,7 +255,8 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
   // working task would corrupt Claude's tree; completing queued/failed/
   // cancelled tasks is semantically meaningless. (Re-checked under the lock
   // below — this is just a cheap early-out.)
-  if (task.status !== 'awaiting_feedback' && task.status !== 'completed') {
+  const isGitErrorFailedEarlyOut = task.status === 'failed' && task.failed_reason === 'git_error';
+  if (task.status !== 'awaiting_feedback' && task.status !== 'completed' && !isGitErrorFailedEarlyOut) {
     res.status(400).json({ error: `Only tasks awaiting feedback can be completed (current status: ${task.status}).` });
     return;
   }
@@ -276,7 +278,10 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
     // Already completed by a concurrent/earlier request — treat as idempotent success.
     if (fresh.status === 'completed') return { code: 200 };
 
-    if (fresh.status !== 'awaiting_feedback') {
+    // Allow retrying completion on a git-error failed task (user may have manually
+    // resolved the issue and is clicking "Retry completion").
+    const isGitErrorFailed = fresh.status === 'failed' && fresh.failed_reason === 'git_error';
+    if (fresh.status !== 'awaiting_feedback' && !isGitErrorFailed) {
       return { code: 400, error: `Only tasks awaiting feedback can be completed (current status: ${fresh.status}).` };
     }
 
@@ -295,7 +300,13 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
     // Handle git operations before marking complete — may block completion on
     // uncommitted changes (remote disabled) or on any git failure.
     const allowed = await handleTaskCompletionGit(fresh);
+    if (allowed === 'git_error') {
+      updateTaskStatus(fresh.id, 'failed', 'git_error');
+      return { code: 409, error: 'Cannot complete: git operation blocked. See task messages for the exact reason.' };
+    }
     if (!allowed) {
+      // Intentional block (e.g. remote-disabled with uncommitted changes) —
+      // keep the task in awaiting_feedback so the user can commit and retry.
       return { code: 409, error: 'Cannot complete: git operation blocked. See task messages for the exact reason.' };
     }
 
