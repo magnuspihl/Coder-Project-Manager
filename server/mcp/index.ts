@@ -311,7 +311,8 @@ function buildServer(ctx: AuthCtx): McpServer {
       if (!task) return errorResult('Task not found');
 
       // Cheap early-out; re-checked under the lock below.
-      if (task.status !== 'awaiting_feedback' && task.status !== 'completed') {
+      const isGitErrorFailedEarlyOut = task.status === 'failed' && task.failed_reason === 'git_error';
+      if (task.status !== 'awaiting_feedback' && task.status !== 'completed' && !isGitErrorFailedEarlyOut) {
         return errorResult(`Only tasks awaiting feedback can be completed (current status: ${task.status}).`);
       }
 
@@ -327,7 +328,8 @@ function buildServer(ctx: AuthCtx): McpServer {
         const fresh = getTask(task.id);
         if (!fresh) return { code: 404, error: 'Task not found' };
         if (fresh.status === 'completed') return { code: 200 };
-        if (fresh.status !== 'awaiting_feedback') {
+        const isGitErrorFailed = fresh.status === 'failed' && fresh.failed_reason === 'git_error';
+        if (fresh.status !== 'awaiting_feedback' && !isGitErrorFailed) {
           return { code: 400, error: `Only tasks awaiting feedback can be completed (current status: ${fresh.status}).` };
         }
 
@@ -343,7 +345,12 @@ function buildServer(ctx: AuthCtx): McpServer {
         }
 
         const allowed = await handleTaskCompletionGit(fresh);
+        if (allowed === 'git_error') {
+          updateTaskStatus(fresh.id, 'failed', 'git_error');
+          return { code: 409, error: 'Cannot complete: git operation blocked. See task messages for the exact reason.' };
+        }
         if (!allowed) {
+          // Intentional block (e.g. remote-disabled with uncommitted changes) — keep awaiting_feedback.
           return { code: 409, error: 'Cannot complete: git operation blocked. See task messages for the exact reason.' };
         }
 

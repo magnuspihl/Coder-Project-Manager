@@ -1014,7 +1014,13 @@ export async function processQueue(workspaceId: string): Promise<void> {
           // Free the port range (shuts down the task's preview server). The worktree
           // is kept until the task is deleted.
           await cleanupPortRange(pending).catch(() => {});
+        } else if (allowed === 'git_error') {
+          setPendingComplete(pending.id, false);
+          addMessage(pending.id, 'system', 'Queued completion could not proceed — see the task messages above for the specific reason, then retry.');
+          updateTaskStatus(pending.id, 'failed', 'git_error');
         } else {
+          // allowed === false: intentional block (e.g. remote-disabled with uncommitted changes)
+          // Leave the task in its current state so the user can complete manually.
           setPendingComplete(pending.id, false);
           addMessage(pending.id, 'system', 'Queued completion could not proceed — see the task messages above for the specific reason, then retry.');
         }
