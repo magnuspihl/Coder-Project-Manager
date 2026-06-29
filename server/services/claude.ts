@@ -1008,16 +1008,19 @@ export async function processQueue(workspaceId: string): Promise<void> {
     while (pending) {
       try {
         const allowed = await handleTaskCompletionGit(pending);
-        if (allowed) {
+        // Check 'git_error' BEFORE the truthy branch: it is a (truthy) string, so
+        // `if (allowed)` would otherwise swallow it and mark a git-failed completion
+        // as `completed`. Mirrors the route handler's ordering in routes/tasks.ts.
+        if (allowed === 'git_error') {
+          setPendingComplete(pending.id, false);
+          addMessage(pending.id, 'system', 'Queued completion could not proceed — see the task messages above for the specific reason, then retry.');
+          updateTaskStatus(pending.id, 'failed', 'git_error');
+        } else if (allowed) {
           setPendingComplete(pending.id, false);
           updateTaskStatus(pending.id, 'completed');
           // Free the port range (shuts down the task's preview server). The worktree
           // is kept until the task is deleted.
           await cleanupPortRange(pending).catch(() => {});
-        } else if (allowed === 'git_error') {
-          setPendingComplete(pending.id, false);
-          addMessage(pending.id, 'system', 'Queued completion could not proceed — see the task messages above for the specific reason, then retry.');
-          updateTaskStatus(pending.id, 'failed', 'git_error');
         } else {
           // allowed === false: intentional block (e.g. remote-disabled with uncommitted changes)
           // Leave the task in its current state so the user can complete manually.
