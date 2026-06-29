@@ -15,6 +15,8 @@ import {
   deleteTask,
   setPendingComplete,
   getWorkingTask,
+  getWorkingTaskCount,
+  getMaxConcurrent,
   getTaskParticipants,
   getTaskTurns,
   type Message,
@@ -379,7 +381,7 @@ function buildServer(ctx: AuthCtx): McpServer {
   server.registerTool(
     'review',
     {
-      description: 'Trigger the red-team reviewer on a task awaiting feedback. The reviewer inspects the task\'s diff and emits a verdict: on "pass" the task returns to awaiting_feedback; on "fail" the issues are routed back to the implementer to fix (up to max_review_loop_count passes). The task moves to "working" while the reviewer runs. Fails if the worktree is clean (nothing to review) or another task is running on the workspace.',
+      description: 'Trigger the red-team reviewer on a task awaiting feedback. The reviewer inspects the task\'s diff and emits a verdict: on "pass" the task returns to awaiting_feedback; on "fail" the issues are routed back to the implementer to fix (up to max_review_loop_count passes). The task moves to "working" while the reviewer runs. Fails if the worktree is clean (nothing to review) or the workspace is already at its task concurrency limit.',
       inputSchema: { task_id: z.string().describe('Task ID') },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
@@ -392,9 +394,12 @@ function buildServer(ctx: AuthCtx): McpServer {
       if (!task.worktree_path) {
         return errorResult('This task has no worktree, so there is nothing to review.');
       }
-      const working = getWorkingTask(task.workspace_id);
-      if (working && working.id !== task.id) {
-        return errorResult('Cannot review while another task is running on this workspace.');
+      // The reviewer is near-read-only and runs inside this task's own worktree,
+      // so it can't corrupt another task's tree. It does occupy a concurrency
+      // slot, so gate on capacity (matching a normal launch and auto-review)
+      // rather than refusing whenever any other task is busy.
+      if (getWorkingTaskCount(task.workspace_id) >= getMaxConcurrent(task.workspace_id)) {
+        return errorResult('Cannot review — this workspace is at its task concurrency limit.');
       }
       try {
         const launched = await triggerManualReview(task);

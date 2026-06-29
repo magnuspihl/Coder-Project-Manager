@@ -15,6 +15,8 @@ import {
   getTaskCostUsd,
   getTaskCostsByWorkspace,
   getWorkingTask,
+  getWorkingTaskCount,
+  getMaxConcurrent,
   setPendingComplete,
   resetTaskSession,
   addTaskParticipant,
@@ -286,8 +288,13 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
     }
 
     // If another task is actively working on this workspace, defer completion
-    // until the queue is idle. Otherwise concurrent git ops (stash/checkout/
-    // commit) would corrupt the working agent's tree.
+    // until the queue is idle. Unlike review, completion MUTATES shared git
+    // state: it commits/pushes the task branch, merges the PR into the default
+    // branch, and ff-merges the shared main checkout (task.project_dir, common
+    // to every worktree on this workspace). Running that concurrently with an
+    // active agent — or another completion — could race the shared checkout/
+    // default-branch ref, so we queue it and auto-finalize once the workspace
+    // is idle (see processQueue's pending_complete flush).
     const working = getWorkingTask(fresh.workspace_id);
     if (working && working.id !== fresh.id) {
       if (!fresh.pending_complete) {
@@ -375,11 +382,14 @@ router.post('/tasks/:taskId/review', requireAuth, async (req: Request, res: Resp
     res.status(400).json({ error: 'This task has no worktree, so there is nothing to review.' });
     return;
   }
-  // A review runs git/SSH against the worktree — refuse if another task is
-  // actively working this workspace (would race the working agent's tree).
-  const working = getWorkingTask(task.workspace_id);
-  if (working && working.id !== task.id) {
-    res.status(409).json({ error: 'Cannot review while another task is running on this workspace.' });
+  // The reviewer is near-read-only and runs entirely inside this task's OWN
+  // worktree (it reads the diff and inspects files there), so it can't corrupt
+  // another task's tree. Launching it does, however, occupy a concurrency slot
+  // (the task flips to `working`), so gate it on the same capacity rule as a
+  // normal task launch rather than refusing whenever any other task is busy.
+  // This matches auto-review, which already runs alongside other working tasks.
+  if (getWorkingTaskCount(task.workspace_id) >= getMaxConcurrent(task.workspace_id)) {
+    res.status(409).json({ error: 'Cannot review — this workspace is at its task concurrency limit.' });
     return;
   }
   try {
