@@ -217,10 +217,14 @@ CREATE TABLE IF NOT EXISTS attachments (
 
 CREATE INDEX IF NOT EXISTS idx_attachments_task ON attachments(task_id);
 
--- Global rate limit tracking (persists across server restarts)
+-- Per-workspace rate limit tracking (persists across server restarts).
+-- Each workspace uses its own Claude account, so session (five_hour) and
+-- weekly (seven_day) limits are tracked separately per workspace.
 CREATE TABLE IF NOT EXISTS rate_limits (
-  type TEXT PRIMARY KEY,
+  workspace_name TEXT NOT NULL,
+  type TEXT NOT NULL,
   utilization REAL NOT NULL DEFAULT 0,
   resets_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (workspace_name, type)
 );
