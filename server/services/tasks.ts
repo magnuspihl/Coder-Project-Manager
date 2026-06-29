@@ -27,6 +27,8 @@ export interface Task {
   session_initialized: number;
   total_input_tokens: number;
   total_output_tokens: number;
+  total_cache_read_tokens: number;
+  total_cache_creation_tokens: number;
   source: string | null;
   client_label: string | null;
   auto_review: number;
@@ -158,6 +160,8 @@ export function getTaskCountsByWorkspace(): Record<string, TaskCounts> {
 export interface WorkspaceTokenTotals {
   total_input_tokens: number;
   total_output_tokens: number;
+  total_cache_read_tokens: number;
+  total_cache_creation_tokens: number;
   total_cost_usd: number;
 }
 
@@ -193,6 +197,8 @@ export function getTokenTotalsByWorkspace(): Record<string, WorkspaceTokenTotals
        t.workspace_id,
        SUM(t.total_input_tokens) as total_input_tokens,
        SUM(t.total_output_tokens) as total_output_tokens,
+       SUM(t.total_cache_read_tokens) as total_cache_read_tokens,
+       SUM(t.total_cache_creation_tokens) as total_cache_creation_tokens,
        COALESCE(SUM(mc.max_cost), 0) as total_cost_usd
      FROM tasks t
      LEFT JOIN (
@@ -202,13 +208,15 @@ export function getTokenTotalsByWorkspace(): Record<string, WorkspaceTokenTotals
        GROUP BY m.task_id
      ) mc ON mc.task_id = t.id
      GROUP BY t.workspace_id`
-  ).all() as Array<{ workspace_id: string; total_input_tokens: number; total_output_tokens: number; total_cost_usd: number }>;
+  ).all() as Array<{ workspace_id: string; total_input_tokens: number; total_output_tokens: number; total_cache_read_tokens: number; total_cache_creation_tokens: number; total_cost_usd: number }>;
 
   const result: Record<string, WorkspaceTokenTotals> = {};
   for (const row of rows) {
     result[row.workspace_id] = {
       total_input_tokens: row.total_input_tokens || 0,
       total_output_tokens: row.total_output_tokens || 0,
+      total_cache_read_tokens: row.total_cache_read_tokens || 0,
+      total_cache_creation_tokens: row.total_cache_creation_tokens || 0,
       total_cost_usd: row.total_cost_usd || 0,
     };
   }
@@ -492,11 +500,11 @@ export function addMessage(
   return { id, task_id: taskId, role, content, cost: cost ?? null, participant_id: participantId ?? null, turn_id: turnId ?? null, created_at: now };
 }
 
-export function addTokenUsage(taskId: string, inputTokens: number, outputTokens: number): void {
+export function addTokenUsage(taskId: string, inputTokens: number, outputTokens: number, cacheReadTokens = 0, cacheCreationTokens = 0): void {
   const db = getDb();
   db.prepare(
-    'UPDATE tasks SET total_input_tokens = total_input_tokens + ?, total_output_tokens = total_output_tokens + ? WHERE id = ?'
-  ).run(inputTokens, outputTokens, taskId);
+    'UPDATE tasks SET total_input_tokens = total_input_tokens + ?, total_output_tokens = total_output_tokens + ?, total_cache_read_tokens = total_cache_read_tokens + ?, total_cache_creation_tokens = total_cache_creation_tokens + ? WHERE id = ?'
+  ).run(inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, taskId);
   invalidateTokenTotalsCache();
 }
 

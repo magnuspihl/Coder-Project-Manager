@@ -44,6 +44,12 @@ export function getDb(): Database.Database {
     if (!cols.some(c => c.name === 'total_output_tokens')) {
       db.exec("ALTER TABLE tasks ADD COLUMN total_output_tokens INTEGER NOT NULL DEFAULT 0");
     }
+    if (!cols.some(c => c.name === 'total_cache_read_tokens')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN total_cache_read_tokens INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!cols.some(c => c.name === 'total_cache_creation_tokens')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0");
+    }
 
     // Migrate tasks CHECK constraint to include 'cancelled' status
     const tableInfo = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'").get() as { sql: string } | undefined;

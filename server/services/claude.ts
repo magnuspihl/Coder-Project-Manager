@@ -1883,9 +1883,9 @@ function startFilePolling(task: Task, implementerTurnId?: string | null): void {
         } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
           updateMessageCost(lastSavedMessageId, event.total_cost_usd);
         }
-        const { inputTokens: inTok, outputTokens: outTok } = extractTokenUsage(event);
-        if (inTok > 0 || outTok > 0) {
-          addTokenUsage(task.id, inTok, outTok);
+        const { inputTokens: inTok, outputTokens: outTok, cacheReadTokens: crTok, cacheCreationTokens: ccTok } = extractTokenUsage(event);
+        if (inTok > 0 || outTok > 0 || crTok > 0 || ccTok > 0) {
+          addTokenUsage(task.id, inTok, outTok, crTok, ccTok);
         }
         if (fatal) resultError = fatal;
         resultSeen = true;
@@ -2322,8 +2322,8 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
               allAssistantText += resultText;
               addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined, undefined, undefined, undefined, undefined, turnId);
             }
-            const { inputTokens, outputTokens } = extractTokenUsage(event);
-            if (inputTokens > 0 || outputTokens > 0) addTokenUsage(task.id, inputTokens, outputTokens);
+            const { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens } = extractTokenUsage(event);
+            if (inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0 || cacheCreationTokens > 0) addTokenUsage(task.id, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
           }
         }
       }
@@ -2606,29 +2606,35 @@ function extractFatalError(event: { [key: string]: unknown }): string | null {
  * Extract token usage from a result event.
  * The CLI stream-json format nests tokens under `usage` and/or `modelUsage`.
  */
-function extractTokenUsage(event: { [key: string]: unknown }): { inputTokens: number; outputTokens: number } {
+function extractTokenUsage(event: { [key: string]: unknown }): { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number } {
   let inputTokens = 0;
   let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheCreationTokens = 0;
 
   // Try modelUsage first (has aggregated per-model totals)
   const modelUsage = event.modelUsage as Record<string, { inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number }> | undefined;
   if (modelUsage) {
     for (const model of Object.values(modelUsage)) {
-      inputTokens += (model.inputTokens || 0) + (model.cacheReadInputTokens || 0) + (model.cacheCreationInputTokens || 0);
+      inputTokens += (model.inputTokens || 0);
       outputTokens += model.outputTokens || 0;
+      cacheReadTokens += model.cacheReadInputTokens || 0;
+      cacheCreationTokens += model.cacheCreationInputTokens || 0;
     }
   }
 
   // Fallback to usage object
-  if (inputTokens === 0 && outputTokens === 0) {
+  if (inputTokens === 0 && outputTokens === 0 && cacheReadTokens === 0 && cacheCreationTokens === 0) {
     const usage = event.usage as { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | undefined;
     if (usage) {
-      inputTokens = (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
+      inputTokens = (usage.input_tokens || 0);
       outputTokens = usage.output_tokens || 0;
+      cacheReadTokens = usage.cache_read_input_tokens || 0;
+      cacheCreationTokens = usage.cache_creation_input_tokens || 0;
     }
   }
 
-  return { inputTokens, outputTokens };
+  return { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens };
 }
 
 /**
@@ -2656,6 +2662,8 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
     const stagedStreamEvents: Array<{ type: string; [k: string]: unknown }> = [];
     let stagedInputTokens = 0;
     let stagedOutputTokens = 0;
+    let stagedCacheReadTokens = 0;
+    let stagedCacheCreationTokens = 0;
     let lastStagedText: string | null = null;
 
     for (const line of output.split('\n')) {
@@ -2683,9 +2691,11 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
           } else if (cost !== undefined && stagedMessages.length > 0) {
             stagedMessages[stagedMessages.length - 1].cost = cost;
           }
-          const { inputTokens: inTok, outputTokens: outTok } = extractTokenUsage(event);
+          const { inputTokens: inTok, outputTokens: outTok, cacheReadTokens: crTok, cacheCreationTokens: ccTok } = extractTokenUsage(event);
           stagedInputTokens += inTok;
           stagedOutputTokens += outTok;
+          stagedCacheReadTokens += crTok;
+          stagedCacheCreationTokens += ccTok;
           resultSeen = true;
           if (fatal) resultError = fatal;
         }
@@ -2711,8 +2721,8 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
       for (const m of stagedMessages) {
         addMessage(task.id, 'assistant', m.text, m.cost, undefined, undefined, undefined, undefined, turnId);
       }
-      if (stagedInputTokens > 0 || stagedOutputTokens > 0) {
-        addTokenUsage(task.id, stagedInputTokens, stagedOutputTokens);
+      if (stagedInputTokens > 0 || stagedOutputTokens > 0 || stagedCacheReadTokens > 0 || stagedCacheCreationTokens > 0) {
+        addTokenUsage(task.id, stagedInputTokens, stagedOutputTokens, stagedCacheReadTokens, stagedCacheCreationTokens);
       }
     })();
 
