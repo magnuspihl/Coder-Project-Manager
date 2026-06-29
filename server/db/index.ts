@@ -284,6 +284,26 @@ export function getDb(): Database.Database {
       db.exec("ALTER TABLE discussions ADD COLUMN worktree_path TEXT");
     }
 
+    // Rate limits: move from global (keyed by type) to per-workspace
+    // (keyed by workspace_name + type), since each workspace now uses its own
+    // Claude account with its own session/weekly limits. Old global rows can't
+    // be attributed to a workspace, so drop and rebuild — usage data is
+    // transient and refills within minutes of any task running.
+    const rlCols = db.prepare("PRAGMA table_info(rate_limits)").all() as Array<{ name: string }>;
+    if (rlCols.length > 0 && !rlCols.some(c => c.name === 'workspace_name')) {
+      db.exec("DROP TABLE rate_limits");
+      db.exec(`
+        CREATE TABLE rate_limits (
+          workspace_name TEXT NOT NULL,
+          type TEXT NOT NULL,
+          utilization REAL NOT NULL DEFAULT 0,
+          resets_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (workspace_name, type)
+        )
+      `);
+    }
+
     // Drop the one-working-per-workspace constraint — replaced by configurable max_concurrent
     db.exec("DROP INDEX IF EXISTS idx_tasks_one_working_per_workspace");
 

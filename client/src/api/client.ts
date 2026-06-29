@@ -189,13 +189,6 @@ export interface TokenTotals {
   total_cost_usd: number;
 }
 
-export interface ClaudeUsage {
-  utilization: number;
-  rateLimitType: string;
-  resetsAt: number;
-  updatedAt: number;
-}
-
 export interface RateLimitUsage {
   utilization: number;
   resetsAt: number;
@@ -203,7 +196,7 @@ export interface RateLimitUsage {
 }
 
 export const getWorkspaces = () =>
-  request<{ workspaces: Workspace[]; taskCounts: Record<string, TaskCounts>; tokenTotals: Record<string, TokenTotals>; githubRepoUrls: Record<string, string>; claudeUsage: Record<string, ClaudeUsage>; globalRateLimits: Record<string, RateLimitUsage> }>('/api/workspaces');
+  request<{ workspaces: Workspace[]; taskCounts: Record<string, TaskCounts>; tokenTotals: Record<string, TokenTotals>; githubRepoUrls: Record<string, string>; rateLimits: Record<string, Record<string, RateLimitUsage>> }>('/api/workspaces');
 
 export const getWorkspace = (id: string) =>
   request<{ workspace: Workspace }>(`/api/workspaces/${id}`);

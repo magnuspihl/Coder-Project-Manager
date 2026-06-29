@@ -28,7 +28,6 @@ import {
   type Task,
   type TaskCounts,
   type TokenTotals,
-  type ClaudeUsage,
   type RateLimitUsage,
 } from '../api/client';
 import { KOKORO_VOICES } from '../utils/kokoroTTS';
@@ -85,13 +84,78 @@ function getApps(workspace: Workspace) {
   return workspace.apps || [];
 }
 
+/**
+ * Per-workspace Claude usage limits. Each workspace uses its own Claude account,
+ * so session (five_hour) and weekly (seven_day) limits are tracked and shown
+ * independently in the workspace's column header.
+ */
+function WorkspaceRateLimits({ limits }: { limits: Record<string, RateLimitUsage> | undefined }) {
+  if (!limits || Object.keys(limits).length === 0) return null;
+  const now = Date.now();
+  const types = (['five_hour', 'seven_day'] as const).filter(t => limits[t]);
+  if (types.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-1 mt-2">
+      {types.map(type => {
+        const limit = limits[type];
+        const pct = Math.round(limit.utilization * 100);
+        const indeterminate = pct === 0 && limit.resetsAt * 1000 > now;
+        const label = type === 'five_hour' ? 'Session' : 'Weekly';
+        const diffMs = limit.resetsAt * 1000 - now;
+        let resetLabel = '';
+        if (diffMs > 0) {
+          const diffD = Math.floor(diffMs / 86400000);
+          const diffH = Math.floor((diffMs % 86400000) / 3600000);
+          const diffM = Math.floor((diffMs % 3600000) / 60000);
+          resetLabel = diffD > 0 ? `${diffD}d ${diffH}h ${diffM}m` : diffH > 0 ? `${diffH}h ${diffM}m` : `${diffM}m`;
+        }
+        return (
+          <div key={type} className="flex items-center gap-2" title={`${label} limit: ${indeterminate ? '<75%' : `${pct}%`}${resetLabel ? ` — resets in ${resetLabel}` : ''}`}>
+            <span className="text-[10px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap w-12">{label}</span>
+            <div className="flex-1 h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+              {indeterminate ? (
+                <div
+                  className="h-full rounded-full"
+                  style={{
+                    width: '75%',
+                    backgroundImage: 'repeating-linear-gradient(135deg, transparent, transparent 2px, rgba(96,165,250,0.3) 2px, rgba(96,165,250,0.3) 4px)',
+                    backgroundColor: 'rgba(96,165,250,0.15)',
+                  }}
+                />
+              ) : (
+                <div
+                  className={`h-full rounded-full transition-all ${
+                    pct >= 90 ? 'bg-red-500' : pct >= 75 ? 'bg-amber-500' : 'bg-blue-500'
+                  }`}
+                  style={{ width: `${Math.min(100, pct)}%` }}
+                />
+              )}
+            </div>
+            <span className={`text-[10px] font-mono whitespace-nowrap ${
+              indeterminate
+                ? 'text-gray-400 dark:text-gray-500'
+                : pct >= 90 ? 'text-red-500' : pct >= 75 ? 'text-amber-500' : 'text-gray-400 dark:text-gray-500'
+            }`}>
+              {indeterminate ? 'OK' : `${pct}%`}
+            </span>
+            {resetLabel && (
+              <span className="text-[10px] text-gray-400 dark:text-gray-500 whitespace-nowrap">
+                {resetLabel}
+              </span>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function WorkspacesPage() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [taskCounts, setTaskCounts] = useState<Record<string, TaskCounts>>({});
   const [tokenTotals, setTokenTotals] = useState<Record<string, TokenTotals>>({});
   const [githubRepoUrls, setGithubRepoUrls] = useState<Record<string, string>>({});
-  const [claudeUsage, setClaudeUsage] = useState<Record<string, ClaudeUsage>>({});
-  const [globalRateLimits, setGlobalRateLimits] = useState<Record<string, RateLimitUsage>>({});
+  const [rateLimits, setRateLimits] = useState<Record<string, Record<string, RateLimitUsage>>>({});
   const [tasksByWorkspace, setTasksByWorkspace] = useState<Record<string, Task[]>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -144,13 +208,12 @@ export default function WorkspacesPage() {
 
   const loadData = async () => {
     try {
-      const { workspaces: ws, taskCounts: tc, tokenTotals: tt, githubRepoUrls: gh, claudeUsage: cu, globalRateLimits: grl } = await getWorkspaces();
+      const { workspaces: ws, taskCounts: tc, tokenTotals: tt, githubRepoUrls: gh, rateLimits: rl } = await getWorkspaces();
       setIfChanged('workspaces', setWorkspaces, ws);
       setIfChanged('taskCounts', setTaskCounts, tc);
       setIfChanged('tokenTotals', setTokenTotals, tt || {});
       setIfChanged('githubRepoUrls', setGithubRepoUrls, gh || {});
-      setIfChanged('claudeUsage', setClaudeUsage, cu || {});
-      setIfChanged('globalRateLimits', setGlobalRateLimits, grl || {});
+      setIfChanged('rateLimits', setRateLimits, rl || {});
       setError('');
 
       // Fetch tasks for running workspaces in parallel
@@ -899,6 +962,7 @@ export default function WorkspacesPage() {
               )}
             </div>
           </div>
+          <WorkspaceRateLimits limits={rateLimits[ws.name]} />
           {memoryOpenWsId === ws.id && (() => {
             const files = memoryByWs[ws.id] ?? [];
             const isLoading = memoryLoadingWsId === ws.id;
@@ -1382,64 +1446,6 @@ export default function WorkspacesPage() {
           </button>
         )}
       </div>
-
-      {/* Global Claude rate limits */}
-      {Object.keys(globalRateLimits).length > 0 && (
-        <div className="flex-shrink-0 flex items-center gap-4 mb-3 px-1">
-          {(['five_hour', 'seven_day'] as const).map(type => {
-            const limit = globalRateLimits[type];
-            if (!limit) return null;
-            const pct = Math.round(limit.utilization * 100);
-            const indeterminate = pct === 0 && limit.resetsAt * 1000 > Date.now();
-            const label = type === 'five_hour' ? 'Session' : 'Weekly';
-            const now = Date.now();
-            const diffMs = limit.resetsAt * 1000 - now;
-            let resetLabel = '';
-            if (diffMs > 0) {
-              const diffD = Math.floor(diffMs / 86400000);
-              const diffH = Math.floor((diffMs % 86400000) / 3600000);
-              const diffM = Math.floor((diffMs % 3600000) / 60000);
-              resetLabel = diffD > 0 ? `${diffD}d ${diffH}h ${diffM}m` : diffH > 0 ? `${diffH}h ${diffM}m` : `${diffM}m`;
-            }
-            return (
-              <div key={type} className="flex items-center gap-2 min-w-0" title={`${label} limit: ${indeterminate ? '<75%' : `${pct}%`}${resetLabel ? ` — resets in ${resetLabel}` : ''}`}>
-                <span className="text-[11px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">{label}</span>
-                <div className="w-24 h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-                  {indeterminate ? (
-                    <div
-                      className="h-full rounded-full"
-                      style={{
-                        width: '75%',
-                        backgroundImage: 'repeating-linear-gradient(135deg, transparent, transparent 2px, rgba(96,165,250,0.3) 2px, rgba(96,165,250,0.3) 4px)',
-                        backgroundColor: 'rgba(96,165,250,0.15)',
-                      }}
-                    />
-                  ) : (
-                    <div
-                      className={`h-full rounded-full transition-all ${
-                        pct >= 90 ? 'bg-red-500' : pct >= 75 ? 'bg-amber-500' : 'bg-blue-500'
-                      }`}
-                      style={{ width: `${Math.min(100, pct)}%` }}
-                    />
-                  )}
-                </div>
-                <span className={`text-[10px] font-mono whitespace-nowrap ${
-                  indeterminate
-                    ? 'text-gray-400 dark:text-gray-500'
-                    : pct >= 90 ? 'text-red-500' : pct >= 75 ? 'text-amber-500' : 'text-gray-400 dark:text-gray-500'
-                }`}>
-                  {indeterminate ? 'OK' : `${pct}%`}
-                </span>
-                {resetLabel && (
-                  <span className="text-[10px] text-gray-400 dark:text-gray-500 whitespace-nowrap">
-                    resets {resetLabel}
-                  </span>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
 
       {workspaces.length === 0 ? (
         <p className="text-gray-500 dark:text-gray-400">No workspaces found.</p>
