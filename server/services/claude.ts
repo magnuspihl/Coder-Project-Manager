@@ -23,9 +23,9 @@ const REVIEWER_MAX_TURNS = process.env.CLAUDE_REVIEWER_MAX_TURNS || '100';
 const ALLOWED_TOOLS = process.env.CLAUDE_ALLOWED_TOOLS || 'Read,Edit,Write,Bash,Glob,Grep';
 const DISCUSSION_ALLOWED_TOOLS = 'Read,Edit,Write,MultiEdit,Bash,Glob,Grep,mcp__coder__coder_report_task';
 
-const PORT_RANGE_START = parseInt(process.env.CPM_PORT_RANGE_START || '40000');
-const PORT_RANGE_SIZE = parseInt(process.env.CPM_PORT_RANGE_SIZE || '10');
-const PORT_RANGE_SLOTS = parseInt(process.env.CPM_PORT_RANGE_SLOTS || '100');
+export const PORT_RANGE_START = parseInt(process.env.CPM_PORT_RANGE_START || '40000');
+export const PORT_RANGE_SIZE = parseInt(process.env.CPM_PORT_RANGE_SIZE || '10');
+export const PORT_RANGE_SLOTS = parseInt(process.env.CPM_PORT_RANGE_SLOTS || '100');
 
 function allocatePortRange(_workspaceId: string): number | null {
   const usedRanges = new Set<number>(
@@ -43,10 +43,89 @@ function allocatePortRange(_workspaceId: string): number | null {
   return null;
 }
 
+/**
+ * Build a self-contained POSIX-sh script (base64-wrapped so we never fight
+ * shell quoting through `coder ssh`) that shuts down a task's dev/preview
+ * servers. It does NOT depend on `fuser`, `ss`, or `lsof` — many workspace
+ * images ship none of them, which historically made cleanup a silent no-op and
+ * leaked orphaned dev servers. Two independent strategies:
+ *
+ *  1. Kill whatever is LISTENing on the task's assigned port range, discovered
+ *     by mapping ports → socket inodes (via /proc/net/tcp{,6}) → owning pids
+ *     (via /proc/<pid>/fd symlinks). `fuser` is tried first as a fast path when
+ *     present, but the /proc scan is the reliable fallback.
+ *  2. Reap any process whose cwd is under the task's worktree. This catches dev
+ *     servers that ignored the injected $PORT and drifted to a port OUTSIDE the
+ *     assigned range (e.g. Vite auto-incrementing when its default is taken) —
+ *     the exact failure that a pure port-range kill can never reach.
+ *
+ * Safe because cleanupPortRange only runs at terminal task states (completed/
+ * failed/cancelled/deleted); nothing legitimate should still be running from
+ * the task's worktree at that point.
+ */
+function buildPortRangeKillScript(startPort: number, size: number, worktreePath: string | null): string {
+  const dec: string[] = [];
+  const hex: string[] = [];
+  for (let i = 0; i < size; i++) {
+    const p = startPort + i;
+    dec.push(String(p));
+    hex.push(p.toString(16).toUpperCase().padStart(4, '0')); // /proc/net/tcp uses uppercase hex ports
+  }
+  // Only pass a worktree path we're confident is a real, absolute CPM worktree,
+  // so an empty/garbage value can never widen the kill to unrelated processes.
+  const wt = worktreePath && worktreePath.startsWith('/') ? worktreePath : '';
+  const script = `set +e
+DEC="${dec.join(' ')}"
+HEX="${hex.join(' ')}"
+WT="${wt}"
+for p in $DEC; do command -v fuser >/dev/null 2>&1 && fuser -k -TERM "$p/tcp" >/dev/null 2>&1; done
+INODES=$(awk -v hp="$HEX" 'BEGIN{n=split(hp,a," ");for(i=1;i<=n;i++)w[a[i]]=1} FNR>1 && $4=="0A"{split($2,L,":"); if(toupper(L[2]) in w) print $10}' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u)
+if [ -n "$INODES" ]; then
+  for l in /proc/[0-9]*/fd/*; do
+    t=$(readlink "$l" 2>/dev/null) || continue
+    case "$t" in
+      socket:\\[*\\])
+        for wi in $INODES; do
+          if [ "$t" = "socket:[$wi]" ]; then
+            pid=$(echo "$l" | cut -d/ -f3)
+            kill "$pid" 2>/dev/null && echo "killed-port pid=$pid"
+            break
+          fi
+        done
+        ;;
+    esac
+  done
+fi
+if [ -n "$WT" ]; then
+  for d in /proc/[0-9]*; do
+    cwd=$(readlink "$d/cwd" 2>/dev/null) || continue
+    case "$cwd" in
+      "$WT"|"$WT"/*)
+        pid=$(echo "$d" | cut -d/ -f3)
+        kill "$pid" 2>/dev/null && echo "killed-worktree pid=$pid"
+        ;;
+    esac
+  done
+fi
+exit 0`;
+  const b64 = Buffer.from(script, 'utf8').toString('base64');
+  return `printf %s '${b64}' | base64 -d | sh`;
+}
+
 export async function cleanupPortRange(task: Task): Promise<void> {
   if (task.port_range_start === null || task.port_range_start === undefined) return;
-  const ports = Array.from({ length: PORT_RANGE_SIZE }, (_, i) => `${task.port_range_start! + i}/tcp`).join(' ');
-  await sshExec(task.workspace_name, `fuser -k ${ports} 2>/dev/null || true`, 10000, task.user_id).catch(() => {});
+  const cmd = buildPortRangeKillScript(task.port_range_start, PORT_RANGE_SIZE, task.worktree_path ?? null);
+  try {
+    const out = await sshExec(task.workspace_name, cmd, 10000, task.user_id);
+    const killed = out.split('\n').filter((l) => l.startsWith('killed-')).length;
+    if (killed > 0) {
+      console.log(`[claude-executor] cleanupPortRange: killed ${killed} process(es) for task ${task.id} (range ${task.port_range_start}-${task.port_range_start + PORT_RANGE_SIZE - 1})`);
+    }
+  } catch (err) {
+    // Don't let a failed remote kill block releasing the range, but do surface
+    // it — a silently-swallowed failure here is what let ports leak before.
+    console.warn(`[claude-executor] cleanupPortRange: kill command failed for task ${task.id}: ${(err as Error).message?.slice(0, 200)}`);
+  }
   // Release the port range back to the pool. The task keeps its worktree but its
   // ports are now free for reallocation; if the task later resumes (retry/reopen)
   // it will be assigned a fresh range. Avoids two tasks claiming the same ports.

@@ -97,6 +97,19 @@ function portInTaskRange(port: number, task: Task, rangeSize: number): boolean {
 }
 
 /**
+ * Which task (if any) owns a forwarded port, among a workspace's tasks. Prefers
+ * the server's worktree-based attribution (`owner_task_id`, which catches ports
+ * that drifted outside the assigned range) and falls back to the numeric
+ * port-range heuristic when the server hasn't attributed it yet.
+ */
+function resolvePortOwnerId(port: WorkspacePort, wsTasks: Task[], rangeSize: number): string | null {
+  if (port.owner_task_id && wsTasks.some((t) => t.id === port.owner_task_id)) {
+    return port.owner_task_id;
+  }
+  return wsTasks.find((t) => portInTaskRange(port.port, t, rangeSize))?.id ?? null;
+}
+
+/**
  * Link to a forwarded port. The default "icon" variant is icon-only (workspace
  * shortcut row); the "pill" variant also shows the `:port` label and is used on
  * task cards, where a bare icon lacks context.
@@ -400,9 +413,9 @@ export default function WorkspacesPage() {
     return result;
   }, [tasksByWorkspace]);
 
-  // Attribute each forwarded port to the task whose reserved range contains it.
-  // These ports render on the individual task card; the rest stay in the
-  // workspace-wide shortcut row at the top of the swimlane.
+  // Attribute each forwarded port to its owning task. These ports render on the
+  // individual task card; the rest stay in the workspace-wide shortcut row at
+  // the top of the swimlane.
   const portsByTaskId = useMemo(() => {
     const map: Record<string, WorkspacePort[]> = {};
     for (const ws of workspaces) {
@@ -410,8 +423,8 @@ export default function WorkspacesPage() {
       if (ports.length === 0) continue;
       const wsTasks = tasksByWorkspace[ws.id] || [];
       for (const p of ports) {
-        const owner = wsTasks.find((t) => portInTaskRange(p.port, t, portRangeSize));
-        if (owner) (map[owner.id] ||= []).push(p);
+        const ownerId = resolvePortOwnerId(p, wsTasks, portRangeSize);
+        if (ownerId) (map[ownerId] ||= []).push(p);
       }
     }
     return map;
@@ -1010,10 +1023,10 @@ export default function WorkspacesPage() {
     const isStarting = STARTING_STATUSES.includes(ws.latest_build.status);
     const counts = taskCounts[ws.id];
     const tasks = tasksByWorkspace[ws.id] || [];
-    // Only ports NOT owned by a task's reserved range appear in the workspace-wide
-    // shortcut row; task-owned ports render on their task card instead.
+    // Only ports NOT owned by a task appear in the workspace-wide shortcut row;
+    // task-owned ports render on their task card instead.
     const openPorts = getOpenPorts(ws).filter(
-      (p) => !tasks.some((t) => portInTaskRange(p.port, t, portRangeSize))
+      (p) => resolvePortOwnerId(p, tasks, portRangeSize) === null
     );
     const apps = getApps(ws);
     const githubRepoUrl = githubRepoUrls[ws.id] || tasks.find(t => t.github_repo_url)?.github_repo_url || null;

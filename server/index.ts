@@ -17,6 +17,7 @@ import { handleMcpRequest, handleMcpMethodNotAllowed } from './mcp/index.js';
 import './db/index.js';
 import { reconnectWorkingTasks, startRateLimitRetryPoller } from './services/claude.js';
 import { reconcileLeakedWorktrees } from './services/git.js';
+import { startPortJanitor } from './services/port-janitor.js';
 
 // Prevent unhandled promise rejections from crashing the server
 process.on('unhandledRejection', (reason) => {
@@ -58,4 +59,7 @@ app.listen(PORT, '0.0.0.0', () => {
   // Periodically re-queue tasks that failed on a usage/token limit once their
   // reset window has passed, so the user doesn't have to retry them by hand.
   startRateLimitRetryPoller();
+  // Periodically reap orphaned dev servers and attribute drifted ports to their
+  // owning task (see services/port-janitor.ts).
+  startPortJanitor();
 });
