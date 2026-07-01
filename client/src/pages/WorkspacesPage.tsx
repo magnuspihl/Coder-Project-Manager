@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback, Fragment } from 'react';
 import {
   getWorkspaces,
   getTasks,
@@ -193,7 +193,10 @@ function WorkspaceRateLimits({ limits }: { limits: Record<string, RateLimitUsage
   const types = (['five_hour', 'seven_day'] as const).filter(t => limits[t]);
   if (types.length === 0) return null;
   return (
-    <div className="flex flex-col gap-1 mt-2">
+    // Grid (not per-row flex) so the label / bar / % / reset columns align
+    // across both rows — this keeps the Session and Weekly bars the same width
+    // regardless of differing reset-label lengths (e.g. "3h 0m" vs "4d 0h 0m").
+    <div className="grid grid-cols-[auto_minmax(0,1fr)_auto_auto] items-center gap-x-2 gap-y-1 mt-2">
       {types.map(type => {
         const limit = limits[type];
         const pct = Math.round(limit.utilization * 100);
@@ -207,10 +210,11 @@ function WorkspaceRateLimits({ limits }: { limits: Record<string, RateLimitUsage
           const diffM = Math.floor((diffMs % 3600000) / 60000);
           resetLabel = diffD > 0 ? `${diffD}d ${diffH}h ${diffM}m` : diffH > 0 ? `${diffH}h ${diffM}m` : `${diffM}m`;
         }
+        const title = `${label} limit: ${indeterminate ? '<75%' : `${pct}%`}${resetLabel ? ` — resets in ${resetLabel}` : ''}`;
         return (
-          <div key={type} className="flex items-center gap-2" title={`${label} limit: ${indeterminate ? '<75%' : `${pct}%`}${resetLabel ? ` — resets in ${resetLabel}` : ''}`}>
-            <span className="text-[10px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap w-12">{label}</span>
-            <div className="flex-1 h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+          <Fragment key={type}>
+            <span title={title} className="text-[10px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">{label}</span>
+            <div title={title} className="h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
               {indeterminate ? (
                 <div
                   className="h-full rounded-full"
@@ -229,19 +233,17 @@ function WorkspaceRateLimits({ limits }: { limits: Record<string, RateLimitUsage
                 />
               )}
             </div>
-            <span className={`text-[10px] font-mono whitespace-nowrap ${
+            <span title={title} className={`text-[10px] font-mono whitespace-nowrap text-right ${
               indeterminate
                 ? 'text-gray-400 dark:text-gray-500'
                 : pct >= 90 ? 'text-red-500' : pct >= 75 ? 'text-amber-500' : 'text-gray-400 dark:text-gray-500'
             }`}>
               {indeterminate ? 'OK' : `${pct}%`}
             </span>
-            {resetLabel && (
-              <span className="text-[10px] text-gray-400 dark:text-gray-500 whitespace-nowrap">
-                {resetLabel}
-              </span>
-            )}
-          </div>
+            <span title={title} className="text-[10px] text-gray-400 dark:text-gray-500 whitespace-nowrap">
+              {resetLabel}
+            </span>
+          </Fragment>
         );
       })}
     </div>
