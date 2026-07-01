@@ -7,6 +7,9 @@ const CODER_URL = process.env.CODER_URL || '';
 const APP_URL = process.env.APP_URL || '';
 const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || '';
 const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || '';
+// Size of the per-task port range (mirrors CPM_PORT_RANGE_SIZE in claude.ts).
+// Exposed to the client so it can attribute listening ports to their owning task.
+const PORT_RANGE_SIZE = parseInt(process.env.CPM_PORT_RANGE_SIZE || '10');
 
 const router = Router();
 
@@ -131,6 +134,7 @@ router.get('/config', (_req: Request, res: Response) => {
     coder_url: CODER_URL,
     self_workspace_id: process.env.CODER_WORKSPACE_ID || null,
     self_workspace_name: process.env.CODER_WORKSPACE_NAME || null,
+    port_range_size: PORT_RANGE_SIZE,
   });
 });
 
