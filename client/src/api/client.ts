@@ -50,6 +50,10 @@ export interface Workspace {
     url: string;
     title: string | null;
     favicon_url: string | null;
+    // Active task that owns this port (set by the server's port janitor when the
+    // owning process runs from that task's worktree, even if the port drifted
+    // outside the task's assigned range). Null → use the port-range heuristic.
+    owner_task_id?: string | null;
   }>;
   apps?: Array<{
     slug: string;

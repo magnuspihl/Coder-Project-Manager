@@ -6,6 +6,7 @@ import { getTaskCountsByWorkspace, getTokenTotalsByWorkspace, getGithubRepoUrlsB
 import { getWorkspaceRateLimits } from '../services/claude.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { getModelsForWorkspace } from '../services/models.js';
+import { getPortOwnerTaskId } from '../services/port-janitor.js';
 import { setWorkspacesForUser } from '../services/workspace-cache.js';
 import { readWorkspaceMemory, writeWorkspaceMemoryFile } from '../services/workspace-memory.js';
 
@@ -59,6 +60,14 @@ async function withTokenRefresh<T>(
 router.get('/', requireAuth, async (req: Request, res: Response) => {
   const workspaces = await withTokenRefresh(req, res, (token) => listWorkspaces(token), 'Failed to fetch workspaces from Coder');
   if (workspaces === undefined) return;
+  // Annotate each forwarded port with the active task that owns it (from the
+  // port janitor's latest scan), so the UI can place drifted ports on the right
+  // task card. Falls back to null when the janitor has no fresh data.
+  for (const w of workspaces) {
+    for (const p of w.listening_ports ?? []) {
+      p.owner_task_id = getPortOwnerTaskId(w.name, p.port);
+    }
+  }
   setWorkspacesForUser(req.user!.id, workspaces.map(w => ({
     id: w.id,
     name: w.name,

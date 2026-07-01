@@ -13,6 +13,10 @@ export interface WorkspacePort {
   url: string;
   title: string | null;
   favicon_url: string | null;
+  // Set by the API layer when the port janitor has attributed this port to an
+  // active task's worktree (even if it drifted outside the task's numeric
+  // range). Null/absent → the client falls back to the port-range heuristic.
+  owner_task_id?: string | null;
 }
 
 export interface WorkspaceApp {
