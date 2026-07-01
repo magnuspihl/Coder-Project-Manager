@@ -22,6 +22,7 @@ import {
   uploadFiles,
   getWorkspaceMemory,
   updateWorkspaceMemoryFile,
+  getAuthConfig,
   type Workspace,
   type ModelInfo,
   type MemoryFile,
@@ -76,8 +77,92 @@ function getAgentStatus(workspace: Workspace): { connected: boolean; name: strin
   return { connected: false, name: '' };
 }
 
+type WorkspacePort = NonNullable<Workspace['listening_ports']>[number];
+
 function getOpenPorts(workspace: Workspace) {
   return workspace.listening_ports || [];
+}
+
+/**
+ * A forwarded port belongs to a task when it falls inside the task's reserved
+ * port range [port_range_start, port_range_start + rangeSize). Such ports are
+ * shown on the task card rather than in the workspace-wide shortcut row.
+ */
+function portInTaskRange(port: number, task: Task, rangeSize: number): boolean {
+  return (
+    task.port_range_start != null &&
+    port >= task.port_range_start &&
+    port < task.port_range_start + rangeSize
+  );
+}
+
+/**
+ * Link to a forwarded port. The default "icon" variant is icon-only (workspace
+ * shortcut row); the "pill" variant also shows the `:port` label and is used on
+ * task cards, where a bare icon lacks context.
+ */
+function PortLink({
+  port,
+  variant = 'icon',
+  onClick,
+}: {
+  port: WorkspacePort;
+  variant?: 'icon' | 'pill';
+  onClick?: (e: React.MouseEvent) => void;
+}) {
+  const icon = (
+    <>
+      {port.favicon_url ? (
+        <img
+          src={port.favicon_url.startsWith('data:') ? port.favicon_url : `/api/workspaces/proxy-icon?url=${encodeURIComponent(port.favicon_url)}`}
+          alt=""
+          className="h-4 w-4 rounded-sm"
+          onError={(e) => {
+            const el = e.currentTarget;
+            el.style.display = 'none';
+            el.nextElementSibling?.classList.remove('hidden');
+          }}
+        />
+      ) : null}
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        className={`h-4 w-4 text-gray-400 dark:text-gray-500 group-hover:text-blue-600 dark:group-hover:text-blue-400${port.favicon_url ? ' hidden' : ''}`}
+        viewBox="0 0 20 20"
+        fill="currentColor"
+      >
+        <path d="M11 3a1 1 0 100 2h2.586l-6.293 6.293a1 1 0 101.414 1.414L15 6.414V9a1 1 0 102 0V4a1 1 0 00-1-1h-5z" />
+        <path d="M5 5a2 2 0 00-2 2v8a2 2 0 002 2h8a2 2 0 002-2v-3a1 1 0 10-2 0v3H5V7h3a1 1 0 000-2H5z" />
+      </svg>
+    </>
+  );
+  const title = port.title || `:${port.port} (${port.process_name})`;
+  if (variant === 'pill') {
+    return (
+      <a
+        href={port.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        onClick={onClick}
+        className="group inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-[11px] font-mono text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
+        title={title}
+      >
+        {icon}
+        <span>:{port.port}</span>
+      </a>
+    );
+  }
+  return (
+    <a
+      href={port.url}
+      target="_blank"
+      rel="noopener noreferrer"
+      onClick={onClick}
+      className="group shrink-0 hover:opacity-80 transition-opacity"
+      title={title}
+    >
+      {icon}
+    </a>
+  );
 }
 
 function getApps(workspace: Workspace) {
@@ -159,6 +244,10 @@ export default function WorkspacesPage() {
   const [tasksByWorkspace, setTasksByWorkspace] = useState<Record<string, Task[]>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  // Size of each task's reserved port range (from server config). Used to attribute
+  // forwarded ports to the task that owns them so they render on the task card
+  // instead of the workspace-wide shortcut row.
+  const [portRangeSize, setPortRangeSize] = useState(10);
   const [showStopped, setShowStopped] = useState(false);
   const [deletedTaskId, setDeletedTaskId] = useState<string | null>(null);
   const [newTaskWorkspaceId, setNewTaskWorkspaceId] = useSessionState<string | null>('newTaskWorkspaceId', null);
@@ -205,6 +294,13 @@ export default function WorkspacesPage() {
       setter(value);
     }
   }
+
+  // Load the per-task port range size once so ports can be attributed to tasks.
+  useEffect(() => {
+    getAuthConfig()
+      .then((cfg) => { if (cfg.port_range_size > 0) setPortRangeSize(cfg.port_range_size); })
+      .catch(() => { /* keep default */ });
+  }, []);
 
   const loadData = async () => {
     try {
@@ -303,6 +399,23 @@ export default function WorkspacesPage() {
     }
     return result;
   }, [tasksByWorkspace]);
+
+  // Attribute each forwarded port to the task whose reserved range contains it.
+  // These ports render on the individual task card; the rest stay in the
+  // workspace-wide shortcut row at the top of the swimlane.
+  const portsByTaskId = useMemo(() => {
+    const map: Record<string, WorkspacePort[]> = {};
+    for (const ws of workspaces) {
+      const ports = ws.listening_ports || [];
+      if (ports.length === 0) continue;
+      const wsTasks = tasksByWorkspace[ws.id] || [];
+      for (const p of ports) {
+        const owner = wsTasks.find((t) => portInTaskRange(p.port, t, portRangeSize));
+        if (owner) (map[owner.id] ||= []).push(p);
+      }
+    }
+    return map;
+  }, [workspaces, tasksByWorkspace, portRangeSize]);
 
   // Workspaces that are spinning up — shown alongside running ones with a spinner
   const startingWorkspaces = useMemo(() =>
@@ -788,6 +901,13 @@ export default function WorkspacesPage() {
           </span>
         </div>
       )}
+      {(portsByTaskId[task.id]?.length ?? 0) > 0 && (
+        <div className="mt-2 flex items-center gap-1.5 flex-wrap">
+          {portsByTaskId[task.id].map((p) => (
+            <PortLink key={p.port} port={p} variant="pill" onClick={(e) => e.stopPropagation()} />
+          ))}
+        </div>
+      )}
       <div className="flex items-center justify-between mt-2">
         <div className="flex items-center gap-1">
           {task.verification_url && (
@@ -890,7 +1010,11 @@ export default function WorkspacesPage() {
     const isStarting = STARTING_STATUSES.includes(ws.latest_build.status);
     const counts = taskCounts[ws.id];
     const tasks = tasksByWorkspace[ws.id] || [];
-    const openPorts = getOpenPorts(ws);
+    // Only ports NOT owned by a task's reserved range appear in the workspace-wide
+    // shortcut row; task-owned ports render on their task card instead.
+    const openPorts = getOpenPorts(ws).filter(
+      (p) => !tasks.some((t) => portInTaskRange(p.port, t, portRangeSize))
+    );
     const apps = getApps(ws);
     const githubRepoUrl = githubRepoUrls[ws.id] || tasks.find(t => t.github_repo_url)?.github_repo_url || null;
 
@@ -1201,36 +1325,7 @@ export default function WorkspacesPage() {
                 );
               })}
               {openPorts.map((p) => (
-                <a
-                  key={p.port}
-                  href={p.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="shrink-0 hover:opacity-80 transition-opacity"
-                  title={p.title || `:${p.port} (${p.process_name})`}
-                >
-                  {p.favicon_url ? (
-                    <img
-                      src={p.favicon_url.startsWith('data:') ? p.favicon_url : `/api/workspaces/proxy-icon?url=${encodeURIComponent(p.favicon_url)}`}
-                      alt=""
-                      className="h-4 w-4 rounded-sm"
-                      onError={(e) => {
-                        const el = e.currentTarget;
-                        el.style.display = 'none';
-                        el.nextElementSibling?.classList.remove('hidden');
-                      }}
-                    />
-                  ) : null}
-                  <svg
-                    xmlns="http://www.w3.org/2000/svg"
-                    className={`h-4 w-4 text-gray-400 dark:text-gray-500 hover:text-blue-600 dark:hover:text-blue-400${p.favicon_url ? ' hidden' : ''}`}
-                    viewBox="0 0 20 20"
-                    fill="currentColor"
-                  >
-                    <path d="M11 3a1 1 0 100 2h2.586l-6.293 6.293a1 1 0 101.414 1.414L15 6.414V9a1 1 0 102 0V4a1 1 0 00-1-1h-5z" />
-                    <path d="M5 5a2 2 0 00-2 2v8a2 2 0 002 2h8a2 2 0 002-2v-3a1 1 0 10-2 0v3H5V7h3a1 1 0 000-2H5z" />
-                  </svg>
-                </a>
+                <PortLink key={p.port} port={p} />
               ))}
             </div>
           )}
