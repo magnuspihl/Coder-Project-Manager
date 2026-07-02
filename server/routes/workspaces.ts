@@ -1,5 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { execFile, exec } from 'child_process';
+import net from 'net';
+import dnsPromises from 'dns/promises';
 import { requireAuth } from '../middleware/auth.js';
 import { listWorkspaces, getWorkspace, stopWorkspace, startWorkspace, CoderAuthError } from '../services/coder.js';
 import { getTaskCountsByWorkspace, getTokenTotalsByWorkspace, getGithubRepoUrlsByWorkspace } from '../services/tasks.js';
@@ -81,6 +83,48 @@ router.get('/', requireAuth, async (req: Request, res: Response) => {
   res.json({ workspaces, taskCounts, tokenTotals, githubRepoUrls, rateLimits });
 });
 
+// Base hostname of the Coder deployment, derived from CODER_URL. The caller's
+// Coder-Session-Token is only ever attached to requests targeting this host or
+// its subdomains (the wildcard port-forward / app hostnames), never to
+// arbitrary destinations.
+const CODER_HOST = (() => {
+  try { return new URL(process.env.CODER_URL || '').hostname.toLowerCase(); } catch { return ''; }
+})();
+
+function isCoderHost(hostname: string): boolean {
+  if (!CODER_HOST) return false;
+  const h = hostname.toLowerCase();
+  return h === CODER_HOST || h.endsWith('.' + CODER_HOST);
+}
+
+function isPrivateIpv4(ip: string): boolean {
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some((p) => Number.isNaN(p))) return true; // malformed → treat as unsafe
+  const [a, b] = parts;
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 169 && b === 254) return true; // link-local (cloud metadata)
+  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+  return false;
+}
+
+function isPrivateIp(ip: string): boolean {
+  const v = net.isIP(ip);
+  if (v === 4) return isPrivateIpv4(ip);
+  if (v === 6) {
+    const lower = ip.toLowerCase();
+    if (lower === '::1' || lower === '::') return true;
+    const mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (mapped) return isPrivateIpv4(mapped[1]);
+    // fe80::/10 link-local, fc00::/7 unique-local
+    if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) return true;
+    if (lower.startsWith('fc') || lower.startsWith('fd')) return true;
+    return false;
+  }
+  return true; // not an IP literal — caller resolves via DNS
+}
+
 // Proxy favicon/icon images from workspace ports (they require Coder auth)
 // Must be before /:id to avoid being caught by the wildcard route
 router.get('/proxy-icon', requireAuth, async (req: Request, res: Response) => {
@@ -90,10 +134,62 @@ router.get('/proxy-icon', requireAuth, async (req: Request, res: Response) => {
     return;
   }
 
+  // Validate the target before making any request. Only the Coder deployment's
+  // own host (and its port-forward/app subdomains) ever receives the caller's
+  // Coder token, so it can't be exfiltrated to an attacker-controlled URL.
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    res.status(400).json({ error: 'Invalid url' });
+    return;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    res.status(400).json({ error: 'Unsupported protocol' });
+    return;
+  }
+  const host = parsed.hostname.toLowerCase();
+  const coderHost = isCoderHost(host);
+
+  // SSRF guards apply only to NON-Coder hosts. The Coder deployment itself is
+  // trusted and, on self-hosted installs, legitimately resolves to a private
+  // address (e.g. coder.pihl.family → 192.168.x.x), so its wildcard favicon
+  // URLs must not be caught by the private-IP block. No token is sent to
+  // non-Coder hosts, so the checks below are purely SSRF-to-internal defense.
+  if (!coderHost) {
+    if (host === 'localhost' || host.endsWith('.localhost')) {
+      res.status(400).json({ error: 'Blocked host' });
+      return;
+    }
+    // Literal IP in a private/reserved range → block outright.
+    if (net.isIP(host) && isPrivateIp(host)) {
+      res.status(400).json({ error: 'Blocked host' });
+      return;
+    }
+    // Hostname → resolve and block if any address is private. Best-effort
+    // pre-flight only: fetch() below resolves DNS independently, so this is
+    // NOT rebinding-proof. That residual is acceptable here because no
+    // credential is attached to non-Coder requests — a rebind can at most
+    // return image bytes from an internal host, never leak the Coder token.
+    if (!net.isIP(host)) {
+      try {
+        const addrs = await dnsPromises.lookup(host, { all: true });
+        if (addrs.length === 0 || addrs.some((a) => isPrivateIp(a.address))) {
+          res.status(400).json({ error: 'Blocked host' });
+          return;
+        }
+      } catch {
+        res.status(502).end();
+        return;
+      }
+    }
+  }
+
   try {
     const iconRes = await fetch(url, {
-      headers: { 'Coder-Session-Token': req.session!.coder_access_token },
+      headers: coderHost ? { 'Coder-Session-Token': req.session!.coder_access_token } : {},
       signal: AbortSignal.timeout(3000),
+      redirect: 'error', // don't follow redirects into blocked hosts
     });
     if (!iconRes.ok) {
       res.status(iconRes.status).end();
@@ -106,6 +202,7 @@ router.get('/proxy-icon', requireAuth, async (req: Request, res: Response) => {
       return;
     }
     res.setHeader('Content-Type', contentType);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Cache-Control', 'public, max-age=300');
     const buffer = Buffer.from(await iconRes.arrayBuffer());
     res.send(buffer);

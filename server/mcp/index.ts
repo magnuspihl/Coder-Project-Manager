@@ -22,6 +22,7 @@ import {
   type Message,
   type TaskTurn,
   type TaskParticipant,
+  type Task,
 } from '../services/tasks.js';
 import {
   processQueue,
@@ -46,6 +47,19 @@ type AuthCtx = {
   authSource: 'api' | 'ui';
   clientLabel: string | null;
 };
+
+/**
+ * Load a task only if it belongs to the authenticated MCP caller. The REST
+ * routes enforce ownership via requireTaskAccess middleware; the task-scoped
+ * MCP tools resolve tasks purely by ID, so without this an API-token holder
+ * could read/mutate/delete any user's task by ID. Returns null for both
+ * "missing" and "not yours" so callers surface an identical "Task not found".
+ */
+function getOwnedTask(taskId: string, ctx: AuthCtx): Task | null {
+  const task = getTask(taskId);
+  if (!task || task.user_id !== ctx.userId) return null;
+  return task;
+}
 
 function jsonResult(data: unknown) {
   return {
@@ -149,7 +163,7 @@ function buildServer(ctx: AuthCtx): McpServer {
       annotations: { readOnlyHint: true },
     },
     async ({ workspace_id }) => {
-      const tasks = listTasks(workspace_id).map(t => ({
+      const tasks = listTasks(workspace_id, ctx.userId).map(t => ({
         id: t.id,
         title: t.title,
         status: t.status,
@@ -186,7 +200,7 @@ function buildServer(ctx: AuthCtx): McpServer {
       annotations: { readOnlyHint: true },
     },
     async ({ task_id, message_limit }) => {
-      const task = getTask(task_id);
+      const task = getOwnedTask(task_id, ctx);
       if (!task) return errorResult('Task not found');
       // getMessages(limit) returns the OLDEST N (ORDER BY created_at ASC LIMIT).
       // The caller wants the most recent N, so offset to the tail of the list;
@@ -218,7 +232,7 @@ function buildServer(ctx: AuthCtx): McpServer {
       annotations: { readOnlyHint: true },
     },
     async ({ task_id }) => {
-      const task = getTask(task_id);
+      const task = getOwnedTask(task_id, ctx);
       if (!task) return errorResult('Task not found');
       try {
         const result = await getTaskBranchDiff(task);
@@ -281,7 +295,7 @@ function buildServer(ctx: AuthCtx): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
     async ({ task_id, message }) => {
-      const task = getTask(task_id);
+      const task = getOwnedTask(task_id, ctx);
       if (!task) return errorResult('Task not found');
       if (task.status !== 'awaiting_feedback') {
         return errorResult(`Task is not awaiting feedback (current status: ${task.status})`);
@@ -309,7 +323,7 @@ function buildServer(ctx: AuthCtx): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     },
     async ({ task_id }) => {
-      const task = getTask(task_id);
+      const task = getOwnedTask(task_id, ctx);
       if (!task) return errorResult('Task not found');
 
       // Cheap early-out; re-checked under the lock below.
@@ -386,7 +400,7 @@ function buildServer(ctx: AuthCtx): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
     async ({ task_id }) => {
-      const task = getTask(task_id);
+      const task = getOwnedTask(task_id, ctx);
       if (!task) return errorResult('Task not found');
       if (task.status !== 'awaiting_feedback') {
         return errorResult(`Only tasks awaiting feedback can be reviewed (current status: ${task.status}).`);
@@ -424,7 +438,7 @@ function buildServer(ctx: AuthCtx): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     },
     async ({ task_id, title }) => {
-      const task = getTask(task_id);
+      const task = getOwnedTask(task_id, ctx);
       if (!task) return errorResult('Task not found');
       const trimmed = title.trim();
       if (!trimmed) return errorResult('Title cannot be empty');
@@ -443,7 +457,7 @@ function buildServer(ctx: AuthCtx): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
     },
     async ({ task_id }) => {
-      const task = getTask(task_id);
+      const task = getOwnedTask(task_id, ctx);
       if (!task) return errorResult('Task not found');
       if (task.status !== 'working') return errorResult('Only working tasks can be interrupted');
       interruptTask(task.id);
@@ -459,12 +473,12 @@ function buildServer(ctx: AuthCtx): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
     },
     async ({ task_id }) => {
-      const task = getTask(task_id);
+      const task = getOwnedTask(task_id, ctx);
       if (!task) return errorResult('Task not found');
       if (task.status !== 'working' && task.status !== 'queued') {
         return errorResult('Only working or queued tasks can be cancelled');
       }
-      if (task.status === 'working') cancelTask(task.workspace_id);
+      if (task.status === 'working') cancelTask(task.id);
       updateTaskStatus(task.id, 'cancelled');
       await processQueue(task.workspace_id);
       return jsonResult({ ok: true, task: getTask(task.id) });
@@ -479,9 +493,9 @@ function buildServer(ctx: AuthCtx): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
     },
     async ({ task_id }) => {
-      const task = getTask(task_id);
+      const task = getOwnedTask(task_id, ctx);
       if (!task) return errorResult('Task not found');
-      if (task.status === 'working') cancelTask(task.workspace_id);
+      if (task.status === 'working') cancelTask(task.id);
       for (const p of getTaskParticipants(task.id)) {
         if (isTaskParticipantRunning(p.id)) {
           try { stopTaskParticipant(p.id); } catch { /* ignore */ }

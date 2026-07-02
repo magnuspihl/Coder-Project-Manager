@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireTaskAccess } from '../middleware/auth.js';
 import {
   listTasks,
   getTask,
@@ -41,10 +41,16 @@ import { getDb } from '../db/index.js';
 
 const router = Router();
 
+// Per-resource authorization for every task-scoped route (`/tasks/:taskId...`).
+// Runs after auth so req.user is set; denies access to tasks the caller doesn't
+// own (identical 404 for missing vs. not-owned). Individual routes keep their
+// own requireAuth — this only adds the ownership gate.
+router.use('/tasks/:taskId', requireAuth, requireTaskAccess);
+
 // List tasks for a workspace
 router.get('/workspaces/:workspaceId/tasks', requireAuth, (req: Request, res: Response) => {
   const costs = getTaskCostsByWorkspace(req.params.workspaceId);
-  const tasks = listTasks(req.params.workspaceId).map(t => ({
+  const tasks = listTasks(req.params.workspaceId, req.user!.id).map(t => ({
     ...t,
     activity: t.status === 'working' ? getTaskActivity(t.id) || null : null,
     total_cost_usd: costs[t.id] || 0,
