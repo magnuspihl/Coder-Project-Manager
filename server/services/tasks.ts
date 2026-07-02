@@ -252,8 +252,15 @@ export function getTaskCostsByWorkspace(workspaceId: string): Record<string, num
   return result;
 }
 
-export function listTasks(workspaceId: string): Task[] {
+export function listTasks(workspaceId: string, userId?: string): Task[] {
   const db = getDb();
+  // When userId is provided, scope to that user's tasks — CPM tasks are
+  // per-user, so cross-user listing would leak another user's work.
+  if (userId !== undefined) {
+    return db
+      .prepare('SELECT * FROM tasks WHERE workspace_id = ? AND user_id = ? AND deleted_at IS NULL ORDER BY position ASC')
+      .all(workspaceId, userId) as Task[];
+  }
   return db
     .prepare('SELECT * FROM tasks WHERE workspace_id = ? AND deleted_at IS NULL ORDER BY position ASC')
     .all(workspaceId) as Task[];

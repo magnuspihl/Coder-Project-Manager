@@ -74,9 +74,28 @@ router.get('/uploads/:id', requireAuth, (req: Request, res: Response) => {
     res.status(404).json({ error: 'File not found on disk' });
     return;
   }
-  res.setHeader('Content-Type', attachment.mime_type);
-  res.setHeader('Content-Disposition', `inline; filename="${attachment.original_name}"`);
-  createReadStream(attachment.storage_path).pipe(res);
+  // Serve untrusted uploads defensively. The stored mime_type and original_name
+  // are attacker-controlled, so:
+  //  - Only render inline for a strict image allow-list; everything else is
+  //    forced to download (attachment) as octet-stream, so an uploaded .html /
+  //    .svg can't execute JS on this origin (stored XSS).
+  //  - X-Content-Type-Options: nosniff stops the browser from MIME-sniffing a
+  //    "download" back into HTML.
+  //  - The filename is percent-encoded via filename* so quotes/CRLF/control
+  //    chars in original_name can't break out of the header.
+  const INLINE_IMAGE_TYPES = new Set([
+    'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp', 'image/x-icon', 'image/vnd.microsoft.icon',
+  ]);
+  const declaredType = typeof attachment.mime_type === 'string' ? attachment.mime_type.split(';')[0].trim().toLowerCase() : '';
+  const inlineOk = INLINE_IMAGE_TYPES.has(declaredType);
+  const disposition = inlineOk ? 'inline' : 'attachment';
+  const encodedName = encodeURIComponent(attachment.original_name || 'file').replace(/['()*]/g, escape);
+  res.setHeader('Content-Type', inlineOk ? declaredType : 'application/octet-stream');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Disposition', `${disposition}; filename*=UTF-8''${encodedName}`);
+  const stream = createReadStream(attachment.storage_path);
+  stream.on('error', () => { if (!res.headersSent) res.status(500).end(); else res.destroy(); });
+  stream.pipe(res);
 });
 
 export interface Attachment {

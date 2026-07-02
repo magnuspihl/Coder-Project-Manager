@@ -1479,6 +1479,20 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
           detached: true,
         });
 
+    // A ChildProcess that fails to spawn (coder/bash missing from PATH, ENOMEM,
+    // EMFILE) emits 'error' on a later tick. With no listener Node treats it as
+    // an unhandled 'error' and crashes the whole server — the surrounding
+    // try/catch cannot catch it because spawn() already returned. Mark the task
+    // failed and free the queue instead.
+    sshProcess.on('error', (err) => {
+      console.error('[claude-executor] Spawn error:', (err as Error).message);
+      activeProcesses.delete(task.id);
+      stopPolling(task.id);
+      addMessage(task.id, 'system', `Error: failed to start Claude process: ${(err as Error).message}`);
+      updateTaskStatus(task.id, 'failed', 'spawn_error');
+      processQueue(task.workspace_id).catch(() => {});
+    });
+
     // Store PID in DB so we can find orphaned processes after restart
     getDb().prepare('UPDATE tasks SET ssh_pid = ? WHERE id = ?').run(sshProcess.pid ?? null, task.id);
 
@@ -2315,6 +2329,18 @@ async function executeReviewer(
           detached: true,
         });
 
+    // Handle async spawn failure (missing binary, ENOMEM, EMFILE) so it can't
+    // crash the server as an unhandled 'error' event. Mirror the catch block's
+    // recovery: fail the reviewer turn and return the task to the user.
+    sshProcess.on('error', (err) => {
+      console.error('[auto-review] Spawn error:', (err as Error).message);
+      stopPolling(`review:${task.id}`);
+      completeTaskTurn(turnId, 'fail', `Reviewer launch failed: ${(err as Error).message}`);
+      setActiveTaskTurnRole(task.id, null);
+      updateTaskStatus(task.id, 'awaiting_feedback');
+      processQueue(task.workspace_id).catch(() => {});
+    });
+
     sshProcess.unref();
     startReviewerPolling(task, turnId, reviewerSessionId, opts.isWrapUp);
   } catch (err) {
@@ -3059,6 +3085,14 @@ export async function launchTaskParticipant(
       env: await buildCoderEnv(task.user_id, ghToken ? { GH_TOKEN: ghToken } : undefined),
       stdio: 'ignore',
       detached: true,
+    });
+    // Handle async spawn failure so it can't crash the server as an unhandled
+    // 'error' event (spawn() has already returned, so the try/catch won't catch it).
+    sshProcess.on('error', (err) => {
+      console.error('[task-participant] Spawn error:', (err as Error).message);
+      activeProcesses.delete(pollKey);
+      stopPolling(pollKey);
+      addMessage(task.id, 'system', `Error launching ${participant.workspace_name}: ${(err as Error).message}`);
     });
     activeProcesses.set(pollKey, sshProcess);
     sshProcess.unref();

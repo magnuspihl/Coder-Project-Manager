@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { getDb } from '../db/index.js';
 import { getSession, getUserForSession, type Session } from '../services/sessions.js';
 import { validateToken, type CoderUser } from '../services/coder.js';
+import { getTask, type Task } from '../services/tasks.js';
 
 declare global {
   namespace Express {
@@ -10,6 +11,7 @@ declare global {
       user?: CoderUser;
       authSource?: 'ui' | 'api';
       clientLabel?: string | null;
+      task?: Task;
     }
   }
 }
@@ -112,5 +114,25 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
   req.user = user;
   req.authSource = 'ui';
   req.clientLabel = null;
+  next();
+}
+
+/**
+ * Per-resource authorization for task-scoped routes. Loads the task named by
+ * `:taskId`, and denies access unless it belongs to the authenticated user.
+ *
+ * CPM is multi-user and task IDs are handed out in workspace listings, stream
+ * logs, and port records — without this gate any authenticated user could
+ * read/reply/complete/delete another user's task by ID. A missing task and a
+ * task owned by someone else both return an identical 404 so ownership can't be
+ * probed by enumeration. Must run after `requireAuth` (needs `req.user`).
+ */
+export function requireTaskAccess(req: Request, res: Response, next: NextFunction): void {
+  const task = getTask(req.params.taskId);
+  if (!task || !req.user || task.user_id !== req.user.id) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  req.task = task;
   next();
 }
