@@ -229,6 +229,77 @@ export function invalidateTokenTotalsCache(): void {
   tokenTotalsCache = null;
 }
 
+export interface WindowedTokenUsage {
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_creation: number;
+}
+
+export interface WindowedTaskTokenUsage extends WindowedTokenUsage {
+  task_id: string;
+  workspace_id: string;
+}
+
+export interface WindowedTokenUsageResult {
+  /** Lower bound of the window as a unix-ms timestamp (inclusive). */
+  since: number;
+  workspaces: Record<string, WindowedTokenUsage>;
+  tasks: WindowedTaskTokenUsage[];
+}
+
+/**
+ * Sum token_events with created_at >= `sinceUnixMs`, attributing tokens to a
+ * rolling time window. Returns per-workspace and per-task splits. Only events
+ * recorded since the token_events table was introduced are present — there is
+ * no historical backfill, which is expected for a rolling window.
+ *
+ * `token_events.created_at` is stored as SQLite `datetime('now')` (UTC, no
+ * timezone suffix), so we compare against a matching UTC string derived from
+ * the unix-ms bound rather than comparing raw epoch numbers.
+ */
+export function getWindowedTokenUsage(sinceUnixMs: number, workspaceId?: string): WindowedTokenUsageResult {
+  const db = getDb();
+  const sinceIso = new Date(sinceUnixMs).toISOString().replace('T', ' ').slice(0, 19);
+  const params: unknown[] = [sinceIso];
+  let workspaceFilter = '';
+  if (workspaceId) {
+    workspaceFilter = ' AND workspace_id = ?';
+    params.push(workspaceId);
+  }
+
+  const rows = db.prepare(
+    `SELECT task_id, workspace_id,
+       COALESCE(SUM(input), 0) as input,
+       COALESCE(SUM(output), 0) as output,
+       COALESCE(SUM(cache_read), 0) as cache_read,
+       COALESCE(SUM(cache_creation), 0) as cache_creation
+     FROM token_events
+     WHERE created_at >= ?${workspaceFilter}
+     GROUP BY task_id, workspace_id`
+  ).all(...params) as Array<WindowedTaskTokenUsage>;
+
+  const workspaces: Record<string, WindowedTokenUsage> = {};
+  const tasks: WindowedTaskTokenUsage[] = [];
+  for (const row of rows) {
+    tasks.push({
+      task_id: row.task_id,
+      workspace_id: row.workspace_id,
+      input: row.input || 0,
+      output: row.output || 0,
+      cache_read: row.cache_read || 0,
+      cache_creation: row.cache_creation || 0,
+    });
+    const ws = workspaces[row.workspace_id] ?? (workspaces[row.workspace_id] = { input: 0, output: 0, cache_read: 0, cache_creation: 0 });
+    ws.input += row.input || 0;
+    ws.output += row.output || 0;
+    ws.cache_read += row.cache_read || 0;
+    ws.cache_creation += row.cache_creation || 0;
+  }
+
+  return { since: sinceUnixMs, workspaces, tasks };
+}
+
 export function getTaskCostUsd(taskId: string): number {
   const db = getDb();
   const row = db.prepare(
@@ -512,6 +583,14 @@ export function addTokenUsage(taskId: string, inputTokens: number, outputTokens:
   db.prepare(
     'UPDATE tasks SET total_input_tokens = total_input_tokens + ?, total_output_tokens = total_output_tokens + ?, total_cache_read_tokens = total_cache_read_tokens + ?, total_cache_creation_tokens = total_cache_creation_tokens + ? WHERE id = ?'
   ).run(inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, taskId);
+  // Record the per-delta event with a timestamp so consumers can attribute
+  // tokens to a rolling time window. workspace_id is pulled from the task row
+  // itself so it can never drift from the task's real workspace. This is
+  // additive: the cumulative tasks.total_*_tokens updates above are unchanged.
+  db.prepare(
+    `INSERT INTO token_events (id, task_id, workspace_id, input, output, cache_read, cache_creation)
+     SELECT ?, id, workspace_id, ?, ?, ?, ? FROM tasks WHERE id = ?`
+  ).run(uuid(), inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, taskId);
   invalidateTokenTotalsCache();
 }
 

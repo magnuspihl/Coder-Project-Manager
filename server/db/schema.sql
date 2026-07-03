@@ -71,6 +71,23 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id, created_at);
 
+-- Token events table: one row per token-usage delta as a Claude session
+-- streams, so consumers can attribute tokens to a rolling time window instead
+-- of only the cumulative per-task totals on the tasks row.
+CREATE TABLE IF NOT EXISTS token_events (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  workspace_id TEXT NOT NULL,
+  input INTEGER NOT NULL DEFAULT 0,
+  output INTEGER NOT NULL DEFAULT 0,
+  cache_read INTEGER NOT NULL DEFAULT 0,
+  cache_creation INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_token_events_workspace ON token_events(workspace_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_token_events_task ON token_events(task_id, created_at);
+
 -- Stream log table: persisted Claude output log per task
 CREATE TABLE IF NOT EXISTS stream_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
