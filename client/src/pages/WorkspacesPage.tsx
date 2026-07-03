@@ -265,6 +265,10 @@ export default function WorkspacesPage() {
   const [portRangeSize, setPortRangeSize] = useState(10);
   const [showStopped, setShowStopped] = useState(false);
   const [deletedTaskId, setDeletedTaskId] = useState<string | null>(null);
+  // Tasks with a completion request in flight. Completing runs the git merge
+  // synchronously on the server (several SSH round-trips), so the button needs
+  // busy feedback; the other task actions return near-instantly.
+  const [completingTaskIds, setCompletingTaskIds] = useState<Set<string>>(new Set());
   const [newTaskWorkspaceId, setNewTaskWorkspaceId] = useSessionState<string | null>('newTaskWorkspaceId', null);
   const [newTaskPrompt, setNewTaskPrompt, clearNewTaskPrompt] = useDraft('newTaskPrompt');
   const [newTaskModel, setNewTaskModel] = useState('');
@@ -621,12 +625,19 @@ export default function WorkspacesPage() {
   const handleComplete = async (e: React.MouseEvent, taskId: string) => {
     e.preventDefault();
     e.stopPropagation();
+    setCompletingTaskIds(prev => new Set(prev).add(taskId));
     try {
       await completeTask(taskId);
     } catch (err: unknown) {
       if (err instanceof Error && err.message.includes('uncommitted')) {
         alert(err.message);
       }
+    } finally {
+      setCompletingTaskIds(prev => {
+        const next = new Set(prev);
+        next.delete(taskId);
+        return next;
+      });
     }
     await loadData();
   };
@@ -943,13 +954,17 @@ export default function WorkspacesPage() {
           {task.status === 'awaiting_feedback' && (
             <button
               onClick={(e) => handleComplete(e, task.id)}
-              disabled={!!task.pending_complete}
+              disabled={!!task.pending_complete || completingTaskIds.has(task.id)}
               className="p-1.5 bg-green-600 text-white rounded hover:bg-green-700 transition-colors disabled:opacity-50"
-              title={task.pending_complete ? 'Completion queued — will finalize once the working task finishes' : 'Mark Complete'}
+              title={task.pending_complete ? 'Completion queued — will finalize once the working task finishes' : completingTaskIds.has(task.id) ? 'Completing — merging the task branch…' : 'Mark Complete'}
             >
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
-              </svg>
+              {completingTaskIds.has(task.id) ? (
+                <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+              ) : (
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
+                </svg>
+              )}
             </button>
           )}
           {(task.status === 'failed' || task.status === 'cancelled') && (

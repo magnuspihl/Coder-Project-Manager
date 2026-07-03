@@ -414,11 +414,17 @@ export async function removeTaskWorktree(task: Task): Promise<boolean> {
     try {
       await sshExec(ws, `${gitRoot}git worktree prune`, 10000).catch(() => {});
       // If the directory is already gone, pruning the metadata alone resolves it.
-      const stillThere = (await sshExec(ws, `test -d ${shellEscape(wt)} && echo yes || echo no`).catch(() => 'no')).trim() === 'yes';
-      if (stillThere) {
+      // Distinguish "confirmed gone" from "couldn't check" (workspace stopped,
+      // SSH failure): only a confirmed 'no' counts as removed. Treating an
+      // unreachable workspace as removed would NULL worktree_path below and leak
+      // the directory forever once the workspace comes back.
+      const check = (await sshExec(ws, `test -d ${shellEscape(wt)} && echo yes || echo no`).catch(() => 'unknown')).trim();
+      if (check === 'yes') {
         await sshExec(ws, `${gitRoot}git worktree remove ${shellEscape(wt)} --force`, 15000);
+        removed = true;
+      } else if (check === 'no') {
+        removed = true;
       }
-      removed = true;
     } catch {
       removed = false;
     }
@@ -449,28 +455,65 @@ export async function removeTaskWorktree(task: Task): Promise<boolean> {
 }
 
 /**
- * Startup sweep: remove worktrees left behind by **deleted** tasks. Worktrees live
+ * Sweep: remove worktrees left behind by **deleted** tasks. Worktrees live
  * for the entire task lifecycle (so any non-deleted task can be resumed) and are
  * removed only on deletion — so the only task that should never still own a worktree
  * is a deleted one. This catches deletions whose removal failed at the time (e.g. a
- * preview server was still holding the directory).
+ * preview server was still holding the directory) — and, now that delete-time
+ * cleanup runs in the background after the HTTP response, deletions whose cleanup
+ * was cut short by a server restart.
+ *
+ * Runs at startup and then periodically (see startWorktreeReconciler). Retries per
+ * task are capped per process lifetime: removeTaskWorktree posts a warning message
+ * to the task on every failure, so unbounded retries against a permanently stuck
+ * worktree (or a long-stopped workspace) would spam messages and SSH timeouts.
+ * Capped-out tasks are retried again after the next server restart.
  *
  * Worktree-dir only — does NOT kill ports, since a deleted task's old port range may
  * already have been reallocated to a now-active task.
  */
+const MAX_RECONCILE_ATTEMPTS = 3;
+const reconcileAttempts = new Map<string, number>();
+
 export async function reconcileLeakedWorktrees(): Promise<void> {
-  const rows = getDb().prepare(
+  const rows = (getDb().prepare(
     `SELECT * FROM tasks WHERE worktree_path IS NOT NULL AND deleted_at IS NOT NULL`
-  ).all() as Task[];
+  ).all() as Task[]).filter(t => (reconcileAttempts.get(t.id) ?? 0) < MAX_RECONCILE_ATTEMPTS);
   if (rows.length === 0) return;
   console.log(`[git] Reconciling ${rows.length} worktree(s) left behind by deleted tasks`);
   for (const task of rows) {
+    let ok = false;
     try {
-      await removeTaskWorktree(task);
+      ok = await removeTaskWorktree(task);
     } catch (err: any) {
       console.error(`[git] Worktree reconcile failed for task ${task.id}:`, err?.message);
     }
+    if (ok) {
+      reconcileAttempts.delete(task.id);
+    } else {
+      reconcileAttempts.set(task.id, (reconcileAttempts.get(task.id) ?? 0) + 1);
+    }
   }
+}
+
+const RECONCILE_INTERVAL_MS = parseInt(process.env.CPM_WORKTREE_RECONCILE_INTERVAL_MS || '600000', 10);
+let reconcileTimer: NodeJS.Timeout | null = null;
+let reconciling = false;
+
+/** Start the worktree reconciler: one immediate startup pass, then periodic. Idempotent. */
+export function startWorktreeReconciler(): void {
+  if (reconcileTimer) return;
+  const run = () => {
+    if (reconciling) return; // never overlap sweeps
+    reconciling = true;
+    reconcileLeakedWorktrees()
+      .catch((err) => console.error(`[git] Worktree reconcile sweep failed: ${(err as Error).message?.slice(0, 200)}`))
+      .finally(() => { reconciling = false; });
+  };
+  run();
+  reconcileTimer = setInterval(run, RECONCILE_INTERVAL_MS);
+  reconcileTimer.unref?.();
+  console.log(`[git] worktree reconciler started (every ${Math.round(RECONCILE_INTERVAL_MS / 1000)}s)`);
 }
 
 // ─── Task Completion ─────────────────────────────────────────────────────────

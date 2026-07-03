@@ -41,6 +41,19 @@ import { getDb } from '../db/index.js';
 
 const router = Router();
 
+// Fire-and-forget for remote work (SSH round-trips) whose outcome the HTTP
+// response doesn't depend on. Every coder-ssh call costs a fresh CLI spawn and
+// connection handshake (~300-400ms each, more when cold), so awaiting cleanup
+// or queue advancement inline made simple actions take seconds. Failures here
+// are recovered elsewhere: the worktree reconciler sweeps deleted tasks that
+// still have a worktree, the port janitor reaps orphaned dev servers, and
+// launch errors inside processQueue mark the task failed with a message.
+function runInBackground(label: string, fn: () => Promise<void>): void {
+  fn().catch((err) =>
+    console.error(`[tasks] background ${label} failed: ${(err as Error)?.message?.slice(0, 200)}`),
+  );
+}
+
 // Per-resource authorization for every task-scoped route (`/tasks/:taskId...`).
 // Runs after auth so req.user is set; denies access to tasks the caller doesn't
 // own (identical 404 for missing vs. not-owned). Individual routes keep their
@@ -115,8 +128,11 @@ router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, 
       linkAttachmentsToTask(attachmentIds.filter((id: unknown) => typeof id === 'string'), task.id);
     }
 
-    await processQueue(req.params.workspaceId);
+    // Respond as soon as the task row exists — launching it involves SSH
+    // round-trips (worktree creation, spawning Claude) that the client observes
+    // via polling anyway; launch failures mark the task failed with a message.
     res.status(201).json({ task: getTask(task.id) });
+    runInBackground(`launch ${task.id}`, () => processQueue(req.params.workspaceId));
   } catch (err) {
     res.status(500).json({ error: 'Failed to create task' });
   }
@@ -230,10 +246,11 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
   }
 
   // Queue and let processQueue handle concurrency — it will resume immediately
-  // if a slot is available, or hold in queue until one opens up.
+  // if a slot is available, or hold in queue until one opens up. Backgrounded:
+  // the client polls the queued→working transition anyway.
   updateTaskStatus(task.id, 'queued');
-  await processQueue(task.workspace_id);
   res.json({ task: getTask(task.id) });
+  runInBackground(`reply-launch ${task.id}`, () => processQueue(task.workspace_id));
 });
 
 // Touch a task: atomically record open time, return previous value
@@ -331,10 +348,14 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
   if (outcome.code === 200 && outcome.completed) {
     // Free the port range (shuts down the task's preview server). The worktree is
     // intentionally kept so the task can be reopened and continued; it is removed
-    // only when the task is deleted. Done outside the lock — processQueue (below)
-    // re-acquires it, so neither may run while the lock is held.
-    await cleanupPortRange(task).catch(() => {});
-    await processQueue(task.workspace_id);
+    // only when the task is deleted. Done outside the lock — processQueue
+    // re-acquires it, so neither may run while the lock is held. Backgrounded:
+    // the task is already marked completed, so the response needn't wait for
+    // these SSH round-trips.
+    runInBackground(`complete-cleanup ${task.id}`, async () => {
+      await cleanupPortRange(task).catch(() => {});
+      await processQueue(task.workspace_id);
+    });
   }
 
   if (outcome.code === 202) {
@@ -454,10 +475,11 @@ router.post('/tasks/:taskId/retry', requireAuth, async (req: Request, res: Respo
   }
 
   // Queue and let processQueue handle concurrency — it will resume immediately
-  // if a slot is available, or hold in queue until one opens up.
+  // if a slot is available, or hold in queue until one opens up. Backgrounded:
+  // the client polls the queued→working transition anyway.
   updateTaskStatus(task.id, 'queued');
-  await processQueue(task.workspace_id);
   res.json({ task: getTask(task.id) });
+  runInBackground(`retry-launch ${task.id}`, () => processQueue(task.workspace_id));
 });
 
 // Reset a task's Claude session — generates a new session_id so the next run
@@ -499,9 +521,8 @@ router.post('/tasks/:taskId/reset-session', requireAuth, async (req: Request, re
   // and feedback=continuationPrompt — and launchTask will see
   // session_initialized=0 and use --session-id, creating a fresh session.
   updateTaskStatus(task.id, 'queued');
-  await processQueue(task.workspace_id);
-
   res.json({ task: getTask(task.id) });
+  runInBackground(`reset-launch ${task.id}`, () => processQueue(task.workspace_id));
 });
 
 // Compact a task's Claude session — sends the `/compact` slash command via
@@ -539,9 +560,8 @@ router.post('/tasks/:taskId/compact-session', requireAuth, async (req: Request, 
   }
 
   updateTaskStatus(task.id, 'queued');
-  await processQueue(task.workspace_id);
-
   res.json({ task: getTask(task.id) });
+  runInBackground(`compact-launch ${task.id}`, () => processQueue(task.workspace_id));
 });
 
 // Interrupt a working task (kills process but transitions to 'awaiting_feedback' so user can continue)
@@ -580,14 +600,16 @@ router.post('/tasks/:taskId/cancel', requireAuth, async (req: Request, res: Resp
   }
 
   updateTaskStatus(task.id, 'cancelled');
-
-  // Free the port range (shuts down any preview server). The worktree is kept so
-  // the task can be retried/resumed later; worktrees are removed only on deletion.
-  await cleanupPortRange(task).catch(() => {});
-
-  await processQueue(task.workspace_id);
-
   res.json({ task: getTask(task.id) });
+
+  // Free the port range (shuts down any preview server) and advance the queue in
+  // the background — both are SSH round-trips the response needn't wait for. The
+  // worktree is kept so the task can be retried/resumed later; worktrees are
+  // removed only on deletion.
+  runInBackground(`cancel-cleanup ${task.id}`, async () => {
+    await cleanupPortRange(task).catch(() => {});
+    await processQueue(task.workspace_id);
+  });
 });
 
 // Delete a task (soft delete)
@@ -610,18 +632,27 @@ router.delete('/tasks/:taskId', requireAuth, async (req: Request, res: Response)
     }
   }
 
-  // Shut down preview servers first, then remove the worktree — a running server
-  // holding the worktree open would otherwise block its removal.
-  await cleanupPortRange(task).catch(() => {});
-  if (task.worktree_path) {
-    await removeTaskWorktree(task).catch(() => {});
-  }
-
+  // Soft-delete first, respond immediately, clean up in the background. Doing
+  // deleteTask before the cleanup also makes a crash mid-cleanup recoverable:
+  // the row already has deleted_at set, which is exactly the shape the worktree
+  // reconciler sweeps for.
   deleteTask(task.id);
-
-  await processQueue(task.workspace_id);
-
   res.json({ ok: true, taskId: task.id });
+
+  runInBackground(`delete-cleanup ${task.id}`, async () => {
+    // Shut down preview servers first, then remove the worktree — a running
+    // server holding the worktree open would otherwise block its removal.
+    await cleanupPortRange(task).catch(() => {});
+    if (task.worktree_path) {
+      // Skip if the user hit Undo while cleanup was in flight — a restored
+      // task keeps its worktree (the reconciler ignores non-deleted tasks).
+      const fresh = getTask(task.id);
+      if (fresh?.deleted_at) {
+        await removeTaskWorktree(fresh).catch(() => {});
+      }
+    }
+    await processQueue(task.workspace_id);
+  });
 });
 
 // Restore a soft-deleted task
@@ -838,9 +869,8 @@ router.post('/tasks/:taskId/task-requests/:requestId/approve', requireAuth, asyn
     : `Task created: "${created.title}" (${created.id})`;
   addMessage(task.id, 'system', msg, undefined, undefined, undefined, req.authSource, req.clientLabel);
 
-  await processQueue(workspaceId);
-
   res.json({ task: created });
+  runInBackground(`approve-launch ${created.id}`, () => processQueue(workspaceId));
 });
 
 // Update the target workspace on a pending task request before approving.
