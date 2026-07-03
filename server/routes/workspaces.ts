@@ -4,7 +4,7 @@ import net from 'net';
 import dnsPromises from 'dns/promises';
 import { requireAuth } from '../middleware/auth.js';
 import { listWorkspaces, getWorkspace, stopWorkspace, startWorkspace, CoderAuthError } from '../services/coder.js';
-import { getTaskCountsByWorkspace, getTokenTotalsByWorkspace, getGithubRepoUrlsByWorkspace } from '../services/tasks.js';
+import { getTaskCountsByWorkspace, getTokenTotalsByWorkspace, getGithubRepoUrlsByWorkspace, getWindowedTokenUsage } from '../services/tasks.js';
 import { getWorkspaceRateLimits } from '../services/claude.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { getModelsForWorkspace } from '../services/models.js';
@@ -278,6 +278,38 @@ router.get('/:id/projects', requireAuth, async (req: Request, res: Response) => 
 });
 
 // Get available Claude models for a workspace
+// Token usage attributable to a rolling time window, for a single workspace.
+// Accepts `?since=<unixms>` (inclusive lower bound) or `?hours=<n>` (window
+// ending now). `since` takes precedence when both are given; defaults to the
+// last 24 hours when neither is supplied. Returns per-workspace and per-task
+// sums with the input/output/cache split. This is additive — the cumulative
+// all-time totals on GET /workspaces (tokenTotals) are unchanged.
+router.get('/:workspaceId/token-usage', requireAuth, (req: Request, res: Response) => {
+  const now = Date.now();
+  let since: number;
+  const sinceRaw = req.query.since;
+  const hoursRaw = req.query.hours;
+  if (typeof sinceRaw === 'string' && sinceRaw.trim() !== '') {
+    since = Number(sinceRaw);
+    if (!Number.isFinite(since) || since < 0) {
+      res.status(400).json({ error: 'Invalid `since` — expected a unix-ms timestamp.' });
+      return;
+    }
+  } else if (typeof hoursRaw === 'string' && hoursRaw.trim() !== '') {
+    const hours = Number(hoursRaw);
+    if (!Number.isFinite(hours) || hours <= 0) {
+      res.status(400).json({ error: 'Invalid `hours` — expected a positive number.' });
+      return;
+    }
+    since = now - hours * 3_600_000;
+  } else {
+    since = now - 24 * 3_600_000;
+  }
+
+  const usage = getWindowedTokenUsage(since, req.params.workspaceId);
+  res.json(usage);
+});
+
 router.get('/:workspaceId/models', requireAuth, async (req: Request, res: Response) => {
   const workspace = await withTokenRefresh(req, res, (token) => getWorkspace(token, req.params.workspaceId), 'Failed to fetch workspace');
   if (!workspace) return;
