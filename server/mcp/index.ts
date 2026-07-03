@@ -26,7 +26,6 @@ import {
 } from '../services/tasks.js';
 import {
   processQueue,
-  resumeTask,
   cancelTask,
   interruptTask,
   isTaskParticipantRunning,
@@ -37,7 +36,7 @@ import {
   getTaskBranchDiff,
   MAX_REVIEW_LOOPS,
 } from '../services/claude.js';
-import { handleTaskCompletionGit } from '../services/git.js';
+import { handleTaskCompletionGit, removeTaskWorktree } from '../services/git.js';
 import { listWorkspaces, getWorkspace, stopWorkspace, startWorkspace, CoderAuthError } from '../services/coder.js';
 
 type AuthCtx = {
@@ -74,6 +73,16 @@ function errorResult(message: string) {
     isError: true,
     content: [{ type: 'text' as const, text: message }],
   };
+}
+
+// Fire-and-forget for remote work (SSH round-trips) whose outcome the tool
+// result doesn't depend on — mirrors runInBackground in routes/tasks.ts.
+// Failures are recovered by the worktree reconciler / port janitor, and launch
+// errors inside processQueue mark the task failed with a message.
+function runInBackground(label: string, fn: () => Promise<void>): void {
+  fn().catch((err) =>
+    console.error(`[mcp] background ${label} failed: ${(err as Error)?.message?.slice(0, 200)}`),
+  );
 }
 
 /**
@@ -276,7 +285,9 @@ function buildServer(ctx: AuthCtx): McpServer {
           source: ctx.authSource,
           clientLabel: ctx.clientLabel,
         });
-        await processQueue(workspace_id);
+        // Return as soon as the task row exists — launching involves SSH
+        // round-trips the caller observes via get_task polling anyway.
+        runInBackground(`launch ${task.id}`, () => processQueue(workspace_id));
         return jsonResult({ task: getTask(task.id) });
       } catch (err) {
         return errorResult(`Failed to create task: ${(err as Error).message}`);
@@ -305,12 +316,12 @@ function buildServer(ctx: AuthCtx): McpServer {
         setPendingComplete(task.id, false);
         addMessage(task.id, 'system', 'Pending completion cancelled — reply received.', undefined, undefined, undefined, ctx.authSource, ctx.clientLabel);
       }
-      const working = getWorkingTask(task.workspace_id);
-      if (working) {
-        updateTaskStatus(task.id, 'queued');
-        return jsonResult({ ok: true, queued: true, task: getTask(task.id) });
-      }
-      await resumeTask(task, message);
+      // Queue and let processQueue resume the session — same path as the REST
+      // reply route. Queueing + lock-serialized launch (instead of calling
+      // resumeTask directly) both avoids a double-launch race between rapid
+      // replies and lets the tool return without waiting for SSH round-trips.
+      updateTaskStatus(task.id, 'queued');
+      runInBackground(`reply-launch ${task.id}`, () => processQueue(task.workspace_id));
       return jsonResult({ ok: true, task: getTask(task.id) });
     },
   );
@@ -377,9 +388,12 @@ function buildServer(ctx: AuthCtx): McpServer {
 
       if (outcome.code === 200 && outcome.completed) {
         // Free the port range; keep the worktree (removed only on delete).
-        // Outside the lock — processQueue re-acquires it.
-        await cleanupPortRange(task).catch(() => {});
-        await processQueue(task.workspace_id);
+        // Outside the lock — processQueue re-acquires it. Backgrounded: the
+        // task is already marked completed.
+        runInBackground(`complete-cleanup ${task.id}`, async () => {
+          await cleanupPortRange(task).catch(() => {});
+          await processQueue(task.workspace_id);
+        });
       }
 
       if (outcome.code === 202) {
@@ -480,7 +494,13 @@ function buildServer(ctx: AuthCtx): McpServer {
       }
       if (task.status === 'working') cancelTask(task.id);
       updateTaskStatus(task.id, 'cancelled');
-      await processQueue(task.workspace_id);
+      // Free the port range (shuts down any preview server) and advance the
+      // queue in the background — mirrors the REST cancel route. The worktree
+      // is kept so the task can be retried; worktrees are removed on deletion.
+      runInBackground(`cancel-cleanup ${task.id}`, async () => {
+        await cleanupPortRange(task).catch(() => {});
+        await processQueue(task.workspace_id);
+      });
       return jsonResult({ ok: true, task: getTask(task.id) });
     },
   );
@@ -501,8 +521,24 @@ function buildServer(ctx: AuthCtx): McpServer {
           try { stopTaskParticipant(p.id); } catch { /* ignore */ }
         }
       }
+      // Soft-delete first, clean up in the background — mirrors the REST delete
+      // route. Previously this path never freed ports or removed the worktree
+      // at all, relying entirely on the reconciler.
       deleteTask(task.id);
-      await processQueue(task.workspace_id);
+      runInBackground(`delete-cleanup ${task.id}`, async () => {
+        // Shut down preview servers first, then remove the worktree — a running
+        // server holding the worktree open would otherwise block its removal.
+        await cleanupPortRange(task).catch(() => {});
+        if (task.worktree_path) {
+          // Skip if the task was restored while cleanup was in flight — a
+          // restored task keeps its worktree.
+          const fresh = getTask(task.id);
+          if (fresh?.deleted_at) {
+            await removeTaskWorktree(fresh).catch(() => {});
+          }
+        }
+        await processQueue(task.workspace_id);
+      });
       return jsonResult({ ok: true, task_id });
     },
   );

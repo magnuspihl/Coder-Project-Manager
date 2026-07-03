@@ -16,7 +16,7 @@ import { handleMcpRequest, handleMcpMethodNotAllowed } from './mcp/index.js';
 // Initialize database on import
 import './db/index.js';
 import { reconnectWorkingTasks, startRateLimitRetryPoller } from './services/claude.js';
-import { reconcileLeakedWorktrees } from './services/git.js';
+import { startWorktreeReconciler } from './services/git.js';
 import { startPortJanitor } from './services/port-janitor.js';
 
 // Prevent unhandled promise rejections from crashing the server
@@ -51,11 +51,10 @@ app.listen(PORT, '0.0.0.0', () => {
   reconnectWorkingTasks().catch(err => {
     console.error('[recovery] Unhandled error during task reconnect:', (err as Error).message?.slice(0, 200));
   });
-  // Clean up any worktrees left behind by tasks that already reached a terminal
-  // state (e.g. a preview server blocked removal at completion time).
-  reconcileLeakedWorktrees().catch(err => {
-    console.error('[recovery] Unhandled error during worktree reconcile:', (err as Error).message?.slice(0, 200));
-  });
+  // Sweep worktrees left behind by deleted tasks — once now, then periodically.
+  // Delete-time cleanup runs in the background after the HTTP response, so this
+  // is the recovery path when that cleanup fails or is cut short by a restart.
+  startWorktreeReconciler();
   // Periodically re-queue tasks that failed on a usage/token limit once their
   // reset window has passed, so the user doesn't have to retry them by hand.
   startRateLimitRetryPoller();
