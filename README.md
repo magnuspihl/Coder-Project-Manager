@@ -31,6 +31,7 @@ Coder Project Manager is a central web app that:
 
 ## Documentation
 
+- [Visual Overview](./docs/OVERVIEW.md) — diagram-first tour: CPM vs Coder, how Claude is layered on, task queueing, and invited agents
 - [Technical Specification](./docs/SPEC.md) — full architecture, API design, data model, and implementation details
 - [CLAUDE.md](./CLAUDE.md) — instructions for the Claude Code agent building this project
 
