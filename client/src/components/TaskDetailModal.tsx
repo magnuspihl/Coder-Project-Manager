@@ -60,6 +60,26 @@ function formatTokens(n: number): string {
   return String(n);
 }
 
+// Assistant messages keep the raw [TASK_REQUEST] block the server parsed into a
+// task_requests row (the interactive colored card). Rendering the block verbatim
+// duplicates the card, so collapse it to a compact one-line quote — which also
+// keeps a trace in the chat after the card disappears on approve/dismiss.
+// Unparseable JSON is left as-is: the server created no card for it either.
+function collapseTaskRequestBlocks(content: string): string {
+  return content.replace(/\[TASK_REQUEST\]\s*([\s\S]*?)\s*\[\/TASK_REQUEST\]/g, (block, body) => {
+    let prompt: string;
+    try {
+      const data = JSON.parse(body);
+      if (typeof data.prompt !== 'string' || !data.prompt.trim()) return block;
+      prompt = data.prompt.trim().replace(/\s+/g, ' ');
+    } catch {
+      return block;
+    }
+    if (prompt.length > 140) prompt = prompt.slice(0, 140) + '…';
+    return `\n\n> 📋 **Proposed task:** ${prompt}\n\n`;
+  });
+}
+
 const STATUS_COLORS: Record<string, string> = {
   queued: 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400',
   working: 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400',
@@ -1460,7 +1480,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         )}
                       </div>
                     </div>
-                    <Markdown content={msg.content} breaks={msg.role === 'user'} />
+                    <Markdown content={msg.role === 'assistant' ? collapseTaskRequestBlocks(msg.content) : msg.content} breaks={msg.role === 'user'} />
                   </div>
                     </React.Fragment>
                   );

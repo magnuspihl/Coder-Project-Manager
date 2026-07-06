@@ -363,14 +363,39 @@ function extractAssistantTurnText(content: Array<{ type: string; text?: string; 
 // Delegation: a task agent that finds out-of-scope work should propose a
 // separate tracked task via a [TASK_REQUEST] block (surfaced for user approval)
 // rather than fixing it inline or creating a task by calling the CPM API.
-const TASK_DELEGATION_PROMPT = `WORK DELEGATION — when to split work into a separate task:
-If you discover work that is out of scope for this task (a separate bug, a follow-up, or a common/general problem that isn't specific to what you're doing), do NOT fix it inline and do NOT create a task by calling the CPM API directly. Propose it as a tracked task by emitting a block in this EXACT format, on its own line (not inside a code block):
+// Agents habitually record follow-up work in proposal .md files instead — the
+// prompt bans that anti-pattern by name, and buildTaskRequestReminder() nudges
+// per-message when the user's text sounds like a task-creation request.
+const TASK_DELEGATION_PROMPT = `WORK DELEGATION — creating tasks and recording follow-up work:
+You run inside CPM (Coder Project Manager), which tracks work as tasks. The ONLY way to create or propose a task is to emit this block in your response text, on its own lines (not inside a code block):
 
 [TASK_REQUEST]
 {"prompt": "detailed, self-contained description of the work to be done"}
 [/TASK_REQUEST]
 
-The user is prompted to approve it; an approved request becomes a new task branched from the default branch. If the user asks you to "create a task" for something, that means emitting a [TASK_REQUEST] — never create tasks via the API. To target a different workspace you have access to, add a "targetWorkspace" field (the workspace's name) to the JSON; otherwise it runs in this workspace.`;
+The user is prompted to approve it; an approved request becomes a new task branched from the default branch. Emit one block per proposed task. To target a different workspace you have access to, add a "targetWorkspace" field (the workspace's name) to the JSON; otherwise it runs in this workspace.
+
+WHEN to emit a [TASK_REQUEST]:
+- The user asks you to "create/add/queue/file a task" or "make a follow-up" — that ALWAYS means emitting a [TASK_REQUEST] block.
+- You discover work that is out of scope for this task (a separate bug, a follow-up, or a common/general problem that isn't specific to what you're doing). Do not fix it inline — propose it.
+
+NEVER do any of these instead (common mistakes):
+- Do NOT write proposed work to a Markdown or text file (TODO.md, FOLLOWUP.md, PROPOSED_TASKS.md, docs/plans, etc.). Files are invisible to the task system — work recorded that way is lost.
+- Do NOT create tasks by calling the CPM HTTP API.
+- Do NOT merely describe the follow-up in prose and move on — emit the block so the work is tracked.`;
+
+// Per-message nudge: appended to a user prompt that sounds like a
+// task-creation request. The system prompt above is present every turn, but
+// agents still reach for proposal .md files when asked to "create a task" —
+// an inline reminder right next to the triggering message is far more salient.
+const TASK_REQUEST_REMINDER = `[Reminder from CPM: to create or propose a task, emit a [TASK_REQUEST] block exactly as described in the WORK DELEGATION section of your system prompt. Do NOT write the proposal to a .md file and do NOT call the CPM API — only a [TASK_REQUEST] block reaches the user for approval.]`;
+
+// Heuristic gate for TASK_REQUEST_REMINDER: a creation-ish verb within a short
+// distance of "task(s)"/"follow-up(s)". False positives only cost a one-line
+// reminder in the prompt, so this errs toward matching.
+function mentionsTaskCreation(text: string): boolean {
+  return /\b(creat\w*|add\w*|mak\w*|queue\w*|fil\w*|open\w*|propos\w*|delegat\w*|split\w*|spin\w*)\b[\s\S]{0,60}?\b(tasks?|follow[ -]?ups?)\b/i.test(text);
+}
 
 // Auto-review opt-out: when a turn produces code changes, an automated reviewer
 // inspects them before the task finishes. Many turns are NOT code changes worth
@@ -1213,6 +1238,12 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     }
   }
   let prompt = rawPrompt + coderUrlNote;
+
+  // The user's message sounds like "create a task" — remind the agent inline
+  // that this means emitting a [TASK_REQUEST], not writing a proposal file.
+  if (!isSlashCommand && mentionsTaskCreation(rawPrompt)) {
+    prompt += `\n\n${TASK_REQUEST_REMINDER}`;
+  }
 
   // Host's Claude session does not contain participant messages — inject them
   // as catch-up context so the host can see what invited agents have said.
@@ -2998,6 +3029,12 @@ export async function launchTaskParticipant(
   isResume: boolean,
 ): Promise<void> {
   const catchUp = buildTaskParticipantContext(task.id, participant.id);
+
+  // Same inline nudge the host gets — participants also default to writing
+  // proposal files when a message asks them to "create a task".
+  if (mentionsTaskCreation(message)) {
+    message += `\n\n${TASK_REQUEST_REMINDER}`;
+  }
 
   let prompt: string;
   if (!isResume) {
