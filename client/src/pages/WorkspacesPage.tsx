@@ -407,14 +407,25 @@ export default function WorkspacesPage() {
       const aHasAny = aCounts ? (aCounts.working + aCounts.queued + aCounts.awaiting_feedback + aCounts.failed + aCounts.completed + aCounts.cancelled) > 0 : false;
       const bHasAny = bCounts ? (bCounts.working + bCounts.queued + bCounts.awaiting_feedback + bCounts.failed + bCounts.completed + bCounts.cancelled) > 0 : false;
       if (aHasAny !== bHasAny) return aHasAny ? -1 : 1;
+      // Break ties by most recent task state change (newer lanes move left)
+      const aTasks = tasksByWorkspace[a.id] || [];
+      const bTasks = tasksByWorkspace[b.id] || [];
+      const aLatest = aTasks.length > 0 ? Math.max(...aTasks.map(t => new Date(t.updated_at).getTime())) : 0;
+      const bLatest = bTasks.length > 0 ? Math.max(...bTasks.map(t => new Date(t.updated_at).getTime())) : 0;
+      if (aLatest !== bLatest) return bLatest - aLatest;
       return a.name.localeCompare(b.name);
-    }), [workspaces, taskCounts]);
+    }), [workspaces, taskCounts, tasksByWorkspace]);
 
   // Pre-sort tasks per workspace so we don't re-sort on every render/keypress
   const sortedTasksByWorkspace = useMemo(() => {
     const result: Record<string, Task[]> = {};
     for (const [wsId, tasks] of Object.entries(tasksByWorkspace)) {
-      result[wsId] = [...tasks].sort((a, b) => (STATUS_ORDER[a.status] ?? 99) - (STATUS_ORDER[b.status] ?? 99));
+      result[wsId] = [...tasks].sort((a, b) => {
+        const statusDiff = (STATUS_ORDER[a.status] ?? 99) - (STATUS_ORDER[b.status] ?? 99);
+        if (statusDiff !== 0) return statusDiff;
+        // Within the same status, most recently entered state goes first
+        return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+      });
     }
     return result;
   }, [tasksByWorkspace]);
