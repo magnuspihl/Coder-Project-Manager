@@ -587,6 +587,16 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   };
 
   const handleReplyKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.ctrlKey && e.key === 'ArrowUp') {
+      e.preventDefault();
+      scrollBodyRef.current?.scrollBy({ top: -200, behavior: 'smooth' });
+      return;
+    }
+    if (e.ctrlKey && e.key === 'ArrowDown') {
+      e.preventDefault();
+      scrollBodyRef.current?.scrollBy({ top: 200, behavior: 'smooth' });
+      return;
+    }
     if (mentionMenu.open && mentionMatches.length > 0) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
@@ -622,6 +632,16 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   // Variant used by the "Send to participant" textarea — same mention-menu
   // behavior, but Ctrl/Cmd+Enter submits to the participant form instead.
   const handleParticipantReplyKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.ctrlKey && e.key === 'ArrowUp') {
+      e.preventDefault();
+      scrollBodyRef.current?.scrollBy({ top: -200, behavior: 'smooth' });
+      return;
+    }
+    if (e.ctrlKey && e.key === 'ArrowDown') {
+      e.preventDefault();
+      scrollBodyRef.current?.scrollBy({ top: 200, behavior: 'smooth' });
+      return;
+    }
     if (mentionMenu.open && mentionMatches.length > 0) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
