@@ -577,10 +577,36 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
     if (task.worktree_path) {
       const currentBranch = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse --abbrev-ref HEAD`)).trim();
       if (currentBranch !== branchName) {
+        // Before failing, check whether all commits are already on origin/main —
+        // if so, the work is done regardless of branch name.
+        const defaultBranchCheck = await getDefaultBranch(ws, dir, userId);
+        let alreadyLanded = false;
+        try {
+          await sshExec(ws,
+            `cd ${shellEscape(dir)} && git fetch origin ${shellEscape(defaultBranchCheck)} && ` +
+            `git merge-base --is-ancestor HEAD origin/${shellEscape(defaultBranchCheck)}`,
+            30000,
+          );
+          alreadyLanded = true;
+        } catch { /* HEAD is not on origin/<default> yet */ }
+
+        if (alreadyLanded && !hasChanges) {
+          // Committed work is already on origin/main AND the working tree is clean —
+          // there is genuinely nothing left to commit, push, or merge.
+          addMessage(task.id, 'system',
+            `Worktree is on branch \`${currentBranch}\` (expected \`${branchName}\`), but all commits are already present on \`origin/${defaultBranchCheck}\`. Marking complete.`
+          );
+          return true;
+        }
+
+        // Either work is not yet merged, or there are uncommitted changes on top of
+        // an already-merged commit. Either way, use the actual current branch so
+        // completion can commit+push those changes rather than silently dropping them.
         addMessage(task.id, 'system',
-          `Cannot complete: worktree is on branch \`${currentBranch}\` instead of expected \`${branchName}\`.`
+          `Note: worktree is on branch \`${currentBranch}\` instead of expected \`${branchName}\`. Using actual branch for completion.`
         );
-        return 'git_error';
+        branchName = currentBranch;
+        storeTaskBranch(task.id, branchName);
       }
     } else {
       // Legacy non-worktree path: check we're on default branch and create task branch
@@ -654,6 +680,26 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
     } catch (err: any) {
       addMessage(task.id, 'system', `Cannot complete: git commit failed: ${err.message}`);
       return 'git_error';
+    }
+
+    // Merge origin/main into the task branch before pushing so the branch is
+    // up-to-date and the resulting PR has no conflicts with the default branch.
+    if (task.worktree_path) {
+      const defaultForMerge = await getDefaultBranch(ws, dir, userId);
+      try {
+        await sshExec(ws,
+          `cd ${shellEscape(dir)} && ` +
+          `git fetch origin ${shellEscape(defaultForMerge)} && ` +
+          `git merge origin/${shellEscape(defaultForMerge)} --no-edit`,
+          60000,
+        );
+      } catch (mergeErr: any) {
+        addMessage(task.id, 'system',
+          `Cannot complete: failed to merge \`origin/${defaultForMerge}\` into task branch before pushing: ${mergeErr.message}. ` +
+          `Resolve any conflicts in the worktree (\`${dir}\`) and retry.`
+        );
+        return 'git_error';
+      }
     }
 
     // Capture the committed tip so we can later verify the merge actually landed
