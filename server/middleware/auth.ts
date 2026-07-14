@@ -53,7 +53,12 @@ async function validateBearerToken(token: string): Promise<CoderUser | null> {
 function extractClientLabel(req: Request): string | null {
   const raw = req.headers['x-client-name'];
   if (typeof raw !== 'string') return null;
-  const trimmed = raw.trim().slice(0, 64);
+  // Node's HTTP parser decodes header values as Latin-1 (ISO-8859-1) per the
+  // spec, so a client sending UTF-8 bytes (e.g. "Mímir") arrives mojibake'd as
+  // "MÃ­mir". Round-trip through the original bytes and re-decode as UTF-8.
+  // This is a no-op for pure ASCII labels.
+  const decoded = Buffer.from(raw, 'latin1').toString('utf8');
+  const trimmed = decoded.trim().slice(0, 64);
   return trimmed || null;
 }
 
