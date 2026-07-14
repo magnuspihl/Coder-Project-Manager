@@ -534,8 +534,21 @@ export function markSessionInitialized(taskId: string): void {
 }
 
 export function getPendingCompletionTask(workspaceId: string): Task | undefined {
+  // Only auto-finalize a task that is in a completable state. A task can be
+  // flagged pending_complete while it is still queued/working — e.g. the
+  // "resolve git issues & complete" flow sets the flag and re-queues the task so
+  // the agent first fixes the git problem. Completing it before the turn ends
+  // would run git ops on the unfixed worktree; the status guard defers the flush
+  // until the agent lands in awaiting_feedback.
+  //
+  // 'failed'/git_error is also admitted: /complete (and the MCP equivalent) allow
+  // retrying completion on a git-error task, and when the workspace is busy they
+  // defer it by setting pending_complete=1 while the status stays 'failed'. That
+  // deferred completion must still flush once the workspace goes idle — excluding
+  // it would strand pending_complete=1 forever and the promised completion would
+  // silently never run.
   return getDb()
-    .prepare("SELECT * FROM tasks WHERE workspace_id = ? AND pending_complete = 1 AND deleted_at IS NULL ORDER BY position ASC LIMIT 1")
+    .prepare("SELECT * FROM tasks WHERE workspace_id = ? AND pending_complete = 1 AND (status = 'awaiting_feedback' OR (status = 'failed' AND failed_reason = 'git_error')) AND deleted_at IS NULL ORDER BY position ASC LIMIT 1")
     .get(workspaceId) as Task | undefined;
 }
 

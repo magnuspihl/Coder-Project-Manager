@@ -279,10 +279,19 @@ export const updateTaskRequestTargetForTask = (taskId: string, requestId: string
 export const getStreamLog = (taskId: string, afterId?: number) =>
   request<{ streamLog: StreamLogEntry[] }>(`/api/tasks/${taskId}/stream-log${afterId ? `?after=${afterId}` : ''}`);
 
-export const replyToTask = (taskId: string, message: string, attachmentIds?: string[]) =>
+export const replyToTask = (
+  taskId: string,
+  message: string,
+  attachmentIds?: string[],
+  opts?: { completeAfter?: boolean },
+) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/reply`, {
     method: 'POST',
-    body: JSON.stringify({ message, ...(attachmentIds?.length ? { attachmentIds } : {}) }),
+    body: JSON.stringify({
+      message,
+      ...(attachmentIds?.length ? { attachmentIds } : {}),
+      ...(opts?.completeAfter ? { completeAfter: true } : {}),
+    }),
   });
 
 export async function uploadFiles(files: File[]): Promise<AttachmentInfo[]> {
