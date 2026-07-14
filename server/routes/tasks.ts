@@ -224,7 +224,7 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
     return;
   }
 
-  const { message, attachmentIds } = req.body;
+  const { message, attachmentIds, completeAfter } = req.body;
   if (!message || typeof message !== 'string') {
     res.status(400).json({ error: 'Message is required' });
     return;
@@ -235,8 +235,15 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
   // User reply resets the review loop so the next implementer turn gets a fresh review
   resetReviewLoopCount(task.id);
 
-  // User replied → cancel any pending completion: they're asking to continue.
-  if (task.pending_complete) {
+  // `completeAfter` (used by "resolve git issues & complete"): finalize the task
+  // automatically once this turn lands in awaiting_feedback. The pending_complete
+  // flush in processQueue is guarded on that status, so it waits for the agent to
+  // finish before running git completion — and does so under the workspace lock,
+  // right after the fix, so another task can't advance origin/<default> in between.
+  // When not requested, a reply means "keep working", so cancel any pending completion.
+  if (completeAfter === true) {
+    setPendingComplete(task.id, true);
+  } else if (task.pending_complete) {
     setPendingComplete(task.id, false);
     addMessage(task.id, 'system', 'Pending completion cancelled — reply received.', undefined, undefined, undefined, req.authSource, req.clientLabel);
   }

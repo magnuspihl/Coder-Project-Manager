@@ -791,8 +791,14 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     if (resolvingGitIssues || sending) return;
     setResolvingGitIssues(true);
     try {
+      // completeAfter: once the agent finishes fixing, completion runs
+      // automatically — under the workspace lock, right after the fix — so
+      // another task can't advance the default branch and re-break the merge
+      // before a manual "Retry completion" click.
       await replyToTask(taskId,
-        'The git operations failed when completing this task. Please review the error messages above and resolve any git issues (push conflicts, merge errors, branch protection issues, uncommitted changes, etc.), then we can retry completion.',
+        'The git operations failed when completing this task. Please review the error messages above and resolve any git issues (push conflicts, merge errors, branch protection issues, uncommitted changes, etc.). Once resolved, completion will run automatically.',
+        undefined,
+        { completeAfter: true },
       );
       onTaskChanged?.();
       await loadData();
@@ -2161,7 +2167,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         <div className="font-medium mb-1">Git operation failed</div>
                         <div className="text-xs">
                           The git operations failed when completing this task — see the conversation above for details.
-                          Ask the agent to resolve the issues, or fix them manually and retry completion.
+                          Ask the agent to resolve the issues (completion then runs automatically), or fix them manually and retry completion.
                         </div>
                       </div>
                       <div className="flex gap-2 flex-wrap">
@@ -2170,7 +2176,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                           disabled={resolvingGitIssues || sending}
                           className="bg-orange-600 text-white text-sm px-4 py-2 rounded-md hover:bg-orange-700 disabled:opacity-50 transition-colors"
                         >
-                          {resolvingGitIssues ? 'Asking agent…' : 'Ask agent to resolve git issues'}
+                          {resolvingGitIssues ? 'Asking agent…' : 'Resolve git issues & complete'}
                         </button>
                         <button
                           onClick={handleComplete}

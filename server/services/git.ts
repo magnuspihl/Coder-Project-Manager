@@ -730,25 +730,15 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
 
     const defaultBranch = await getDefaultBranch(ws, dir, userId);
 
-    // Sync local main with origin first — handles the case where origin/main has
-    // advanced (e.g. a PR was merged on GitHub before CPM performs its merge step).
-    // Only applies in worktree mode where task.project_dir is the main checkout.
-    if (task.worktree_path && task.project_dir) {
-      try {
-        await sshExec(ws,
-          `cd ${shellEscape(task.project_dir)} && ` +
-          `git fetch origin ${shellEscape(defaultBranch)} && ` +
-          `git merge --ff-only origin/${shellEscape(defaultBranch)}`,
-          30000,
-        );
-      } catch (syncErr: any) {
-        addMessage(task.id, 'system',
-          `Cannot complete: local \`${defaultBranch}\` has diverged from origin/${defaultBranch} and cannot be fast-forwarded: ${syncErr.message}. ` +
-          `Reconcile the branch manually then retry completion.`
-        );
-        return 'git_error';
-      }
-    }
+    // NOTE: we deliberately do NOT sync the local `main` checkout here. In worktree
+    // mode the merge into the default branch happens entirely on the remote via the
+    // PR, and every local git step runs in the task's worktree against the freshly
+    // fetched `origin/<default>` ref — the main checkout (task.project_dir) plays no
+    // part in the merge, and new worktrees branch from `origin/<default>` regardless
+    // of its state. A pre-merge `git merge --ff-only` on the main checkout used to
+    // live here and hard-blocked completion whenever the checkout had diverged from
+    // origin (e.g. a stray local commit), even though completion would otherwise
+    // succeed. The post-merge pull below refreshes the checkout as a best effort.
 
     // Nothing-to-merge guard. A reopened task that was previously completed already
     // has its commit on origin/<default>. If the committed tip is already an
