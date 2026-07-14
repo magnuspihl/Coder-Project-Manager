@@ -368,6 +368,15 @@ export function getDb(): Database.Database {
   db.exec("CREATE INDEX IF NOT EXISTS idx_token_events_workspace ON token_events(workspace_id, created_at)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_token_events_task ON token_events(task_id, created_at)");
 
+  // Strip trailing markdown/punctuation from verification_url values that were
+  // captured with Markdown bold markers (e.g. "**https://...family**").
+  db.exec(`
+    UPDATE tasks
+    SET verification_url = rtrim(verification_url, '*\`.,!?')
+    WHERE verification_url IS NOT NULL
+      AND verification_url != rtrim(verification_url, '*\`.,!?')
+  `);
+
   migrateDiscussionsToTasks(db);
 
   return db;

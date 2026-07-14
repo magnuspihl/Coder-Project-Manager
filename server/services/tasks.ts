@@ -546,7 +546,9 @@ export function getPendingCompletionTask(workspaceId: string): Task | undefined 
 function extractVerificationUrl(content: string): string | null {
   // Match Coder subdomain proxy URLs: https://PORT--agent--workspace--user.domain
   const match = content.match(/https?:\/\/\d+--[a-zA-Z0-9._-]+--[a-zA-Z0-9._-]+--[a-zA-Z0-9._-]+\.[^\s)"\]]+/);
-  return match ? match[0] : null;
+  if (!match) return null;
+  // Strip trailing markdown/punctuation that agents append after URLs (e.g. **bold**, `code`)
+  return match[0].replace(/[*`.,!?]+$/, '');
 }
 
 export function addMessage(
