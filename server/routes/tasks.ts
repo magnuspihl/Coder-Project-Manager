@@ -318,13 +318,15 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
     }
 
     // If another task is actively working on this workspace, defer completion
-    // until the queue is idle. Unlike review, completion MUTATES shared git
-    // state: it commits/pushes the task branch, merges the PR into the default
-    // branch, and ff-merges the shared main checkout (task.project_dir, common
-    // to every worktree on this workspace). Running that concurrently with an
-    // active agent — or another completion — could race the shared checkout/
-    // default-branch ref, so we queue it and auto-finalize once the workspace
-    // is idle (see processQueue's pending_complete flush).
+    // until the queue is idle. Even though each task has its own worktree, all
+    // worktrees share ONE `.git` (object store + ref namespace), and completion
+    // hits it hard: it fetches, pushes the task branch, merges the PR into the
+    // default branch, and does a best-effort ff-pull of the shared main checkout
+    // (task.project_dir). Running those ref/lock-heavy ops concurrently with a
+    // live agent's git activity in another worktree risks transient "cannot lock
+    // ref" failures — the exact spurious completion errors we want to avoid. So
+    // we queue it and auto-finalize once the workspace is idle (see
+    // processQueue's pending_complete flush).
     const working = getWorkingTask(fresh.workspace_id);
     if (working && working.id !== fresh.id) {
       if (!fresh.pending_complete) {

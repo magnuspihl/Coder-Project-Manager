@@ -360,8 +360,11 @@ function buildServer(ctx: AuthCtx): McpServer {
           return { code: 400, error: `Only tasks awaiting feedback can be completed (current status: ${fresh.status}).` };
         }
 
-        // Defer if another task is working this workspace — concurrent git ops
-        // would corrupt the working agent's tree.
+        // Defer if another task is working this workspace. Worktrees are isolated
+        // per task, but all share one `.git`, so completion's fetch/push/ref
+        // updates can hit transient lock contention with a live agent's git
+        // activity. Queue it and auto-finalize once idle (see routes/tasks.ts for
+        // the full rationale).
         const working = getWorkingTask(fresh.workspace_id);
         if (working && working.id !== fresh.id) {
           if (!fresh.pending_complete) {
