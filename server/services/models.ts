@@ -22,6 +22,7 @@ const OLLAMA_CACHE_TTL_MS = 5 * 60 * 1000; // Shorter — models can be pulled/r
 // effectively the source of truth. Keep it current as new models ship.
 // Ordered newest-first so the latest model surfaces at the top of the dropdown.
 const FALLBACK_ANTHROPIC: ModelInfo[] = [
+  { id: 'claude-opus-5', display_name: 'Claude Opus 5', provider: 'anthropic' },
   { id: 'claude-fable-5', display_name: 'Claude Fable 5', provider: 'anthropic' },
   { id: 'claude-opus-4-8', display_name: 'Claude Opus 4.8', provider: 'anthropic' },
   { id: 'claude-opus-4-7', display_name: 'Claude Opus 4.7', provider: 'anthropic' },
