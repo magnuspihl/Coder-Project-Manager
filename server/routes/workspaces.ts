@@ -5,7 +5,8 @@ import dnsPromises from 'dns/promises';
 import { requireAuth } from '../middleware/auth.js';
 import { listWorkspaces, getWorkspace, stopWorkspace, startWorkspace, CoderAuthError } from '../services/coder.js';
 import { getTaskCountsByWorkspace, getTokenTotalsByWorkspace, getGithubRepoUrlsByWorkspace, getWindowedTokenUsage } from '../services/tasks.js';
-import { getWorkspaceRateLimits } from '../services/claude.js';
+import { getSubscriptionUsage, getObservedSubscriptionKeys, subscriptionKeyFor, type RateLimitUsage } from '../services/claude.js';
+import { listAccounts } from '../services/claude-accounts.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { getModelsForWorkspace } from '../services/models.js';
 import { getPortOwnerTaskId } from '../services/port-janitor.js';
@@ -13,6 +14,94 @@ import { setWorkspacesForUser } from '../services/workspace-cache.js';
 import { readWorkspaceMemory, writeWorkspaceMemoryFile } from '../services/workspace-memory.js';
 
 const router = Router();
+
+/**
+ * Rate limits for the workspace list, attributed to the subscription each
+ * workspace is actually running on.
+ *
+ * Usage is tracked per subscription, not per workspace, because a task can now
+ * pick which Claude subscription it burns. A workspace card still wants one pair
+ * of bars, so resolve each workspace to the subscription its most recent task
+ * used. `rateLimitSubscriptions` carries the human label for that choice so the
+ * card can say which subscription the bars refer to instead of implying it's the
+ * workspace's own.
+ *
+ * Deliberately NOT restricted to live tasks. Rate limits describe a reset window
+ * measured in hours or days, so the bars are meant to persist between tasks — and
+ * with a default account configured (the expected setup) every task is
+ * acct:-billed, so a live-only filter would blank the card the moment a task
+ * completed and leave nothing for the `ws:` fallback to restore.
+ */
+function buildWorkspaceRateLimits(userId: string): {
+  rateLimits: Record<string, Record<string, RateLimitUsage>>;
+  rateLimitSubscriptions: Record<string, string>;
+} {
+  const rateLimits: Record<string, Record<string, RateLimitUsage>> = {};
+  const rateLimitSubscriptions: Record<string, string> = {};
+
+  const labels = new Map(listAccounts(userId).map(a => [a.id, a.label]));
+  // One row per workspace: the account used by its most recently touched task.
+  // Relies on SQLite's documented guarantee that bare columns in a MAX() aggregate
+  // come from the row that produced the max.
+  //
+  // MAX(datetime(...)), not MAX(...): tasks.updated_at holds two formats —
+  // "2026-07-30 12:00:00" from the schema's datetime('now') default (what
+  // createTask leaves behind) and "2026-07-30T12:00:00.000Z" from
+  // new Date().toISOString() on every later write. Space sorts before 'T', so a
+  // plain string MAX picks a stale row over a newer never-updated one.
+  //
+  // Scoped by user_id because workspace_name is only unique per Coder owner —
+  // template-derived names repeat across users, so an unscoped GROUP BY would let
+  // another user's task decide what this user's card is attributed to.
+  const rows = getDb().prepare(`
+    SELECT workspace_name, claude_account_id, MAX(datetime(updated_at)) AS latest
+    FROM tasks
+    WHERE deleted_at IS NULL
+      AND user_id = ?
+    GROUP BY workspace_name
+  `).all(userId) as Array<{ workspace_name: string; claude_account_id: string | null; latest: string }>;
+
+  for (const row of rows) {
+    const workspaceName = row.workspace_name;
+    // An account that has since been deleted has no usable label or usage; treat
+    // the workspace as being on its own login rather than inventing an attribution.
+    const accountId = row.claude_account_id && labels.has(row.claude_account_id)
+      ? row.claude_account_id
+      : null;
+
+    // Prefer the resolved subscription, but fall back to the workspace's own login
+    // when that subscription has no usage recorded yet — e.g. an account added
+    // moments ago, or one whose window has never been reported. Without this a
+    // freshly pinned workspace would show nothing despite having login history.
+    const preferred = getSubscriptionUsage(subscriptionKeyFor(accountId, workspaceName));
+    if (preferred) {
+      rateLimits[workspaceName] = preferred;
+      rateLimitSubscriptions[workspaceName] = accountId ? labels.get(accountId)! : 'workspace login';
+      continue;
+    }
+    if (accountId) {
+      const ownLogin = getSubscriptionUsage(subscriptionKeyFor(null, workspaceName));
+      if (ownLogin) {
+        rateLimits[workspaceName] = ownLogin;
+        rateLimitSubscriptions[workspaceName] = 'workspace login';
+      }
+    }
+  }
+
+  // Workspaces with no tasks at all: surface their own login's usage so a
+  // workspace used outside CPM still shows whatever was last observed for it.
+  for (const key of getObservedSubscriptionKeys()) {
+    if (!key.startsWith('ws:')) continue;
+    const workspaceName = key.slice('ws:'.length);
+    if (rateLimits[workspaceName]) continue;
+    const usage = getSubscriptionUsage(key);
+    if (!usage) continue;
+    rateLimits[workspaceName] = usage;
+    rateLimitSubscriptions[workspaceName] = 'workspace login';
+  }
+
+  return { rateLimits, rateLimitSubscriptions };
+}
 
 /**
  * Wraps a Coder API call with automatic token refresh on auth failure.
@@ -79,8 +168,8 @@ router.get('/', requireAuth, async (req: Request, res: Response) => {
   const taskCounts = getTaskCountsByWorkspace();
   const tokenTotals = getTokenTotalsByWorkspace();
   const githubRepoUrls = getGithubRepoUrlsByWorkspace();
-  const rateLimits = getWorkspaceRateLimits();
-  res.json({ workspaces, taskCounts, tokenTotals, githubRepoUrls, rateLimits });
+  const { rateLimits, rateLimitSubscriptions } = buildWorkspaceRateLimits(req.user!.id);
+  res.json({ workspaces, taskCounts, tokenTotals, githubRepoUrls, rateLimits, rateLimitSubscriptions });
 });
 
 // Base hostname of the Coder deployment, derived from CODER_URL. The caller's

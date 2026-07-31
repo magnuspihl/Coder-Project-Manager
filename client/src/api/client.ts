@@ -109,6 +109,7 @@ export interface Task {
   worktree_path: string | null;
   port_range_start: number | null;
   model: string | null;
+  claude_account_id: string | null;
   caveman: string | null;
   auto_review: number;
   review_loop_count: number;
@@ -200,7 +201,7 @@ export interface RateLimitUsage {
 }
 
 export const getWorkspaces = () =>
-  request<{ workspaces: Workspace[]; taskCounts: Record<string, TaskCounts>; tokenTotals: Record<string, TokenTotals>; githubRepoUrls: Record<string, string>; rateLimits: Record<string, Record<string, RateLimitUsage>> }>('/api/workspaces');
+  request<{ workspaces: Workspace[]; taskCounts: Record<string, TaskCounts>; tokenTotals: Record<string, TokenTotals>; githubRepoUrls: Record<string, string>; rateLimits: Record<string, Record<string, RateLimitUsage>>; rateLimitSubscriptions: Record<string, string> }>('/api/workspaces');
 
 export const getWorkspace = (id: string) =>
   request<{ workspace: Workspace }>(`/api/workspaces/${id}`);
@@ -219,6 +220,76 @@ export interface ModelInfo {
   display_name: string;
   provider: 'anthropic' | 'ollama-local' | 'ollama-cloud';
 }
+
+// ─── Claude subscription accounts ──────────────────────────────────────────
+
+/**
+ * Sentinel for "run on the target workspace's own `claude login`" — the
+ * behaviour before CPM could hold subscription tokens of its own.
+ */
+export const WORKSPACE_CLAUDE_ACCOUNT = 'workspace';
+
+export interface ClaudeAccount {
+  id: string;
+  label: string;
+  tokenHint: string;
+  isDefault: boolean;
+  createdAt: string;
+  updatedAt: string;
+  lastUsedAt: string | null;
+}
+
+/** Accounts plus each one's observed rate-limit usage, keyed by account id. */
+export const getClaudeAccounts = () =>
+  request<{
+    accounts: ClaudeAccount[];
+    rateLimits: Record<string, Record<string, RateLimitUsage>>;
+  }>('/api/claude-accounts');
+
+export const createClaudeAccount = (label: string, token: string, isDefault = false) =>
+  request<{ account: ClaudeAccount }>('/api/claude-accounts', {
+    method: 'POST',
+    body: JSON.stringify({ label, token, isDefault }),
+  });
+
+export const updateClaudeAccount = (
+  id: string,
+  patch: { label?: string; token?: string; isDefault?: boolean },
+) =>
+  request<{ account: ClaudeAccount }>(`/api/claude-accounts/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+
+export const deleteClaudeAccount = (id: string) =>
+  request<{ ok: boolean }>(`/api/claude-accounts/${id}`, { method: 'DELETE' });
+
+/**
+ * Result of testing a stored token. `status` matters: 'unknown' means the check was
+ * inconclusive (e.g. an unexpected HTTP status), which must not be presented as a
+ * broken subscription.
+ */
+export interface TokenCheck {
+  ok: boolean;
+  detail: string;
+  status: 'valid' | 'rejected' | 'unknown';
+}
+
+export const verifyClaudeAccount = (id: string) =>
+  request<TokenCheck>(`/api/claude-accounts/${id}/verify`, { method: 'POST' });
+
+export const setTaskClaudeAccount = (taskId: string, claudeAccountId: string | null) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}`, {
+    method: 'PUT',
+    body: JSON.stringify({ claudeAccountId }),
+  });
+
+/** Switch a task's model. Applies from its next turn; null = CLI default. */
+export const setTaskModel = (taskId: string, model: string | null) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}`, {
+    method: 'PUT',
+    body: JSON.stringify({ model }),
+  });
 
 export const getModels = (workspaceId: string) =>
   request<{ models: ModelInfo[] }>(`/api/workspaces/${workspaceId}/models`);
@@ -242,10 +313,31 @@ export const updateWorkspaceMemoryFile = (workspaceId: string, filename: string,
 export const getTasks = (workspaceId: string) =>
   request<{ tasks: Task[] }>(`/api/workspaces/${workspaceId}/tasks`);
 
-export const createTask = (workspaceId: string, prompt: string, model?: string, caveman?: string, attachmentIds?: string[], autoReview?: boolean) =>
+export interface CreateTaskOptions {
+  model?: string;
+  caveman?: string;
+  attachmentIds?: string[];
+  autoReview?: boolean;
+  /** Account id, or WORKSPACE_CLAUDE_ACCOUNT to use the workspace's own login. */
+  claudeAccountId?: string;
+}
+
+export const createTask = (workspaceId: string, prompt: string, opts: CreateTaskOptions = {}) =>
   request<{ task: Task }>(`/api/workspaces/${workspaceId}/tasks`, {
     method: 'POST',
-    body: JSON.stringify({ prompt, ...(model ? { model } : {}), ...(caveman ? { caveman } : {}), ...(attachmentIds?.length ? { attachmentIds } : {}), ...(autoReview === false ? { autoReview: false } : {}) }),
+    body: JSON.stringify({
+      prompt,
+      ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.caveman ? { caveman: opts.caveman } : {}),
+      ...(opts.attachmentIds?.length ? { attachmentIds: opts.attachmentIds } : {}),
+      ...(opts.autoReview === false ? { autoReview: false } : {}),
+      // Only sent when the caller actually knows the user's choice. Omitting the
+      // key makes the server apply the user's default account; sending
+      // WORKSPACE_CLAUDE_ACCOUNT is an explicit "use the workspace's own login".
+      // Defaulting to the sentinel here would silently override the user's default
+      // account whenever the account list hadn't loaded.
+      ...(opts.claudeAccountId ? { claudeAccountId: opts.claudeAccountId } : {}),
+    }),
   });
 
 export interface AttachmentInfo {

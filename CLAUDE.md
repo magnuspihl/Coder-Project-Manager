@@ -97,7 +97,9 @@ queued → working → awaiting_feedback → working → ... → completed
 ### Security
 - NEVER store Coder API tokens in the database — keep them in encrypted HTTP-only session cookies
 - All API routes require authentication
-- The app does NOT implement its own authorization — it relies on Coder's RBAC via the user's token
+- Authorization is Coder's RBAC via the user's token **for anything Coder owns** (workspaces, users). For data CPM owns, CPM must scope it itself — Coder has no opinion on it:
+  - Tasks are per-user (`requireTaskAccess`; `listTasks` filters by `user_id`)
+  - Claude subscription accounts (`claude_accounts`) are per-user and never shared. A token there is a bearer credential for a paid subscription, and staging one into a workspace exposes it to anyone with a shell there — so scope every read, write, and resolve by `user_id`
 - Validate all user input
 - Use parameterized queries for all SQL
 
@@ -113,4 +115,4 @@ queued → working → awaiting_feedback → working → ... → completed
 - Don't use an ORM — raw SQL with better-sqlite3 is intentional.
 - Don't add heavy UI frameworks or component libraries.
 - Don't implement your own auth system — Coder is the auth provider.
-- Don't store secrets in the database or in environment variables committed to the repo.
+- Don't store secrets in the database or in environment variables committed to the repo. The one deliberate exception is `claude_accounts.token_enc` (Claude subscription tokens), which is encrypted with AES-256-GCM via `server/services/secrets.ts` — a user-supplied credential CPM has to replay later, so there is nowhere else for it to live. Encrypt anything similar the same way; don't add plaintext secret columns.

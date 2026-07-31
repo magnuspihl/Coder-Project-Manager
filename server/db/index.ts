@@ -6,7 +6,14 @@ import { randomUUID } from 'crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const DB_PATH = process.env.DATABASE_PATH || join(__dirname, '../../data/cpm.db');
+/**
+ * Exported so anything that must live alongside the database (e.g. the secrets
+ * encryption key) can derive its location from the same value. Deriving matters
+ * because start-stable.sh pins DATABASE_PATH to the repo's data/ dir while
+ * __dirname resolves under dist/ in a compiled run — so a second, independently
+ * computed default would point somewhere else in prod than in dev.
+ */
+export const DB_PATH = process.env.DATABASE_PATH || join(__dirname, '../../data/cpm.db');
 
 let db: Database.Database;
 
@@ -284,24 +291,60 @@ export function getDb(): Database.Database {
       db.exec("ALTER TABLE discussions ADD COLUMN worktree_path TEXT");
     }
 
-    // Rate limits: move from global (keyed by type) to per-workspace
-    // (keyed by workspace_name + type), since each workspace now uses its own
-    // Claude account with its own session/weekly limits. Old global rows can't
-    // be attributed to a workspace, so drop and rebuild — usage data is
-    // transient and refills within minutes of any task running.
+    // Claude subscription override: which CPM-held account a task authenticates
+    // with. NULL means "use whatever the workspace itself is logged in as".
+    const tasksCols5 = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+    if (!tasksCols5.some(c => c.name === 'claude_account_id')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN claude_account_id TEXT");
+    }
+
+    // claude_accounts predates per-user ownership. Any rows from that window are
+    // unattributable subscription tokens readable by every user, so drop them
+    // rather than guess an owner — they are re-pasted from `claude setup-token`
+    // in seconds, and tasks pinned to a dropped id fail loudly.
+    const acctCols = db.prepare("PRAGMA table_info(claude_accounts)").all() as Array<{ name: string }>;
+    if (acctCols.length > 0 && !acctCols.some(c => c.name === 'user_id')) {
+      const orphaned = (db.prepare('SELECT COUNT(*) c FROM claude_accounts').get() as { c: number }).c;
+      // Recreated inline (not just dropped) because schema.sql already ran above.
+      db.exec(`
+        DROP TABLE claude_accounts;
+        CREATE TABLE claude_accounts (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          label TEXT NOT NULL,
+          token_enc TEXT NOT NULL,
+          token_hint TEXT NOT NULL,
+          is_default INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          last_used_at TEXT,
+          FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_claude_accounts_user ON claude_accounts(user_id);
+      `);
+      console.log(`[migration] Rebuilt claude_accounts with per-user ownership (discarded ${orphaned} unowned account(s) — re-add them in Settings)`);
+    }
+
+    // Rate limits: originally global (keyed by type), then per-workspace
+    // (workspace_name + type), now per-subscription (subscription_key + type) —
+    // because a task can pick its Claude subscription, so the workspace is no
+    // longer a proxy for the credential the usage was billed to. Old rows can't
+    // be re-attributed, so drop and rebuild; usage data is transient and refills
+    // within minutes of any task running.
     const rlCols = db.prepare("PRAGMA table_info(rate_limits)").all() as Array<{ name: string }>;
-    if (rlCols.length > 0 && !rlCols.some(c => c.name === 'workspace_name')) {
+    if (rlCols.length > 0 && !rlCols.some(c => c.name === 'subscription_key')) {
       db.exec("DROP TABLE rate_limits");
       db.exec(`
         CREATE TABLE rate_limits (
-          workspace_name TEXT NOT NULL,
+          subscription_key TEXT NOT NULL,
           type TEXT NOT NULL,
           utilization REAL NOT NULL DEFAULT 0,
           resets_at INTEGER NOT NULL,
           updated_at INTEGER NOT NULL,
-          PRIMARY KEY (workspace_name, type)
+          PRIMARY KEY (subscription_key, type)
         )
       `);
+      console.log('[migration] Rebuilt rate_limits keyed by subscription instead of workspace');
     }
 
     // Drop the one-working-per-workspace constraint — replaced by configurable max_concurrent

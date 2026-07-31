@@ -13,6 +13,9 @@ import {
   restoreTask,
   createTask,
   getModels,
+  getClaudeAccounts,
+  WORKSPACE_CLAUDE_ACCOUNT,
+  type ClaudeAccount,
   getGitSettings,
   updateGitSettings,
   getPreviewSettings,
@@ -187,11 +190,21 @@ function getApps(workspace: Workspace) {
  * so session (five_hour) and weekly (seven_day) limits are tracked and shown
  * independently in the workspace's column header.
  */
-function WorkspaceRateLimits({ limits }: { limits: Record<string, RateLimitUsage> | undefined }) {
+/**
+ * `subscription` names the credential these bars are measuring — a CPM-held
+ * subscription's label, or "workspace login". Usage is tracked per subscription
+ * now that a task can choose one, so without this the bars would silently mean
+ * different things on different cards.
+ */
+function WorkspaceRateLimits({ limits, subscription }: {
+  limits: Record<string, RateLimitUsage> | undefined;
+  subscription?: string;
+}) {
   if (!limits || Object.keys(limits).length === 0) return null;
   const now = Date.now();
   const types = (['five_hour', 'seven_day'] as const).filter(t => limits[t]);
   if (types.length === 0) return null;
+  const attribution = subscription ? ` (${subscription})` : '';
   return (
     // Grid (not per-row flex) so the label / bar / % / reset columns align
     // across both rows — this keeps the Session and Weekly bars the same width
@@ -210,7 +223,7 @@ function WorkspaceRateLimits({ limits }: { limits: Record<string, RateLimitUsage
           const diffM = Math.floor((diffMs % 3600000) / 60000);
           resetLabel = diffD > 0 ? `${diffD}d ${diffH}h ${diffM}m` : diffH > 0 ? `${diffH}h ${diffM}m` : `${diffM}m`;
         }
-        const title = `${label} limit: ${indeterminate ? '<75%' : `${pct}%`}${resetLabel ? ` — resets in ${resetLabel}` : ''}`;
+        const title = `${label} limit${attribution}: ${indeterminate ? '<75%' : `${pct}%`}${resetLabel ? ` — resets in ${resetLabel}` : ''}`;
         return (
           <Fragment key={type}>
             <span title={title} className="text-[10px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">{label}</span>
@@ -256,6 +269,8 @@ export default function WorkspacesPage() {
   const [tokenTotals, setTokenTotals] = useState<Record<string, TokenTotals>>({});
   const [githubRepoUrls, setGithubRepoUrls] = useState<Record<string, string>>({});
   const [rateLimits, setRateLimits] = useState<Record<string, Record<string, RateLimitUsage>>>({});
+  // Which subscription each workspace's bars are measuring, keyed by workspace name.
+  const [rateLimitSubscriptions, setRateLimitSubscriptions] = useState<Record<string, string>>({});
   const [tasksByWorkspace, setTasksByWorkspace] = useState<Record<string, Task[]>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -274,7 +289,12 @@ export default function WorkspacesPage() {
   const [newTaskModel, setNewTaskModel] = useState('');
   const [newTaskCaveman, setNewTaskCaveman] = useState('');
   const [newTaskAutoReview, setNewTaskAutoReview] = useState(true);
+  // '' means "not resolved yet" — createTask then omits the field so the server
+  // applies the user's default account.
+  const [newTaskClaudeAccount, setNewTaskClaudeAccount] = useState('');
+  const [accountsLoaded, setAccountsLoaded] = useState(false);
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
+  const [claudeAccounts, setClaudeAccounts] = useState<ClaudeAccount[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
   const [creatingTask, setCreatingTask] = useState(false);
   const [newTaskFiles, setNewTaskFiles] = useState<File[]>([]);
@@ -323,12 +343,13 @@ export default function WorkspacesPage() {
 
   const loadData = async () => {
     try {
-      const { workspaces: ws, taskCounts: tc, tokenTotals: tt, githubRepoUrls: gh, rateLimits: rl } = await getWorkspaces();
+      const { workspaces: ws, taskCounts: tc, tokenTotals: tt, githubRepoUrls: gh, rateLimits: rl, rateLimitSubscriptions: rls } = await getWorkspaces();
       setIfChanged('workspaces', setWorkspaces, ws);
       setIfChanged('taskCounts', setTaskCounts, tc);
       setIfChanged('tokenTotals', setTokenTotals, tt || {});
       setIfChanged('githubRepoUrls', setGithubRepoUrls, gh || {});
       setIfChanged('rateLimits', setRateLimits, rl || {});
+      setIfChanged('rateLimitSubscriptions', setRateLimitSubscriptions, rls || {});
       setError('');
 
       // Fetch tasks for running workspaces in parallel
@@ -598,8 +619,38 @@ export default function WorkspacesPage() {
       setAvailableModels([]);
       setNewTaskModel('');
       setNewTaskCaveman('');
+      setNewTaskClaudeAccount('');
+      setAccountsLoaded(false);
       return;
     }
+    let cancelled = false;
+
+    // Subscriptions are CPM-wide, not per-workspace, so this list is the same
+    // whichever workspace the task targets.
+    setAccountsLoaded(false);
+    getClaudeAccounts()
+      .then(({ accounts }) => {
+        if (cancelled) return;
+        setClaudeAccounts(accounts);
+        // Restore the per-workspace pick, falling back to the account marked
+        // default, then to the workspace's own login. Done here rather than in
+        // the block below because a stored id may point at a deleted account.
+        let stored: string | undefined;
+        try {
+          stored = JSON.parse(localStorage.getItem('taskDefaults') || '{}')[newTaskWorkspaceId]?.claudeAccountId;
+        } catch { /* ignore */ }
+        if (stored && (stored === WORKSPACE_CLAUDE_ACCOUNT || accounts.some(a => a.id === stored))) {
+          setNewTaskClaudeAccount(stored);
+        } else {
+          setNewTaskClaudeAccount(accounts.find(a => a.isDefault)?.id ?? WORKSPACE_CLAUDE_ACCOUNT);
+        }
+        setAccountsLoaded(true);
+      })
+      // Leave the selection empty on failure. createTask then omits the field and
+      // the server applies the user's default account, rather than this form
+      // silently pinning every task to the workspace login.
+      .catch(() => { if (!cancelled) { setClaudeAccounts([]); setNewTaskClaudeAccount(''); } });
+
     // Restore per-workspace defaults
     try {
       const defaults = JSON.parse(localStorage.getItem('taskDefaults') || '{}');
@@ -609,7 +660,6 @@ export default function WorkspacesPage() {
         setNewTaskCaveman(ws.caveman || '');
       }
     } catch { /* ignore */ }
-    let cancelled = false;
     setLoadingModels(true);
     getModels(newTaskWorkspaceId)
       .then(({ models }) => { if (!cancelled) setAvailableModels(models); })
@@ -880,13 +930,29 @@ export default function WorkspacesPage() {
     if (!newTaskPrompt.trim()) return;
     setCreatingTask(true);
     try {
-      const model = newTaskModel || undefined;
-      const caveman = newTaskCaveman || undefined;
-      const attIds = newTaskAttachmentIds.length > 0 ? newTaskAttachmentIds : undefined;
-      await createTask(workspaceId, newTaskPrompt.trim(), model, caveman, attIds, newTaskAutoReview);
+      await createTask(workspaceId, newTaskPrompt.trim(), {
+        model: newTaskModel || undefined,
+        caveman: newTaskCaveman || undefined,
+        attachmentIds: newTaskAttachmentIds.length > 0 ? newTaskAttachmentIds : undefined,
+        autoReview: newTaskAutoReview,
+        // Omitted when the account list hasn't resolved, so the server falls back
+        // to the user's default rather than this form forcing the workspace login.
+        claudeAccountId: accountsLoaded ? newTaskClaudeAccount || undefined : undefined,
+      });
       try {
         const defaults = JSON.parse(localStorage.getItem('taskDefaults') || '{}');
-        defaults[workspaceId] = { model: newTaskModel, caveman: newTaskCaveman };
+        // Only overwrite the stored subscription when we actually know the user's
+        // choice. On the accounts-fetch-failure path the picker was never shown, so
+        // rewriting the entry without it would silently erase a preference the user
+        // set earlier — keep whatever was already stored instead.
+        const storedAccountId = accountsLoaded && newTaskClaudeAccount
+          ? newTaskClaudeAccount
+          : defaults[workspaceId]?.claudeAccountId;
+        defaults[workspaceId] = {
+          model: newTaskModel,
+          caveman: newTaskCaveman,
+          ...(storedAccountId ? { claudeAccountId: storedAccountId } : {}),
+        };
         localStorage.setItem('taskDefaults', JSON.stringify(defaults));
       } catch { /* ignore */ }
       lastTaskWorkspaceIdRef.current = workspaceId;
@@ -1127,7 +1193,7 @@ export default function WorkspacesPage() {
               )}
             </div>
           </div>
-          <WorkspaceRateLimits limits={rateLimits[ws.name]} />
+          <WorkspaceRateLimits limits={rateLimits[ws.name]} subscription={rateLimitSubscriptions[ws.name]} />
           {memoryOpenWsId === ws.id && (() => {
             const files = memoryByWs[ws.id] ?? [];
             const isLoading = memoryLoadingWsId === ws.id;
@@ -1462,6 +1528,22 @@ export default function WorkspacesPage() {
                   </optgroup>
                 )}
               </select>
+              {accountsLoaded && claudeAccounts.length > 0 && (
+                <select
+                  value={newTaskClaudeAccount}
+                  onChange={(e) => setNewTaskClaudeAccount(e.target.value)}
+                  className="w-full text-sm border border-gray-300 dark:border-gray-700 rounded-md p-1.5 mt-1 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  disabled={creatingTask}
+                  title="Which Claude subscription this task runs on"
+                >
+                  <option value={WORKSPACE_CLAUDE_ACCOUNT}>Subscription: workspace's own login</option>
+                  {claudeAccounts.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      Subscription: {a.label}{a.isDefault ? ' (default)' : ''}
+                    </option>
+                  ))}
+                </select>
+              )}
               <select
                 value={newTaskCaveman}
                 onChange={(e) => setNewTaskCaveman(e.target.value)}
