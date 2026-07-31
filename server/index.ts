@@ -10,6 +10,7 @@ import taskRoutes from './routes/tasks.js';
 import uploadRoutes from './routes/uploads.js';
 import ttsRoutes from './routes/tts.js';
 import sttRoutes from './routes/stt.js';
+import claudeAccountRoutes from './routes/claude-accounts.js';
 import { requireAuth } from './middleware/auth.js';
 import { handleMcpRequest, handleMcpMethodNotAllowed } from './mcp/index.js';
 
@@ -40,6 +41,7 @@ app.use('/api', taskRoutes);
 app.use('/api', uploadRoutes);
 app.use('/api', ttsRoutes);
 app.use('/api', sttRoutes);
+app.use('/api', claudeAccountRoutes);
 
 // MCP endpoint — Bearer-token or cookie-authed, one stateless server per request.
 app.post('/mcp', requireAuth, handleMcpRequest);

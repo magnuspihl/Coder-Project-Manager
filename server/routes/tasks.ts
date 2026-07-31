@@ -1,5 +1,9 @@
 import { Router, Request, Response } from 'express';
 import { requireAuth, requireTaskAccess } from '../middleware/auth.js';
+import { getAccount } from '../services/claude-accounts.js';
+
+/** Sentinel meaning "use the target workspace's own `claude login`, not a CPM account". */
+const WORKSPACE_CLAUDE_ACCOUNT = 'workspace';
 import {
   listTasks,
   getTask,
@@ -18,6 +22,8 @@ import {
   getWorkingTaskCount,
   getMaxConcurrent,
   setPendingComplete,
+  setTaskClaudeAccount,
+  setTaskModel,
   resetTaskSession,
   addTaskParticipant,
   removeTaskParticipant,
@@ -74,10 +80,27 @@ router.get('/workspaces/:workspaceId/tasks', requireAuth, (req: Request, res: Re
 
 // Create a new task
 router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, res: Response) => {
-  const { prompt, model, caveman, attachmentIds, autoReview } = req.body;
+  const { prompt, model, claudeAccountId, caveman, attachmentIds, autoReview } = req.body;
   if (!prompt) {
     res.status(400).json({ error: 'Prompt is required' });
     return;
+  }
+
+  // Which Claude subscription to run on. An explicit id pins that account (only
+  // the caller's own — accounts are never shared); WORKSPACE_CLAUDE_ACCOUNT pins
+  // the workspace's own `claude login`. Left `undefined` when the field is absent
+  // so createTask applies the caller's default account, the same way MCP and
+  // task-request approval get it.
+  let requestedAccountId: string | null | undefined;
+  if (claudeAccountId === undefined) {
+    requestedAccountId = undefined;
+  } else if (typeof claudeAccountId !== 'string' || claudeAccountId === '' || claudeAccountId === WORKSPACE_CLAUDE_ACCOUNT) {
+    requestedAccountId = null;
+  } else if (!getAccount(claudeAccountId, req.user!.id)) {
+    res.status(404).json({ error: 'Unknown claudeAccountId' });
+    return;
+  } else {
+    requestedAccountId = claudeAccountId;
   }
 
   // Fetch workspace name, with token refresh on auth failure
@@ -118,6 +141,7 @@ router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, 
       username: req.user!.username,
       prompt,
       model: typeof model === 'string' ? model.trim() : undefined,
+      claudeAccountId: requestedAccountId,
       caveman: typeof caveman === 'string' && ['lite', 'full', 'ultra'].includes(caveman) ? caveman : undefined,
       source: req.authSource,
       clientLabel: req.clientLabel,
@@ -187,10 +211,11 @@ router.put('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
     return;
   }
 
-  if (req.body.position !== undefined) {
-    updateTaskPosition(task.id, req.body.position);
-  }
-
+  // Validate every field BEFORE writing any of them. Interleaving validation with
+  // writes let a request with one good field and one bad field return an error
+  // having already committed the good one — a partial update the caller has no way
+  // to detect from the 4xx response.
+  let newTitle: string | undefined;
   if (req.body.title !== undefined) {
     if (typeof req.body.title !== 'string') {
       res.status(400).json({ error: 'Title must be a string' });
@@ -205,8 +230,56 @@ router.put('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
       res.status(400).json({ error: 'Title must be 200 characters or fewer' });
       return;
     }
-    updateTaskTitle(task.id, trimmed);
+    newTitle = trimmed;
   }
+
+  // Switch the model mid-task. Takes effect on the next turn for the same reason
+  // the subscription switch does: each turn is a fresh `--resume` invocation and a
+  // session's transcript stores the model per message, so one conversation can
+  // span models.
+  let newModel: string | null | undefined;
+  if (req.body.model !== undefined) {
+    const value = req.body.model;
+    // Trim before every check so a whitespace-only value normalises to NULL (one
+    // representation of "default") rather than being stored as '', and so a long
+    // padded string isn't rejected for a length it doesn't really have.
+    const trimmed = typeof value === 'string' ? value.trim() : value;
+    if (trimmed === null || trimmed === '') {
+      newModel = null;
+    } else if (typeof trimmed !== 'string' || trimmed.length > 120) {
+      res.status(400).json({ error: 'model must be a string of 120 characters or fewer' });
+      return;
+    } else {
+      newModel = trimmed;
+    }
+  }
+
+  // Re-point the task at a different Claude subscription. Takes effect on the
+  // next turn (resume, reviewer, or advisor) — the currently running process
+  // keeps the token it launched with. This is the escape hatch for "this
+  // subscription is rate-limited, finish the task on the other one".
+  let newAccountId: string | null | undefined;
+  if (req.body.claudeAccountId !== undefined) {
+    const value = req.body.claudeAccountId;
+    if (value === null || value === '' || value === WORKSPACE_CLAUDE_ACCOUNT) {
+      newAccountId = null;
+    } else if (typeof value !== 'string' || !getAccount(value, task.user_id)) {
+      // Scoped to the task's owner, not the caller: the token is staged under the
+      // owner's identity at launch, so pinning an account the owner doesn't have
+      // would only fail later.
+      res.status(404).json({ error: 'Unknown claudeAccountId' });
+      return;
+    } else {
+      newAccountId = value;
+    }
+  }
+
+  if (req.body.position !== undefined) {
+    updateTaskPosition(task.id, req.body.position);
+  }
+  if (newTitle !== undefined) updateTaskTitle(task.id, newTitle);
+  if (newModel !== undefined) setTaskModel(task.id, newModel);
+  if (newAccountId !== undefined) setTaskClaudeAccount(task.id, newAccountId);
 
   res.json({ task: getTask(task.id) });
 });

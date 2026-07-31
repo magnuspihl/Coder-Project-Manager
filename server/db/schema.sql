@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   verification_url TEXT,
   branch TEXT,
   model TEXT,
+  claude_account_id TEXT,
   pending_complete INTEGER NOT NULL DEFAULT 0,
   source TEXT,
   client_label TEXT,
@@ -200,6 +201,28 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Claude accounts: subscription credentials CPM can inject into a task, so the
+-- Claude subscription a task burns is chosen by CPM rather than being fixed by
+-- whatever `claude login` the target workspace happens to hold. Tokens are
+-- minted with `claude setup-token` and stored encrypted (see services/secrets.ts).
+-- Accounts are per-user and never shared: a token here is a bearer credential for
+-- someone's paid subscription, and injecting one into a workspace hands it to
+-- anyone with a shell there. Every query scopes by user_id for that reason.
+CREATE TABLE IF NOT EXISTS claude_accounts (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  label TEXT NOT NULL,
+  token_enc TEXT NOT NULL,
+  token_hint TEXT NOT NULL,
+  is_default INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_used_at TEXT,
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_claude_accounts_user ON claude_accounts(user_id);
+
 -- Sessions table: server-side session storage
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
@@ -234,14 +257,21 @@ CREATE TABLE IF NOT EXISTS attachments (
 
 CREATE INDEX IF NOT EXISTS idx_attachments_task ON attachments(task_id);
 
--- Per-workspace rate limit tracking (persists across server restarts).
--- Each workspace uses its own Claude account, so session (five_hour) and
--- weekly (seven_day) limits are tracked separately per workspace.
+-- Rate limit tracking, keyed by the SUBSCRIPTION the usage was billed to
+-- (persists across server restarts). Session (five_hour) and weekly (seven_day)
+-- limits are tracked separately.
+--
+-- subscription_key is 'acct:<claude_account_id>' when the task ran on a
+-- CPM-held subscription, or 'ws:<workspace_name>' when it used the workspace's
+-- own `claude login`. It was previously just the workspace name, which assumed
+-- one subscription per workspace — no longer true now that a task can pick its
+-- subscription, and two tasks on one workspace using different subscriptions
+-- would otherwise overwrite each other's utilization.
 CREATE TABLE IF NOT EXISTS rate_limits (
-  workspace_name TEXT NOT NULL,
+  subscription_key TEXT NOT NULL,
   type TEXT NOT NULL,
   utilization REAL NOT NULL DEFAULT 0,
   resets_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  PRIMARY KEY (workspace_name, type)
+  PRIMARY KEY (subscription_key, type)
 );

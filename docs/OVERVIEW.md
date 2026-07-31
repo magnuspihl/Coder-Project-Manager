@@ -54,11 +54,23 @@ flowchart TB
 | **CPM** | Task queue, conversation history, streaming UI | Adds workflow that Coder doesn't provide |
 | **Claude Code** | Actually doing the work inside a workspace | CPM launches and resumes it; it runs *in* the workspace, not on the CPM server |
 
-**Key principle:** CPM implements *no* authorization of its own. It keeps the
-user's Coder token server-side in the SQLite `sessions` table; the browser holds
-only an opaque, httpOnly `session_id` cookie that keys into that row. Every Coder
-call is made with the stored token — so a user can only ever touch workspaces
-Coder already lets them touch.
+**Key principle:** CPM defers authorization to Coder wherever Coder has an
+opinion. It keeps the user's Coder token server-side in the SQLite `sessions`
+table; the browser holds only an opaque, httpOnly `session_id` cookie that keys
+into that row. Every Coder call is made with the stored token — so a user can
+only ever touch workspaces Coder already lets them touch.
+
+**The exception** is data CPM owns rather than mirrors from Coder. Coder has no
+opinion on these, so CPM scopes them itself:
+
+- **Tasks** are per-user — `requireTaskAccess` 404s a task belonging to someone
+  else, and `listTasks` filters by `user_id`.
+- **Claude subscription accounts** are per-user and never shared. A stored token
+  is a bearer credential for someone's paid subscription, and staging one into a
+  workspace exposes it to anyone with a shell there — so every read, write, and
+  resolve is scoped by `user_id`. Without that, any authenticated user could pin
+  someone else's subscription to a task in a workspace they control and read the
+  token out of the process environment.
 
 ---
 
@@ -251,6 +263,85 @@ while collaborating in the *host* task's conversation.
 
 ---
 
+## 5. Choosing the model and the Claude subscription
+
+By default the Claude subscription a task burns belongs to the **workspace** —
+whatever `claude login` was run inside it. CPM can override that per task, so one
+user with two subscriptions can decide which one pays for which work.
+
+```mermaid
+flowchart LR
+    A[Settings → Claude subscriptions<br/>paste `claude setup-token` output] --> B[(claude_accounts<br/>AES-256-GCM at rest)]
+    B --> C{Task launch}
+    C -->|pinned, via coder ssh| D[pipe token over ssh stdin<br/>into a 0600 file, read + rm]
+    C -->|pinned, local spawn| G[inherited child env<br/>never written to disk]
+    C -->|not pinned| E[workspace's own `claude login`]
+    D --> F[CLAUDE_CODE_OAUTH_TOKEN set<br/>claude -p --resume UUID --model X]
+    G --> F
+    E --> F
+```
+
+Both the **model** and the **subscription** are switchable mid-task. Each turn is
+a fresh `claude -p --resume <uuid>` invocation, and a session transcript records
+the model per assistant message rather than pinning one for its lifetime — so
+successive turns of one conversation can differ. A change applies from the next
+turn; the turn already running finishes on what it started with.
+
+Mechanics worth knowing:
+
+- Tokens come from `claude setup-token` (an `sk-ant-oat…` value). CPM cannot run
+  the browser OAuth flow itself, so the user pastes it.
+- Delivery depends on how the turn is started. Runs reached over **`coder ssh`**
+  get the token piped over the staging process's **stdin** into a 0600 file, which
+  the launch command reads into the environment and deletes immediately — SSH won't
+  forward environment variables, so a file is the only option. Runs spawned
+  **locally** (the CPM host, including advisors there) inherit it from the child's
+  environment and nothing is written to disk. Neither path puts the token in an
+  argv, so it can't appear in `ps` on either host or in CPM's logs.
+- **What that does not buy you.** Once exported, the value is readable via
+  `/proc/<pid>/environ` by anything running as that uid, for the whole session —
+  *longer* than the staged file exists. So the local path avoids leaving a
+  credential on disk but is not otherwise safer. The actual control is that
+  accounts are per-user and a token only ever goes to a workspace its owner may
+  use; on a genuinely shared host, a pinned subscription is visible to anyone with
+  a shell there either way.
+- The launch prefix `unset`s `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+  `ANTHROPIC_BASE_URL` and the Bedrock/Vertex switches first. Those take
+  precedence over `CLAUDE_CODE_OAUTH_TOKEN`, so a template that exports one would
+  otherwise silently bill a different account.
+- **Fail closed:** if a pinned subscription can't be prepared (deleted, wrong
+  owner, undecryptable, workspace unreachable, or unsafe to stage), the turn fails
+  with an explanatory message instead of falling back to the workspace's login.
+  Launch-failure paths remove anything they staged, so a token can't be left behind
+  by a spawn error or an aborted launch.
+- Rate limits are tracked per *subscription*, not per workspace — see
+  `rate_limits.subscription_key` (`acct:<id>` or `ws:<name>`).
+
+### Operational dependency: the encryption key
+
+Subscription tokens are encrypted at rest. The key is resolved in this order:
+
+1. `CPM_SECRET_KEY` — 64 hex characters (32 bytes). **Preferred for deployment**:
+   the key never lands on disk beside the database.
+2. Otherwise `secret.key`, generated once at 0600 in the *same directory as the
+   database* (derived from `DATABASE_PATH`, so a compiled run under `dist/` and a
+   dev run agree).
+
+Consequences to plan for:
+
+- **Restoring `cpm.db` without the matching key** leaves every stored token
+  undecryptable. Nothing else breaks and no task silently misruns — affected tasks
+  fail with a message telling the user to re-paste — but the tokens must be
+  re-added from `claude setup-token`. Back up the key alongside the database, or
+  set `CPM_SECRET_KEY` so there is nothing extra to back up.
+- A malformed `secret.key` is a hard error rather than being regenerated, so a
+  truncated write or half-restored backup can't quietly destroy the tokens.
+- The generated-key path protects against casual `.db` copies, **not** against
+  someone who can read the whole data directory — key and ciphertext live side by
+  side there. Use `CPM_SECRET_KEY` if that matters.
+
+---
+
 ## Summary
 
 ```mermaid
@@ -261,8 +352,9 @@ flowchart LR
 ```
 
 - **Coder** provides identity, workspaces, and the pipe to reach them.
-- **CPM** adds the queue, the conversation, and the real-time UI — delegating all
-  auth to Coder.
+- **CPM** adds the queue, the conversation, and the real-time UI — delegating auth
+  to Coder, and scoping the data Coder has no opinion on (tasks, subscriptions) by
+  user itself.
 - **Claude** runs *inside* each workspace, one resumable session per task (and per
   invited participant).
 - **Invited agents** collaborate through one shared log, passing turns with

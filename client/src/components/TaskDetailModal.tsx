@@ -10,6 +10,11 @@ import {
   resetTaskSession,
   compactTaskSession,
   updateTaskTitle,
+  getClaudeAccounts,
+  setTaskClaudeAccount,
+  setTaskModel,
+  getModels,
+  WORKSPACE_CLAUDE_ACCOUNT,
   interruptTask,
   cancelTask,
   deleteTask,
@@ -25,6 +30,8 @@ import {
   dismissTaskRequestForTask,
   updateTaskRequestTargetForTask,
   type Task,
+  type ClaudeAccount,
+  type ModelInfo,
   type Message,
   type StreamLogEntry,
   type TaskParticipant,
@@ -105,6 +112,18 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [sending, setSending] = useState(false);
   const [optimisticMessage, setOptimisticMessage] = useState<Message | null>(null);
   const [idCopied, setIdCopied] = useState(false);
+  const [claudeAccounts, setClaudeAccounts] = useState<ClaudeAccount[]>([]);
+  // Distinguishes "no accounts" from "haven't loaded / load failed", so a pinned
+  // account is never mislabelled as removed just because the fetch failed.
+  // Tri-state, not a boolean: a failed fetch must not be treated as "no accounts".
+  // A task pinned to an account still needs the switcher rendered so it can be
+  // re-pointed — that control is what AUTH_STAGING_MESSAGE tells the user to use —
+  // but we must not claim the pinned account was *removed* when we simply couldn't
+  // load the list.
+  const [accountsState, setAccountsState] = useState<'loading' | 'loaded' | 'failed'>('loading');
+  const [switchingAccount, setSwitchingAccount] = useState(false);
+  const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
+  const [switchingModel, setSwitchingModel] = useState(false);
   const [completing, setCompleting] = useState(false);
   const [reviewing, setReviewing] = useState(false);
   const [resetSessionOpen, setResetSessionOpen] = useState(false);
@@ -160,6 +179,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const maxStreamLogIdRef = useRef(0);
 
   const lastTaskJsonRef = useRef('');
+  // Bumped by every local edit to the task row so an in-flight poll can tell its
+  // response predates the edit and skip applying it. See loadData.
+  const editSeqRef = useRef(0);
   const lastMessagesJsonRef = useRef('');
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
@@ -224,6 +246,14 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   }, [useWhisper, recorder.stopRecording, speechRec.stopListening]);
 
   const loadData = async () => {
+    // Snapshot the edit counter before the await. A poll in flight across a local
+    // edit (title / model / subscription) carries the pre-edit row, which would
+    // overwrite the optimistic value and re-seed lastTaskJsonRef with stale JSON —
+    // making the control visibly snap back for a whole poll interval before
+    // self-healing. Edits bump the counter both before and after their request, so
+    // a poll started mid-request is invalidated too: its server read can predate
+    // the commit even though it began after the pre-bump.
+    const seqAtStart = editSeqRef.current;
     try {
       const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments, turns: newTurns, taskRequests: newTaskRequests } = await getTaskDetail(taskId);
       setTaskRequests(newTaskRequests || []);
@@ -233,7 +263,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       prevStatusRef.current = newTask.status;
       taskStatusRef.current = newTask.status;
       const taskJson = JSON.stringify(newTask);
-      if (taskJson !== lastTaskJsonRef.current) {
+      // Drop this response's task row if an edit landed while it was in flight;
+      // the next poll picks up the server's authoritative version.
+      if (taskJson !== lastTaskJsonRef.current && editSeqRef.current === seqAtStart) {
         lastTaskJsonRef.current = taskJson;
         setTask(newTask);
       }
@@ -306,6 +338,35 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     tick(); // Initial load + start chain
     return () => { cancelled = true; clearTimeout(timer); };
   }, [taskId]);
+
+  // CPM-held Claude subscriptions, so the header can offer a switch. Fetched once
+  // per open — the list changes only when the user edits it in settings.
+  useEffect(() => {
+    let cancelled = false;
+    setAccountsState('loading');
+    getClaudeAccounts()
+      .then(({ accounts }) => { if (!cancelled) { setClaudeAccounts(accounts); setAccountsState('loaded'); } })
+      .catch(() => { if (!cancelled) { setClaudeAccounts([]); setAccountsState('failed'); } });
+    return () => { cancelled = true; };
+  }, [taskId]);
+
+  // Model list for the mid-task model switcher. Needs the workspace (the Anthropic
+  // list is fetched through it), so it waits for the task to load. On failure the
+  // header falls back to a static chip rather than offering an empty picker.
+  const modelsWorkspaceId = task?.workspace_id;
+  useEffect(() => {
+    if (!modelsWorkspaceId) return;
+    let cancelled = false;
+    // Clear first: the Anthropic list is fetched over SSH with a 20s timeout, so on
+    // a cold cache the previous workspace's list would otherwise stay on screen for
+    // that whole window — offering models this workspace may not have, and marking
+    // valid ones "(unavailable)". Empty falls back to the static chip.
+    setAvailableModels([]);
+    getModels(modelsWorkspaceId)
+      .then(({ models }) => { if (!cancelled) setAvailableModels(models); })
+      .catch(() => { if (!cancelled) setAvailableModels([]); });
+    return () => { cancelled = true; };
+  }, [modelsWorkspaceId]);
 
   // Scroll to bottom on initial load and when new messages arrive
   useEffect(() => {
@@ -921,6 +982,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       return;
     }
     setSavingTitle(true);
+    editSeqRef.current++;
     try {
       const { task: updated } = await updateTaskTitle(taskId, trimmed);
       setTask(prev => (prev ? { ...prev, title: updated.title } : prev));
@@ -931,7 +993,58 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     } catch (err: any) {
       alert(err?.message || 'Failed to update title');
     } finally {
+      // Second bump: invalidates any poll that started during the request,
+      // whose server read may still predate the commit.
+      editSeqRef.current++;
       setSavingTitle(false);
+    }
+  };
+
+  /**
+   * Switch the model for the task's remaining turns. The turn currently running
+   * keeps the model it launched with — nothing interrupts it.
+   */
+  const handleChangeModel = async (value: string) => {
+    if (!task) return;
+    setSwitchingModel(true);
+    editSeqRef.current++;
+    try {
+      const { task: updated } = await setTaskModel(taskId, value || null);
+      setTask(prev => (prev ? { ...prev, model: updated.model } : prev));
+      lastTaskJsonRef.current = '';
+      onTaskChanged?.();
+    } catch (err: any) {
+      alert(err?.message || 'Failed to change model');
+    } finally {
+      // Second bump: invalidates any poll that started during the request,
+      // whose server read may still predate the commit.
+      editSeqRef.current++;
+      setSwitchingModel(false);
+    }
+  };
+
+  /**
+   * Move the task to a different Claude subscription. Applies from the next turn
+   * — the escape hatch when the current subscription hits its rate limit and you
+   * want to finish the task on the other one instead of waiting for the reset.
+   */
+  const handleChangeClaudeAccount = async (value: string) => {
+    if (!task) return;
+    const accountId = value === WORKSPACE_CLAUDE_ACCOUNT ? null : value;
+    setSwitchingAccount(true);
+    editSeqRef.current++;
+    try {
+      const { task: updated } = await setTaskClaudeAccount(taskId, accountId);
+      setTask(prev => (prev ? { ...prev, claude_account_id: updated.claude_account_id } : prev));
+      lastTaskJsonRef.current = '';
+      onTaskChanged?.();
+    } catch (err: any) {
+      alert(err?.message || 'Failed to change subscription');
+    } finally {
+      // Second bump: invalidates any poll that started during the request,
+      // whose server read may still predate the commit.
+      editSeqRef.current++;
+      setSwitchingAccount(false);
     }
   };
 
@@ -1295,7 +1408,42 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                     {task.status.replace('_', ' ')}
                   </span>
                   <span className="text-xs text-gray-400 dark:text-gray-500">{task.workspace_name}</span>
-                  {task.model && (
+                  {/* Model is switchable mid-task: each turn is a fresh
+                      `--resume` invocation and a session's transcript records the
+                      model per message, so one conversation can span models.
+                      Applies from the next turn — the running turn keeps its own.
+                      Falls back to a static chip until the model list loads, so
+                      the current model is never hidden. */}
+                  {availableModels.length > 0 ? (
+                    <select
+                      value={task.model ?? ''}
+                      onChange={(e) => handleChangeModel(e.target.value)}
+                      disabled={switchingModel}
+                      title="Model — applies from the next turn"
+                      className={`hidden sm:inline-block text-xs px-1.5 py-0.5 rounded font-medium border-0 focus:outline-none focus:ring-1 disabled:opacity-50 cursor-pointer ${
+                        task.model?.startsWith('ollama/')
+                          ? 'bg-green-50 dark:bg-green-900/20 text-green-600 dark:text-green-400 focus:ring-green-500'
+                          : 'bg-purple-50 dark:bg-purple-900/20 text-purple-600 dark:text-purple-400 focus:ring-purple-500'
+                      }`}
+                    >
+                      <option value="">default model</option>
+                      {(['anthropic', 'ollama-local', 'ollama-cloud'] as const)
+                        .filter(p => availableModels.some(m => m.provider === p))
+                        .map(p => (
+                          <optgroup key={p} label={p === 'anthropic' ? 'Claude' : p === 'ollama-local' ? 'Ollama (local)' : 'Ollama (cloud)'}>
+                            {availableModels.filter(m => m.provider === p).map(m => (
+                              <option key={m.id} value={m.id}>{m.display_name}</option>
+                            ))}
+                          </optgroup>
+                        ))}
+                      {/* A model that is no longer offered (renamed, or an Ollama
+                          model since removed) must stay selectable or the select
+                          would silently jump to "default model". */}
+                      {task.model && !availableModels.some(m => m.id === task.model) && (
+                        <option value={task.model}>{task.model} (unavailable)</option>
+                      )}
+                    </select>
+                  ) : task.model ? (
                     <span className={`hidden sm:inline-block text-xs px-1.5 py-0.5 rounded font-medium ${
                       task.model.startsWith('ollama/')
                         ? 'bg-green-50 dark:bg-green-900/20 text-green-600 dark:text-green-400'
@@ -1305,7 +1453,72 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         ? task.model.slice('ollama/'.length).replace(/:latest$/, '')
                         : task.model.replace(/^claude-/, '')}
                     </span>
-                  )}
+                  ) : null}
+                  {/* Which Claude subscription this task burns. Editable mid-task:
+                      the change lands on the next turn, so a rate-limited task can
+                      be finished on the other subscription. Hidden for Ollama
+                      models, which never reach Anthropic.
+
+                      Also shown when the task is pinned to an account that no
+                      longer exists, even with no accounts left — a pinned task
+                      fails every turn until it is re-pointed, so this control has
+                      to stay reachable to be the fix. That includes the case where
+                      the account list failed to load: still render it for a pinned
+                      task (so the escape hatch exists), but don't claim the account
+                      was removed, because we don't know. */}
+                  {accountsState !== 'loading'
+                    && (claudeAccounts.length > 0 || task.claude_account_id)
+                    // Suppressed for Ollama models, which never reach Anthropic —
+                    // but NOT when the task is actually pinned to an account.
+                    // Advisors stage the token regardless of the model, so a pinned
+                    // Ollama task can still fail on a dead pin, and hiding the
+                    // control would leave the failure message pointing at a control
+                    // that isn't rendered.
+                    && (!!task.claude_account_id || !task.model?.startsWith('ollama/'))
+                    && (() => {
+                    const pinnedId = task.claude_account_id;
+                    const known = claudeAccounts.some(a => a.id === pinnedId);
+                    // Only assert "removed" when the list actually loaded.
+                    const isDangling = accountsState === 'loaded' && !!pinnedId && !known;
+                    // Pinned, list unavailable — keep it usable without diagnosing.
+                    const isUnverifiable = accountsState === 'failed' && !!pinnedId && !known;
+                    const highlight = isDangling || isUnverifiable;
+                    return (
+                      <select
+                        value={pinnedId ?? WORKSPACE_CLAUDE_ACCOUNT}
+                        onChange={(e) => handleChangeClaudeAccount(e.target.value)}
+                        disabled={switchingAccount}
+                        title={isDangling
+                          ? 'This subscription was removed — pick another or switch to the workspace login to make this task runnable again'
+                          : isUnverifiable
+                            ? 'Could not load your subscriptions. This task is pinned to one; switch it to the workspace login if turns are failing.'
+                            : 'Claude subscription — applies from the next turn'}
+                        // Stays visible on narrow screens whenever the pin needs
+                        // attention: it is the only control that can make the task
+                        // runnable again, so hiding it below sm would strand the
+                        // task on a phone.
+                        className={`text-xs px-1.5 py-0.5 rounded font-medium border-0 focus:outline-none focus:ring-1 disabled:opacity-50 cursor-pointer ${
+                          isDangling
+                            ? 'inline-block bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 focus:ring-red-500'
+                            : isUnverifiable
+                              ? 'inline-block bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-400 focus:ring-amber-500'
+                              : 'hidden sm:inline-block bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-400 focus:ring-indigo-500'
+                        }`}
+                      >
+                        <option value={WORKSPACE_CLAUDE_ACCOUNT}>workspace login</option>
+                        {claudeAccounts.map((a) => (
+                          <option key={a.id} value={a.id}>{a.label}</option>
+                        ))}
+                        {/* Keeps the select controlled (and the state visible)
+                            rather than silently displaying the first option. */}
+                        {highlight && (
+                          <option value={pinnedId!}>
+                            {isDangling ? 'subscription removed' : 'pinned subscription'}
+                          </option>
+                        )}
+                      </select>
+                    );
+                  })()}
                   <button
                     onClick={() => {
                       navigator.clipboard.writeText(task.id);

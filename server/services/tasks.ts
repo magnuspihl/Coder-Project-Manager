@@ -1,6 +1,7 @@
 import { getDb } from '../db/index.js';
 import { v4 as uuid } from 'uuid';
 import { execFile } from 'child_process';
+import { getDefaultAccountId } from './claude-accounts.js';
 
 export interface Task {
   id: string;
@@ -16,6 +17,7 @@ export interface Task {
   failed_reason: string | null;
   verification_url: string | null;
   model: string | null;
+  claude_account_id: string | null;
   ssh_pid: number | null;
   git_branch: string | null;
   github_repo_url: string | null;
@@ -351,6 +353,13 @@ export function createTask(params: {
   prompt: string;
   projectDir?: string;
   model?: string;
+  /**
+   * Which Claude subscription to run on. `undefined` (omitted) resolves to the
+   * user's default account, so callers that know nothing about accounts — MCP
+   * create_task, task-request approval — still honour the user's choice. Pass an
+   * explicit `null` to mean "use the workspace's own `claude login`".
+   */
+  claudeAccountId?: string | null;
   caveman?: string;
   source?: string | null;
   clientLabel?: string | null;
@@ -359,6 +368,10 @@ export function createTask(params: {
   const db = getDb();
   const id = uuid();
   const claudeSessionId = uuid();
+
+  const claudeAccountId = params.claudeAccountId === undefined
+    ? getDefaultAccountId(params.userId)
+    : params.claudeAccountId;
 
   // Get next position for this workspace
   const maxPos = db
@@ -372,9 +385,9 @@ export function createTask(params: {
   const autoReview = params.autoReview === false ? 0 : 1;
 
   db.prepare(
-    `INSERT INTO tasks (id, workspace_id, workspace_name, user_id, title, prompt, status, position, project_dir, claude_session_id, model, caveman, source, client_label, auto_review)
-     VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(id, params.workspaceId, params.workspaceName, params.userId, title, params.prompt, position, params.projectDir || null, claudeSessionId, params.model || null, params.caveman || null, params.source || null, params.clientLabel || null, autoReview);
+    `INSERT INTO tasks (id, workspace_id, workspace_name, user_id, title, prompt, status, position, project_dir, claude_session_id, model, claude_account_id, caveman, source, client_label, auto_review)
+     VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(id, params.workspaceId, params.workspaceName, params.userId, title, params.prompt, position, params.projectDir || null, claudeSessionId, params.model || null, claudeAccountId, params.caveman || null, params.source || null, params.clientLabel || null, autoReview);
 
   // Store the initial prompt as a user message (inherits provenance from the task creation call)
   addMessage(id, 'user', params.prompt, undefined, params.username, undefined, params.source || null, params.clientLabel || null);
@@ -414,6 +427,34 @@ export function updateTaskTitle(taskId: string, newTitle: string): void {
   const db = getDb();
   db.prepare('UPDATE tasks SET title = ?, updated_at = ? WHERE id = ?').run(
     newTitle, new Date().toISOString(), taskId
+  );
+}
+
+/**
+ * Change the model a task runs on. NULL means the CLI's default.
+ *
+ * Safe to change mid-task: every turn is a fresh `claude -p --resume <session>`
+ * invocation, and a session transcript records the model per message rather than
+ * pinning one for its lifetime — so successive turns of the same conversation can
+ * use different models. Read fresh at each launch, so this applies from the next
+ * turn onward; the turn already running keeps the model it started with.
+ */
+export function setTaskModel(taskId: string, model: string | null): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET model = ?, updated_at = ? WHERE id = ?').run(
+    model, new Date().toISOString(), taskId
+  );
+}
+
+/**
+ * Pin the task to a CPM-held Claude subscription, or NULL to use the target
+ * workspace's own `claude login`. Read fresh at each launch, so a change applies
+ * from the next turn onward.
+ */
+export function setTaskClaudeAccount(taskId: string, accountId: string | null): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET claude_account_id = ?, updated_at = ? WHERE id = ?').run(
+    accountId, new Date().toISOString(), taskId
   );
 }
 

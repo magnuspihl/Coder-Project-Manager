@@ -1,5 +1,5 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
-import { createReadStream, createWriteStream } from 'fs';
+import { createReadStream, createWriteStream, promises as fsPromises } from 'fs';
 import { randomUUID } from 'crypto';
 import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, getLatestTaskTurn, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, type Task, type TaskParticipant } from './tasks.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
@@ -10,6 +10,7 @@ import { getAttachmentsByTask, type Attachment } from '../routes/uploads.js';
 import { writeCpmGuidelines } from './workspace-memory.js';
 import { buildMemoryMcpConfig, MEMORY_MCP_ALLOWED_TOOL, buildMemoryUsagePrompt } from './memory-mcp.js';
 import { getValidCoderTokenForUser, forceRefreshCoderTokenForUser } from './sessions.js';
+import { resolveAccountToken, markAccountUsed } from './claude-accounts.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
@@ -21,6 +22,56 @@ const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || '200';
 // verdict" message. Give it generous headroom (still bounded to cap cost).
 const REVIEWER_MAX_TURNS = process.env.CLAUDE_REVIEWER_MAX_TURNS || '100';
 const ALLOWED_TOOLS = process.env.CLAUDE_ALLOWED_TOOLS || 'Read,Edit,Write,Bash,Glob,Grep';
+/**
+ * Written to a run's exit file when the pinned Claude subscription token could not
+ * be loaded in the remote shell, so pollers can say why instead of reporting a
+ * bare "exited with code N". 111 is outside the range `claude` itself returns and
+ * outside the 126/127/128+N range the shell reserves.
+ */
+const AUTH_STAGING_EXIT_CODE = 111;
+
+/**
+ * Cleared from the remote shell before a pinned subscription token is exported.
+ *
+ * CLAUDE_CODE_OAUTH_TOKEN does NOT win against every other credential the CLI
+ * recognises — verified against the CLI: with both ANTHROPIC_AUTH_TOKEN and
+ * CLAUDE_CODE_OAUTH_TOKEN set, the failure is "401 Invalid bearer token", i.e.
+ * the former is used. Coder templates are free to export any of these into the
+ * agent environment, and CPM inherits that environment, so leaving them set would
+ * let a workspace-level credential silently bill a different account than the one
+ * the user pinned — the exact fail-open this feature exists to prevent, and
+ * invisible because the task would still succeed.
+ *
+ * ANTHROPIC_BASE_URL and the Bedrock/Vertex switches go too: they would send the
+ * pinned token to a different endpoint or provider entirely. The Ollama redirect
+ * is unaffected because it is only applied when no account is pinned, and it is
+ * exported after this prefix runs in any case.
+ */
+const COMPETING_ANTHROPIC_AUTH_VARS = [
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_CUSTOM_HEADERS',
+  'ANTHROPIC_DEFAULT_HEADERS',
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'AWS_BEARER_TOKEN_BEDROCK',
+  'ANTHROPIC_BEDROCK_BASE_URL',
+  'ANTHROPIC_VERTEX_BASE_URL',
+  'ANTHROPIC_VERTEX_PROJECT_ID',
+  'ANTHROPIC_FOUNDRY_API_KEY',
+  'ANTHROPIC_AWS_API_KEY',
+  'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR',
+] as const;
+
+/** Single source of truth, so the shell `unset` and the local env overlay agree. */
+const CLEAR_COMPETING_ANTHROPIC_AUTH = `unset ${COMPETING_ANTHROPIC_AUTH_VARS.join(' ')}; `;
+
+/** Shared so the implementer, reviewer, and advisor paths all explain it the same way. */
+const AUTH_STAGING_MESSAGE =
+  'The pinned Claude subscription token could not be loaded on the workspace, so the run was aborted ' +
+  "rather than falling back to the workspace's own Claude login. Re-test the subscription in " +
+  'Settings → Claude subscriptions, or switch this task to the workspace login.';
 const DISCUSSION_ALLOWED_TOOLS = 'Read,Edit,Write,MultiEdit,Bash,Glob,Grep,mcp__coder__coder_report_task';
 
 export const PORT_RANGE_START = parseInt(process.env.CPM_PORT_RANGE_START || '40000');
@@ -163,17 +214,30 @@ export function getRateLimitInfo(key: string): RateLimitInfo | undefined {
   return info;
 }
 
-// Per-workspace rate limit tracking — stores both five_hour and seven_day
-// separately for each workspace. Each workspace uses its own Claude account
-// with its own session/weekly limits. Persisted to SQLite so data survives
-// server restarts.
+// Rate limit tracking, keyed by the SUBSCRIPTION the usage was billed to rather
+// than by workspace. Stores five_hour and seven_day separately. Persisted to
+// SQLite so data survives server restarts.
+//
+// Keying by workspace was only valid while a workspace implied one Claude
+// account. Now that a task can pin its own subscription, two concurrent tasks on
+// one workspace using different subscriptions would overwrite each other's
+// utilization — corrupting the very number you'd consult to decide which
+// subscription to switch to.
 export interface RateLimitUsage {
   utilization: number; // 0-1 fraction
   resetsAt: number;    // Unix timestamp (seconds)
   updatedAt: number;   // Date.now() ms when last updated
 }
-// keyed by workspace name → (rateLimitType → usage)
-const workspaceRateLimits = new Map<string, Map<string, RateLimitUsage>>();
+// keyed by subscription key → (rateLimitType → usage)
+const subscriptionRateLimits = new Map<string, Map<string, RateLimitUsage>>();
+
+/**
+ * Identifies the credential a run's usage is billed to: a CPM-held subscription,
+ * or the target workspace's own `claude login`.
+ */
+export function subscriptionKeyFor(accountId: string | null | undefined, workspaceName: string): string {
+  return accountId ? `acct:${accountId}` : `ws:${workspaceName}`;
+}
 
 // Load persisted rate limits from DB on first access
 let rateLimitsLoaded = false;
@@ -182,14 +246,14 @@ function ensureRateLimitsLoaded(): void {
   rateLimitsLoaded = true;
   try {
     const db = getDb();
-    const rows = db.prepare('SELECT workspace_name, type, utilization, resets_at, updated_at FROM rate_limits').all() as Array<{
-      workspace_name: string; type: string; utilization: number; resets_at: number; updated_at: number;
+    const rows = db.prepare('SELECT subscription_key, type, utilization, resets_at, updated_at FROM rate_limits').all() as Array<{
+      subscription_key: string; type: string; utilization: number; resets_at: number; updated_at: number;
     }>;
     for (const row of rows) {
-      let limits = workspaceRateLimits.get(row.workspace_name);
+      let limits = subscriptionRateLimits.get(row.subscription_key);
       if (!limits) {
         limits = new Map();
-        workspaceRateLimits.set(row.workspace_name, limits);
+        subscriptionRateLimits.set(row.subscription_key, limits);
       }
       limits.set(row.type, {
         utilization: row.utilization,
@@ -203,26 +267,26 @@ function ensureRateLimitsLoaded(): void {
   }
 }
 
-function persistRateLimit(workspaceName: string, type: string, usage: RateLimitUsage): void {
+function persistRateLimit(subscriptionKey: string, type: string, usage: RateLimitUsage): void {
   try {
     const db = getDb();
     db.prepare(
-      'INSERT INTO rate_limits (workspace_name, type, utilization, resets_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(workspace_name, type) DO UPDATE SET utilization=excluded.utilization, resets_at=excluded.resets_at, updated_at=excluded.updated_at'
-    ).run(workspaceName, type, usage.utilization, usage.resetsAt, usage.updatedAt);
+      'INSERT INTO rate_limits (subscription_key, type, utilization, resets_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(subscription_key, type) DO UPDATE SET utilization=excluded.utilization, resets_at=excluded.resets_at, updated_at=excluded.updated_at'
+    ).run(subscriptionKey, type, usage.utilization, usage.resetsAt, usage.updatedAt);
   } catch {
     // Non-critical — best effort persistence
   }
 }
 
-function updateWorkspaceUsage(workspaceName: string, info: { utilization?: number; rateLimitType?: string; resetsAt?: number }): void {
+function updateSubscriptionUsage(subscriptionKey: string, info: { utilization?: number; rateLimitType?: string; resetsAt?: number }): void {
   // Only track when we have a limit type and a reset window to attribute to.
   if (!info.rateLimitType || !info.resetsAt) return;
   ensureRateLimitsLoaded();
   const now = Date.now();
-  let limits = workspaceRateLimits.get(workspaceName);
+  let limits = subscriptionRateLimits.get(subscriptionKey);
   if (!limits) {
     limits = new Map();
-    workspaceRateLimits.set(workspaceName, limits);
+    subscriptionRateLimits.set(subscriptionKey, limits);
   }
 
   const existing = limits.get(info.rateLimitType);
@@ -237,7 +301,7 @@ function updateWorkspaceUsage(workspaceName: string, info: { utilization?: numbe
       updatedAt: now,
     };
     limits.set(info.rateLimitType, usage);
-    persistRateLimit(workspaceName, info.rateLimitType, usage);
+    persistRateLimit(subscriptionKey, info.rateLimitType, usage);
   }
 
   // When we see any rate limit event, seed the other limit type if missing
@@ -247,30 +311,56 @@ function updateWorkspaceUsage(workspaceName: string, info: { utilization?: numbe
     // Use a far-future resetsAt so it shows as active/indeterminate
     const seed: RateLimitUsage = { utilization: 0, resetsAt: Math.floor(now / 1000) + 86400 * 7, updatedAt: now };
     limits.set(otherType, seed);
-    persistRateLimit(workspaceName, otherType, seed);
+    persistRateLimit(subscriptionKey, otherType, seed);
   }
 }
 
-// Returns rate limits keyed by workspace name, each mapping limit type
-// (five_hour / seven_day) → usage.
-export function getWorkspaceRateLimits(): Record<string, Record<string, RateLimitUsage>> {
+/**
+ * Usage for one subscription key, with expired periods zeroed. Shared by the
+ * workspace-login and per-account views so both apply the same reset handling.
+ */
+function usageForSubscription(subscriptionKey: string): Record<string, RateLimitUsage> | undefined {
+  const limits = subscriptionRateLimits.get(subscriptionKey);
+  if (!limits) return undefined;
+  const now = Date.now();
+  const out: Record<string, RateLimitUsage> = {};
+  for (const [type, usage] of limits) {
+    if (usage.resetsAt * 1000 <= now) {
+      // Reset period has passed — clear stale utilization in the actual map so it
+      // isn't carried over when new events arrive without utilization.
+      const reset = { ...usage, utilization: 0 };
+      limits.set(type, reset);
+      out[type] = reset;
+    } else {
+      out[type] = usage;
+    }
+  }
+  return out;
+}
+
+/**
+ * Usage for one subscription key. Returns undefined when nothing has been
+ * observed for it yet.
+ */
+export function getSubscriptionUsage(subscriptionKey: string): Record<string, RateLimitUsage> | undefined {
+  ensureRateLimitsLoaded();
+  return usageForSubscription(subscriptionKey);
+}
+
+/** Every subscription key usage has been observed for. */
+export function getObservedSubscriptionKeys(): string[] {
+  ensureRateLimitsLoaded();
+  return [...subscriptionRateLimits.keys()];
+}
+
+/** Rate limits for CPM-held subscriptions, keyed by claude_accounts.id. */
+export function getAccountRateLimits(): Record<string, Record<string, RateLimitUsage>> {
   ensureRateLimitsLoaded();
   const result: Record<string, Record<string, RateLimitUsage>> = {};
-  const now = Date.now();
-  for (const [workspaceName, limits] of workspaceRateLimits) {
-    const wsResult: Record<string, RateLimitUsage> = {};
-    for (const [type, usage] of limits) {
-      if (usage.resetsAt * 1000 <= now) {
-        // Reset period has passed — clear stale utilization in the actual map
-        // so it doesn't get carried over when new events arrive without utilization
-        const reset = { ...usage, utilization: 0 };
-        limits.set(type, reset);
-        wsResult[type] = reset;
-      } else {
-        wsResult[type] = usage;
-      }
-    }
-    result[workspaceName] = wsResult;
+  for (const key of subscriptionRateLimits.keys()) {
+    if (!key.startsWith('acct:')) continue;
+    const usage = usageForSubscription(key);
+    if (usage) result[key.slice('acct:'.length)] = usage;
   }
   return result;
 }
@@ -905,6 +995,172 @@ async function buildCoderEnv(userId?: string | null, extra?: NodeJS.ProcessEnv):
   return env;
 }
 
+/**
+ * What a caller needs in order to run a turn on a pinned Claude subscription.
+ * `prefix` is '' and the rest absent when no account is pinned.
+ */
+interface AccountAuth {
+  /** Shell text to prepend to the launch command. */
+  prefix: string;
+  /** Env overlay for the child process. Local launches only — see below. */
+  env?: NodeJS.ProcessEnv;
+  /** Best-effort removal of anything staged, for launch-failure paths. */
+  cleanup?: () => void;
+}
+
+const NO_ACCOUNT_AUTH: AccountAuth = { prefix: '' };
+
+/**
+ * Make a CPM-held Claude subscription token available to a turn.
+ *
+ * The Claude Code CLI prefers CLAUDE_CODE_OAUTH_TOKEN over its own on-disk
+ * `claude login`, which is what makes the override work: the subscription a task
+ * burns becomes CPM's choice rather than a property of the target workspace.
+ *
+ * Two delivery mechanisms, chosen by how the caller starts the turn:
+ *
+ * - **Locally spawned child** (`bash -c`, i.e. the CPM host): the token goes into
+ *   the child's inherited environment and is never written to disk. The overlay
+ *   also strips the competing Anthropic credentials so they never reach the child.
+ * - **Over `coder ssh`**: piped over the staging process's stdin into a 0600 file,
+ *   because SSH will not forward arbitrary environment variables. The launch
+ *   command reads the file into the environment and deletes it immediately.
+ *
+ * Neither mechanism puts the token in an argv, so it can't appear in `ps` on either
+ * host or in CPM's own logs.
+ *
+ * **What this does NOT protect against.** Once exported, the value is inherited by
+ * claude and every process it starts (MCP servers, build scripts, dev servers) and
+ * is readable via /proc/<pid>/environ by anyone running as that uid, for the whole
+ * session. That is inherent to env-var auth and is *longer-lived* than the staged
+ * file, which exists for seconds. So the env path is not a security upgrade over
+ * the file path — it simply avoids leaving a credential on disk. The real control
+ * is that accounts are per-user and a token is only ever handed to a workspace its
+ * owner is entitled to use. On a genuinely shared host, a pinned subscription is
+ * visible to anyone with a shell there either way.
+ *
+ * THROWS when an account is pinned but cannot be prepared: silently continuing
+ * would run the task on whichever subscription the workspace happens to be logged
+ * into, which is the opposite of the control the user asked for (and could bill
+ * someone else).
+ */
+async function buildAccountAuth(
+  workspaceName: string,
+  accountId: string | null | undefined,
+  ownerUserId: string,
+  tokenFile: string,
+  exitFile: string,
+  /**
+   * How the caller will start the turn — it must match, because only a locally
+   * spawned child can inherit an env overlay. Passed explicitly rather than
+   * inferred from the workspace name, because the advisor path always goes through
+   * `coder ssh` even when its target happens to be the local workspace.
+   */
+  delivery: 'env' | 'file',
+  logPrefix = '[claude-accounts]',
+): Promise<AccountAuth> {
+  const resolved = resolveAccountToken(accountId, ownerUserId);
+  if (!resolved) return NO_ACCOUNT_AUTH;
+
+  // Internal invariant, not a security boundary: every caller that targets the CPM
+  // host spawns its child locally and can therefore use env delivery, which avoids
+  // putting a credential in that host's shared /tmp. It does NOT reduce the /proc
+  // exposure — see the note above — so this is a "use the better mechanism you
+  // already have" assertion rather than a refusal to run.
+  if (delivery === 'file' && isLocalWorkspace(workspaceName)) {
+    throw new Error(
+      `Internal error: file delivery requested for Claude subscription "${resolved.label}" on the ` +
+      `CPM host (${workspaceName}). Local launches must use env delivery.`,
+    );
+  }
+
+  // Fail-closed guard shared by both mechanisms: if the variable didn't make it
+  // into the shell, abort instead of letting the CLI fall back to the workspace's
+  // own login. Writing the exit file before exiting is what lets the poller see
+  // the failure — `echo $? > exitFile` at the end of the launch command never runs
+  // once we exit here.
+  const guard =
+    `if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then ` +
+    `echo ${AUTH_STAGING_EXIT_CODE} > ${shellEscape(exitFile)}; exit ${AUTH_STAGING_EXIT_CODE}; fi; `;
+
+  const announce = () => {
+    markAccountUsed(resolved.id);
+    console.log(`${logPrefix} Using CPM Claude account "${resolved.label}" (…${resolved.token.slice(-4)}) on ${workspaceName}`);
+  };
+
+  if (delivery === 'env') {
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const key of COMPETING_ANTHROPIC_AUTH_VARS) delete env[key];
+    env.CLAUDE_CODE_OAUTH_TOKEN = resolved.token;
+    announce();
+    // No `unset` needed — the overlay already excludes the competing vars — but
+    // keep it so the guard's contract is identical on both paths.
+    return { prefix: CLEAR_COMPETING_ANTHROPIC_AUTH + guard, env };
+  }
+
+  const coderEnv = await buildCoderEnv(ownerUserId);
+  const bytes = Buffer.byteLength(resolved.token, 'utf8');
+  // Sweep tokens stranded by earlier launches that never reached the shell. The
+  // launch-failure paths clean up their own file explicitly (see cleanup below);
+  // this catches anything a hard crash left behind.
+  const sweep = `find /tmp -maxdepth 1 -name 'cpm-auth-*.token' -mmin +10 -delete 2>/dev/null; `;
+
+  await new Promise<void>((resolve, reject) => {
+    // `head -c` exits on byte count rather than waiting for an stdin EOF that
+    // `coder ssh` does not reliably propagate (same reason as file transfers).
+    const proc = spawn('coder', [
+      'ssh', workspaceName, '--',
+      `${sweep}umask 077 && head -c ${bytes} > ${shellEscape(tokenFile)}`,
+    ], { env: coderEnv, stdio: ['pipe', 'ignore', 'pipe'] });
+
+    const timer = setTimeout(() => {
+      proc.kill('SIGKILL');
+      reject(new Error(`Timed out staging the token for Claude subscription "${resolved.label}"`));
+    }, 30_000);
+
+    // Must be drained, not just piped: an unread stderr pipe fills its buffer
+    // and blocks the child, which would turn a chatty `coder ssh` into a 30s
+    // timeout. Capped so a flood can't grow unboundedly.
+    let stderr = '';
+    proc.stderr?.on('data', (chunk: Buffer) => {
+      if (stderr.length < 2000) stderr += chunk.toString();
+    });
+
+    proc.stdin.on('error', () => {}); // remote may close stdin once satisfied
+    proc.stdin.end(resolved.token);
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(
+        `Could not stage the token for Claude subscription "${resolved.label}" on ${workspaceName} ` +
+        `(exit ${code})${stderr.trim() ? `: ${stderr.trim().slice(0, 300)}` : ''}`,
+      ));
+    });
+    proc.on('error', (err) => { clearTimeout(timer); reject(err); });
+  });
+
+  announce();
+
+  const f = shellEscape(tokenFile);
+  // `export VAR="$(cat f)"` cannot detect a missing file on its own: it reports
+  // export's status, not the substitution's (shellcheck SC2155), hence the
+  // explicit `-s` test. `rm` runs before claude so the file is gone for the whole
+  // session; the value survives in the exported variable.
+  return {
+    prefix:
+      CLEAR_COMPETING_ANTHROPIC_AUTH +
+      `if [ ! -s ${f} ]; then echo ${AUTH_STAGING_EXIT_CODE} > ${shellEscape(exitFile)}; exit ${AUTH_STAGING_EXIT_CODE}; fi; ` +
+      `export CLAUDE_CODE_OAUTH_TOKEN="$(cat ${f})"; rm -f ${f}; ` +
+      guard,
+    cleanup: () => {
+      // Fire-and-forget: the launch never reached the shell, so its in-band `rm`
+      // will not run and the staged token would otherwise sit there until some
+      // later pinned launch to this same workspace happened to sweep it.
+      sshExec(workspaceName, `rm -f ${f}`, 10000, ownerUserId).catch(() => {});
+    },
+  };
+}
+
 /** Heuristic: does this coder-CLI stderr indicate an authentication failure? */
 function isCoderAuthFailure(stderr: string): boolean {
   if (!stderr) return false;
@@ -1030,6 +1286,15 @@ function remoteOutputPath(taskId: string): string {
 /** Remote path for task exit code file */
 function remoteExitCodePath(taskId: string): string {
   return `/tmp/cpm-task-${taskId}.exit`;
+}
+
+/**
+ * Remote path where a CPM Claude subscription token is staged before launch.
+ * Unique per launch so concurrent runs on one workspace can't read each other's
+ * token, and short-lived — the launch command deletes it after exporting.
+ */
+function remoteAuthTokenPath(scope: string): string {
+  return `/tmp/cpm-auth-${scope}-${randomUUID()}.token`;
 }
 
 /**
@@ -1162,6 +1427,15 @@ export async function processQueue(workspaceId: string): Promise<void> {
  * Output is written directly to a remote file which we poll via startFilePolling().
  */
 async function launchTask(task: Task, isResume = false, feedback?: string): Promise<void> {
+  // Re-read the fields the user can change between turns, so "applies from the
+  // next turn" is a guarantee rather than a side effect of every caller happening
+  // to load the row fresh. resumeTask, for instance, re-reads the row for its
+  // status check but forwards the caller's original object.
+  {
+    const fresh = getTask(task.id);
+    if (fresh) task = { ...task, model: fresh.model, claude_account_id: fresh.claude_account_id };
+  }
+
   const rawPrompt = isResume && feedback ? feedback : task.prompt;
 
   // Slash commands (e.g. /compact) must reach Claude Code as the bare prompt —
@@ -1448,6 +1722,9 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   console.log('[claude-executor] Model:', task.model || '(default)', isOllama ? `→ Ollama (${actualModel})` : '');
   console.log('[claude-executor] Remote cmd:', remoteCmd.slice(0, 300));
 
+  // Declared outside the try so the catch below can clean up anything staged.
+  let accountAuth: AccountAuth = NO_ACCOUNT_AUTH;
+
   try {
     // Re-read status immediately before we commit to spawning. If the task
     // was cancelled/deleted between the caller's check and here, bail out
@@ -1464,6 +1741,27 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     if (workingCount >= maxConcurrent) {
       console.log(`[claude-executor] Refusing to launch ${task.id}: workspace at concurrency limit ${maxConcurrent}`);
       return;
+    }
+
+    // Override which Claude subscription this task authenticates with, if one is
+    // pinned. Ollama tasks don't touch Anthropic at all, so skip them. Staged
+    // only once the launch is committed — the aborts above return without
+    // spawning, and the launch command is what deletes the staged file, so
+    // staging earlier would strand a token on the workspace. Also runs after the
+    // remoteCmd log above, so the token can never reach the console. A failure
+    // here throws into the catch below, failing the task rather than quietly
+    // running it on the workspace's own subscription.
+    if (!isOllama) {
+      accountAuth = await buildAccountAuth(
+        task.workspace_name,
+        task.claude_account_id,
+        task.user_id,
+        remoteAuthTokenPath(`task-${task.id}`),
+        exitFile,
+        isLocalWorkspace(task.workspace_name) ? 'env' : 'file',
+        '[claude-executor]',
+      );
+      remoteCmd = accountAuth.prefix + remoteCmd;
     }
 
     updateTaskStatus(task.id, 'working');
@@ -1500,7 +1798,9 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     // otherwise via coder ssh so it runs inside the remote workspace.
     const sshProcess = isLocalWorkspace(task.workspace_name)
       ? spawn('bash', ['-c', remoteCmd], {
-          env: { ...process.env },
+          // accountAuth.env carries the pinned token for local launches, which is
+          // why it is passed by inheritance rather than written to a shared /tmp.
+          env: accountAuth.env ?? { ...process.env },
           stdio: 'ignore',
           detached: true,
         })
@@ -1517,6 +1817,8 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     // failed and free the queue instead.
     sshProcess.on('error', (err) => {
       console.error('[claude-executor] Spawn error:', (err as Error).message);
+      // The launch command never ran, so its in-band `rm` never will either.
+      accountAuth.cleanup?.();
       activeProcesses.delete(task.id);
       stopPolling(task.id);
       addMessage(task.id, 'system', `Error: failed to start Claude process: ${(err as Error).message}`);
@@ -1544,6 +1846,9 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   } catch (err) {
     const errorMsg = (err as Error).message || 'Failed to launch Claude';
     console.error('[claude-executor] Launch failed:', errorMsg);
+    // Anything staged before the failure would otherwise linger until some later
+    // pinned launch to the same workspace happened to sweep it.
+    accountAuth.cleanup?.();
     addMessage(task.id, 'system', `Error: ${errorMsg}`);
     updateTaskStatus(task.id, 'failed', errorMsg);
     processQueue(task.workspace_id).catch(() => {});
@@ -1804,7 +2109,15 @@ export async function reconnectWorkingTasks(): Promise<void> {
                 updateTaskStatus(task.id, 'queued');
               }
             } else {
-              updateTaskStatus(task.id, 'failed', `Claude exited with code ${exitCode}`);
+              // Third consumer of a run's exit code (alongside the live poller and
+              // the reviewer), so it needs the same staging-failure translation —
+              // otherwise a restart during a credential abort surfaces only a bare
+              // code, with no message in the transcript at all.
+              const errorMsg = exitCode === AUTH_STAGING_EXIT_CODE
+                ? AUTH_STAGING_MESSAGE
+                : `Claude exited with code ${exitCode}`;
+              addMessage(task.id, 'system', `Error: ${errorMsg}`);
+              updateTaskStatus(task.id, 'failed', errorMsg);
             }
           } else {
             // SSH process gone with no exit code. The CLI may have hung post-result
@@ -1964,7 +2277,9 @@ function startFilePolling(task: Task, implementerTurnId?: string | null): void {
       if (event.type === 'rate_limit_event') {
         const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string; status?: string; utilization?: number } | undefined;
         if (info) {
-          updateWorkspaceUsage(task.workspace_name, info);
+          // Bill the usage to the subscription this run actually authenticated
+          // with, not the workspace — they diverge whenever a task pins an account.
+          updateSubscriptionUsage(subscriptionKeyFor(task.claude_account_id, task.workspace_name), info);
           if (info.status === 'rate_limited' && info.resetsAt && info.resetsAt * 1000 > Date.now()) {
             rateLimitInfo.set(task.id, { resetsAt: info.resetsAt, rateLimitType: info.rateLimitType || 'unknown' });
           }
@@ -2138,7 +2453,9 @@ function startFilePolling(task: Task, implementerTurnId?: string | null): void {
             updateTaskStatus(task.id, 'queued');
           }
         } else {
-          const errorMsg = `Claude exited with code ${exitCode}`;
+          const errorMsg = exitCode === AUTH_STAGING_EXIT_CODE
+            ? AUTH_STAGING_MESSAGE
+            : `Claude exited with code ${exitCode}`;
           addMessage(task.id, 'system', `Error: ${errorMsg}`);
           updateTaskStatus(task.id, 'failed', errorMsg);
         }
@@ -2276,6 +2593,15 @@ async function executeReviewer(
   reviewerSessionId: string,
   opts: ExecuteReviewerOpts,
 ): Promise<void> {
+  // Same fresh read as launchTask: the reviewer inherits the implementer's model
+  // and subscription, and one of this function's callers is the wrap-up resume,
+  // whose task object was captured in a poller closure before the reviewer turn
+  // began — long enough for the user to have switched either.
+  {
+    const fresh = getTask(task.id);
+    if (fresh) task = { ...task, model: fresh.model, claude_account_id: fresh.claude_account_id };
+  }
+
   const claudeParts: string[] = [];
   claudeParts.push('claude');
   claudeParts.push('-p', shellEscape(opts.prompt));
@@ -2330,7 +2656,26 @@ async function executeReviewer(
 
   console.log(`[auto-review] ${opts.resume ? 'Resuming' : 'Launching'} reviewer for task ${task.id}`);
 
+  // Declared outside the try so the catch below can clean up anything staged.
+  let accountAuth: AccountAuth = NO_ACCOUNT_AUTH;
+
   try {
+    // The reviewer runs on the same subscription as the implementer, matching
+    // how it already inherits the implementer's model. A staging failure throws
+    // into the catch below, which returns the task to the user.
+    if (!isOllama) {
+      accountAuth = await buildAccountAuth(
+        task.workspace_name,
+        task.claude_account_id,
+        task.user_id,
+        remoteAuthTokenPath(`review-${task.id}`),
+        exitFile,
+        isLocalWorkspace(task.workspace_name) ? 'env' : 'file',
+        '[auto-review]',
+      );
+      remoteCmd = accountAuth.prefix + remoteCmd;
+    }
+
     // Archive the previous reviewer run's output/exit files in a SEPARATE,
     // AWAITED step before spawning — mirroring the implementer (launchTask).
     // The remote command's own `rm -f` is in-band and only runs once the
@@ -2353,7 +2698,13 @@ async function executeReviewer(
     }
 
     const sshProcess = isLocalWorkspace(task.workspace_name)
-      ? spawn('bash', ['-c', remoteCmd], { env: { ...process.env }, stdio: 'ignore', detached: true })
+      ? spawn('bash', ['-c', remoteCmd], {
+          // See buildAccountAuth: local launches receive the pinned token by
+          // inheritance rather than through a file in a shared /tmp.
+          env: accountAuth.env ?? { ...process.env },
+          stdio: 'ignore',
+          detached: true,
+        })
       : spawn('coder', ['ssh', task.workspace_name, '--', remoteCmd], {
           env: await buildCoderEnv(task.user_id),
           stdio: 'ignore',
@@ -2365,6 +2716,7 @@ async function executeReviewer(
     // recovery: fail the reviewer turn and return the task to the user.
     sshProcess.on('error', (err) => {
       console.error('[auto-review] Spawn error:', (err as Error).message);
+      accountAuth.cleanup?.(); // launch command never ran; its in-band `rm` won't either
       stopPolling(`review:${task.id}`);
       completeTaskTurn(turnId, 'fail', `Reviewer launch failed: ${(err as Error).message}`);
       setActiveTaskTurnRole(task.id, null);
@@ -2377,6 +2729,7 @@ async function executeReviewer(
   } catch (err) {
     const errorMsg = (err as Error).message || 'Failed to launch reviewer';
     console.error('[auto-review] Launch failed:', errorMsg);
+    accountAuth.cleanup?.();
     completeTaskTurn(turnId, 'fail', `Reviewer launch failed: ${errorMsg}`);
     setActiveTaskTurnRole(task.id, null);
     updateTaskStatus(task.id, 'awaiting_feedback');
@@ -2467,6 +2820,27 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
       }
 
       const done = exitPart !== 'RUNNING' && exitPart !== '';
+
+      // A credential-staging abort produces no output at all, which would
+      // otherwise read as "the reviewer ran but emitted no verdict" — burning a
+      // wrap-up retry and then presenting the task as reviewed when it never was.
+      // Report it as the failure it is and hand the task back to the user.
+      if (done && !finalized && parseInt(exitPart, 10) === AUTH_STAGING_EXIT_CODE) {
+        finalized = true;
+        stopPolling(pollKey);
+        console.error(`[auto-review] Reviewer for task ${task.id} aborted: could not load the pinned subscription token`);
+        completeTaskTurn(turnId, 'fail', 'Reviewer could not load the pinned Claude subscription token');
+        addMessage(task.id, 'system', `Error: ${AUTH_STAGING_MESSAGE}`);
+        // Matches every other hand-back-to-user path: a residual count from
+        // earlier fail verdicts would otherwise escalate a loop early on the
+        // user's next turn.
+        resetReviewLoopCount(task.id);
+        setActiveTaskTurnRole(task.id, null);
+        updateTaskStatus(task.id, 'awaiting_feedback');
+        processQueue(task.workspace_id).catch(() => {});
+        return;
+      }
+
       if (done && !finalized) {
         finalized = true;
         stopPolling(pollKey);
@@ -3028,6 +3402,14 @@ export async function launchTaskParticipant(
   message: string,
   isResume: boolean,
 ): Promise<void> {
+  // Same fresh read as launchTask and executeReviewer, so "applies from the next
+  // turn" is guaranteed for advisors too rather than depending on every caller
+  // happening to pass a freshly loaded row.
+  {
+    const fresh = getTask(task.id);
+    if (fresh) task = { ...task, model: fresh.model, claude_account_id: fresh.claude_account_id };
+  }
+
   const catchUp = buildTaskParticipantContext(task.id, participant.id);
 
   // Same inline nudge the host gets — participants also default to writing
@@ -3107,9 +3489,34 @@ export async function launchTaskParticipant(
 
   console.log('[task-participant] Launching on workspace:', participant.workspace_name, 'for task:', task.id);
 
+  // Declared outside the try so the catch below can clean up anything staged.
+  let accountAuth: AccountAuth = NO_ACCOUNT_AUTH;
+
   try {
     const pollKey = `task-p:${participant.id}`;
     taskActivity.set(pollKey, { timestamp: new Date().toISOString(), summary: 'Starting advisory session' });
+
+    // Advisors run on a different workspace than the task, but the subscription
+    // override belongs to CPM rather than the workspace — so it follows the task.
+    // Inside the try so a staging failure surfaces as a system message instead of
+    // silently advising on the advisor workspace's own subscription.
+    //
+    // Deliberately NOT gated on an Ollama model the way the implementer and
+    // reviewer are: advisors never pass `--model` and never point
+    // ANTHROPIC_BASE_URL at Ollama, so they always talk to Anthropic even when the
+    // task itself is running on a local model. Skipping staging here would let an
+    // Ollama task's advisors quietly use the advisor workspace's own subscription.
+    accountAuth = await buildAccountAuth(
+      participant.workspace_name,
+      task.claude_account_id,
+      task.user_id,
+      remoteAuthTokenPath(`task-p-${participant.id}`),
+      exitFile,
+      isLocalWorkspace(participant.workspace_name) ? 'env' : 'file',
+      '[task-participant]',
+    );
+    remoteCmd = accountAuth.prefix + remoteCmd;
+
     try {
       await sshExec(participant.workspace_name,
         `mv -f ${shellEscape(outputFile)} ${shellEscape(outputFile + '.prev')} 2>/dev/null; ` +
@@ -3118,15 +3525,28 @@ export async function launchTaskParticipant(
     } catch { /* */ }
 
     const ghToken = await fetchGitHubToken().catch(() => null);
-    const sshProcess = spawn('coder', ['ssh', participant.workspace_name, '--', remoteCmd], {
-      env: await buildCoderEnv(task.user_id, ghToken ? { GH_TOKEN: ghToken } : undefined),
-      stdio: 'ignore',
-      detached: true,
-    });
+    // An advisor on the CPM host runs locally, like launchTask/executeReviewer, so
+    // it can inherit the pinned token from its environment. Routing it through
+    // `coder ssh` instead would force file delivery into a shared /tmp for no gain.
+    const sshProcess = isLocalWorkspace(participant.workspace_name)
+      ? spawn('bash', ['-c', remoteCmd], {
+          env: {
+            ...(accountAuth.env ?? process.env),
+            ...(ghToken ? { GH_TOKEN: ghToken } : {}),
+          },
+          stdio: 'ignore',
+          detached: true,
+        })
+      : spawn('coder', ['ssh', participant.workspace_name, '--', remoteCmd], {
+          env: await buildCoderEnv(task.user_id, ghToken ? { GH_TOKEN: ghToken } : undefined),
+          stdio: 'ignore',
+          detached: true,
+        });
     // Handle async spawn failure so it can't crash the server as an unhandled
     // 'error' event (spawn() has already returned, so the try/catch won't catch it).
     sshProcess.on('error', (err) => {
       console.error('[task-participant] Spawn error:', (err as Error).message);
+      accountAuth.cleanup?.(); // launch command never ran; its in-band `rm` won't either
       activeProcesses.delete(pollKey);
       stopPolling(pollKey);
       addMessage(task.id, 'system', `Error launching ${participant.workspace_name}: ${(err as Error).message}`);
@@ -3135,6 +3555,7 @@ export async function launchTaskParticipant(
     sshProcess.unref();
     startTaskParticipantPolling(task, participant);
   } catch (err) {
+    accountAuth.cleanup?.();
     addMessage(task.id, 'system', `Error launching ${participant.workspace_name}: ${(err as Error).message}`);
   }
 }
@@ -3178,7 +3599,8 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
     try {
       if (event.type === 'rate_limit_event') {
         const info = event.rate_limit_info as { resetsAt?: number; rateLimitType?: string } | undefined;
-        if (info) updateWorkspaceUsage(participant.workspace_name, info);
+        // Advisors inherit the task's subscription, so bill it there.
+        if (info) updateSubscriptionUsage(subscriptionKeyFor(task.claude_account_id, participant.workspace_name), info);
       }
       const now = new Date().toISOString();
       if (event.type === 'assistant' && event.message) {
@@ -3278,7 +3700,9 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant): 
         }
         finalized = true;
         stopPolling(pollKey); taskActivity.delete(pollKey); activeProcesses.delete(pollKey);
-        if (exitCode !== 0) {
+        if (exitCode === AUTH_STAGING_EXIT_CODE) {
+          addMessage(task.id, 'system', `${participant.workspace_name} could not start: ${AUTH_STAGING_MESSAGE}`);
+        } else if (exitCode !== 0) {
           addMessage(task.id, 'system', `${participant.workspace_name} session ended with error (exit ${exitCode})`);
         }
       }
