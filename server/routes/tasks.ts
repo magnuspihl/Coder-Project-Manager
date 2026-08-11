@@ -635,6 +635,8 @@ router.post('/tasks/:taskId/compact-session', requireAuth, async (req: Request, 
   }
 
   addMessage(task.id, 'system', 'Compacting session — Claude will summarize prior turns to free up context.', undefined, undefined, undefined, req.authSource, req.clientLabel);
+  // Stored bare; launchTask attaches the summarization instructions on the way
+  // out, so the chat shows a clean "/compact" rather than the instruction blob.
   addMessage(task.id, 'user', '/compact', undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
 
   if (task.pending_complete) {

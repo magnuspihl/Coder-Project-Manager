@@ -22,6 +22,44 @@ const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || '200';
 // verdict" message. Give it generous headroom (still bounded to cap cost).
 const REVIEWER_MAX_TURNS = process.env.CLAUDE_REVIEWER_MAX_TURNS || '100';
 const ALLOWED_TOOLS = process.env.CLAUDE_ALLOWED_TOOLS || 'Read,Edit,Write,Bash,Glob,Grep';
+
+/**
+ * Compaction can fail outright on a very large session: the summarization turn
+ * stops on `max_tokens` and the CLI reports "Error during compaction: ...
+ * exceeded the 20000 output token maximum". That strands the task — too big to
+ * resume, and unable to shrink itself.
+ *
+ * The CLI's own error says to raise CLAUDE_CODE_MAX_OUTPUT_TOKENS. CPM does NOT,
+ * deliberately. Reading the minified bundle, the compaction turn asks for
+ * `Math.min(20000, <that var>)` — the same `Math.min(<20000 alias>, <env reader>)`
+ * shape appears at the `querySource: "compact"` call sites in 2.1.84, 2.1.176 and
+ * 2.1.178 — so the variable can only *lower* the cap, never raise it. Setting it
+ * would be inert on the compaction request while still applying to every other
+ * request in the run, and the model list is populated from a live /v1/models
+ * whose entries include 8192- and 4096-token limits. That is a 400 risk for no
+ * expected benefit, so the bound below is the mitigation instead.
+ */
+
+/**
+ * The `/compact` turn CPM actually sends. `/compact` takes optional custom
+ * summarization instructions, and unlike the cap above this bounds the summary
+ * through the prompt itself — so it works regardless of CLI version or how the
+ * cap resolves. This is the load-bearing mitigation.
+ *
+ * Attached launch-side rather than stored as the user's message, so the chat
+ * shows a clean "/compact" next to the system notice that explains it.
+ *
+ * Keep it on ONE line: the CLI dispatches a slash command by parsing the prompt
+ * it is given, so a newline here risks the instructions being read as a separate
+ * prompt rather than as arguments to `/compact`. (This has no bearing on
+ * launchTask's `isSlashCommand`, which is derived from the incoming rawPrompt and
+ * is already decided before this substitution happens.)
+ */
+const COMPACT_COMMAND =
+  '/compact Keep the summary under roughly 1500 words. Prioritize: the current task state, ' +
+  'unresolved problems, decisions already made and why, and file paths that matter. ' +
+  'Drop resolved detail, tool-call transcripts, and quoted code blocks.';
+
 /**
  * Written to a run's exit file when the pinned Claude subscription token could not
  * be loaded in the remote shell, so pollers can say why instead of reporting a
@@ -1442,6 +1480,11 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   // skip all prepends/appends so the harness recognizes the command.
   const isSlashCommand = isResume && !!feedback && rawPrompt.startsWith('/') && !rawPrompt.includes('\n');
 
+  // Compaction runs under a tight output cap — see COMPACT_COMMAND. Detected
+  // here so the launch can bound the summary and the poller can explain a
+  // failure in terms of the recovery CPM actually offers.
+  const isCompact = isSlashCommand && rawPrompt.startsWith('/compact');
+
   // Allocate a port range before building prompts/system messages — the
   // coderUrlNote and portNote below both read task.port_range_start. Allocate
   // whenever the task has no range, including on resume: a reopened/retried task
@@ -1512,6 +1555,20 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     }
   }
   let prompt = rawPrompt + coderUrlNote;
+
+  // Swap the bare "/compact" the route stored for the instruction-carrying form.
+  //
+  // Gated on isCompact, not just the text: a first-launch task whose prompt
+  // happens to be exactly "/compact" is not a compaction request, and replacing
+  // its prompt here would silently drop the coderUrlNote already appended above.
+  //
+  // Exact match as well, because `/compact <instructions>` also reaches here as
+  // free text typed by the user, and their own summarization instructions must
+  // not be overwritten with ours — they may have asked for the opposite of
+  // "keep it short".
+  if (isCompact && rawPrompt.trim() === '/compact') {
+    prompt = COMPACT_COMMAND;
+  }
 
   // The user's message sounds like "create a task" — remind the agent inline
   // that this means emitting a [TASK_REQUEST], not writing a proposal file.
@@ -1841,7 +1898,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     sshProcess.unref();
 
     // Observe the task by polling the remote output file
-    startFilePolling(task, implementerTurn.id);
+    startFilePolling(task, implementerTurn.id, isCompact);
 
   } catch (err) {
     const errorMsg = (err as Error).message || 'Failed to launch Claude';
@@ -2077,7 +2134,10 @@ export async function reconnectWorkingTasks(): Promise<void> {
         console.log(`[recovery] Task "${task.title}" SSH process (PID ${sshPid}) still alive, reconnecting via file polling`);
         addMessage(task.id, 'system', 'Server restarted while task was running — reconnecting to remote session. Any assistant output produced during the restart will be reloaded from the remote output file.');
         // Don't set a fake activity — startFilePolling will immediately poll
-        // the remote file and derive real activity from Claude's output
+        // the remote file and derive real activity from Claude's output.
+        // compactRun defaults to false: whether the interrupted run was a
+        // compaction isn't recoverable here, and failing closed only costs the
+        // cosmetic error rewrite, whereas failing open would corrupt turn text.
         startFilePolling(task);
       } else {
         // SSH process is gone — check if it finished (exit code file exists)
@@ -2230,7 +2290,7 @@ export function startRateLimitRetryPoller(): void {
  * Poll a remote output file for a reconnected task.
  * Used when the SSH process survived a server restart but we lost the stdout pipe.
  */
-function startFilePolling(task: Task, implementerTurnId?: string | null): void {
+function startFilePolling(task: Task, implementerTurnId?: string | null, compactRun = false): void {
   stopPolling(task.id);
 
   // On the reconnect-after-restart path no turn id is passed; recover the
@@ -2289,7 +2349,8 @@ function startFilePolling(task: Task, implementerTurnId?: string | null): void {
       // Save each assistant turn's text as a message immediately,
       // so it appears in the chat UI while the task is still working.
       if (event.type === 'assistant' && (event.message as { content?: unknown })?.content) {
-        const turnText = stripNoReviewMarker(task.id, extractAssistantTurnText((event.message as { content: Array<{ type: string; text?: string; name?: string; input?: unknown }> }).content));
+        const rawTurnText = stripNoReviewMarker(task.id, extractAssistantTurnText((event.message as { content: Array<{ type: string; text?: string; name?: string; input?: unknown }> }).content));
+        const turnText = compactRun ? rewriteCompactionFailure(rawTurnText) : rawTurnText;
         if (turnText) {
           const msg = addMessage(task.id, 'assistant', turnText, undefined, undefined, undefined, undefined, undefined, turnId);
           lastSavedMessageId = msg.id;
@@ -2300,8 +2361,18 @@ function startFilePolling(task: Task, implementerTurnId?: string | null): void {
       }
 
       if (event.type === 'result') {
-        const fatal = extractFatalError(event);
-        const resultText = stripNoReviewMarker(task.id, extractResultText(event));
+        // Rewritten too: a compaction failure reported as is_error:true flows
+        // from here into finalizeTask as "Error: <raw>", which would show the
+        // dead-end env-var advice this rewrite exists to suppress.
+        const rawFatal = extractFatalError(event);
+        const fatal = rawFatal !== null && compactRun ? rewriteCompactionFailure(rawFatal) : rawFatal;
+        const rawResultText = stripNoReviewMarker(task.id, extractResultText(event));
+        // Rewritten on the same terms as turnText above, so the dedupe check
+        // below compares like with like. Skipping it here would let the raw
+        // "set CLAUDE_CODE_MAX_OUTPUT_TOKENS" text through as a second message
+        // right after the friendly notice — a duplicate the pre-rewrite code
+        // collapsed, since it no longer matches lastSavedMessageText.
+        const resultText = compactRun ? rewriteCompactionFailure(rawResultText) : rawResultText;
         // For non-error results, save the result text as an assistant message
         // (when distinct from the last). For errors, skip — finalizeTask will
         // write a structured system message instead of leaking the raw error
@@ -3103,6 +3174,43 @@ function extractFatalError(event: { [key: string]: unknown }): string | null {
     return `${CONTEXT_WINDOW_ERROR_PREFIX}${errMsg}`;
   }
   return errMsg;
+}
+
+/**
+ * Turn a failed-compaction message into the recovery path CPM actually offers.
+ *
+ * The CLI reports this as "Error during compaction: ... exceeded the ... output
+ * token maximum. To configure this behavior, set CLAUDE_CODE_MAX_OUTPUT_TOKENS."
+ * That advice is a dead end for a CPM user: they cannot set env vars on the run,
+ * and the cap logic means that variable cannot raise the compaction limit anyway
+ * (see the note above COMPACT_COMMAND). So point at the buttons that do exist.
+ *
+ * Applied on the assistant-message path, not just to errored `result` events:
+ * the observed failure (task 3534a38e) arrived as an ordinary `assistant` turn
+ * followed by `result` with `is_error: false` and empty text, so an error-only
+ * hook never sees it.
+ *
+ * ONLY call this for runs known to be compactions, and take that flag from
+ * launchTask rather than inferring it. Inferring from the last user message
+ * specifically does NOT work: the auto-review retry path re-launches the
+ * implementer with its prompt passed as `feedback` and its notice stored as
+ * `system`, so a preceding `/compact` stays the last user message and a real
+ * implementer turn would be treated as a compaction.
+ */
+const COMPACTION_MAX_TOKENS_ERROR =
+  /^\s*(?:Error:\s*)?Error during compaction:[\s\S]*output token maximum/i;
+
+function rewriteCompactionFailure(text: string): string {
+  // Anchored to the CLI's literal "Error during compaction:" prefix rather than
+  // matching the phrases anywhere in the text. A *successful* compaction of a
+  // session that discussed this very bug would otherwise have its whole summary
+  // replaced by a false failure notice — and persisted that way, since the
+  // summary is the only record of the turn.
+  if (!COMPACTION_MAX_TOKENS_ERROR.test(text)) return text;
+  return 'Compaction failed: the summary did not fit in the output budget Claude Code allows ' +
+    'for a compaction turn. Compacting again may fit, since each attempt summarizes ' +
+    'differently. Otherwise start a fresh session — that discards in-session memory but keeps ' +
+    'this task and its messages.';
 }
 
 /**
