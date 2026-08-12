@@ -48,6 +48,7 @@ import { useWorkspacePreview } from '../hooks/useWorkspacePreview';
 import WorkspacePreviewPanel, { PreviewToggleButton } from './WorkspacePreviewPanel';
 import { linkify } from '../utils/linkify';
 import Markdown from './Markdown';
+import MarkdownComposer, { type ComposerHandle, type ComposerKeyEvent } from './MarkdownComposer';
 import { useTTSVoice } from '../hooks/useTTSVoice';
 import { useVoiceRecorder } from '../hooks/useVoiceRecorder';
 import { useVoiceMode } from '../hooks/useVoiceMode';
@@ -163,8 +164,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   // @-mention autocomplete. Same shape and behavior as DiscussionModal — when
   // there are participants, typing '@' (or tapping the "@ Mention" pill on
   // mobile) opens a picker for inserting an agent name into the reply.
-  const replyTextareaRef = useRef<HTMLTextAreaElement>(null);
-  const isComposingRef = useRef(false);
+  // The composer owns its own caret plumbing (CodeMirror on desktop, textarea on
+  // touch), so mention insertion goes through this handle rather than a DOM node.
+  const composerRef = useRef<ComposerHandle>(null);
   const [mentionMenu, setMentionMenu] = useState<{
     open: boolean;
     anchorStart: number;
@@ -589,29 +591,20 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     }
   }, [participants.length, mentionMenu.open]);
 
-  const handleReplyChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const value = e.target.value;
+  // caret is null mid-IME-composition; the caret settles on the following
+  // onCaretMove, so mention detection just waits for that.
+  const handleReplyChange = (value: string, caret: number | null) => {
     setReply(value);
-    if (isComposingRef.current) return;
-    const caret = e.target.selectionStart ?? value.length;
+    if (caret === null) return;
     refreshMentionMenu(value, caret);
   };
 
-  const handleReplyCompositionEnd = (e: React.CompositionEvent<HTMLTextAreaElement>) => {
-    isComposingRef.current = false;
-    const el = e.currentTarget;
-    refreshMentionMenu(el.value, el.selectionStart ?? el.value.length);
-  };
-
-  const handleReplySelect = (e: React.SyntheticEvent<HTMLTextAreaElement>) => {
-    if (isComposingRef.current) return;
-    const el = e.currentTarget;
-    refreshMentionMenu(el.value, el.selectionStart ?? el.value.length);
+  const handleReplyCaretMove = (value: string, caret: number) => {
+    refreshMentionMenu(value, caret);
   };
 
   const openMentionMenu = () => {
-    const el = replyTextareaRef.current;
-    const caret = el?.selectionStart ?? reply.length;
+    const caret = composerRef.current?.getCaret() ?? reply.length;
     const before = reply.slice(0, caret);
     const after = reply.slice(caret);
     const needsLeadingSpace = before.length > 0 && !/\s$/.test(before);
@@ -621,18 +614,15 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     setReply(next);
     setMentionMenu({ open: true, anchorStart: atIndex, query: '', selectedIndex: 0 });
     requestAnimationFrame(() => {
-      const t = replyTextareaRef.current;
-      if (!t) return;
-      t.focus();
-      const c = atIndex + 1;
-      t.setSelectionRange(c, c);
+      composerRef.current?.focus();
+      composerRef.current?.setCaret(atIndex + 1);
     });
   };
 
   const insertMention = (name: string) => {
     if (!mentionMenu.open || mentionMenu.anchorStart < 0) return;
     const before = reply.slice(0, mentionMenu.anchorStart);
-    const caret = replyTextareaRef.current?.selectionStart ?? reply.length;
+    const caret = composerRef.current?.getCaret() ?? reply.length;
     const after = reply.slice(caret);
     const inserted = `@${name} `;
     const next = before + inserted + after;
@@ -640,14 +630,12 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     setMentionMenu({ open: false, anchorStart: -1, query: '', selectedIndex: 0 });
     const newCaret = before.length + inserted.length;
     requestAnimationFrame(() => {
-      const el = replyTextareaRef.current;
-      if (!el) return;
-      el.focus();
-      el.setSelectionRange(newCaret, newCaret);
+      composerRef.current?.focus();
+      composerRef.current?.setCaret(newCaret);
     });
   };
 
-  const handleReplyKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+  const handleReplyKeyDown = (e: ComposerKeyEvent) => {
     if (e.ctrlKey && e.key === 'ArrowUp') {
       e.preventDefault();
       scrollBodyRef.current?.scrollBy({ top: -200, behavior: 'smooth' });
@@ -692,7 +680,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
   // Variant used by the "Send to participant" textarea — same mention-menu
   // behavior, but Ctrl/Cmd+Enter submits to the participant form instead.
-  const handleParticipantReplyKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+  const handleParticipantReplyKeyDown = (e: ComposerKeyEvent) => {
     if (e.ctrlKey && e.key === 'ArrowUp') {
       e.preventDefault();
       scrollBodyRef.current?.scrollBy({ top: -200, behavior: 'smooth' });
@@ -2081,21 +2069,18 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                     /* Sending to a participant */
                     <form onSubmit={handleSendToParticipant} className="flex flex-col gap-2">
                       <div className="relative">
-                        <textarea
-                          ref={replyTextareaRef}
+                        <MarkdownComposer
+                          ref={composerRef}
+                          accent="teal"
                           value={reply}
                           onChange={handleReplyChange}
+                          onCaretMove={handleReplyCaretMove}
                           onKeyDown={handleParticipantReplyKeyDown}
-                          onSelect={handleReplySelect}
-                          onCompositionStart={() => { isComposingRef.current = true; }}
-                          onCompositionEnd={handleReplyCompositionEnd}
                           placeholder={anyParticipantRunning
                             ? 'Advisor is thinking...'
                             : `${`Ask ${participants.find(p => p.id === targetParticipantId)?.workspace_name || 'advisor'}...`}${participants.length > 0 ? ' (type @ to mention)' : ''}`}
-                          rows={3}
                           autoFocus
                           disabled={sending || anyParticipantRunning}
-                          className="w-full px-3 py-2 border border-teal-300 dark:border-teal-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-teal-500 resize-y disabled:opacity-50 sm:min-h-[11rem]"
                         />
                         {mentionDropdown}
                       </div>
@@ -2111,23 +2096,19 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                     /* Sending to the task agent (normal reply) */
                     <form onSubmit={handleReply} className="flex flex-col gap-2">
                       <div className="relative">
-                        <textarea
-                          ref={replyTextareaRef}
+                        <MarkdownComposer
+                          ref={composerRef}
                           value={reply}
                           onChange={handleReplyChange}
+                          onCaretMove={handleReplyCaretMove}
                           onKeyDown={handleReplyKeyDown}
-                          onSelect={handleReplySelect}
-                          onCompositionStart={() => { isComposingRef.current = true; }}
-                          onCompositionEnd={handleReplyCompositionEnd}
                           placeholder={anyParticipantRunning
                             ? 'Advisor is thinking...'
                             : participants.length > 0
                               ? 'Reply with feedback... (type @ to mention)'
                               : 'Reply with feedback...'}
-                          rows={3}
                           autoFocus
                           disabled={anyParticipantRunning}
-                          className="w-full px-3 py-2 border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y disabled:opacity-50 sm:min-h-[11rem]"
                         />
                         {mentionDropdown}
                       </div>
