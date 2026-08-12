@@ -10,8 +10,15 @@
 .cpm-composer .EasyMDEContainer .editor-toolbar,
 .cpm-composer .EasyMDEContainer .editor-statusbar,
 .cpm-composer .EasyMDEContainer .editor-preview,
-.cpm-composer .EasyMDEContainer .editor-preview-side {
-  display: none;
+.cpm-composer .EasyMDEContainer .editor-preview-side,
+/* Belt and braces: the preview/fullscreen shortcuts that would spawn these are
+   unbound in MarkdownComposerRich's options, but without a toolbar there is no
+   way to dismiss either overlay if one ever does appear. */
+.cpm-composer .EasyMDEContainer .editor-preview-full {
+  display: none !important;
+}
+.cpm-composer .EasyMDEContainer .CodeMirror-fullscreen {
+  position: static !important;
 }
 
 .cpm-composer .EasyMDEContainer .CodeMirror {

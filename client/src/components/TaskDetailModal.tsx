@@ -613,10 +613,10 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     const atIndex = before.length + insert.length - 1;
     setReply(next);
     setMentionMenu({ open: true, anchorStart: atIndex, query: '', selectedIndex: 0 });
-    requestAnimationFrame(() => {
-      composerRef.current?.focus();
-      composerRef.current?.setCaret(atIndex + 1);
-    });
+    // Set synchronously, not in a rAF: the composer holds the requested caret
+    // until it has absorbed the new value, so there is no frame to race.
+    composerRef.current?.focus();
+    composerRef.current?.setCaret(atIndex + 1);
   };
 
   const insertMention = (name: string) => {
@@ -629,10 +629,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     setReply(next);
     setMentionMenu({ open: false, anchorStart: -1, query: '', selectedIndex: 0 });
     const newCaret = before.length + inserted.length;
-    requestAnimationFrame(() => {
-      composerRef.current?.focus();
-      composerRef.current?.setCaret(newCaret);
-    });
+    composerRef.current?.focus();
+    composerRef.current?.setCaret(newCaret);
   };
 
   const handleReplyKeyDown = (e: ComposerKeyEvent) => {

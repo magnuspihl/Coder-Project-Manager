@@ -1,4 +1,5 @@
-import { Suspense, forwardRef, lazy, useImperativeHandle, useRef } from 'react';
+import { Suspense, forwardRef, lazy, useEffect, useImperativeHandle, useRef } from 'react';
+import { clampCaret, mapCaret } from './composerCaret';
 
 /*
  * The task reply composer, ported from the agent-box workspace's MarkdownEditor.
@@ -77,6 +78,23 @@ const MarkdownComposer = forwardRef<ComposerHandle, ComposerProps>(function Mark
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isComposingRef = useRef(false);
   const richRef = useRef<ComposerHandle>(null);
+  // A controlled textarea also throws the caret away when the value is replaced
+  // from outside, so the same repair the rich branch does is needed here.
+  //
+  // It can't be done the same way, though: React writes textarea.value during
+  // the commit, i.e. before layout effects run, and that write already moves the
+  // caret to the end. There is no effect that can observe the prior state. So
+  // the last value/caret the *user* produced is tracked from the event handlers
+  // instead, and anything that doesn't match it is by definition external.
+  const lastRef = useRef({ value, caret: value.length });
+  const pendingCaretRef = useRef<number | null>(null);
+
+  const applyCaret = (pos: number) => {
+    const el = textareaRef.current;
+    if (!el) return;
+    const c = clampCaret(pos, el.value.length);
+    el.setSelectionRange(c, c);
+  };
 
   useImperativeHandle(ref, (): ComposerHandle => {
     if (!isCoarsePointer) {
@@ -89,9 +107,25 @@ const MarkdownComposer = forwardRef<ComposerHandle, ComposerProps>(function Mark
     return {
       focus: () => textareaRef.current?.focus(),
       getCaret: () => textareaRef.current?.selectionStart ?? value.length,
-      setCaret: (pos) => textareaRef.current?.setSelectionRange(pos, pos),
+      // Remembered as well as applied: callers set the caret in the same tick as
+      // the value change that motivated it, so the DOM hasn't caught up yet.
+      setCaret: (pos) => { pendingCaretRef.current = pos; applyCaret(pos); },
     };
   });
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    const last = lastRef.current;
+    const pending = pendingCaretRef.current;
+    pendingCaretRef.current = null;
+    if (!el) return;
+    // Matching the last value the user typed means they drove this update and
+    // the browser has already put the caret where it belongs.
+    if (last.value === value && pending === null) return;
+    const caret = pending ?? mapCaret(last.value, value, last.caret);
+    applyCaret(caret);
+    lastRef.current = { value, caret };
+  }, [value]);
 
   if (!isCoarsePointer) {
     return (
@@ -119,26 +153,36 @@ const MarkdownComposer = forwardRef<ComposerHandle, ComposerProps>(function Mark
       value={value}
       onChange={(e) => {
         const el = e.target;
-        onChange(el.value, isComposingRef.current ? null : el.selectionStart ?? el.value.length);
+        const caret = el.selectionStart ?? el.value.length;
+        // The user is driving, so any caret a caller asked for is stale.
+        pendingCaretRef.current = null;
+        lastRef.current = { value: el.value, caret };
+        onChange(el.value, isComposingRef.current ? null : caret);
       }}
       onKeyDown={(e) => onKeyDown?.(e)}
       onSelect={(e) => {
         if (isComposingRef.current) return;
         const el = e.currentTarget;
-        onCaretMove?.(el.value, el.selectionStart ?? el.value.length);
+        const caret = el.selectionStart ?? el.value.length;
+        lastRef.current = { value: el.value, caret };
+        onCaretMove?.(el.value, caret);
       }}
       onCompositionStart={() => { isComposingRef.current = true; }}
       onCompositionEnd={(e) => {
         isComposingRef.current = false;
         const el = e.currentTarget;
-        onCaretMove?.(el.value, el.selectionStart ?? el.value.length);
+        const caret = el.selectionStart ?? el.value.length;
+        lastRef.current = { value: el.value, caret };
+        onCaretMove?.(el.value, caret);
       }}
       placeholder={placeholder}
       rows={3}
       autoFocus={autoFocus}
       disabled={disabled}
       className={
-        'w-full px-3 py-2 rounded-md border text-sm resize-y disabled:opacity-50 ' +
+        // sm:min-h-[11rem] matches the textarea this replaced, so tablets wide
+        // enough to hit the sm breakpoint keep the taller composer.
+        'w-full px-3 py-2 rounded-md border text-sm resize-y disabled:opacity-50 sm:min-h-[11rem] ' +
         'bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 ' +
         BORDER[accent]
       }
