@@ -166,7 +166,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [pendingFinding, setPendingFinding] = useState<string | null>(null);
   const [dismissNoteFor, setDismissNoteFor] = useState<string | null>(null);
   const [dismissNote, setDismissNote] = useState('');
-  const [unresolvedOpen, setUnresolvedOpen] = useState(true);
+  const [unresolvedOpen, setUnresolvedOpen] = useState(false);
+  const [expandedFindings, setExpandedFindings] = useState<Set<string>>(new Set());
   const [resolvingGitIssues, setResolvingGitIssues] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastParticipantsJsonRef = useRef('');
@@ -1356,11 +1357,15 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   // `scope` distinguishes the two places a finding can appear (its turn card and
   // the pinned unresolved panel) so opening the dismiss note in one doesn't also
   // open — and autoFocus — a second input in the other.
-  const renderFinding = (f: ReviewFinding, index: number, canAct: boolean, scope = 'card') => {
+  const renderFinding = (f: ReviewFinding, index: number, canAct: boolean, scope = 'card', compact = false) => {
     const noteKey = `${scope}:${f.id}`;
     const busy = pendingFinding === f.id;
     const dismissed = f.state === 'dismissed';
     const noteOpen = dismissNoteFor === noteKey;
+    // In the pinned panel the bodies are clamped: reviewer findings run to a
+    // full paragraph each, and a handful at full length pushed the conversation
+    // and the composer off screen entirely.
+    const clamped = compact && !expandedFindings.has(noteKey);
 
     return (
       <div
@@ -1376,13 +1381,25 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
             {index + 1}.
           </span>
           <div className="flex-1 min-w-0">
-            <p className={`text-sm break-words ${
+            <p className={`text-sm break-words ${clamped ? 'line-clamp-2' : ''} ${
               dismissed
                 ? 'text-gray-500 dark:text-gray-400 line-through decoration-gray-400/60'
                 : 'text-amber-900 dark:text-amber-200'
             }`}>
               {f.body}
             </p>
+            {compact && (
+              <button
+                onClick={() => setExpandedFindings(prev => {
+                  const next = new Set(prev);
+                  if (next.has(noteKey)) next.delete(noteKey); else next.add(noteKey);
+                  return next;
+                })}
+                className="text-[11px] text-amber-700/70 dark:text-amber-300/70 hover:text-amber-800 dark:hover:text-amber-200 underline"
+              >
+                {clamped ? 'Show more' : 'Show less'}
+              </button>
+            )}
 
             {dismissed && (
               <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400 italic">
@@ -1470,8 +1487,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
    * composer. Fixing one finding spawns a new reviewer turn, which pushes the
    * findings you were working through far up the conversation — without this
    * you have to scroll back through earlier messages to act on the rest.
-   * Expanded by default and collapsible — undecided findings are exactly what
-   * this view exists to surface, so it never hides them on its own.
+   * Collapsed by default, and when open it is capped at min(14rem, 20vh) with
+   * its own scroll and two-line clamped bodies, so it never crowds out the
+   * composer no matter how many findings accumulate. It was originally
+   * expanded by default
+   * at full body length, which on a task with several accumulated findings
+   * filled the whole modal and pushed the conversation and composer out of
+   * view. The header alone carries the signal; the detail is opt-in.
    */
   const renderUnresolvedFindingsPanel = () => {
     const unresolved = unresolvedFindings();
@@ -1498,7 +1520,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
         </button>
         {unresolvedOpen && (
           <div className="px-3 pb-3 space-y-2">
-            {unresolved.map((f, i) => renderFinding(f, i, true, 'unresolved'))}
+            <div className="max-h-[min(14rem,20vh)] overflow-y-auto space-y-2 pr-1">
+              {unresolved.map((f, i) => renderFinding(f, i, true, 'unresolved', true))}
+            </div>
             {unresolved.length > 1 && (
               <button
                 onClick={() => handleFixFindings(unresolved, 'unresolved-panel')}

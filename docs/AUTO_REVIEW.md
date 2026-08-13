@@ -676,6 +676,14 @@ or `fixing`, across all turns, oldest first) is also mirrored in a collapsible p
 above the reply composer, with the same per-finding **Fix this** / **Ignore** and a **Fix all N
 remaining**. Without it the user has to scroll back through earlier messages to act on the rest.
 
+The panel is **collapsed by default** and its body is capped at `min(14rem, 20vh)` with its own
+scroll; each body is clamped to two lines with a per-finding **Show more**. Findings accumulate
+across passes and each is a full paragraph, so an expanded, unclamped panel filled the entire modal
+on a real task — burying the conversation and the composer. The header line alone carries the
+signal (`N review findings still undecided`); all detail is opt-in. Any change here should be
+re-measured at 800px viewport height, where the composer's action row is the first thing to be
+pushed out of view.
+
 ### A pass does not resolve open findings
 
 When a later reviewer pass runs without re-raising a finding, that is evidence it was fixed — the
