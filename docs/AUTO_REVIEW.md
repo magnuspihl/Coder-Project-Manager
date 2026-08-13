@@ -120,8 +120,19 @@ and the diff:
   bodies (the per-finding fix action and the legacy "Apply suggested fixes" button) are excluded —
   replaying those would echo the reviewer's own prior verdict back at it as if the user had asked
   for it independently.
-- `buildWaiverBlock` replays every finding the user **dismissed** (see Section 16), with the user's
-  reason, and states that re-raising one is itself a review failure.
+- `buildWaiverBlock` replays **every finding raised by an earlier pass on this task** (see Section
+  16), labelled with what happened to it — `dismissed` (never raise again), `resolved` (user says
+  it's done: verify, don't restate), `fixing` / `open` (known; don't reword into a new-looking
+  problem). It also forbids contradicting an earlier finding on the same code without saying so.
+
+  This originally replayed **only dismissed** findings, which meant the *automatic* loop got nothing
+  at all: it fires the next Reviewer seconds after the previous verdict, long before the user has
+  triaged anything, so every finding is still `open` and therefore invisible. That is the common
+  case, not the edge case — on task `a22ff87b` reviewer turn #6 ran at 14:11 and the turn #4
+  findings were not dismissed until 14:17 and 14:23. The pass had no way to know what had already
+  been said, so it restated it, and contradicted turn #4 on the same function.
+
+  A turn never sees its own findings (`getPriorFindings(taskId, excludeTurnId)`).
 
 Each block is capped at 6 000 characters; the direction block keeps the *most recent* replies when
 trimming, since later direction is what matters.
@@ -614,7 +625,7 @@ CREATE TABLE review_findings (
   turn_id TEXT NOT NULL REFERENCES task_turns(id) ON DELETE CASCADE,
   position INTEGER NOT NULL,        -- order within the verdict
   body TEXT NOT NULL,
-  state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'dismissed')),
+  state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'dismissed', 'resolved')),
   note TEXT,                        -- user's reason when dismissing
   decided_at TEXT,
   created_at TEXT NOT NULL
@@ -629,13 +640,20 @@ finding holding the summary, so a fail is never un-triageable.
 
 ### States
 
-| State | Meaning |
-|---|---|
-| `open` | Not yet decided. |
-| `fixing` | Sent to the Implementer via the fix action. |
-| `dismissed` | Waived by the user. Replayed to every later Reviewer as a waiver (Section 4). |
+| State | Meaning | UI action |
+|---|---|---|
+| `open` | Not yet decided. | — |
+| `fixing` | Sent to the Implementer; outcome unknown. Re-sendable. | **Fix this** |
+| `dismissed` | User decided this will **not** be changed. | **Ignore** |
+| `resolved` | User asserts it is **already fixed**. | **Already fixed** |
 
-Reopening a dismissed finding clears its note and `decided_at`.
+`dismissed` and `resolved` both retire a finding but mean opposite things to the next Reviewer
+("don't change this" vs "verify this is done"), so they must not be collapsed into one action.
+Without `resolved`, users dismissed with a note of "Fixed" — which fed the Reviewer a waiver saying
+the user had decided it *would not be changed*, the exact opposite of what they meant. The migration
+that adds the state reclassifies historical dismissals whose note was `Fixed`/`Done`.
+
+**Undo** returns a decided finding to `open`, clearing its note and `decided_at`.
 
 ### Routes
 
@@ -648,9 +666,17 @@ Reopening a dismissed finding clears its note and `decided_at`.
 
 `GET /api/tasks/:taskId` gains a `findings` array.
 
+### One problem per issue
+
+`REVIEW_DECISION_FORMAT` requires each entry in `issues` to be exactly one problem, because each
+entry is a separate decision the user has to make. Two call sites needing the same guard is ONE
+issue naming both, and the remedy belongs inside that issue's text rather than as its own entry.
+On `a22ff87b` a single "wrap these two calls in try/catch" problem was emitted as three findings —
+the third being the fix instruction for the first two — tripling the triage burden.
+
 ### UI
 
-Each finding renders as its own row with **Fix this** and **Ignore**. Ignore opens an optional
+Each finding renders as its own row with **Fix this**, **Already fixed** and **Ignore**. Ignore opens an optional
 one-line reason (shown to later reviewers) before confirming. Dismissed findings render struck
 through and muted with their reason and an **Undo dismiss** link. A **Fix all N remaining** button
 appears when more than one finding is still open. Verdicts recorded before this feature have no

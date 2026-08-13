@@ -864,7 +864,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
    * these is precisely the "did it assume I wanted to ignore it?" failure.
    */
   const supersededByLaterReview = (f: ReviewFinding): boolean => {
-    if (f.state === 'dismissed') return false;
+    if (f.state === 'dismissed' || f.state === 'resolved') return false;
     const raisedAt = turnNumberOf(f.turn_id);
     return turns.some(t => t.role === 'reviewer' && t.completed_at && t.turn_number > raisedAt);
   };
@@ -884,7 +884,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     if (pendingFinding || sending || applyingFixes) return;
     // 'fixing' is re-sendable: it means "handed to the implementer, outcome
     // unknown". Only an explicit dismissal takes a finding out of play.
-    const ids = selected.filter(f => f.state !== 'dismissed').map(f => f.id);
+    const ids = selected.filter(f => f.state === 'open' || f.state === 'fixing').map(f => f.id);
     if (ids.length === 0) return;
     setPendingFinding(busyKey);
     editSeqRef.current++;
@@ -905,7 +905,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
   // Fix every still-open finding in this verdict in one implementer turn.
   const handleFixAllOpen = (turnId: string) =>
-    handleFixFindings(findingsForTurn(turnId).filter(f => f.state !== 'dismissed'), turnId);
+    handleFixFindings(findingsForTurn(turnId).filter(f => f.state === 'open' || f.state === 'fixing'), turnId);
 
   // Dismiss a finding. This is the durable signal: dismissed findings are
   // replayed into every later reviewer prompt as a waiver, so the reviewer
@@ -921,6 +921,27 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       setDismissNote('');
     } catch (err: any) {
       alert(err?.message || 'Failed to dismiss finding');
+    } finally {
+      editSeqRef.current++;
+      setPendingFinding(null);
+    }
+  };
+
+  /**
+   * "Already fixed" — distinct from Ignore. Both retire the finding, but they
+   * tell the next reviewer opposite things ("don't change this" vs "verify this
+   * is done"), so they must not collapse into one action. Users were dismissing
+   * with a note of "Fixed", which fed the reviewer the wrong signal.
+   */
+  const handleResolveFinding = async (finding: ReviewFinding) => {
+    if (pendingFinding) return;
+    setPendingFinding(finding.id);
+    editSeqRef.current++;
+    try {
+      const { findings: updated } = await setFindingState(taskId, finding.id, 'resolved');
+      setFindings(updated);
+    } catch (err: any) {
+      alert(err?.message || 'Failed to mark finding as fixed');
     } finally {
       editSeqRef.current++;
       setPendingFinding(null);
@@ -1351,9 +1372,11 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     if (e.target === overlayRef.current) closeModal();
   };
 
-  // One reviewer finding as an independently actionable row: Fix sends just this
-  // issue back to the implementer, Dismiss waives it permanently (and tells
-  // every later reviewer not to raise it again).
+  // One reviewer finding as an independently actionable row. Fix sends just this
+  // issue back to the implementer; Ignore waives it ("do not change this");
+  // Mark fixed asserts it is already done ("verify, don't restate"). Ignore and
+  // Mark fixed both retire the finding but carry opposite meanings to the next
+  // reviewer, so they are separate actions.
   // `scope` distinguishes the two places a finding can appear (its turn card and
   // the pinned unresolved panel) so opening the dismiss note in one doesn't also
   // open — and autoFocus — a second input in the other.
@@ -1361,6 +1384,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     const noteKey = `${scope}:${f.id}`;
     const busy = pendingFinding === f.id;
     const dismissed = f.state === 'dismissed';
+    const resolved = f.state === 'resolved';
+    const decided = dismissed || resolved;
     const noteOpen = dismissNoteFor === noteKey;
     // In the pinned panel the bodies are clamped: reviewer findings run to a
     // full paragraph each, and a handful at full length pushed the conversation
@@ -1371,18 +1396,18 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       <div
         key={f.id}
         className={`rounded-md border p-2.5 ${
-          dismissed
+          decided
             ? 'border-gray-200 dark:border-gray-700 bg-gray-50/70 dark:bg-gray-800/40'
             : 'border-amber-200 dark:border-amber-800 bg-white/60 dark:bg-gray-900/30'
         }`}
       >
         <div className="flex items-start gap-2">
-          <span className={`text-[11px] font-semibold mt-0.5 shrink-0 ${dismissed ? 'text-gray-400 dark:text-gray-500' : 'text-amber-700 dark:text-amber-300'}`}>
+          <span className={`text-[11px] font-semibold mt-0.5 shrink-0 ${decided ? 'text-gray-400 dark:text-gray-500' : 'text-amber-700 dark:text-amber-300'}`}>
             {index + 1}.
           </span>
           <div className="flex-1 min-w-0">
             <p className={`text-sm break-words ${clamped ? 'line-clamp-2' : ''} ${
-              dismissed
+              decided
                 ? 'text-gray-500 dark:text-gray-400 line-through decoration-gray-400/60'
                 : 'text-amber-900 dark:text-amber-200'
             }`}>
@@ -1403,13 +1428,18 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
             {dismissed && (
               <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400 italic">
-                Dismissed{f.note ? ` — ${f.note}` : ''}
+                Ignored — won't be changed{f.note ? ` (${f.note})` : ''}
+              </p>
+            )}
+            {resolved && (
+              <p className="mt-1 text-[11px] text-green-700 dark:text-green-400 italic">
+                Marked as already fixed
               </p>
             )}
             {f.state === 'fixing' && (
               <p className="mt-1 text-[11px] text-blue-600 dark:text-blue-400">Sent to the implementer</p>
             )}
-            {!dismissed && supersededByLaterReview(f) && (
+            {!decided && supersededByLaterReview(f) && (
               <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">
                 A later review didn't raise this again — likely fixed, but not confirmed.
               </p>
@@ -1446,13 +1476,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
               </div>
             ) : (
               <div className="flex items-center gap-2 mt-1.5">
-                {dismissed ? (
+                {decided ? (
                   <button
                     onClick={() => handleReopenFinding(f)}
                     disabled={busy}
                     className="text-[11px] text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 underline disabled:opacity-50"
                   >
-                    {busy ? 'Reopening…' : 'Undo dismiss'}
+                    {busy ? 'Reopening…' : 'Undo'}
                   </button>
                 ) : (
                   <>
@@ -1465,6 +1495,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         {busy ? 'Sending…' : 'Fix this'}
                       </button>
                     )}
+                    <button
+                      onClick={() => handleResolveFinding(f)}
+                      disabled={busy || pendingFinding !== null}
+                      className="text-[11px] font-medium px-2 py-1 rounded border border-green-300 dark:border-green-700 text-green-700 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/30 disabled:opacity-50 transition-colors"
+                    >
+                      {busy ? 'Saving…' : 'Already fixed'}
+                    </button>
                     <button
                       onClick={() => { setDismissNoteFor(noteKey); setDismissNote(''); }}
                       disabled={busy || pendingFinding !== null}
@@ -1602,8 +1639,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     // only once it has been decided, not because time passed.
     const canApply = task?.status === 'awaiting_feedback';
     const turnFindings = findingsForTurn(turn.id);
-    const openCount = turnFindings.filter(f => f.state !== 'dismissed').length;
-    const dismissedCount = turnFindings.filter(f => f.state === 'dismissed').length;
+    const openCount = turnFindings.filter(f => f.state === 'open' || f.state === 'fixing').length;
+    const decidedCount = turnFindings.length - openCount;
     return (
       <div className="space-y-2">
         <div className="flex items-center gap-2 py-1">
@@ -1647,9 +1684,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                 {applyingFixes ? 'Applying…' : 'Apply suggested fixes'}
               </button>
             )}
-            {dismissedCount > 0 && (
+            {decidedCount > 0 && (
               <span className="text-[11px] text-amber-700/70 dark:text-amber-300/70">
-                {dismissedCount} dismissed — later reviews are told not to raise {dismissedCount === 1 ? 'it' : 'them'} again
+                {decidedCount} decided — later reviews are told about {decidedCount === 1 ? 'it' : 'them'}
               </span>
             )}
             {fullReview && (

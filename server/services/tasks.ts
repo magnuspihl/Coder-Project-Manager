@@ -62,8 +62,13 @@ export interface ReviewFinding {
   turn_id: string;
   position: number;
   body: string;
-  /** 'fixing' = user asked the implementer to address it; 'dismissed' = waived. */
-  state: 'open' | 'fixing' | 'dismissed';
+  /**
+   * open      — not yet decided
+   * fixing    — handed to the implementer to fix; outcome unknown
+   * dismissed — user decided this will NOT be changed (waived)
+   * resolved  — user asserts it is already addressed
+   */
+  state: 'open' | 'fixing' | 'dismissed' | 'resolved';
   note: string | null;
   decided_at: string | null;
   created_at: string;
@@ -556,7 +561,7 @@ export function getReviewFinding(findingId: string): ReviewFinding | undefined {
 
 export function setReviewFindingState(
   findingId: string,
-  state: 'open' | 'fixing' | 'dismissed',
+  state: 'open' | 'fixing' | 'dismissed' | 'resolved',
   note?: string | null,
 ): void {
   const db = getDb();
@@ -568,15 +573,37 @@ export function setReviewFindingState(
 }
 
 /**
- * Findings the user has explicitly dismissed on this task. Fed into every later
- * reviewer prompt — the reviewer starts a fresh session each pass, so without
- * this it re-derives its opinion from the original prompt and re-raises them.
+ * Findings the user has explicitly dismissed on this task — i.e. decided will
+ * NOT be changed. Fed to the implementer as do-not-touch.
  */
 export function getDismissedFindings(taskId: string): ReviewFinding[] {
   const db = getDb();
   return db.prepare(
     "SELECT * FROM review_findings WHERE task_id = ? AND state = 'dismissed' ORDER BY decided_at"
   ).all(taskId) as ReviewFinding[];
+}
+
+/**
+ * Every finding raised on this task by an *earlier* reviewer turn, whatever its
+ * state, oldest first. The reviewer starts a fresh session each pass and sees
+ * only the original prompt plus the diff, so without this it has no idea what
+ * previous passes already said — it restates them, and sometimes contradicts
+ * itself on the same code.
+ *
+ * Only dismissed findings used to be replayed, which meant the *automatic*
+ * review loop got nothing at all: it fires the next reviewer seconds after the
+ * previous verdict, long before the user has triaged anything, so every finding
+ * is still `open` and therefore invisible. That is the common case, not the
+ * edge case.
+ */
+export function getPriorFindings(taskId: string, excludeTurnId: string): ReviewFinding[] {
+  const db = getDb();
+  return db.prepare(
+    `SELECT f.* FROM review_findings f
+     JOIN task_turns t ON t.id = f.turn_id
+     WHERE f.task_id = ? AND f.turn_id != ?
+     ORDER BY t.turn_number, f.position`
+  ).all(taskId, excludeTurnId) as ReviewFinding[];
 }
 
 export function setActiveTaskTurnRole(taskId: string, role: 'implementer' | 'reviewer' | null): void {
