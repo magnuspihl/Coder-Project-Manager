@@ -444,6 +444,46 @@ const HARNESS_REMINDER_NOTE = `Claude Code's harness appends a <system-reminder>
 // the agent calls it anyway — see formatAskUserQuestion.)
 const INTERACTIVE_PROMPT_NOTE = `ASKING THE USER — IMPORTANT: You are running inside the Coder Project Manager (CPM), a web UI, with no interactive terminal attached. Interactive prompts are NOT visible to the user here: the AskUserQuestion tool and any tool-permission prompts will never reach them, and they will think you went silent and ignored them. Whenever you need a decision, clarification, choice, or permission from the user, write it as plain text in your normal response and then stop — your message becomes a chat entry they can reply to. Do NOT call AskUserQuestion and do NOT wait on a permission prompt.`;
 
+const SYSTEM_PROMPT_FRAGMENT_SEPARATOR = '\n\n---\n\n';
+
+// Raw (un-escaped) text already appended for a given argv, so a second call can
+// merge into it instead of emitting a duplicate flag. Keyed by the argv array
+// itself, which is discarded once the command is built.
+const appendedSystemPrompts = new WeakMap<string[], string>();
+
+// The Claude CLI registers `--append-system-prompt` as a SCALAR commander
+// option (`.argParser(String)`), so repeating the flag OVERWRITES the previous
+// value instead of accumulating — only the last occurrence on the command line
+// ever reaches the model, and every earlier one is dropped without a warning.
+// CPM used to push one flag per prompt fragment (up to six for a task run), so
+// agents silently ran without the delegation, git-ownership, port-range,
+// caveman and memory sections, and reviewers ran without their entire persona.
+// Every launcher must therefore funnel its fragments through this helper, which
+// joins them into exactly ONE flag. Never push '--append-system-prompt'
+// directly.
+function pushAppendSystemPrompt(claudeParts: string[], fragments: Array<string | null | undefined>): void {
+  const combined = fragments
+    .map(f => f?.trim())
+    .filter((f): f is string => !!f)
+    .join(SYSTEM_PROMPT_FRAGMENT_SEPARATOR);
+  if (!combined) return;
+
+  const flagIndex = claudeParts.indexOf('--append-system-prompt');
+  if (flagIndex === -1) {
+    appendedSystemPrompts.set(claudeParts, combined);
+    claudeParts.push('--append-system-prompt', shellEscape(combined));
+    return;
+  }
+
+  // Pushing a second flag here would silently discard the first one — exactly
+  // the bug this helper exists to prevent. Merge into the existing value and
+  // log, so the instructions survive and the duplicate call is still visible.
+  console.error('[claude] pushAppendSystemPrompt() called more than once for one command — merging into the existing flag. Prefer a single call with all fragments.');
+  const merged = `${appendedSystemPrompts.get(claudeParts) ?? ''}${SYSTEM_PROMPT_FRAGMENT_SEPARATOR}${combined}`;
+  appendedSystemPrompts.set(claudeParts, merged);
+  claudeParts[flagIndex + 1] = shellEscape(merged);
+}
+
 // The agent may still call AskUserQuestion despite INTERACTIVE_PROMPT_NOTE. In
 // stream-json the question text/options live in the tool_use block's `input`
 // (not in any text block), so without this they are dropped and the user only
@@ -494,14 +534,19 @@ function extractAssistantTurnText(content: Array<{ type: string; text?: string; 
 // Agents habitually record follow-up work in proposal .md files instead — the
 // prompt bans that anti-pattern by name, and buildTaskRequestReminder() nudges
 // per-message when the user's text sounds like a task-creation request.
-const TASK_DELEGATION_PROMPT = `WORK DELEGATION — creating tasks and recording follow-up work:
+// `defaultWorkspaceName` must be where an untargeted request actually lands —
+// parseTaskRequestsForTask resolves that to the HOST task's workspace, which is
+// not the participant's own workspace for an invited agent. Naming it explicitly
+// keeps the instruction true for both callers.
+function buildTaskDelegationPrompt(defaultWorkspaceName: string): string {
+  return `WORK DELEGATION — creating tasks and recording follow-up work:
 You run inside CPM (Coder Project Manager), which tracks work as tasks. The ONLY way to create or propose a task is to emit this block in your response text, on its own lines (not inside a code block):
 
 [TASK_REQUEST]
 {"prompt": "detailed, self-contained description of the work to be done"}
 [/TASK_REQUEST]
 
-The user is prompted to approve it; an approved request becomes a new task branched from the default branch. Emit one block per proposed task. To target a different workspace you have access to, add a "targetWorkspace" field (the workspace's name) to the JSON; otherwise it runs in this workspace.
+The user is prompted to approve it; an approved request becomes a new task branched from the default branch. Emit one block per proposed task. An untargeted request runs in \`${defaultWorkspaceName}\`. To run it anywhere else, add a "targetWorkspace" field (the workspace's name) to the JSON — any workspace you have access to is valid there, INCLUDING the one you are yourself running in if that is not \`${defaultWorkspaceName}\`.
 
 WHEN to emit a [TASK_REQUEST]:
 - The user asks you to "create/add/queue/file a task" or "make a follow-up" — that ALWAYS means emitting a [TASK_REQUEST] block.
@@ -511,6 +556,7 @@ NEVER do any of these instead (common mistakes):
 - Do NOT write proposed work to a Markdown or text file (TODO.md, FOLLOWUP.md, PROPOSED_TASKS.md, docs/plans, etc.). Files are invisible to the task system — work recorded that way is lost.
 - Do NOT create tasks by calling the CPM HTTP API.
 - Do NOT merely describe the follow-up in prose and move on — emit the block so the work is tracked.`;
+}
 
 // Per-message nudge: appended to a user prompt that sounds like a
 // task-creation request. The system prompt above is present every turn, but
@@ -1707,42 +1753,48 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     claudeParts.push('--model', shellEscape(actualModel));
   }
 
+  // Every system-prompt fragment for this run, in priority order. They are
+  // combined into a single --append-system-prompt below: repeating the flag
+  // makes the CLI keep only the last value (see pushAppendSystemPrompt).
+  const systemPromptFragments: Array<string | null> = [];
+
   // Caveman mode — inject as system prompt for stronger enforcement
   if (task.caveman) {
-    claudeParts.push('--append-system-prompt', shellEscape(buildCavemanPrompt(task.caveman)));
+    systemPromptFragments.push(buildCavemanPrompt(task.caveman));
     console.log(`[caveman] Task ${task.id} using caveman mode: ${task.caveman} (via --append-system-prompt)`);
   }
 
   // Port range instruction — tell agent which ports to use
   if (!isSlashCommand && portStart !== null && proxyUriForTask) {
     const previewUrl = proxyUriForTask.replace('{{port}}', String(portStart));
-    const portNote = `This task runs in a dedicated git worktree. Use ports ${portStart}–${portEnd} for any services you start — do not use default ports like 3000 or 5173 (those are reserved). Your primary preview URL is: ${previewUrl}`;
-    claudeParts.push('--append-system-prompt', shellEscape(portNote));
+    systemPromptFragments.push(`This task runs in a dedicated git worktree. Use ports ${portStart}–${portEnd} for any services you start — do not use default ports like 3000 or 5173 (those are reserved). Your primary preview URL is: ${previewUrl}`);
   }
 
   // CPM owns git when remote pushes are enabled — tell the agent to stay out
   // of branching/committing so completion's fresh-branch+PR+merge flow works.
   if (isRemoteAllowed(task.workspace_id)) {
-    claudeParts.push('--append-system-prompt', shellEscape(CPM_GIT_OWNERSHIP_PROMPT));
+    systemPromptFragments.push(CPM_GIT_OWNERSHIP_PROMPT);
   }
 
   if (!isSlashCommand) {
-    claudeParts.push('--append-system-prompt', shellEscape(TASK_DELEGATION_PROMPT));
+    systemPromptFragments.push(buildTaskDelegationPrompt(task.workspace_name));
   }
 
   // Let the implementer opt out of the reviewer when its turn isn't a
   // review-worthy code change (question/diagnosis/advisory). Only relevant when
   // auto-review is actually on for this task.
   if (!isSlashCommand && task.auto_review) {
-    claudeParts.push('--append-system-prompt', shellEscape(NO_REVIEW_PROMPT));
+    systemPromptFragments.push(NO_REVIEW_PROMPT);
   }
 
   if (memoryMcpConfig) {
-    claudeParts.push('--append-system-prompt', shellEscape(buildMemoryUsagePrompt(task.user_id, task.workspace_name)));
+    systemPromptFragments.push(buildMemoryUsagePrompt(task.user_id, task.workspace_name));
   }
 
-  claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
-  claudeParts.push('--append-system-prompt', shellEscape(INTERACTIVE_PROMPT_NOTE));
+  systemPromptFragments.push(HARNESS_REMINDER_NOTE);
+  systemPromptFragments.push(INTERACTIVE_PROMPT_NOTE);
+
+  pushAppendSystemPrompt(claudeParts, systemPromptFragments);
 
   const claudeCmd = claudeParts.join(' ');
   const outputFile = remoteOutputPath(task.id);
@@ -2770,8 +2822,7 @@ async function executeReviewer(
   if (actualModel) {
     claudeParts.push('--model', shellEscape(actualModel));
   }
-  claudeParts.push('--append-system-prompt', shellEscape(buildReviewerSystemPrompt()));
-  claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
+  pushAppendSystemPrompt(claudeParts, [buildReviewerSystemPrompt(), HARNESS_REMINDER_NOTE]);
 
   const claudeCmd = claudeParts.join(' ');
   const outputFile = remoteReviewerOutputPath(task.id);
@@ -3426,40 +3477,50 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
 function getDiscussionPromptPrefix(
   projectDir: string | null,
   ownWorkspaceName: string,
+  defaultTargetWorkspace: string,
   userId: string | null,
   worktreePath: string | null = null,
 ): string {
-  const boundary = worktreePath
-    ? `You are working in an isolated git branch (\`${worktreePath}\`). You have full access to read and modify files — your changes are isolated from the main project branch and will only be merged if you or the user decides to. You can also output a [TASK_REQUEST] to create a formal tracked task.`
-    : projectDir
-      ? `You MUST NOT modify, create, or delete any files within \`${projectDir}\` (the git-tracked project directory) — treat it as read-only. If work needs to be done inside the project, output a [TASK_REQUEST] instead and the user will approve it as a task.\n\nYou MAY freely read, explore, and write to files outside this path — global config files like \`~/.claude/CLAUDE.md\`, workspace memory files, temp files, etc.`
-      : `You MUST NOT modify, create, or delete files in the project repository — treat it as read-only. If work needs to be done in the project, output a [TASK_REQUEST] instead and the user will approve it as a task.`;
+  // An untargeted [TASK_REQUEST] runs in the HOST task's workspace (see
+  // parseTaskRequestsForTask), which for an invited advisor is not the
+  // workspace it is sitting in. Every boundary rule below pushes local work
+  // into a [TASK_REQUEST], so each one must also say how to aim that request
+  // back here — otherwise an advisor obeying the boundary files the task
+  // against the wrong repo.
+  const aimHere = ownWorkspaceName === defaultTargetWorkspace
+    ? ''
+    : ` An untargeted [TASK_REQUEST] runs in \`${defaultTargetWorkspace}\` (the host task's workspace), so for work that belongs to THIS workspace you must add \`"targetWorkspace": "${ownWorkspaceName}"\` to the JSON.`;
 
+  const boundary = worktreePath
+    ? `You are working in an isolated git branch (\`${worktreePath}\`). You have full access to read and modify files — your changes are isolated from the main project branch and will only be merged if you or the user decides to. You can also output a [TASK_REQUEST] to create a formal tracked task.${aimHere}`
+    : projectDir
+      ? `You MUST NOT modify, create, or delete any files within \`${projectDir}\` (the git-tracked project directory) — treat it as read-only. If work needs to be done inside the project, output a [TASK_REQUEST] instead and the user will approve it as a task.${aimHere}\n\nYou MAY freely read, explore, and write to files outside this path — global config files like \`~/.claude/CLAUDE.md\`, workspace memory files, temp files, etc.`
+      : `You MUST NOT modify, create, or delete files in the project repository — treat it as read-only. If work needs to be done in the project, output a [TASK_REQUEST] instead and the user will approve it as a task.${aimHere}`;
+
+  // Workspaces worth naming in `targetWorkspace`: the default target is left
+  // out because naming it changes nothing, and this agent's OWN workspace is
+  // deliberately kept in whenever it differs from that default — that is the
+  // one it most often needs to name.
   const workspaces = userId ? getWorkspacesForUser(userId) : null;
-  const otherRunning = (workspaces ?? [])
-    .filter(w => w.running && w.name !== ownWorkspaceName)
+  const targetable = (workspaces ?? [])
+    .filter(w => w.running && w.name !== defaultTargetWorkspace)
     .map(w => w.name);
 
-  const targetingBlock = otherRunning.length > 0
-    ? `By default, a [TASK_REQUEST] runs in this workspace (\`${ownWorkspaceName}\`). If the work clearly belongs to a DIFFERENT workspace the user has access to, you may suggest it there by adding a \`targetWorkspace\` field with that workspace's name. The user will see the chosen target and can change it before approving.
+  // The [TASK_REQUEST] format and its default target live in the WORK
+  // DELEGATION system-prompt section (buildTaskDelegationPrompt), which is
+  // present on every turn. Restating them here would only duplicate them. This
+  // prefix carries just the parts that depend on which workspace the agent is
+  // sitting in.
+  const targetingBlock = targetable.length > 0
+    ? `Running workspaces you can name in \`targetWorkspace\`:
+${targetable.map(n => `  - ${n}`).join('\n')}
 
-Other running workspaces you can target:
-${otherRunning.map(n => `  - ${n}`).join('\n')}
-
-Only set \`targetWorkspace\` when you have specific reason to believe the task belongs elsewhere (e.g. the user asked you to relay it). When unsure, omit the field.`
-    : `By default, a [TASK_REQUEST] runs in this workspace (\`${ownWorkspaceName}\`). You may also suggest a task in a different workspace by adding \`"targetWorkspace": "workspace-name"\` to the [TASK_REQUEST] JSON — the user can confirm the target before approving.`;
+Only set \`targetWorkspace\` when the work clearly belongs to that workspace (e.g. it touches that workspace's repo, or the user asked you to relay it there). When unsure, omit the field. The user sees the chosen target and can change it before approving.`
+    : `The user sees the chosen target and can change it before approving.`;
 
   return `You are a discussion agent for this workspace (\`${ownWorkspaceName}\`). ${boundary}
 
-If the discussion leads to work that should be done inside the project, output a task request in this EXACT format (on its own, not inside a code block):
-
-[TASK_REQUEST]
-{"prompt": "detailed task description here"}
-[/TASK_REQUEST]
-
 ${targetingBlock}
-
-The user will be prompted to approve the task before it runs.
 
 ---
 
@@ -3597,13 +3658,6 @@ export async function launchTaskParticipant(
     message += `\n\n${TASK_REQUEST_REMINDER}`;
   }
 
-  let prompt: string;
-  if (!isResume) {
-    prompt = getDiscussionPromptPrefix(participant.project_dir ?? null, participant.workspace_name, task.user_id) + (catchUp ? catchUp + '\n' : '') + message;
-  } else {
-    prompt = catchUp ? catchUp + '\n' + message : message;
-  }
-
   if (!participant.project_dir) {
     const detected = await detectProjectDir(participant.workspace_name, task.user_id);
     if (detected) {
@@ -3636,6 +3690,19 @@ export async function launchTaskParticipant(
     } catch { /* Non-fatal */ }
   }
 
+  // The prefix carries the participant's boundary rules and is sent once, on
+  // the turn that opens the session. It must therefore follow the probe above,
+  // not `isResume`: when a resumed session's .jsonl has vanished the CLI falls
+  // back to --session-id and starts a FRESH session, which would otherwise
+  // never see the prefix at all. `!isResume` is kept as an additional trigger
+  // so a first launch that happens to find an existing session file still
+  // behaves as before.
+  const needsPromptPrefix = !isResume || !remoteSessionExists;
+  const prefix = needsPromptPrefix
+    ? getDiscussionPromptPrefix(participant.project_dir ?? null, participant.workspace_name, task.workspace_name, task.user_id)
+    : '';
+  const prompt = prefix + (catchUp ? catchUp + '\n' : '') + message;
+
   const claudeParts: string[] = ['claude'];
   claudeParts.push('-p', shellEscape(prompt));
   if (remoteSessionExists && participant.claude_session_id) {
@@ -3651,11 +3718,15 @@ export async function launchTaskParticipant(
     claudeParts.push('--mcp-config', shellEscape(memoryMcpConfig));
   }
   claudeParts.push('--max-turns', MAX_TURNS);
-  if (memoryMcpConfig) {
-    claudeParts.push('--append-system-prompt', shellEscape(buildMemoryUsagePrompt(task.user_id, participant.workspace_name)));
-  }
-  claudeParts.push('--append-system-prompt', shellEscape(HARNESS_REMINDER_NOTE));
-  claudeParts.push('--append-system-prompt', shellEscape(INTERACTIVE_PROMPT_NOTE));
+  pushAppendSystemPrompt(claudeParts, [
+    // Participants get TASK_REQUEST_REMINDER too, which points at "the WORK
+    // DELEGATION section of your system prompt" — so they need the section.
+    // An untargeted request lands in the host task's workspace, not theirs.
+    buildTaskDelegationPrompt(task.workspace_name),
+    memoryMcpConfig ? buildMemoryUsagePrompt(task.user_id, participant.workspace_name) : null,
+    HARNESS_REMINDER_NOTE,
+    INTERACTIVE_PROMPT_NOTE,
+  ]);
 
   const outputFile = remoteTaskParticipantOutputPath(participant.id);
   const exitFile = remoteTaskParticipantExitCodePath(participant.id);
