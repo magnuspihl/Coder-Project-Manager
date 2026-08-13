@@ -1,7 +1,7 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { createReadStream, createWriteStream, promises as fsPromises } from 'fs';
 import { randomUUID } from 'crypto';
-import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, getLatestTaskTurn, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, createReviewFindings, getDismissedFindings, getUserReplies, type Task, type TaskParticipant } from './tasks.js';
+import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, getLatestTaskTurn, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, createReviewFindings, getDismissedFindings, getPriorFindings, getUserReplies, type Task, type TaskParticipant } from './tasks.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, fetchGitHubToken, isRemoteAllowed } from './git.js';
@@ -800,7 +800,9 @@ const REVIEW_DECISION_FORMAT = `Output exactly one of these two lines as the ver
 REVIEW_DECISION: {"outcome":"pass","summary":"<one sentence>"}
 REVIEW_DECISION: {"outcome":"fail","summary":"<one sentence>","issues":["<specific issue>","..."]}
 
-"pass" = no significant issues found. "fail" = specific actionable issues were found; list each one in "issues". Output only the raw JSON after the marker — no markdown, no code fences, no commentary after it.`;
+"pass" = no significant issues found. "fail" = specific actionable issues were found; list each one in "issues". Output only the raw JSON after the marker — no markdown, no code fences, no commentary after it.
+
+ONE PROBLEM PER ENTRY IN "issues". Each entry is triaged individually by the user — they fix, dismiss, or mark it done one by one — so every entry you add is a separate decision they have to make. Do NOT split one problem across several entries: two call sites needing the same guard is ONE issue naming both, and the remedy for an issue belongs inside that issue's text, never as its own entry. Merge anything that would be fixed by a single edit.`;
 
 function buildReviewerSystemPrompt(): string {
   return `MANDATORY REVIEW RULES — RED TEAM MODE:
@@ -2679,24 +2681,41 @@ ${list}
  * memory of them and re-raises the same issue every pass, which is what drove
  * tasks into double-digit review rounds.
  */
-export function buildWaiverBlock(taskId: string): string {
-  const dismissed = getDismissedFindings(taskId);
-  if (dismissed.length === 0) return '';
+export function buildWaiverBlock(taskId: string, currentTurnId = ''): string {
+  const prior = getPriorFindings(taskId, currentTurnId);
+  if (prior.length === 0) return '';
 
-  const list = dismissed
-    .map((f, i) => `${i + 1}. ${f.body}${f.note ? `\n   User's reason: ${f.note}` : ''}`)
+  const label: Record<string, string> = {
+    dismissed: 'DISMISSED by the user — will not be changed',
+    resolved: 'MARKED ALREADY FIXED by the user',
+    fixing: 'SENT TO THE IMPLEMENTER to fix in the turn you are now reviewing',
+    open: 'ALREADY RAISED in an earlier pass and still in front of the user',
+  };
+
+  const list = prior
+    .map((f, i) => `${i + 1}. [${label[f.state] ?? f.state}] ${f.body}${f.note ? `\n   User's note: ${f.note}` : ''}`)
     .join('\n')
     .slice(0, REVIEW_CONTEXT_CHAR_BUDGET);
 
   return `
-Findings the user has ALREADY REVIEWED AND DISMISSED on this task. Do NOT raise
-these again, and do NOT raise reworded or semantically equivalent variants of
-them. The user has seen each one and decided it is not going to be changed;
-that decision is final and is not yours to relitigate. Raising a dismissed
-finding again is itself a review failure. If you believe a dismissed finding has
-become genuinely more severe because of *new* code in this diff, you may
-mention it once as context in your summary — but it must not appear in "issues"
-and must not be the basis of a "fail" verdict:
+Findings ALREADY RAISED on this task by earlier review passes, with what has
+happened to each. You are a fresh session and did not see any of this; without
+it you will restate points the user has already dealt with. Rules:
+
+- DISMISSED: do NOT raise again, and do NOT raise a reworded or semantically
+  equivalent variant. The user decided it will not be changed; that decision is
+  final and is not yours to relitigate. Re-raising one is itself a review failure.
+- MARKED ALREADY FIXED: the user says this is done. Verify it in the current
+  code. Only raise it again if you can point to the specific line that still
+  exhibits it, and say plainly that you are contradicting the user's assessment.
+- SENT TO THE IMPLEMENTER / ALREADY RAISED: these are known. If the code now
+  fixes one, say so in your summary and do NOT list it in "issues". If one is
+  genuinely still present, you may list it — but restate it in the SAME terms,
+  do not reword it into what looks like a new problem.
+
+Do not contradict an earlier finding on the same code without saying so
+explicitly: if a previous pass asked for X and you now believe X was wrong, name
+that in your summary rather than issuing an opposing finding as if it were new.
 ${list}
 `;
 }
@@ -2718,7 +2737,7 @@ async function launchReviewerOnTask(task: Task): Promise<void> {
 
   const gitDiff = await getGitDiff(task.worktree_path!, task.workspace_name, task.user_id);
 
-  const reviewerPrompt = `Original task:\n${task.prompt}\n${buildUserDirectionBlock(task.id)}${buildWaiverBlock(task.id)}\nChanges made by the implementer:\n${gitDiff}\n\n---\nReview the change adversarially, then emit your verdict. ${REVIEW_DECISION_FORMAT}`;
+  const reviewerPrompt = `Original task:\n${task.prompt}\n${buildUserDirectionBlock(task.id)}${buildWaiverBlock(task.id, turn.id)}\nChanges made by the implementer:\n${gitDiff}\n\n---\nReview the change adversarially, then emit your verdict. ${REVIEW_DECISION_FORMAT}`;
 
   await executeReviewer(task, turn.id, reviewerSessionId, {
     prompt: reviewerPrompt,

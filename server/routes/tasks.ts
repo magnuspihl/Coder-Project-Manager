@@ -358,8 +358,8 @@ router.patch('/tasks/:taskId/findings/:findingId', requireAuth, (req: Request, r
   }
 
   const { state, note } = req.body;
-  if (state !== 'open' && state !== 'dismissed') {
-    res.status(400).json({ error: "state must be 'open' or 'dismissed'" });
+  if (state !== 'open' && state !== 'dismissed' && state !== 'resolved') {
+    res.status(400).json({ error: "state must be 'open', 'dismissed' or 'resolved'" });
     return;
   }
   if (note !== undefined && note !== null && typeof note !== 'string') {

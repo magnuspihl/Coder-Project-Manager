@@ -395,21 +395,58 @@ export function getDb(): Database.Database {
 
   // Per-finding review triage. task_turns.review_issues stays the verbatim
   // verdict payload; this table is the actionable, individually-decidable copy.
-  // 'dismissed' findings are replayed into every later reviewer prompt as a
-  // waiver list, which is what stops a memoryless reviewer re-raising them.
+  // Every decided finding is replayed into later reviewer prompts, which is what
+  // stops a memoryless reviewer re-raising them.
   db.exec(`CREATE TABLE IF NOT EXISTS review_findings (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     turn_id TEXT NOT NULL REFERENCES task_turns(id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
     body TEXT NOT NULL,
-    state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'dismissed')),
+    state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'dismissed', 'resolved')),
     note TEXT,
     decided_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`);
   db.exec("CREATE INDEX IF NOT EXISTS idx_review_findings_task ON review_findings(task_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_review_findings_turn ON review_findings(turn_id, position)");
+
+  // Add the 'resolved' state to pre-existing tables. SQLite can't ALTER a CHECK
+  // constraint, so the table is rebuilt. 'dismissed' means "the user decided this
+  // will NOT be changed" — replayed to reviewers as a waiver. Users had no way to
+  // say "already fixed", so they dismissed with a note of "Fixed", which told the
+  // reviewer the exact opposite of what they meant.
+  const findingsSql = (db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='review_findings'"
+  ).get() as { sql: string } | undefined)?.sql ?? '';
+  if (findingsSql && !findingsSql.includes("'resolved'")) {
+    db.exec(`
+      CREATE TABLE review_findings_new (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        turn_id TEXT NOT NULL REFERENCES task_turns(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL,
+        body TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'dismissed', 'resolved')),
+        note TEXT,
+        decided_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO review_findings_new SELECT * FROM review_findings;
+      DROP TABLE review_findings;
+      ALTER TABLE review_findings_new RENAME TO review_findings;
+      CREATE INDEX IF NOT EXISTS idx_review_findings_task ON review_findings(task_id);
+      CREATE INDEX IF NOT EXISTS idx_review_findings_turn ON review_findings(turn_id, position);
+    `);
+    // Reclassify the historical workaround: dismissals whose note says the issue
+    // was already fixed were "resolved", not "waived".
+    const moved = db.prepare(`
+      UPDATE review_findings SET state = 'resolved'
+      WHERE state = 'dismissed' AND note IS NOT NULL
+        AND lower(trim(note)) IN ('fixed', 'done', 'already fixed', 'fixed.', 'done.')
+    `).run();
+    console.log(`[migration] review_findings gained 'resolved' state (${moved.changes} dismissal(s) reclassified)`);
+  }
 
   // Per-delta token usage events, so consumers can attribute tokens to a
   // rolling time window (e.g. "tokens in the last 5 hours") instead of only the
