@@ -656,4 +656,33 @@ through and muted with their reason and an **Undo dismiss** link. A **Fix all N 
 appears when more than one finding is still open. Verdicts recorded before this feature have no
 finding rows and fall back to the original flat bullet list plus **Apply suggested fixes**.
 
-Only the latest reviewer turn's findings are actionable; earlier turns' issues are superseded.
+### Actionability is per-finding, not per-turn
+
+A finding stays actionable until it is **decided** — `dismissed` is the only state that takes it out
+of play. `fixing` is re-sendable, since it only means "handed to the implementer, outcome unknown".
+
+This was originally gated on the finding belonging to the *latest* reviewer turn, inherited from the
+pre-findings design where a verdict was one indivisible blob that a newer verdict superseded
+wholesale. With individual findings that silently orphans them: fixing one finding starts an
+implementer turn and then a **new** reviewer turn, at which point every other finding you were
+working through belongs to an older turn and loses its **Fix this** button forever — **Ignore**
+stays, so the only path left is one the user never chose. The auto-review loop orphans findings the
+same way, without any user action at all.
+
+### Unresolved findings panel
+
+Because fixing one finding pushes the rest far up the conversation, every undecided finding (`open`
+or `fixing`, across all turns, oldest first) is also mirrored in a collapsible panel pinned directly
+above the reply composer, with the same per-finding **Fix this** / **Ignore** and a **Fix all N
+remaining**. Without it the user has to scroll back through earlier messages to act on the rest.
+
+### A pass does not resolve open findings
+
+When a later reviewer pass runs without re-raising a finding, that is evidence it was fixed — the
+implementer resumes with full context and routinely fixes neighbouring issues it can still see in
+the conversation, even ones the fix action didn't send. It is **not** proof: a fresh reviewer
+session can simply miss it. So a pass never changes a finding's state. Instead the finding is
+labelled *"A later review didn't raise this again — likely fixed, but not confirmed"*, and the panel
+header notes that a later review passed without raising them. Auto-resolving here would reproduce
+exactly the failure the per-finding design exists to prevent: the system quietly deciding an issue
+the user never ruled on.

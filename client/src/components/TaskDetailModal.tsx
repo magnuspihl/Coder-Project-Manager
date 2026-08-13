@@ -166,6 +166,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [pendingFinding, setPendingFinding] = useState<string | null>(null);
   const [dismissNoteFor, setDismissNoteFor] = useState<string | null>(null);
   const [dismissNote, setDismissNote] = useState('');
+  const [unresolvedOpen, setUnresolvedOpen] = useState(true);
   const [resolvingGitIssues, setResolvingGitIssues] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastParticipantsJsonRef = useRef('');
@@ -850,33 +851,44 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const findingsForTurn = (turnId: string): ReviewFinding[] =>
     findings.filter(f => f.turn_id === turnId).sort((a, b) => a.position - b.position);
 
-  // Fix a single finding: resumes the implementer with just that issue.
-  const handleFixFinding = async (finding: ReviewFinding) => {
-    if (pendingFinding || sending || applyingFixes) return;
-    setPendingFinding(finding.id);
-    editSeqRef.current++;
-    try {
-      const { findings: updated } = await fixFindings(taskId, [finding.id]);
-      setFindings(updated);
-      onTaskChanged?.();
-      await loadData();
-    } catch (err: any) {
-      alert(err?.message || 'Failed to send finding to the implementer');
-    } finally {
-      editSeqRef.current++;
-      setPendingFinding(null);
-    }
+  const turnNumberOf = (turnId: string): number =>
+    turns.find(t => t.id === turnId)?.turn_number ?? 0;
+
+  /**
+   * Whether a later reviewer pass ran after this finding was raised without
+   * re-raising it. That is evidence it was resolved — the implementer resumes
+   * with full context and often fixes neighbouring issues it can still see —
+   * but it is NOT proof, since a fresh reviewer session can simply miss it. So
+   * this only ever labels the finding; it never decides it. Silently dropping
+   * these is precisely the "did it assume I wanted to ignore it?" failure.
+   */
+  const supersededByLaterReview = (f: ReviewFinding): boolean => {
+    if (f.state === 'dismissed') return false;
+    const raisedAt = turnNumberOf(f.turn_id);
+    return turns.some(t => t.role === 'reviewer' && t.completed_at && t.turn_number > raisedAt);
   };
 
-  // Fix every still-open finding in this verdict in one implementer turn.
-  const handleFixAllOpen = async (turnId: string) => {
+  // Every finding still awaiting a decision, oldest first, across all turns.
+  const unresolvedFindings = (): ReviewFinding[] =>
+    findings
+      .filter(f => f.state === 'open' || f.state === 'fixing')
+      .sort((a, b) => turnNumberOf(a.turn_id) - turnNumberOf(b.turn_id) || a.position - b.position);
+
+  /**
+   * Send one or more findings to the implementer as a single turn. `busyKey`
+   * is what `pendingFinding` is set to while in flight, so the caller decides
+   * which control shows the spinner (a finding row, or a "fix all" button).
+   */
+  const handleFixFindings = async (selected: ReviewFinding[], busyKey: string) => {
     if (pendingFinding || sending || applyingFixes) return;
-    const open = findingsForTurn(turnId).filter(f => f.state !== 'dismissed');
-    if (open.length === 0) return;
-    setPendingFinding(turnId);
+    // 'fixing' is re-sendable: it means "handed to the implementer, outcome
+    // unknown". Only an explicit dismissal takes a finding out of play.
+    const ids = selected.filter(f => f.state !== 'dismissed').map(f => f.id);
+    if (ids.length === 0) return;
+    setPendingFinding(busyKey);
     editSeqRef.current++;
     try {
-      const { findings: updated } = await fixFindings(taskId, open.map(f => f.id));
+      const { findings: updated } = await fixFindings(taskId, ids);
       setFindings(updated);
       onTaskChanged?.();
       await loadData();
@@ -887,6 +899,12 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       setPendingFinding(null);
     }
   };
+
+  const handleFixFinding = (finding: ReviewFinding) => handleFixFindings([finding], finding.id);
+
+  // Fix every still-open finding in this verdict in one implementer turn.
+  const handleFixAllOpen = (turnId: string) =>
+    handleFixFindings(findingsForTurn(turnId).filter(f => f.state !== 'dismissed'), turnId);
 
   // Dismiss a finding. This is the durable signal: dismissed findings are
   // replayed into every later reviewer prompt as a waiver, so the reviewer
@@ -1335,10 +1353,14 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   // One reviewer finding as an independently actionable row: Fix sends just this
   // issue back to the implementer, Dismiss waives it permanently (and tells
   // every later reviewer not to raise it again).
-  const renderFinding = (f: ReviewFinding, index: number, canAct: boolean) => {
+  // `scope` distinguishes the two places a finding can appear (its turn card and
+  // the pinned unresolved panel) so opening the dismiss note in one doesn't also
+  // open — and autoFocus — a second input in the other.
+  const renderFinding = (f: ReviewFinding, index: number, canAct: boolean, scope = 'card') => {
+    const noteKey = `${scope}:${f.id}`;
     const busy = pendingFinding === f.id;
     const dismissed = f.state === 'dismissed';
-    const noteOpen = dismissNoteFor === f.id;
+    const noteOpen = dismissNoteFor === noteKey;
 
     return (
       <div
@@ -1369,6 +1391,11 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
             )}
             {f.state === 'fixing' && (
               <p className="mt-1 text-[11px] text-blue-600 dark:text-blue-400">Sent to the implementer</p>
+            )}
+            {!dismissed && supersededByLaterReview(f) && (
+              <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">
+                A later review didn't raise this again — likely fixed, but not confirmed.
+              </p>
             )}
 
             {noteOpen ? (
@@ -1422,7 +1449,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                       </button>
                     )}
                     <button
-                      onClick={() => { setDismissNoteFor(f.id); setDismissNote(''); }}
+                      onClick={() => { setDismissNoteFor(noteKey); setDismissNote(''); }}
                       disabled={busy || pendingFinding !== null}
                       className="text-[11px] font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 transition-colors"
                     >
@@ -1434,6 +1461,55 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
             )}
           </div>
         </div>
+      </div>
+    );
+  };
+
+  /**
+   * Every undecided finding across every reviewer turn, pinned just above the
+   * composer. Fixing one finding spawns a new reviewer turn, which pushes the
+   * findings you were working through far up the conversation — without this
+   * you have to scroll back through earlier messages to act on the rest.
+   * Expanded by default and collapsible — undecided findings are exactly what
+   * this view exists to surface, so it never hides them on its own.
+   */
+  const renderUnresolvedFindingsPanel = () => {
+    const unresolved = unresolvedFindings();
+    if (unresolved.length === 0) return null;
+    const allSuperseded = unresolved.every(supersededByLaterReview);
+
+    return (
+      <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/70 dark:bg-amber-900/20">
+        <button
+          onClick={() => setUnresolvedOpen(o => !o)}
+          className="w-full flex items-center gap-2 px-3 py-2 text-left"
+        >
+          <svg className={`w-3 h-3 text-amber-700 dark:text-amber-300 transition-transform ${unresolvedOpen ? 'rotate-90' : ''}`} fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+          </svg>
+          <span className="text-xs font-medium text-amber-800 dark:text-amber-200">
+            {unresolved.length} review finding{unresolved.length === 1 ? '' : 's'} still undecided
+          </span>
+          {allSuperseded && (
+            <span className="text-[11px] text-amber-700/70 dark:text-amber-300/70">
+              — a later review passed without raising {unresolved.length === 1 ? 'it' : 'them'}
+            </span>
+          )}
+        </button>
+        {unresolvedOpen && (
+          <div className="px-3 pb-3 space-y-2">
+            {unresolved.map((f, i) => renderFinding(f, i, true, 'unresolved'))}
+            {unresolved.length > 1 && (
+              <button
+                onClick={() => handleFixFindings(unresolved, 'unresolved-panel')}
+                disabled={pendingFinding !== null || sending || applyingFixes}
+                className="text-xs font-medium px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-50 transition-colors"
+              >
+                {pendingFinding === 'unresolved-panel' ? 'Sending…' : `Fix all ${unresolved.length} remaining`}
+              </button>
+            )}
+          </div>
+        )}
       </div>
     );
   };
@@ -1491,16 +1567,19 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     }
 
     // Fail (or a missing/garbled verdict, which the server records as a fail).
-    // Only the latest reviewer turn can apply fixes — earlier failed turns are
-    // superseded and their issues are stale.
-    const latestReviewerTurnId = turns.reduce<TaskTurn | null>(
-      (acc, t) => (t.role === 'reviewer' && (!acc || t.turn_number > acc.turn_number) ? t : acc),
-      null,
-    )?.id ?? null;
-    const canApply = task?.status === 'awaiting_feedback' && turn.id === latestReviewerTurnId;
+    //
+    // Actionability is per-finding, NOT per-turn. This used to require
+    // `turn.id === latestReviewerTurnId` — a holdover from when a verdict was
+    // one indivisible blob, so a newer verdict superseded the whole of an older
+    // one. With individual findings that silently orphans them: fixing one
+    // finding starts an implementer turn and then a *new* reviewer turn, which
+    // made every still-open finding of the turn you were working through
+    // permanently un-fixable (Ignore stayed, Fix vanished). A finding is stale
+    // only once it has been decided, not because time passed.
+    const canApply = task?.status === 'awaiting_feedback';
     const turnFindings = findingsForTurn(turn.id);
     const openCount = turnFindings.filter(f => f.state !== 'dismissed').length;
-    const dismissedCount = turnFindings.length - openCount;
+    const dismissedCount = turnFindings.filter(f => f.state === 'dismissed').length;
     return (
       <div className="space-y-2">
         <div className="flex items-center gap-2 py-1">
@@ -2186,6 +2265,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
               )}
               {task.status === 'awaiting_feedback' && (
                 <div className="space-y-3">
+                  {renderUnresolvedFindingsPanel()}
                   {!!task.pending_complete && (
                     <div className="text-xs px-3 py-2 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-300">
                       Completion is queued — will finalize once the working task on this workspace finishes. Replying below will cancel the pending completion.
