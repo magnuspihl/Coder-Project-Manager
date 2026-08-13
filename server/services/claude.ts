@@ -11,6 +11,7 @@ import { writeCpmGuidelines } from './workspace-memory.js';
 import { buildMemoryMcpConfig, MEMORY_MCP_ALLOWED_TOOL, buildMemoryUsagePrompt } from './memory-mcp.js';
 import { getValidCoderTokenForUser, forceRefreshCoderTokenForUser } from './sessions.js';
 import { resolveAccountToken, markAccountUsed } from './claude-accounts.js';
+import { writeRemoteStdin } from './ssh-stdin.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
@@ -1143,39 +1144,20 @@ async function buildAccountAuth(
   // this catches anything a hard crash left behind.
   const sweep = `find /tmp -maxdepth 1 -name 'cpm-auth-*.token' -mmin +10 -delete 2>/dev/null; `;
 
-  await new Promise<void>((resolve, reject) => {
-    // `head -c` exits on byte count rather than waiting for an stdin EOF that
-    // `coder ssh` does not reliably propagate (same reason as file transfers).
-    const proc = spawn('coder', [
-      'ssh', workspaceName, '--',
-      `${sweep}umask 077 && head -c ${bytes} > ${shellEscape(tokenFile)}`,
-    ], { env: coderEnv, stdio: ['pipe', 'ignore', 'pipe'] });
-
-    const timer = setTimeout(() => {
-      proc.kill('SIGKILL');
-      reject(new Error(`Timed out staging the token for Claude subscription "${resolved.label}"`));
-    }, 30_000);
-
-    // Must be drained, not just piped: an unread stderr pipe fills its buffer
-    // and blocks the child, which would turn a chatty `coder ssh` into a 30s
-    // timeout. Capped so a flood can't grow unboundedly.
-    let stderr = '';
-    proc.stderr?.on('data', (chunk: Buffer) => {
-      if (stderr.length < 2000) stderr += chunk.toString();
+  try {
+    await writeRemoteStdin({
+      workspaceName,
+      remoteScript: `${sweep}umask 077; head -c ${bytes} > ${shellEscape(tokenFile)}`,
+      source: Buffer.from(resolved.token, 'utf8'),
+      env: coderEnv,
+      timeoutMs: 30_000,
     });
-
-    proc.stdin.on('error', () => {}); // remote may close stdin once satisfied
-    proc.stdin.end(resolved.token);
-    proc.on('close', (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error(
-        `Could not stage the token for Claude subscription "${resolved.label}" on ${workspaceName} ` +
-        `(exit ${code})${stderr.trim() ? `: ${stderr.trim().slice(0, 300)}` : ''}`,
-      ));
-    });
-    proc.on('error', (err) => { clearTimeout(timer); reject(err); });
-  });
+  } catch (err) {
+    throw new Error(
+      `Could not stage the token for Claude subscription "${resolved.label}" on ${workspaceName}: ` +
+      `${(err as Error).message}`,
+    );
+  }
 
   announce();
 
@@ -1275,38 +1257,25 @@ async function transferFilesToWorkspace(
           src.on('error', (err) => { dst.destroy(); reject(err); });
         });
       } else {
-        await new Promise<void>((resolve, reject) => {
-          // `head -c <size>` reads exactly `size` bytes then exits cleanly —
-          // unlike `cat`, it doesn't depend on stdin EOF, which `coder ssh`
-          // does not reliably propagate to the remote side (observed: 5+ min
-          // hangs after data fully transferred).
-          const proc = spawn('coder', [
-            'ssh', workspaceName, '--',
-            `head -c ${att.size} > ${shellEscape(remotePath)}`,
-          ], {
+        // Raw-mode + exact-byte-count read; see writeRemoteStdin. Before that,
+        // any attachment whose bytes happened to include 0x03/0x04 (i.e. every
+        // non-trivial binary) was interpreted by the PTY instead of written,
+        // and the transfer died with the file never created.
+        try {
+          await writeRemoteStdin({
+            workspaceName,
+            remoteScript: `head -c ${att.size} > ${shellEscape(remotePath)}`,
+            source: createReadStream(att.storage_path),
             env: spawnEnv,
-            stdio: ['pipe', 'ignore', 'pipe'],
+            // Belt-and-suspenders timeout in case SSH itself hangs (network /
+            // workspace stall). 30s base + ~1ms/KB scales to the 20MB cap.
+            timeoutMs: 30_000 + Math.ceil(att.size / 1024),
           });
-          // Belt-and-suspenders timeout in case SSH itself hangs (network /
-          // workspace stall). 30s base + ~1ms/KB scales to the 20MB cap.
-          const timeoutMs = 30_000 + Math.ceil(att.size / 1024);
-          const timer = setTimeout(() => {
-            proc.kill('SIGKILL');
-            reject(new Error(`File transfer timed out for ${att.original_name} (${att.size} bytes, ${timeoutMs}ms)`));
-          }, timeoutMs);
-          const fileStream = createReadStream(att.storage_path);
-          fileStream.pipe(proc.stdin);
-          // Suppress EPIPE if remote closes stdin once it has its bytes —
-          // proc.on('close') is authoritative.
-          proc.stdin.on('error', () => {});
-          fileStream.on('error', (err) => { clearTimeout(timer); proc.kill(); reject(err); });
-          proc.on('close', (code) => {
-            clearTimeout(timer);
-            if (code === 0) resolve();
-            else reject(new Error(`SCP failed for ${att.original_name} (exit ${code})`));
-          });
-          proc.on('error', (err) => { clearTimeout(timer); reject(err); });
-        });
+        } catch (err) {
+          throw new Error(
+            `Transfer failed for ${att.original_name} (${att.size} bytes): ${(err as Error).message}`,
+          );
+        }
       }
       pathMap.set(att.id, remotePath);
     } catch (err) {

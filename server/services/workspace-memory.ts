@@ -1,4 +1,5 @@
-import { spawn, execFile } from 'child_process';
+import { execFile } from 'child_process';
+import { writeRemoteStdin } from './ssh-stdin.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 
@@ -104,6 +105,12 @@ export async function writeCpmGuidelines(workspaceName: string): Promise<void> {
   // Remote bash script — picks memdir based on whether primaryDir exists,
   // short-circuits if version marker is present, otherwise creates the dir,
   // reads file content from stdin, and maintains the MEMORY.md index.
+  //
+  // Every path reads exactly `bytes` with `head -c`, including the
+  // short-circuit: `cat` waits for an EOF that `coder ssh` never delivers, so
+  // this used to run to its 15s timeout and log a failure on every launch even
+  // though the content had long since arrived. See writeRemoteStdin.
+  const bytes = Buffer.byteLength(GUIDELINES_CONTENT, 'utf8');
   const script =
     `set -e\n` +
     `if [ -d ${shellEscape(primaryDir)} ]; then\n` +
@@ -113,44 +120,28 @@ export async function writeCpmGuidelines(workspaceName: string): Promise<void> {
     `fi\n` +
     `MEMFILE="$MEMDIR/${GUIDELINES_FILENAME}"\n` +
     `if [ -f "$MEMFILE" ] && grep -qF ${shellEscape(VERSION_MARKER)} "$MEMFILE" 2>/dev/null; then\n` +
-    `  cat > /dev/null\n` +
+    `  head -c ${bytes} > /dev/null\n` +
     `  exit 0\n` +
     `fi\n` +
     `mkdir -p "$MEMDIR"\n` +
-    `cat > "$MEMFILE"\n` +
+    `head -c ${bytes} > "$MEMFILE"\n` +
     `INDEX="$MEMDIR/MEMORY.md"\n` +
     `if [ ! -f "$INDEX" ] || ! grep -qF ${shellEscape(GUIDELINES_FILENAME)} "$INDEX" 2>/dev/null; then\n` +
     `  printf '%s\\n' ${shellEscape(INDEX_LINE)} >> "$INDEX"\n` +
     `fi\n`;
 
-  return new Promise<void>((resolve) => {
-    const proc = spawn('coder', ['ssh', workspaceName, '--', script], {
+  try {
+    await writeRemoteStdin({
+      workspaceName,
+      remoteScript: script,
+      source: Buffer.from(GUIDELINES_CONTENT, 'utf8'),
       env: { ...process.env, CODER_URL },
-      stdio: ['pipe', 'ignore', 'pipe'],
+      timeoutMs: 15000,
     });
-    let stderr = '';
-    proc.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });
-    proc.stdin?.on('error', () => { /* EPIPE when remote short-circuits — ignore */ });
-
-    const timeout = setTimeout(() => {
-      proc.kill();
-    }, 15000);
-
-    proc.on('close', (code) => {
-      clearTimeout(timeout);
-      if (code !== 0) {
-        console.warn(`[cpm-guidelines] write failed on ${workspaceName} (exit ${code}): ${stderr.slice(0, 200)}`);
-      }
-      resolve();
-    });
-    proc.on('error', (err) => {
-      clearTimeout(timeout);
-      console.warn(`[cpm-guidelines] spawn error on ${workspaceName}: ${err.message?.slice(0, 200)}`);
-      resolve();
-    });
-
-    proc.stdin?.end(GUIDELINES_CONTENT);
-  });
+  } catch (err) {
+    // Best-effort: a workspace without guidelines still runs tasks.
+    console.warn(`[cpm-guidelines] write failed on ${workspaceName}: ${(err as Error).message?.slice(0, 200)}`);
+  }
 }
 
 /**
@@ -254,32 +245,19 @@ export async function writeWorkspaceMemoryFile(
     throw new Error('invalid memory filename');
   }
 
+  // `head -c`, not `cat`: see writeRemoteStdin — the read has to end on a byte
+  // count because `coder ssh` does not deliver stdin EOF to the remote side.
+  const bytes = Buffer.byteLength(content, 'utf8');
   const script =
     memDirScript(workspaceName, projectDir) +
     `mkdir -p "$MEMDIR"\n` +
-    `cat > "$MEMDIR/${filename}"\n`;
+    `head -c ${bytes} > "$MEMDIR/${filename}"\n`;
 
-  return new Promise<void>((resolve, reject) => {
-    const proc = spawn('coder', ['ssh', workspaceName, '--', script], {
-      env: { ...process.env, CODER_URL },
-      stdio: ['pipe', 'ignore', 'pipe'],
-    });
-    let stderr = '';
-    proc.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });
-    proc.stdin?.on('error', () => { /* EPIPE — ignore */ });
-
-    const timeout = setTimeout(() => { proc.kill(); reject(new Error('SSH timeout')); }, 15000);
-
-    proc.on('close', (code) => {
-      clearTimeout(timeout);
-      if (code !== 0) reject(new Error(`SSH exit ${code}: ${stderr.slice(0, 200)}`));
-      else resolve();
-    });
-    proc.on('error', (err) => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-
-    proc.stdin?.end(content);
+  await writeRemoteStdin({
+    workspaceName,
+    remoteScript: script,
+    source: Buffer.from(content, 'utf8'),
+    env: { ...process.env, CODER_URL },
+    timeoutMs: 15000,
   });
 }
