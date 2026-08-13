@@ -61,6 +61,12 @@ export interface ComposerProps {
   autoFocus?: boolean;
   /** Matches the two composer variants: task agent (blue) vs participant (teal). */
   accent?: 'blue' | 'teal';
+  /**
+   * 'default' is the full-height reply box. 'compact' is for inline boxes that
+   * sit in a dense list — the "+ Task" quick-create under a workspace card —
+   * where a tall editor would push the rest of the column off-screen.
+   */
+  size?: 'default' | 'compact';
 }
 
 // Spelled out in full rather than composed, so Tailwind's scanner can see them.
@@ -72,9 +78,19 @@ const BORDER_WITHIN = {
   blue: 'border-gray-300 dark:border-gray-700 focus-within:ring-blue-500',
   teal: 'border-teal-300 dark:border-teal-700 focus-within:ring-teal-500',
 } as const;
+// The rich branch sizes itself in MarkdownComposer.css, which has to fight
+// EasyMDE's inline styles; these are the textarea branch's matching heights.
+const MIN_HEIGHT = {
+  default: 'sm:min-h-[11rem]',
+  compact: '',
+} as const;
+const FALLBACK_HEIGHT = {
+  default: 'min-h-[5rem] sm:min-h-[11rem]',
+  compact: 'min-h-[3.5rem]',
+} as const;
 
 const MarkdownComposer = forwardRef<ComposerHandle, ComposerProps>(function MarkdownComposer(props, ref) {
-  const { value, onChange, onCaretMove, onKeyDown, placeholder, disabled = false, autoFocus = false, accent = 'blue' } = props;
+  const { value, onChange, onCaretMove, onKeyDown, placeholder, disabled = false, autoFocus = false, accent = 'blue', size = 'default' } = props;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isComposingRef = useRef(false);
   const richRef = useRef<ComposerHandle>(null);
@@ -135,8 +151,8 @@ const MarkdownComposer = forwardRef<ComposerHandle, ComposerProps>(function Mark
           // the CodeMirror chunk lands.
           <div
             className={
-              'w-full rounded-md border bg-white dark:bg-gray-800 sm:min-h-[11rem] min-h-[5rem] ' +
-              BORDER_WITHIN[accent]
+              'w-full rounded-md border bg-white dark:bg-gray-800 ' +
+              FALLBACK_HEIGHT[size] + ' ' + BORDER_WITHIN[accent]
             }
           />
         }
@@ -176,13 +192,14 @@ const MarkdownComposer = forwardRef<ComposerHandle, ComposerProps>(function Mark
         onCaretMove?.(el.value, caret);
       }}
       placeholder={placeholder}
-      rows={3}
+      rows={size === 'compact' ? 2 : 3}
       autoFocus={autoFocus}
       disabled={disabled}
       className={
-        // sm:min-h-[11rem] matches the textarea this replaced, so tablets wide
-        // enough to hit the sm breakpoint keep the taller composer.
-        'w-full px-3 py-2 rounded-md border text-sm resize-y disabled:opacity-50 sm:min-h-[11rem] ' +
+        // The default size keeps sm:min-h-[11rem] from the textarea it replaced,
+        // so tablets past the sm breakpoint still get the taller composer.
+        'w-full px-3 py-2 rounded-md border text-sm resize-y disabled:opacity-50 ' +
+        MIN_HEIGHT[size] + ' ' +
         'bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 ' +
         BORDER[accent]
       }

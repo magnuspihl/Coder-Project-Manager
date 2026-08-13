@@ -19,7 +19,7 @@ import { clampCaret, mapCaret } from './composerCaret';
  */
 
 const MarkdownComposerRich = forwardRef<ComposerHandle, ComposerProps>(function MarkdownComposerRich(
-  { value, onChange, onCaretMove, onKeyDown, placeholder, disabled = false, autoFocus = false, accent = 'blue' },
+  { value, onChange, onCaretMove, onKeyDown, placeholder, disabled = false, autoFocus = false, accent = 'blue', size = 'default' },
   ref,
 ) {
   const instanceRef = useRef<EasyMDE | null>(null);
@@ -201,7 +201,8 @@ const MarkdownComposerRich = forwardRef<ComposerHandle, ComposerProps>(function 
   return (
     <div
       className={
-        `cpm-composer${accent === 'teal' ? ' cpm-composer-teal' : ''} ` +
+        `cpm-composer${accent === 'teal' ? ' cpm-composer-teal' : ''}` +
+        `${size === 'compact' ? ' cpm-composer-compact' : ''} ` +
         'w-full rounded-md border bg-white dark:bg-gray-800 overflow-hidden ' +
         'focus-within:outline-none focus-within:ring-2 ' +
         (accent === 'teal'

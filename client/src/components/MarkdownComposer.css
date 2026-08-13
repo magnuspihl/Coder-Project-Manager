@@ -56,6 +56,21 @@
   }
 }
 
+/*
+ * Compact variant, for the inline "+ Task" box in a workspace column. Declared
+ * after the media query above so it wins at every breakpoint on source order.
+ * Both bounds need !important: min-height to beat EasyMDE's inline style, and
+ * max-height to beat the default rule's own !important min-height.
+ */
+.cpm-composer-compact .EasyMDEContainer .CodeMirror-scroll {
+  min-height: 3.5rem !important;
+  max-height: 14rem !important;
+}
+.cpm-composer-compact .EasyMDEContainer .CodeMirror {
+  padding: 0.5rem;
+  font-size: 0.875rem;
+}
+
 /* Caret + selection, per accent */
 .cpm-composer .EasyMDEContainer .CodeMirror-cursor {
   border-left: 2px solid #2563eb; /* blue-600 */
