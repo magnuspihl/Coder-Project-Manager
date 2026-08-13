@@ -90,6 +90,18 @@ export interface TaskTurn {
   completed_at: string | null;
 }
 
+export interface ReviewFinding {
+  id: string;
+  task_id: string;
+  turn_id: string;
+  position: number;
+  body: string;
+  state: 'open' | 'fixing' | 'dismissed';
+  note: string | null;
+  decided_at: string | null;
+  created_at: string;
+}
+
 export interface Task {
   id: string;
   workspace_id: string;
@@ -351,7 +363,21 @@ export interface AttachmentInfo {
 }
 
 export const getTaskDetail = (taskId: string) =>
-  request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[]; turns: TaskTurn[]; taskRequests: TaskRequestItem[] }>(`/api/tasks/${taskId}`);
+  request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[]; turns: TaskTurn[]; taskRequests: TaskRequestItem[]; findings: ReviewFinding[] }>(`/api/tasks/${taskId}`);
+
+/** Dismiss a reviewer finding (waived — replayed to later reviewers as such) or reopen it. */
+export const setFindingState = (taskId: string, findingId: string, state: 'open' | 'dismissed', note?: string) =>
+  request<{ findings: ReviewFinding[] }>(`/api/tasks/${taskId}/findings/${findingId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ state, note: note ?? null }),
+  });
+
+/** Send the selected findings back to the implementer to fix. */
+export const fixFindings = (taskId: string, findingIds: string[]) =>
+  request<{ task: Task; findings: ReviewFinding[] }>(`/api/tasks/${taskId}/findings/fix`, {
+    method: 'POST',
+    body: JSON.stringify({ findingIds }),
+  });
 
 export const approveTaskRequestForTask = (taskId: string, requestId: string, targetWorkspaceId?: string | null) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/task-requests/${requestId}/approve`, {

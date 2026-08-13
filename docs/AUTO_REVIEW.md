@@ -107,6 +107,25 @@ If the diff exceeds ~8 000 tokens (estimated by character count), it is truncate
 8 000 tokens with a note: `[diff truncated — review what you can see]`. Full file reads are
 available via the Reviewer's Read tool.
 
+**Reviewer memory (user direction + waivers).** `task.prompt` alone was the reviewer's *entire*
+notion of what was asked. Because the Reviewer starts a fresh session every pass, any direction the
+user gave in a later reply went only to the Implementer (via `--resume`) and was structurally
+invisible to the Reviewer — which then re-derived its opinion from the original prompt and re-raised
+issues the user had already overruled ("don't do what the reviewer said about issue X, the first
+implementation was correct" had no effect on the next pass). Two blocks now sit between the prompt
+and the diff:
+
+- `buildUserDirectionBlock` replays the user's subsequent replies, oldest first, stating explicitly
+  that later instructions override earlier ones *including the original task*. Auto-generated
+  bodies (the per-finding fix action and the legacy "Apply suggested fixes" button) are excluded —
+  replaying those would echo the reviewer's own prior verdict back at it as if the user had asked
+  for it independently.
+- `buildWaiverBlock` replays every finding the user **dismissed** (see Section 16), with the user's
+  reason, and states that re-raising one is itself a review failure.
+
+Each block is capped at 6 000 characters; the direction block keeps the *most recent* replies when
+trimming, since later direction is what matters.
+
 The Reviewer's working directory is the task's existing worktree. It inherits the same `coder ssh`
 invocation path. No new worktree is created.
 
@@ -578,3 +597,63 @@ The per-task `auto_review` column is the primary control. There is no workspace-
 - **Git workflow** — Mark Complete commits whatever is in the worktree, regardless of review outcome
 - **Retries** — a failed task can be retried as before; `review_loop_count` resets
 - **Cost tracking** — Reviewer turns are counted as normal assistant messages; cost is attributed to the task
+
+---
+
+## 16. Per-Finding Triage
+
+A fail verdict's `issues` array is also exploded into one `review_findings` row per issue, so each
+one is decided on its own rather than as an all-or-nothing block.
+
+### Data model
+
+```sql
+CREATE TABLE review_findings (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  turn_id TEXT NOT NULL REFERENCES task_turns(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL,        -- order within the verdict
+  body TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'dismissed')),
+  note TEXT,                        -- user's reason when dismissing
+  decided_at TEXT,
+  created_at TEXT NOT NULL
+);
+```
+
+`task_turns.review_issues` is unchanged and remains the verbatim verdict payload; `review_findings`
+is the actionable copy. `createReviewFindings` is idempotent per turn (a re-finalized turn replaces
+its own rows), and findings from other turns are left alone so waivers accumulate across passes.
+Blank issue strings are skipped. A fail verdict that carried no issues list falls back to one
+finding holding the summary, so a fail is never un-triageable.
+
+### States
+
+| State | Meaning |
+|---|---|
+| `open` | Not yet decided. |
+| `fixing` | Sent to the Implementer via the fix action. |
+| `dismissed` | Waived by the user. Replayed to every later Reviewer as a waiver (Section 4). |
+
+Reopening a dismissed finding clears its note and `decided_at`.
+
+### Routes
+
+- `PATCH /api/tasks/:taskId/findings/:findingId` — `{state: 'open'|'dismissed', note?}`. Scoped by
+  task as well as id, so a finding id from another task is not mutable through this route.
+- `POST /api/tasks/:taskId/findings/fix` — `{findingIds: string[]}`. Posts a user reply containing
+  only the selected findings, marks them `fixing`, resets the review loop, and queues the task. The
+  reply also lists any dismissed findings as explicit do-not-touch, so the Implementer does not
+  "helpfully" fix a waived issue it can still see earlier in the conversation.
+
+`GET /api/tasks/:taskId` gains a `findings` array.
+
+### UI
+
+Each finding renders as its own row with **Fix this** and **Ignore**. Ignore opens an optional
+one-line reason (shown to later reviewers) before confirming. Dismissed findings render struck
+through and muted with their reason and an **Undo dismiss** link. A **Fix all N remaining** button
+appears when more than one finding is still open. Verdicts recorded before this feature have no
+finding rows and fall back to the original flat bullet list plus **Apply suggested fixes**.
+
+Only the latest reviewer turn's findings are actionable; earlier turns' issues are superseded.

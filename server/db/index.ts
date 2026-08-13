@@ -393,6 +393,24 @@ export function getDb(): Database.Database {
     db.exec("ALTER TABLE messages ADD COLUMN turn_id TEXT REFERENCES task_turns(id)");
   }
 
+  // Per-finding review triage. task_turns.review_issues stays the verbatim
+  // verdict payload; this table is the actionable, individually-decidable copy.
+  // 'dismissed' findings are replayed into every later reviewer prompt as a
+  // waiver list, which is what stops a memoryless reviewer re-raising them.
+  db.exec(`CREATE TABLE IF NOT EXISTS review_findings (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL REFERENCES task_turns(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'dismissed')),
+    note TEXT,
+    decided_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_review_findings_task ON review_findings(task_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_review_findings_turn ON review_findings(turn_id, position)");
+
   // Per-delta token usage events, so consumers can attribute tokens to a
   // rolling time window (e.g. "tokens in the last 5 hours") instead of only the
   // cumulative per-task totals on the tasks row. One row is inserted per token

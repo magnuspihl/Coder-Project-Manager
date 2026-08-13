@@ -39,6 +39,9 @@ import {
   type Workspace,
   type AttachmentInfo,
   type TaskRequestItem,
+  type ReviewFinding,
+  setFindingState,
+  fixFindings,
 } from '../api/client';
 import { playChime } from '../utils/chime';
 import { playListenChime } from '../utils/listenChime';
@@ -156,6 +159,12 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   // full reviewer prose is hidden behind a per-turn "details" toggle.
   const [expandedReviews, setExpandedReviews] = useState<Set<string>>(new Set());
   const [applyingFixes, setApplyingFixes] = useState(false);
+  // Per-finding triage: each reviewer issue is individually fixable or
+  // dismissable. `pendingFinding` marks the row whose request is in flight.
+  const [findings, setFindings] = useState<ReviewFinding[]>([]);
+  const [pendingFinding, setPendingFinding] = useState<string | null>(null);
+  const [dismissNoteFor, setDismissNoteFor] = useState<string | null>(null);
+  const [dismissNote, setDismissNote] = useState('');
   const [resolvingGitIssues, setResolvingGitIssues] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastParticipantsJsonRef = useRef('');
@@ -255,7 +264,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     // the commit even though it began after the pre-bump.
     const seqAtStart = editSeqRef.current;
     try {
-      const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments, turns: newTurns, taskRequests: newTaskRequests } = await getTaskDetail(taskId);
+      const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments, turns: newTurns, taskRequests: newTaskRequests, findings: newFindings } = await getTaskDetail(taskId);
       setTaskRequests(newTaskRequests || []);
       if (prevStatusRef.current && prevStatusRef.current !== 'awaiting_feedback' && newTask.status === 'awaiting_feedback') {
         playChime();
@@ -281,6 +290,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       }
       if (newAttachments) setAttachments(newAttachments);
       if (newTurns) setTurns(newTurns);
+      // Don't clobber an in-flight local triage decision with a poll response
+      // that predates it — same hazard as the task row above.
+      if (newFindings && editSeqRef.current === seqAtStart) setFindings(newFindings);
     } catch {
       // ignore
     } finally {
@@ -848,6 +860,83 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     }
   };
 
+  // Findings for one reviewer turn, in the order the reviewer listed them.
+  const findingsForTurn = (turnId: string): ReviewFinding[] =>
+    findings.filter(f => f.turn_id === turnId).sort((a, b) => a.position - b.position);
+
+  // Fix a single finding: resumes the implementer with just that issue.
+  const handleFixFinding = async (finding: ReviewFinding) => {
+    if (pendingFinding || sending || applyingFixes) return;
+    setPendingFinding(finding.id);
+    editSeqRef.current++;
+    try {
+      const { findings: updated } = await fixFindings(taskId, [finding.id]);
+      setFindings(updated);
+      onTaskChanged?.();
+      await loadData();
+    } catch (err: any) {
+      alert(err?.message || 'Failed to send finding to the implementer');
+    } finally {
+      editSeqRef.current++;
+      setPendingFinding(null);
+    }
+  };
+
+  // Fix every still-open finding in this verdict in one implementer turn.
+  const handleFixAllOpen = async (turnId: string) => {
+    if (pendingFinding || sending || applyingFixes) return;
+    const open = findingsForTurn(turnId).filter(f => f.state !== 'dismissed');
+    if (open.length === 0) return;
+    setPendingFinding(turnId);
+    editSeqRef.current++;
+    try {
+      const { findings: updated } = await fixFindings(taskId, open.map(f => f.id));
+      setFindings(updated);
+      onTaskChanged?.();
+      await loadData();
+    } catch (err: any) {
+      alert(err?.message || 'Failed to send findings to the implementer');
+    } finally {
+      editSeqRef.current++;
+      setPendingFinding(null);
+    }
+  };
+
+  // Dismiss a finding. This is the durable signal: dismissed findings are
+  // replayed into every later reviewer prompt as a waiver, so the reviewer
+  // stops re-raising them despite starting a fresh session each pass.
+  const handleDismissFinding = async (finding: ReviewFinding, note: string) => {
+    if (pendingFinding) return;
+    setPendingFinding(finding.id);
+    editSeqRef.current++;
+    try {
+      const { findings: updated } = await setFindingState(taskId, finding.id, 'dismissed', note);
+      setFindings(updated);
+      setDismissNoteFor(null);
+      setDismissNote('');
+    } catch (err: any) {
+      alert(err?.message || 'Failed to dismiss finding');
+    } finally {
+      editSeqRef.current++;
+      setPendingFinding(null);
+    }
+  };
+
+  const handleReopenFinding = async (finding: ReviewFinding) => {
+    if (pendingFinding) return;
+    setPendingFinding(finding.id);
+    editSeqRef.current++;
+    try {
+      const { findings: updated } = await setFindingState(taskId, finding.id, 'open');
+      setFindings(updated);
+    } catch (err: any) {
+      alert(err?.message || 'Failed to reopen finding');
+    } finally {
+      editSeqRef.current++;
+      setPendingFinding(null);
+    }
+  };
+
   const handleResolveGitIssues = async () => {
     if (resolvingGitIssues || sending) return;
     setResolvingGitIssues(true);
@@ -1257,6 +1346,112 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     if (e.target === overlayRef.current) closeModal();
   };
 
+  // One reviewer finding as an independently actionable row: Fix sends just this
+  // issue back to the implementer, Dismiss waives it permanently (and tells
+  // every later reviewer not to raise it again).
+  const renderFinding = (f: ReviewFinding, index: number, canAct: boolean) => {
+    const busy = pendingFinding === f.id;
+    const dismissed = f.state === 'dismissed';
+    const noteOpen = dismissNoteFor === f.id;
+
+    return (
+      <div
+        key={f.id}
+        className={`rounded-md border p-2.5 ${
+          dismissed
+            ? 'border-gray-200 dark:border-gray-700 bg-gray-50/70 dark:bg-gray-800/40'
+            : 'border-amber-200 dark:border-amber-800 bg-white/60 dark:bg-gray-900/30'
+        }`}
+      >
+        <div className="flex items-start gap-2">
+          <span className={`text-[11px] font-semibold mt-0.5 shrink-0 ${dismissed ? 'text-gray-400 dark:text-gray-500' : 'text-amber-700 dark:text-amber-300'}`}>
+            {index + 1}.
+          </span>
+          <div className="flex-1 min-w-0">
+            <p className={`text-sm break-words ${
+              dismissed
+                ? 'text-gray-500 dark:text-gray-400 line-through decoration-gray-400/60'
+                : 'text-amber-900 dark:text-amber-200'
+            }`}>
+              {f.body}
+            </p>
+
+            {dismissed && (
+              <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400 italic">
+                Dismissed{f.note ? ` — ${f.note}` : ''}
+              </p>
+            )}
+            {f.state === 'fixing' && (
+              <p className="mt-1 text-[11px] text-blue-600 dark:text-blue-400">Sent to the implementer</p>
+            )}
+
+            {noteOpen ? (
+              <div className="mt-2 space-y-1.5">
+                <input
+                  autoFocus
+                  value={dismissNote}
+                  onChange={e => setDismissNote(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') { e.preventDefault(); handleDismissFinding(f, dismissNote); }
+                    if (e.key === 'Escape') { setDismissNoteFor(null); setDismissNote(''); }
+                  }}
+                  placeholder="Why? (optional — the reviewer is shown this reason)"
+                  className="w-full text-xs px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                />
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => handleDismissFinding(f, dismissNote)}
+                    disabled={busy}
+                    className="text-[11px] font-medium px-2 py-1 rounded bg-gray-600 hover:bg-gray-700 text-white disabled:opacity-50"
+                  >
+                    {busy ? 'Dismissing…' : 'Confirm dismiss'}
+                  </button>
+                  <button
+                    onClick={() => { setDismissNoteFor(null); setDismissNote(''); }}
+                    className="text-[11px] text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 mt-1.5">
+                {dismissed ? (
+                  <button
+                    onClick={() => handleReopenFinding(f)}
+                    disabled={busy}
+                    className="text-[11px] text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 underline disabled:opacity-50"
+                  >
+                    {busy ? 'Reopening…' : 'Undo dismiss'}
+                  </button>
+                ) : (
+                  <>
+                    {canAct && (
+                      <button
+                        onClick={() => handleFixFinding(f)}
+                        disabled={busy || pendingFinding !== null || sending || applyingFixes}
+                        className="text-[11px] font-medium px-2 py-1 rounded bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-50 transition-colors"
+                      >
+                        {busy ? 'Sending…' : 'Fix this'}
+                      </button>
+                    )}
+                    <button
+                      onClick={() => { setDismissNoteFor(f.id); setDismissNote(''); }}
+                      disabled={busy || pendingFinding !== null}
+                      className="text-[11px] font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 transition-colors"
+                    >
+                      Ignore
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   // Renders a reviewer turn as a compact pass/fail summary instead of the full
   // verbose review prose. On pass it's a single line; on fail it lists the
   // actionable issues and offers an "Apply suggested fixes" button. The raw
@@ -1317,6 +1512,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       null,
     )?.id ?? null;
     const canApply = task?.status === 'awaiting_feedback' && turn.id === latestReviewerTurnId;
+    const turnFindings = findingsForTurn(turn.id);
+    const openCount = turnFindings.filter(f => f.state !== 'dismissed').length;
+    const dismissedCount = turnFindings.length - openCount;
     return (
       <div className="space-y-2">
         <div className="flex items-center gap-2 py-1">
@@ -1328,7 +1526,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
           <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
         </div>
         <div className="rounded-lg p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 mr-8">
-          {issues.length > 0 ? (
+          {turnFindings.length > 0 ? (
+            <div className="space-y-2">
+              {turnFindings.map((f, i) => renderFinding(f, i, canApply))}
+            </div>
+          ) : issues.length > 0 ? (
+            // Legacy verdicts (recorded before per-finding triage) have no
+            // finding rows, so fall back to the flat bullet list.
             <ul className="list-disc list-outside ml-4 space-y-1 text-sm text-amber-900 dark:text-amber-200">
               {issues.map((iss, i) => <li key={i}>{iss}</li>)}
             </ul>
@@ -1336,7 +1540,16 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
             <p className="text-sm text-amber-900 dark:text-amber-200">{turn.review_summary || 'The reviewer reported issues.'}</p>
           )}
           <div className="flex items-center gap-3 mt-3 flex-wrap">
-            {canApply && (
+            {canApply && openCount > 1 && (
+              <button
+                onClick={() => handleFixAllOpen(turn.id)}
+                disabled={pendingFinding !== null || sending || applyingFixes}
+                className="text-xs font-medium px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-50 transition-colors"
+              >
+                {pendingFinding === turn.id ? 'Sending…' : `Fix all ${openCount} remaining`}
+              </button>
+            )}
+            {canApply && turnFindings.length === 0 && (
               <button
                 onClick={() => handleApplyFixes(turn)}
                 disabled={applyingFixes || sending}
@@ -1344,6 +1557,11 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
               >
                 {applyingFixes ? 'Applying…' : 'Apply suggested fixes'}
               </button>
+            )}
+            {dismissedCount > 0 && (
+              <span className="text-[11px] text-amber-700/70 dark:text-amber-300/70">
+                {dismissedCount} dismissed — later reviews are told not to raise {dismissedCount === 1 ? 'it' : 'them'} again
+              </span>
             )}
             {fullReview && (
               <button

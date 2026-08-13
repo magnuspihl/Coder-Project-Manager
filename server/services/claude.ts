@@ -1,7 +1,7 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { createReadStream, createWriteStream, promises as fsPromises } from 'fs';
 import { randomUUID } from 'crypto';
-import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, getLatestTaskTurn, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, type Task, type TaskParticipant } from './tasks.js';
+import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, getLatestTaskTurn, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, createReviewFindings, getDismissedFindings, getUserReplies, type Task, type TaskParticipant } from './tasks.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, fetchGitHubToken, isRemoteAllowed } from './git.js';
@@ -2616,6 +2616,70 @@ async function onImplementerTurnComplete(task: Task): Promise<void> {
  * The reviewer runs a fresh session, sees the git diff, and emits a
  * REVIEW_DECISION line that the server parses to determine next action.
  */
+/** Cap on how much replayed context the reviewer prompt may carry, per block. */
+const REVIEW_CONTEXT_CHAR_BUDGET = 6000;
+
+/**
+ * The reviewer runs a fresh session every pass and only ever saw `task.prompt`
+ * — the *original* creation prompt. Any direction the user gave later (in a
+ * reply) went to the implementer via --resume and was structurally invisible to
+ * the reviewer, which then re-derived its opinion from the original prompt and
+ * re-insisted on things the user had already overruled. This replays the user's
+ * subsequent instructions so later direction carries the weight it should.
+ */
+export function buildUserDirectionBlock(taskId: string): string {
+  const replies = getUserReplies(taskId);
+  if (replies.length === 0) return '';
+
+  // Most recent direction matters most, so keep the tail when trimming.
+  const kept: string[] = [];
+  let budget = REVIEW_CONTEXT_CHAR_BUDGET;
+  for (let i = replies.length - 1; i >= 0; i--) {
+    const body = replies[i].trim();
+    if (!body) continue;
+    if (body.length > budget) break;
+    budget -= body.length;
+    kept.unshift(body);
+  }
+  if (kept.length === 0) return '';
+
+  const list = kept.map((r, i) => `${i + 1}. ${r}`).join('\n\n');
+  return `
+Subsequent direction from the user on this task, in order (LATER INSTRUCTIONS
+OVERRIDE EARLIER ONES, INCLUDING THE ORIGINAL TASK ABOVE). These are the user's
+decisions, not suggestions. If the user has settled a question, treat it as
+settled and do not reopen it — even if you would have decided it differently:
+${list}
+`;
+}
+
+/**
+ * Findings the user explicitly dismissed. Without this the reviewer has no
+ * memory of them and re-raises the same issue every pass, which is what drove
+ * tasks into double-digit review rounds.
+ */
+export function buildWaiverBlock(taskId: string): string {
+  const dismissed = getDismissedFindings(taskId);
+  if (dismissed.length === 0) return '';
+
+  const list = dismissed
+    .map((f, i) => `${i + 1}. ${f.body}${f.note ? `\n   User's reason: ${f.note}` : ''}`)
+    .join('\n')
+    .slice(0, REVIEW_CONTEXT_CHAR_BUDGET);
+
+  return `
+Findings the user has ALREADY REVIEWED AND DISMISSED on this task. Do NOT raise
+these again, and do NOT raise reworded or semantically equivalent variants of
+them. The user has seen each one and decided it is not going to be changed;
+that decision is final and is not yours to relitigate. Raising a dismissed
+finding again is itself a review failure. If you believe a dismissed finding has
+become genuinely more severe because of *new* code in this diff, you may
+mention it once as context in your summary — but it must not appear in "issues"
+and must not be the basis of a "fail" verdict:
+${list}
+`;
+}
+
 async function launchReviewerOnTask(task: Task): Promise<void> {
   // Fresh reviewer turn — clear any stale interrupt guard from a prior pass so
   // this run's verdict is allowed to route.
@@ -2633,7 +2697,7 @@ async function launchReviewerOnTask(task: Task): Promise<void> {
 
   const gitDiff = await getGitDiff(task.worktree_path!, task.workspace_name, task.user_id);
 
-  const reviewerPrompt = `Original task:\n${task.prompt}\n\nChanges made by the implementer:\n${gitDiff}\n\n---\nReview the change adversarially, then emit your verdict. ${REVIEW_DECISION_FORMAT}`;
+  const reviewerPrompt = `Original task:\n${task.prompt}\n${buildUserDirectionBlock(task.id)}${buildWaiverBlock(task.id)}\nChanges made by the implementer:\n${gitDiff}\n\n---\nReview the change adversarially, then emit your verdict. ${REVIEW_DECISION_FORMAT}`;
 
   await executeReviewer(task, turn.id, reviewerSessionId, {
     prompt: reviewerPrompt,
@@ -3028,6 +3092,13 @@ function finalizeReviewer(
   completeTaskTurn(turnId, decision.outcome, decision.summary, decision.issues);
   appendStreamLog(task.id, decision.outcome === 'pass' ? 'reviewer_pass' : 'reviewer_fail',
     `[Reviewer] ${decision.outcome.toUpperCase()}: ${decision.summary}`);
+
+  // Explode the verdict into individually triageable findings. Fall back to the
+  // summary when the verdict carried no issues list, so a fail is never
+  // un-triageable.
+  if (decision.outcome === 'fail') {
+    createReviewFindings(task.id, turnId, decision.issues ?? [decision.summary]);
+  }
 
   if (decision.outcome === 'pass') {
     console.log(`[auto-review] Task ${task.id} reviewer passed`);
