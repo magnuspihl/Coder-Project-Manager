@@ -55,6 +55,26 @@ CREATE TABLE IF NOT EXISTS task_turns (
 
 CREATE INDEX IF NOT EXISTS idx_task_turns_task ON task_turns(task_id, turn_number);
 
+-- Review findings: one row per issue in a reviewer's fail verdict, so each can
+-- be triaged individually. task_turns.review_issues remains the verbatim
+-- verdict payload; this is the actionable copy. 'dismissed' rows are replayed
+-- into every later reviewer prompt as a waiver list — the reviewer runs a fresh
+-- session each pass, so this table is its only memory of the user's decisions.
+CREATE TABLE IF NOT EXISTS review_findings (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  turn_id TEXT NOT NULL REFERENCES task_turns(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL,
+  body TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'dismissed')),
+  note TEXT,
+  decided_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_findings_task ON review_findings(task_id);
+CREATE INDEX IF NOT EXISTS idx_review_findings_turn ON review_findings(turn_id, position);
+
 -- Messages table: conversation history per task
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,

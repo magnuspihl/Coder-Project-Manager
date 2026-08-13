@@ -36,6 +36,11 @@ import {
   approveTaskRequest,
   dismissTaskRequest,
   setTaskRequestTarget,
+  getReviewFindings,
+  getReviewFinding,
+  setReviewFindingState,
+  getDismissedFindings,
+  REVIEW_FIX_REPLY_PREFIX,
 } from '../services/tasks.js';
 import { findUserWorkspaceById } from '../services/workspace-cache.js';
 import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview } from '../services/claude.js';
@@ -185,7 +190,8 @@ router.get('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
   const attachments = getAttachmentsByTask(task.id);
   const turns = getTaskTurns(task.id);
   const taskRequests = getPendingTaskRequestsForTask(task.id);
-  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages, participants, attachments, turns, taskRequests });
+  const findings = getReviewFindings(task.id);
+  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages, participants, attachments, turns, taskRequests, findings });
 });
 
 // Get stream log for a task (loaded on demand)
@@ -331,6 +337,87 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
   updateTaskStatus(task.id, 'queued');
   res.json({ task: getTask(task.id) });
   runInBackground(`reply-launch ${task.id}`, () => processQueue(task.workspace_id));
+});
+
+// Triage a single reviewer finding. 'dismissed' is the load-bearing state: the
+// reviewer starts a fresh session every pass and only ever saw the original
+// prompt, so dismissed findings are replayed into later reviewer prompts as a
+// waiver list. Without that it re-raises the same issue indefinitely.
+router.patch('/tasks/:taskId/findings/:findingId', requireAuth, (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  const finding = getReviewFinding(req.params.findingId);
+  // Scope by task as well as id — a finding id from another task must not be
+  // mutable through this task's (already access-checked) route.
+  if (!finding || finding.task_id !== task.id) {
+    res.status(404).json({ error: 'Finding not found' });
+    return;
+  }
+
+  const { state, note } = req.body;
+  if (state !== 'open' && state !== 'dismissed') {
+    res.status(400).json({ error: "state must be 'open' or 'dismissed'" });
+    return;
+  }
+  if (note !== undefined && note !== null && typeof note !== 'string') {
+    res.status(400).json({ error: 'note must be a string' });
+    return;
+  }
+
+  setReviewFindingState(finding.id, state, typeof note === 'string' ? note.slice(0, 2000) : null);
+  res.json({ findings: getReviewFindings(task.id) });
+});
+
+// Send selected findings back to the implementer. Same effect as a reply (the
+// implementer resumes with full context), but scoped to the findings the user
+// actually wants addressed rather than the whole verdict.
+router.post('/tasks/:taskId/findings/fix', requireAuth, (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  if (task.status !== 'awaiting_feedback') {
+    res.status(400).json({ error: 'Task is not awaiting feedback' });
+    return;
+  }
+
+  const { findingIds } = req.body;
+  if (!Array.isArray(findingIds) || findingIds.length === 0) {
+    res.status(400).json({ error: 'findingIds must be a non-empty array' });
+    return;
+  }
+
+  const all = getReviewFindings(task.id);
+  const selected = findingIds
+    .filter((id: unknown) => typeof id === 'string')
+    .map((id: string) => all.find(f => f.id === id))
+    .filter((f): f is NonNullable<typeof f> => f !== undefined);
+  if (selected.length === 0) {
+    res.status(404).json({ error: 'No matching findings' });
+    return;
+  }
+
+  const issueList = selected.map((f, i) => `${i + 1}. ${f.body}`).join('\n');
+  const dismissed = getDismissedFindings(task.id);
+  // Tell the implementer what NOT to touch as well, so it doesn't "helpfully"
+  // fix a waived finding it can still see in the earlier conversation.
+  const waiverNote = dismissed.length > 0
+    ? `\n\nThe user has explicitly DISMISSED the following reviewer findings. Do not act on them, and do not undo or "improve" the code they refer to:\n${dismissed.map((f, i) => `${i + 1}. ${f.body}${f.note ? ` (user's reason: ${f.note})` : ''}`).join('\n')}`
+    : '';
+  const body = `${REVIEW_FIX_REPLY_PREFIX}:\n\n${issueList}${waiverNote}`;
+
+  addMessage(task.id, 'user', body, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
+  selected.forEach(f => setReviewFindingState(f.id, 'fixing'));
+  resetReviewLoopCount(task.id);
+  if (task.pending_complete) setPendingComplete(task.id, false);
+
+  updateTaskStatus(task.id, 'queued');
+  res.json({ task: getTask(task.id), findings: getReviewFindings(task.id) });
+  runInBackground(`findings-fix ${task.id}`, () => processQueue(task.workspace_id));
 });
 
 // Touch a task: atomically record open time, return previous value
