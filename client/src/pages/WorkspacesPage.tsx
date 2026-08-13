@@ -38,6 +38,7 @@ import { KOKORO_VOICES } from '../utils/kokoroTTS';
 import { playChime } from '../utils/chime';
 import { useDraft, useSessionState } from '../hooks/useDraft';
 import TaskDetailModal from '../components/TaskDetailModal';
+import MarkdownComposer from '../components/MarkdownComposer';
 
 function timeAgo(iso: string): string {
   const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -1481,22 +1482,25 @@ export default function WorkspacesPage() {
           </div>
           {isRunning && newTaskWorkspaceId === ws.id && (
             <div className="mt-2">
-              <textarea
+              <MarkdownComposer
                 autoFocus
+                size="compact"
                 value={newTaskPrompt}
-                onChange={(e) => setNewTaskPrompt(e.target.value)}
+                onChange={(v) => setNewTaskPrompt(v)}
                 onKeyDown={(e) => {
+                  // Both need preventDefault so CodeMirror doesn't also act on
+                  // them — Ctrl+Enter would otherwise insert a newline as well.
                   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                    e.preventDefault();
                     handleCreateTask(ws.id);
                   }
                   if (e.key === 'Escape') {
+                    e.preventDefault();
                     setNewTaskWorkspaceId(null);
                     clearNewTaskPrompt();
                   }
                 }}
                 placeholder="What should Claude do?"
-                className="w-full text-sm border border-gray-300 dark:border-gray-700 rounded-md p-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 resize-none focus:outline-none focus:ring-1 focus:ring-blue-500"
-                rows={2}
                 disabled={creatingTask}
               />
               <select
