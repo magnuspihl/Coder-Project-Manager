@@ -1,0 +1,149 @@
+/*
+ * Chrome-free EasyMDE (CodeMirror 5) skin for the task composer.
+ *
+ * CodeMirror 5 is deliberate: CM6 drives input through a contenteditable, which
+ * drops keypresses under mobile virtual keyboards. CM5 types into a hidden
+ * textarea, so phone keyboards behave, and we still get live markdown
+ * decorations in the editor.
+ */
+
+.cpm-composer .EasyMDEContainer .editor-toolbar,
+.cpm-composer .EasyMDEContainer .editor-statusbar,
+.cpm-composer .EasyMDEContainer .editor-preview,
+.cpm-composer .EasyMDEContainer .editor-preview-side,
+/* Belt and braces: the preview/fullscreen shortcuts that would spawn these are
+   unbound in MarkdownComposerRich's options, but without a toolbar there is no
+   way to dismiss either overlay if one ever does appear. */
+.cpm-composer .EasyMDEContainer .editor-preview-full {
+  display: none !important;
+}
+.cpm-composer .EasyMDEContainer .CodeMirror-fullscreen {
+  position: static !important;
+}
+
+.cpm-composer .EasyMDEContainer .CodeMirror {
+  background: transparent;
+  color: #111827; /* gray-900 */
+  border: none;
+  border-radius: 0;
+  height: auto;
+  overflow-x: hidden;
+  padding: 0.5rem 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.875rem; /* text-sm */
+  line-height: 1.6;
+}
+:is(.dark) .cpm-composer .EasyMDEContainer .CodeMirror {
+  color: #f3f4f6; /* gray-100 */
+}
+
+/*
+ * EasyMDE stamps inline height AND min-height onto .CodeMirror-scroll, both set
+ * to maxHeight — it ignores the separate minHeight option once maxHeight exists.
+ * Take those back with !important so the box auto-sizes to its content between
+ * our own bounds, matching the sm:min-h-[11rem] textarea it replaces.
+ */
+.cpm-composer .EasyMDEContainer .CodeMirror-scroll {
+  height: auto !important;
+  min-height: 5rem !important;
+  max-height: 22rem;
+  overflow-y: auto;
+  overflow-x: hidden !important;
+}
+@media (min-width: 640px) {
+  .cpm-composer .EasyMDEContainer .CodeMirror-scroll {
+    min-height: 11rem !important;
+  }
+}
+
+/* Caret + selection, per accent */
+.cpm-composer .EasyMDEContainer .CodeMirror-cursor {
+  border-left: 2px solid #2563eb; /* blue-600 */
+}
+.cpm-composer-teal .EasyMDEContainer .CodeMirror-cursor {
+  border-left-color: #0d9488; /* teal-600 */
+}
+:is(.dark) .cpm-composer .EasyMDEContainer .CodeMirror-cursor {
+  border-left-color: #93c5fd; /* blue-300 */
+}
+:is(.dark) .cpm-composer-teal .EasyMDEContainer .CodeMirror-cursor {
+  border-left-color: #5eead4; /* teal-300 */
+}
+
+.cpm-composer .EasyMDEContainer .CodeMirror-selected {
+  background: #dbeafe; /* blue-100 */
+}
+.cpm-composer-teal .EasyMDEContainer .CodeMirror-selected {
+  background: #ccfbf1; /* teal-100 */
+}
+:is(.dark) .cpm-composer .EasyMDEContainer .CodeMirror-selected {
+  background: #1e3a5f;
+}
+:is(.dark) .cpm-composer-teal .EasyMDEContainer .CodeMirror-selected {
+  background: #134e4a;
+}
+
+.cpm-composer .CodeMirror-placeholder {
+  color: #9ca3af !important; /* gray-400 */
+  font-style: italic;
+}
+:is(.dark) .cpm-composer .CodeMirror-placeholder {
+  color: #6b7280 !important; /* gray-500 */
+}
+
+/* ── Live markdown decorations ─────────────────────────────────── */
+
+/* Headings — the whole line, hash marks included, scales up. Colour first, so
+   the per-level weights below win instead of being flattened by a later rule. */
+.cpm-composer .cm-header-1,
+.cpm-composer .cm-header-2,
+.cpm-composer .cm-header-3,
+.cpm-composer .cm-header-4,
+.cpm-composer .cm-header-5,
+.cpm-composer .cm-header-6 { color: #1d4ed8; font-weight: 600; } /* blue-700 */
+.cpm-composer .cm-header-1 { font-size: 1.45em; font-weight: 700; line-height: 1.35; }
+.cpm-composer .cm-header-2 { font-size: 1.25em; font-weight: 700; }
+.cpm-composer .cm-header-3 { font-size: 1.1em; }
+.cpm-composer-teal .cm-header-1,
+.cpm-composer-teal .cm-header-2,
+.cpm-composer-teal .cm-header-3,
+.cpm-composer-teal .cm-header-4,
+.cpm-composer-teal .cm-header-5,
+.cpm-composer-teal .cm-header-6 { color: #0f766e; } /* teal-700 */
+:is(.dark) .cpm-composer .cm-header-1,
+:is(.dark) .cpm-composer .cm-header-2,
+:is(.dark) .cpm-composer .cm-header-3,
+:is(.dark) .cpm-composer .cm-header-4,
+:is(.dark) .cpm-composer .cm-header-5,
+:is(.dark) .cpm-composer .cm-header-6 { color: #93c5fd; } /* blue-300 */
+:is(.dark) .cpm-composer-teal .cm-header-1,
+:is(.dark) .cpm-composer-teal .cm-header-2,
+:is(.dark) .cpm-composer-teal .cm-header-3,
+:is(.dark) .cpm-composer-teal .cm-header-4,
+:is(.dark) .cpm-composer-teal .cm-header-5,
+:is(.dark) .cpm-composer-teal .cm-header-6 { color: #5eead4; } /* teal-300 */
+
+/* Inline formatting */
+.cpm-composer .cm-strong { font-weight: 700; }
+.cpm-composer .cm-em { font-style: italic; }
+.cpm-composer .cm-strikethrough { text-decoration: line-through; }
+
+/* Inline code — CM5's markdown mode tags it as cm-comment */
+.cpm-composer .cm-comment {
+  background: rgba(0, 0, 0, 0.07);
+  border-radius: 3px;
+  padding: 0 3px;
+}
+:is(.dark) .cpm-composer .cm-comment {
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.cpm-composer .cm-quote { color: #6b7280; font-style: italic; }
+:is(.dark) .cpm-composer .cm-quote { color: #9ca3af; }
+
+.cpm-composer .cm-link { color: #2563eb; }
+.cpm-composer .cm-url,
+.cpm-composer .cm-string { color: #1d4ed8; }
+:is(.dark) .cpm-composer .cm-link { color: #93c5fd; }
+:is(.dark) .cpm-composer .cm-url,
+:is(.dark) .cpm-composer .cm-string { color: #60a5fa; }
