@@ -646,6 +646,25 @@ export function verifyClaimedFixes(taskId: string, exceptIds: string[] = []): nu
 }
 
 /**
+ * A reviewer pass settles every finding still outstanding — not just the ones
+ * the implementer claimed. The reviewer is handed each prior finding with its
+ * state and told to re-raise anything still present, so a pass is its verdict
+ * on all of them.
+ *
+ * User decisions (`dismissed` / `resolved`) are deliberately excluded: those are
+ * the user's calls, and the reviewer does not get to overwrite them.
+ */
+export function closeOutstandingOnPass(taskId: string): number {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const res = db.prepare(
+    `UPDATE review_findings SET state = 'verified', decided_at = ?
+     WHERE task_id = ? AND state IN ('open', 'fixing', 'fixed')`
+  ).run(now, taskId);
+  return res.changes;
+}
+
+/**
  * The reviewer judged a previous fix inadequate. The finding is reopened in
  * place with the reviewer's revised reasoning rather than added as a new row —
  * otherwise every disputed fix would leave a duplicate behind in the inbox.
