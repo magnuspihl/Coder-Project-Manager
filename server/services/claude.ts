@@ -1,7 +1,7 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { createReadStream, createWriteStream, promises as fsPromises } from 'fs';
 import { randomUUID } from 'crypto';
-import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, getLatestTaskTurn, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, createReviewFindings, getReviewFindings, getDismissedFindings, getPriorFindings, getUserReplies, findingRef, findFindingByRef, verifyClaimedFixes, reraiseReviewFinding, reopenUnreportedFindings, setReviewFindingState, type Task, type TaskParticipant } from './tasks.js';
+import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, getLatestTaskTurn, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, createReviewFindings, getReviewFindings, getFindingsInFlight, closeOutstandingOnPass, getDismissedFindings, getPriorFindings, getUserReplies, findingRef, findFindingByRef, verifyClaimedFixes, reraiseReviewFinding, reopenUnreportedFindings, setReviewFindingState, type Task, type TaskParticipant } from './tasks.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, fetchGitHubToken, isRemoteAllowed } from './git.js';
@@ -652,7 +652,9 @@ ${FINDING_REPORT_MARKER}: [{"ref":"<ref>","status":"fixed|not_fixed|disagree","n
 - "not_fixed" — you did not address it (out of scope, needs a decision, ran out of room). Say why in "note"; it goes back to the user.
 - "disagree" — you believe the finding is wrong. Say why in "note"; it goes back to the user.
 
-Use the exact refs you were given. Include an entry for every finding — one you omit is treated as unaddressed and handed back to the user. The line is stripped before your message is shown.`;
+Use the exact refs you were given. Include an entry for every finding — one you omit is treated as unaddressed and handed back to the user.
+
+If you were given MORE THAN ONE finding you must name every ref explicitly; a report that omits refs is read as applying to ALL of them, so a bare status would wrongly claim findings you did not touch. The line is stripped before your message is shown.`;
 
 // Caveman mode prompt — reduces output token usage by forcing terse communication
 function buildCavemanPrompt(intensity: string): string {
@@ -774,7 +776,30 @@ export function parseFindingReport(text: string): FindingReportEntry[] | null {
 
   for (let i = starts.length - 1; i >= 0; i--) {
     const rest = text.slice(starts[i]);
-    const open = rest.indexOf('[');
+
+    // Degenerate but very common when only ONE finding is in flight: the model
+    // drops the array and the ref and just states the status
+    // (`FINDING_REPORT: fixed`). Observed in the wild on task 6745fb16, where it
+    // silently cost the finding its report and reopened it. ALL_IN_FLIGHT_REF
+    // means "every finding I was handed"; applyFindingReport expands it.
+    const bare = /^\s*[*`_]*(fixed|not_fixed|disagree)[*`_]*\s*$/im.exec(rest.split('\n')[0]);
+    if (bare) return [{ ref: ALL_IN_FLIGHT_REF, status: bare[1] as FindingReportEntry['status'] }];
+
+    // A single object rather than an array is the other natural degeneration.
+    const objStart = rest.indexOf('{');
+    const arrStart = rest.indexOf('[');
+    if (arrStart === -1 && objStart !== -1) {
+      const single = extractBalanced(rest, objStart, '{', '}');
+      if (single) {
+        try {
+          const parsed = JSON.parse(single);
+          const one = normaliseReportEntries([parsed]);
+          if (one.length > 0) return one;
+        } catch { /* fall through */ }
+      }
+    }
+
+    const open = arrStart;
     if (open === -1) continue;
     // Walk bracket depth so `]` inside a string value doesn't end the array early.
     let depth = 0, inStr = false, esc = false, end = -1;
@@ -791,13 +816,41 @@ export function parseFindingReport(text: string): FindingReportEntry[] | null {
     try {
       const parsed = JSON.parse(rest.slice(open, end));
       if (!Array.isArray(parsed)) continue;
-      const entries = parsed
-        .filter((e): e is FindingReportEntry =>
-          !!e && typeof e.ref === 'string' &&
-          (e.status === 'fixed' || e.status === 'not_fixed' || e.status === 'disagree'))
-        .map(e => ({ ref: e.ref.trim().toLowerCase(), status: e.status, note: typeof e.note === 'string' ? e.note : undefined }));
+      const entries = normaliseReportEntries(parsed);
       if (entries.length > 0) return entries;
     } catch { /* try an earlier marker */ }
+  }
+  return null;
+}
+
+/** Sentinel ref meaning "every finding this turn was handed". */
+export const ALL_IN_FLIGHT_REF = '*';
+
+function normaliseReportEntries(raw: unknown[]): FindingReportEntry[] {
+  return raw
+    .filter((e): e is { ref?: unknown; status: FindingReportEntry['status']; note?: unknown } =>
+      !!e && typeof e === 'object' &&
+      ((e as any).status === 'fixed' || (e as any).status === 'not_fixed' || (e as any).status === 'disagree'))
+    .map(e => ({
+      // A single-entry report often omits the ref entirely; treat that the same
+      // as the bare-status form rather than discarding the report.
+      ref: typeof e.ref === 'string' && e.ref.trim() ? e.ref.trim().toLowerCase() : ALL_IN_FLIGHT_REF,
+      status: e.status,
+      note: typeof e.note === 'string' ? e.note : undefined,
+    }));
+}
+
+/** Slice the balanced `open`..`close` run beginning at `from`, respecting strings. */
+function extractBalanced(text: string, from: number, open: string, close: string): string | null {
+  let depth = 0, inStr = false, esc = false;
+  for (let i = from; i < text.length; i++) {
+    const c = text[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\') { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === open) depth++;
+    else if (c === close && --depth === 0) return text.slice(from, i + 1);
   }
   return null;
 }
@@ -807,11 +860,15 @@ function stripFindingReport(taskId: string, text: string): string {
   if (!text.includes(FINDING_REPORT_MARKER)) return text;
   const entries = parseFindingReport(text);
   if (entries) findingReports.set(taskId, entries);
-  // Drop from the marker to the end of its JSON array, wherever it sits.
-  const stripped = text.replace(
-    new RegExp(`^[ \\t]*\\**\`?${FINDING_REPORT_MARKER}\`?\\**\\s*:[\\s\\S]*?\\][ \\t]*$`, 'gm'),
-    '',
-  );
+
+  // Strip the JSON-array form first, then anything else on the marker's line.
+  // The fallback matters: when the model writes a form the parser can't read,
+  // the array-only regex left `FINDING_REPORT: fixed` sitting in the message the
+  // user reads. The marker is machine plumbing and must never be user-visible,
+  // whether or not we understood it.
+  const stripped = text
+    .replace(new RegExp(`^[ \\t]*[*\`_]*${FINDING_REPORT_MARKER}[*\`_]*\\s*:[\\s\\S]*?\\][ \\t]*$`, 'gm'), '')
+    .replace(new RegExp(`^[ \\t]*[*\`_]*${FINDING_REPORT_MARKER}[*\`_]*\\s*:.*$`, 'gm'), '');
   return stripped.replace(/\n{3,}/g, '\n\n').trim();
 }
 
@@ -828,19 +885,27 @@ function applyFindingReport(task: Task): void {
   const entries = findingReports.get(task.id) ?? [];
   findingReports.delete(task.id);
 
+  const inFlight = getFindingsInFlight(task.id);
   let claimed = 0, handedBack = 0;
   for (const entry of entries) {
-    const finding = findFindingByRef(task.id, entry.ref);
-    // Only findings currently with the implementer are its to report on — a
-    // stale or hallucinated ref must not reopen something the user has decided.
-    if (!finding || (finding.state !== 'fixing' && finding.state !== 'fixed')) continue;
-    if (entry.status === 'fixed') {
-      setReviewFindingState(finding.id, 'fixed', entry.note ?? null);
-      claimed++;
-    } else {
-      setReviewFindingState(finding.id, 'open',
-        `Implementer ${entry.status === 'disagree' ? 'disagrees' : 'did not fix this'}${entry.note ? `: ${entry.note}` : ''}`);
-      handedBack++;
+    // ALL_IN_FLIGHT_REF comes from a report that stated a status without naming
+    // refs — it applies to everything this turn was handed.
+    const targets = entry.ref === ALL_IN_FLIGHT_REF
+      ? inFlight
+      : [findFindingByRef(task.id, entry.ref)].filter((f): f is NonNullable<typeof f> => !!f);
+
+    for (const finding of targets) {
+      // Only findings currently with the implementer are its to report on — a
+      // stale or hallucinated ref must not reopen something the user has decided.
+      if (finding.state !== 'fixing' && finding.state !== 'fixed') continue;
+      if (entry.status === 'fixed') {
+        setReviewFindingState(finding.id, 'fixed', entry.note ?? null);
+        claimed++;
+      } else {
+        setReviewFindingState(finding.id, 'open',
+          `Implementer ${entry.status === 'disagree' ? 'disagrees' : 'did not fix this'}${entry.note ? `: ${entry.note}` : ''}`);
+        handedBack++;
+      }
     }
   }
 
@@ -3358,6 +3423,15 @@ function finalizeReviewer(
   }
 
   if (decision.outcome === 'pass') {
+    // A pass closes the whole outstanding set, not just claimed fixes. The
+    // reviewer is handed every prior finding with its state and told to
+    // re-raise anything still present, so passing IS its verdict on them.
+    // Previously only 'fixed' findings were promoted, so a finding that came
+    // back 'open' (e.g. its report failed to parse) survived every later pass
+    // and sat in the inbox forever while the UI said "Review passed".
+    // User decisions (dismissed / resolved) are never overwritten.
+    const closed = closeOutstandingOnPass(task.id);
+    if (closed > 0) console.log(`[auto-review] Task ${task.id}: ${closed} outstanding finding(s) closed by passing review`);
     console.log(`[auto-review] Task ${task.id} reviewer passed`);
     resetReviewLoopCount(task.id);
     setActiveTaskTurnRole(task.id, null);
