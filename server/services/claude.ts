@@ -1,7 +1,7 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { createReadStream, createWriteStream, promises as fsPromises } from 'fs';
 import { randomUUID } from 'crypto';
-import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, getLatestTaskTurn, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, createReviewFindings, getDismissedFindings, getPriorFindings, getUserReplies, type Task, type TaskParticipant } from './tasks.js';
+import { updateTaskStatus, addMessage, addTokenUsage, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, getLatestTaskTurn, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, createReviewFindings, getReviewFindings, getDismissedFindings, getPriorFindings, getUserReplies, findingRef, findFindingByRef, verifyClaimedFixes, reraiseReviewFinding, reopenUnreportedFindings, setReviewFindingState, type Task, type TaskParticipant } from './tasks.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, fetchGitHubToken, isRemoteAllowed } from './git.js';
@@ -587,6 +587,23 @@ ${NO_REVIEW_MARKER}
 
 This skips the reviewer and hands control straight back to the user. Do NOT emit it if you wrote or modified code that should be checked. The marker is stripped before your message is shown to the user.`;
 
+const FINDING_REPORT_MARKER = 'FINDING_REPORT';
+
+/**
+ * The implementer's per-finding status report. Without it, the only signal that
+ * a finding was dealt with was "a later reviewer didn't mention it", which left
+ * the user hand-closing an inbox of already-fixed items.
+ */
+const FINDING_REPORT_FORMAT = `When you are done, report on EVERY finding you were given, as the last line of your response, with nothing after it:
+
+${FINDING_REPORT_MARKER}: [{"ref":"<ref>","status":"fixed|not_fixed|disagree","note":"<one sentence>"}]
+
+- "fixed" — you changed the code so the finding no longer applies. The reviewer re-checks this; claiming a fix you did not make wastes a whole round trip.
+- "not_fixed" — you did not address it (out of scope, needs a decision, ran out of room). Say why in "note"; it goes back to the user.
+- "disagree" — you believe the finding is wrong. Say why in "note"; it goes back to the user.
+
+Use the exact refs you were given. Include an entry for every finding — one you omit is treated as unaddressed and handed back to the user. The line is stripped before your message is shown.`;
+
 // Caveman mode prompt — reduces output token usage by forcing terse communication
 function buildCavemanPrompt(intensity: string): string {
   const level = intensity || 'full';
@@ -681,6 +698,106 @@ function stripNoReviewMarker(taskId: string, text: string): string {
   if (!re.test(text)) return text;
   noReviewDeclared.add(taskId);
   return text.replace(re, '').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+export interface FindingReportEntry {
+  ref: string;
+  status: 'fixed' | 'not_fixed' | 'disagree';
+  note?: string;
+}
+
+// Reports parsed from the in-flight implementer turn, consumed when it completes.
+const findingReports = new Map<string, FindingReportEntry[]>();
+
+/**
+ * Parse the implementer's FINDING_REPORT line. Tolerant in the same spirit as
+ * parseReviewDecision: the marker may be bolded, fenced or indented, and the
+ * JSON array may span lines. Later markers win, since a model that restates the
+ * block means the last one.
+ */
+export function parseFindingReport(text: string): FindingReportEntry[] | null {
+  // Tolerate markdown wrappers between the marker and its colon (`**FINDING_REPORT**:`,
+  // `` `FINDING_REPORT`: ``) — models emphasise it far more often than not.
+  const marker = new RegExp(`${FINDING_REPORT_MARKER}[*\`_]*\\s*:`, 'g');
+  const starts: number[] = [];
+  for (let m = marker.exec(text); m; m = marker.exec(text)) starts.push(m.index + m[0].length);
+
+  for (let i = starts.length - 1; i >= 0; i--) {
+    const rest = text.slice(starts[i]);
+    const open = rest.indexOf('[');
+    if (open === -1) continue;
+    // Walk bracket depth so `]` inside a string value doesn't end the array early.
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let j = open; j < rest.length; j++) {
+      const c = rest[j];
+      if (esc) { esc = false; continue; }
+      if (c === '\\') { esc = true; continue; }
+      if (c === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (c === '[') depth++;
+      else if (c === ']' && --depth === 0) { end = j + 1; break; }
+    }
+    if (end === -1) continue;
+    try {
+      const parsed = JSON.parse(rest.slice(open, end));
+      if (!Array.isArray(parsed)) continue;
+      const entries = parsed
+        .filter((e): e is FindingReportEntry =>
+          !!e && typeof e.ref === 'string' &&
+          (e.status === 'fixed' || e.status === 'not_fixed' || e.status === 'disagree'))
+        .map(e => ({ ref: e.ref.trim().toLowerCase(), status: e.status, note: typeof e.note === 'string' ? e.note : undefined }));
+      if (entries.length > 0) return entries;
+    } catch { /* try an earlier marker */ }
+  }
+  return null;
+}
+
+/** Detect, record and strip the implementer's FINDING_REPORT block. */
+function stripFindingReport(taskId: string, text: string): string {
+  if (!text.includes(FINDING_REPORT_MARKER)) return text;
+  const entries = parseFindingReport(text);
+  if (entries) findingReports.set(taskId, entries);
+  // Drop from the marker to the end of its JSON array, wherever it sits.
+  const stripped = text.replace(
+    new RegExp(`^[ \\t]*\\**\`?${FINDING_REPORT_MARKER}\`?\\**\\s*:[\\s\\S]*?\\][ \\t]*$`, 'gm'),
+    '',
+  );
+  return stripped.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/**
+ * Consume the implementer's FINDING_REPORT for a finished turn.
+ *
+ * "fixed" is a *claim*, not a conclusion — it parks the finding in `fixed`, and
+ * only the next reviewer pass can promote it to `verified`. "not_fixed" and
+ * "disagree" go straight back to the user with the implementer's reason, since
+ * those are exactly the calls it should not be making alone. Anything sent but
+ * never reported on is reopened rather than left in limbo.
+ */
+function applyFindingReport(task: Task): void {
+  const entries = findingReports.get(task.id) ?? [];
+  findingReports.delete(task.id);
+
+  let claimed = 0, handedBack = 0;
+  for (const entry of entries) {
+    const finding = findFindingByRef(task.id, entry.ref);
+    // Only findings currently with the implementer are its to report on — a
+    // stale or hallucinated ref must not reopen something the user has decided.
+    if (!finding || (finding.state !== 'fixing' && finding.state !== 'fixed')) continue;
+    if (entry.status === 'fixed') {
+      setReviewFindingState(finding.id, 'fixed', entry.note ?? null);
+      claimed++;
+    } else {
+      setReviewFindingState(finding.id, 'open',
+        `Implementer ${entry.status === 'disagree' ? 'disagrees' : 'did not fix this'}${entry.note ? `: ${entry.note}` : ''}`);
+      handedBack++;
+    }
+  }
+
+  const forgotten = reopenUnreportedFindings(task.id);
+  if (claimed || handedBack || forgotten) {
+    console.log(`[auto-review] Task ${task.id} finding report: ${claimed} claimed fixed, ${handedBack} handed back, ${forgotten} unreported`);
+  }
 }
 
 async function worktreeHasChanges(worktreePath: string, workspaceName: string, userId?: string | null): Promise<boolean> {
@@ -802,6 +919,8 @@ REVIEW_DECISION: {"outcome":"fail","summary":"<one sentence>","issues":["<specif
 
 "pass" = no significant issues found. "fail" = specific actionable issues were found; list each one in "issues". Output only the raw JSON after the marker — no markdown, no code fences, no commentary after it.
 
+Entries in "issues" may be a plain string, or an object {"text":"...","reraises":"<ref>"} when you are re-raising a finding you were told about. Always use "reraises" for those — it reopens that finding in place instead of piling a near-duplicate onto the user.
+
 ONE PROBLEM PER ENTRY IN "issues". Each entry is triaged individually by the user — they fix, dismiss, or mark it done one by one — so every entry you add is a separate decision they have to make. Do NOT split one problem across several entries: two call sites needing the same guard is ONE issue naming both, and the remedy for an issue belongs inside that issue's text, never as its own entry. Merge anything that would be fixed by a single edit.`;
 
 function buildReviewerSystemPrompt(): string {
@@ -862,10 +981,16 @@ DO NOT, under any circumstances:
 Before you finish, check: is the literal text "REVIEW_DECISION:" present as your final line? If not, add it now. This is non-negotiable.`;
 }
 
+/** One issue from a verdict. `reraises` links it to a finding the implementer claimed fixed. */
+interface ReviewIssue {
+  text: string;
+  reraises?: string;
+}
+
 interface ReviewDecision {
   outcome: 'pass' | 'fail';
   summary: string;
-  issues?: string[];
+  issues?: ReviewIssue[];
 }
 
 // The literal placeholder tokens from the verdict template / worked example in
@@ -925,9 +1050,21 @@ function extractDecisionAt(text: string, from: number): ReviewDecision | null {
     // filling in (e.g. "<specific issue>", "..."), keeping only real issues. An
     // empty list collapses to undefined so downstream routing falls back to the
     // summary rather than surfacing an empty "issues found" list.
-    const realIssues = Array.isArray(parsed.issues)
-      ? parsed.issues.filter((x: unknown): x is string =>
-          typeof x === 'string' && !PLACEHOLDER_ISSUES.has(x.trim()))
+    // Entries may be plain strings (the long-standing shape) or objects
+    // carrying a `reraises` ref. Both are normalised to ReviewIssue.
+    const realIssues: ReviewIssue[] = Array.isArray(parsed.issues)
+      ? parsed.issues.flatMap((x: unknown): ReviewIssue[] => {
+          if (typeof x === 'string') {
+            return PLACEHOLDER_ISSUES.has(x.trim()) ? [] : [{ text: x }];
+          }
+          if (x && typeof x === 'object' && typeof (x as any).text === 'string') {
+            const text = (x as any).text;
+            if (PLACEHOLDER_ISSUES.has(text.trim())) return [];
+            const ref = (x as any).reraises;
+            return [{ text, reraises: typeof ref === 'string' && ref.trim() ? ref.trim().toLowerCase() : undefined }];
+          }
+          return [];
+        })
       : [];
     return { outcome: parsed.outcome, summary, issues: realIssues.length ? realIssues : undefined };
   } catch {
@@ -1848,6 +1985,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     setActiveTaskTurnRole(task.id, 'implementer');
     // Clear any opt-out flag from a prior turn before this one starts streaming.
     noReviewDeclared.delete(task.id);
+    findingReports.delete(task.id);
     // Record this implementer run as a turn so its messages carry a turn_id.
     // Reviewer turns were always recorded, but implementer turns were not — so
     // implementer messages had a NULL turn_id and the UI couldn't attribute
@@ -2372,7 +2510,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
       // Save each assistant turn's text as a message immediately,
       // so it appears in the chat UI while the task is still working.
       if (event.type === 'assistant' && (event.message as { content?: unknown })?.content) {
-        const rawTurnText = stripNoReviewMarker(task.id, extractAssistantTurnText((event.message as { content: Array<{ type: string; text?: string; name?: string; input?: unknown }> }).content));
+        const rawTurnText = stripFindingReport(task.id, stripNoReviewMarker(task.id, extractAssistantTurnText((event.message as { content: Array<{ type: string; text?: string; name?: string; input?: unknown }> }).content)));
         const turnText = compactRun ? rewriteCompactionFailure(rawTurnText) : rawTurnText;
         if (turnText) {
           const msg = addMessage(task.id, 'assistant', turnText, undefined, undefined, undefined, undefined, undefined, turnId);
@@ -2389,7 +2527,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
         // dead-end env-var advice this rewrite exists to suppress.
         const rawFatal = extractFatalError(event);
         const fatal = rawFatal !== null && compactRun ? rewriteCompactionFailure(rawFatal) : rawFatal;
-        const rawResultText = stripNoReviewMarker(task.id, extractResultText(event));
+        const rawResultText = stripFindingReport(task.id, stripNoReviewMarker(task.id, extractResultText(event)));
         // Rewritten on the same terms as turnText above, so the dedupe check
         // below compares like with like. Skipping it here would let the raw
         // "set CLAUDE_CODE_MAX_OUTPUT_TOKENS" text through as a second message
@@ -2601,6 +2739,8 @@ async function onImplementerTurnComplete(task: Task): Promise<void> {
   // a question, gave a diagnosis, or only investigated). Honor it even if the
   // worktree is dirty from incidental noise — but NOT mid review-loop, where the
   // implementer is meant to be fixing flagged issues rather than opting out.
+  applyFindingReport(current);
+
   const declaredNoReview = noReviewDeclared.delete(task.id);
   if (declaredNoReview && current.review_loop_count === 0) {
     appendStreamLog(task.id, 'reviewer_skip', 'Implementer signalled NO_REVIEW_NEEDED — skipping review');
@@ -2688,12 +2828,14 @@ export function buildWaiverBlock(taskId: string, currentTurnId = ''): string {
   const label: Record<string, string> = {
     dismissed: 'DISMISSED by the user — will not be changed',
     resolved: 'MARKED ALREADY FIXED by the user',
+    fixed: 'IMPLEMENTER CLAIMS FIXED — you must verify this',
+    verified: 'ALREADY VERIFIED FIXED by an earlier pass',
     fixing: 'SENT TO THE IMPLEMENTER to fix in the turn you are now reviewing',
     open: 'ALREADY RAISED in an earlier pass and still in front of the user',
   };
 
   const list = prior
-    .map((f, i) => `${i + 1}. [${label[f.state] ?? f.state}] ${f.body}${f.note ? `\n   User's note: ${f.note}` : ''}`)
+    .map(f => `- ref ${findingRef(f)} [${label[f.state] ?? f.state}] ${f.body}${f.note ? `\n    Note: ${f.note}` : ''}`)
     .join('\n')
     .slice(0, REVIEW_CONTEXT_CHAR_BUDGET);
 
@@ -2708,10 +2850,19 @@ it you will restate points the user has already dealt with. Rules:
 - MARKED ALREADY FIXED: the user says this is done. Verify it in the current
   code. Only raise it again if you can point to the specific line that still
   exhibits it, and say plainly that you are contradicting the user's assessment.
+- IMPLEMENTER CLAIMS FIXED: check each one against the current code. This is the
+  most important thing you do. If the fix is good, say nothing about it — it is
+  closed automatically and never reaches the user. If the fix is inadequate or
+  wrong, re-raise it with:
+      {"text":"<why the fix does not work>","reraises":"<ref>"}
+  Use "reraises" so it reopens the SAME finding instead of appearing as a new
+  one. Explain what is still wrong with the attempted fix, not just the original
+  complaint.
+- ALREADY VERIFIED FIXED: settled. Do not raise again.
 - SENT TO THE IMPLEMENTER / ALREADY RAISED: these are known. If the code now
   fixes one, say so in your summary and do NOT list it in "issues". If one is
-  genuinely still present, you may list it — but restate it in the SAME terms,
-  do not reword it into what looks like a new problem.
+  genuinely still present, re-raise it with its "reraises" ref rather than
+  rewording it into what looks like a new problem.
 
 Do not contradict an earlier finding on the same code without saying so
 explicitly: if a previous pass asked for X and you now believe X was wrong, name
@@ -3128,15 +3279,32 @@ function finalizeReviewer(
     return;
   }
 
-  completeTaskTurn(turnId, decision.outcome, decision.summary, decision.issues);
+  const issueTexts = (decision.issues ?? []).map(i => i.text);
+  completeTaskTurn(turnId, decision.outcome, decision.summary, issueTexts.length ? issueTexts : undefined);
   appendStreamLog(task.id, decision.outcome === 'pass' ? 'reviewer_pass' : 'reviewer_fail',
     `[Reviewer] ${decision.outcome.toUpperCase()}: ${decision.summary}`);
 
-  // Explode the verdict into individually triageable findings. Fall back to the
-  // summary when the verdict carried no issues list, so a fail is never
-  // un-triageable.
+  // Apply the verdict to the findings the implementer claimed to have fixed.
+  // Re-raised ones reopen in place with the reviewer's revised reasoning;
+  // everything else it did not object to is now verified rather than merely
+  // "not mentioned again".
+  const reraisedIds: string[] = [];
   if (decision.outcome === 'fail') {
-    createReviewFindings(task.id, turnId, decision.issues ?? [decision.summary]);
+    const fresh: string[] = [];
+    for (const issue of decision.issues ?? [{ text: decision.summary }]) {
+      const target = issue.reraises ? findFindingByRef(task.id, issue.reraises) : undefined;
+      if (target) {
+        reraiseReviewFinding(target.id, issue.text);
+        reraisedIds.push(target.id);
+      } else {
+        fresh.push(issue.text);
+      }
+    }
+    if (fresh.length > 0) createReviewFindings(task.id, turnId, fresh);
+  }
+  const verifiedCount = verifyClaimedFixes(task.id, reraisedIds);
+  if (verifiedCount > 0) {
+    console.log(`[auto-review] Task ${task.id}: ${verifiedCount} claimed fix(es) verified by reviewer`);
   }
 
   if (decision.outcome === 'pass') {
@@ -3154,15 +3322,23 @@ function finalizeReviewer(
   if (!refreshed) return;
 
   if (refreshed.review_loop_count >= MAX_REVIEW_LOOPS) {
-    escalateToUser(refreshed, decision.issues ?? [decision.summary]);
+    escalateToUser(refreshed, (decision.issues ?? []).map(i => i.text));
     return;
   }
 
-  // Send issues back to the implementer as a new resume turn
-  const issueList = (decision.issues ?? [decision.summary])
-    .map((s, i) => `${i + 1}. ${s}`)
-    .join('\n');
-  const retryPrompt = `The reviewer found the following issues with your previous implementation:\n\n${issueList}\n\nPlease address these issues. Original task:\n${task.prompt}`;
+  // Hand every still-open finding to the implementer, tagged with the refs it
+  // must report back against. Marking them 'fixing' means an unreported one is
+  // detectable when the turn ends rather than silently lost.
+  const toFix = getReviewFindings(task.id).filter(f => f.state === 'open');
+  toFix.forEach(f => setReviewFindingState(f.id, 'fixing'));
+
+  const issueList = toFix.length > 0
+    ? toFix.map(f => `[${findingRef(f)}] ${f.body}${f.revision > 0 ? '  (RE-RAISED: your previous fix was judged inadequate)' : ''}`).join('\n\n')
+    : (decision.issues ?? []).map((i, n) => `${n + 1}. ${i.text}`).join('\n');
+
+  const retryPrompt = toFix.length > 0
+    ? `The reviewer found the following issues with your previous implementation. Each is tagged with a ref you must report against.\n\n${issueList}\n\nAddress what you can, then report on every one of them. Original task:\n${task.prompt}\n\n${FINDING_REPORT_FORMAT}`
+    : `The reviewer found the following issues with your previous implementation:\n\n${issueList}\n\nPlease address these issues. Original task:\n${task.prompt}`;
 
   addMessage(task.id, 'system', `Auto-review found issues — resuming implementer:\n${issueList}`);
   setActiveTaskTurnRole(task.id, 'implementer');

@@ -96,7 +96,8 @@ export interface ReviewFinding {
   turn_id: string;
   position: number;
   body: string;
-  state: 'open' | 'fixing' | 'dismissed' | 'resolved';
+  state: 'open' | 'fixing' | 'fixed' | 'verified' | 'dismissed' | 'resolved';
+  revision: number;
   note: string | null;
   decided_at: string | null;
   created_at: string;
