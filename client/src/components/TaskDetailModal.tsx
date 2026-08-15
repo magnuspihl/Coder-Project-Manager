@@ -166,7 +166,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [pendingFinding, setPendingFinding] = useState<string | null>(null);
   const [dismissNoteFor, setDismissNoteFor] = useState<string | null>(null);
   const [dismissNote, setDismissNote] = useState('');
-  const [unresolvedOpen, setUnresolvedOpen] = useState(true);
+  const [unresolvedOpen, setUnresolvedOpen] = useState(false);
+  const [expandedFindings, setExpandedFindings] = useState<Set<string>>(new Set());
   const [resolvingGitIssues, setResolvingGitIssues] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastParticipantsJsonRef = useRef('');
@@ -863,7 +864,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
    * these is precisely the "did it assume I wanted to ignore it?" failure.
    */
   const supersededByLaterReview = (f: ReviewFinding): boolean => {
-    if (f.state === 'dismissed') return false;
+    if (f.state !== 'open') return false;
+    // A re-raised finding was explicitly looked at and objected to by a later
+    // review, so "a later review didn't raise this again" is flatly false for
+    // it. This heuristic only still applies to findings that never went through
+    // the implementer loop — anything that did now carries a real verdict
+    // (`verified`, or a re-raise) instead of this guess.
+    if (f.revision > 0 || f.note) return false;
     const raisedAt = turnNumberOf(f.turn_id);
     return turns.some(t => t.role === 'reviewer' && t.completed_at && t.turn_number > raisedAt);
   };
@@ -871,7 +878,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   // Every finding still awaiting a decision, oldest first, across all turns.
   const unresolvedFindings = (): ReviewFinding[] =>
     findings
-      .filter(f => f.state === 'open' || f.state === 'fixing')
+      .filter(f => f.state === 'open')
       .sort((a, b) => turnNumberOf(a.turn_id) - turnNumberOf(b.turn_id) || a.position - b.position);
 
   /**
@@ -883,7 +890,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     if (pendingFinding || sending || applyingFixes) return;
     // 'fixing' is re-sendable: it means "handed to the implementer, outcome
     // unknown". Only an explicit dismissal takes a finding out of play.
-    const ids = selected.filter(f => f.state !== 'dismissed').map(f => f.id);
+    const ids = selected.filter(f => f.state === 'open').map(f => f.id);
     if (ids.length === 0) return;
     setPendingFinding(busyKey);
     editSeqRef.current++;
@@ -904,7 +911,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
   // Fix every still-open finding in this verdict in one implementer turn.
   const handleFixAllOpen = (turnId: string) =>
-    handleFixFindings(findingsForTurn(turnId).filter(f => f.state !== 'dismissed'), turnId);
+    handleFixFindings(findingsForTurn(turnId).filter(f => f.state === 'open'), turnId);
 
   // Dismiss a finding. This is the durable signal: dismissed findings are
   // replayed into every later reviewer prompt as a waiver, so the reviewer
@@ -920,6 +927,27 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       setDismissNote('');
     } catch (err: any) {
       alert(err?.message || 'Failed to dismiss finding');
+    } finally {
+      editSeqRef.current++;
+      setPendingFinding(null);
+    }
+  };
+
+  /**
+   * "Already fixed" — distinct from Ignore. Both retire the finding, but they
+   * tell the next reviewer opposite things ("don't change this" vs "verify this
+   * is done"), so they must not collapse into one action. Users were dismissing
+   * with a note of "Fixed", which fed the reviewer the wrong signal.
+   */
+  const handleResolveFinding = async (finding: ReviewFinding) => {
+    if (pendingFinding) return;
+    setPendingFinding(finding.id);
+    editSeqRef.current++;
+    try {
+      const { findings: updated } = await setFindingState(taskId, finding.id, 'resolved');
+      setFindings(updated);
+    } catch (err: any) {
+      alert(err?.message || 'Failed to mark finding as fixed');
     } finally {
       editSeqRef.current++;
       setPendingFinding(null);
@@ -1350,49 +1378,99 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     if (e.target === overlayRef.current) closeModal();
   };
 
-  // One reviewer finding as an independently actionable row: Fix sends just this
-  // issue back to the implementer, Dismiss waives it permanently (and tells
-  // every later reviewer not to raise it again).
+  // One reviewer finding as an independently actionable row. Fix sends just this
+  // issue back to the implementer; Ignore waives it ("do not change this");
+  // Mark fixed asserts it is already done ("verify, don't restate"). Ignore and
+  // Mark fixed both retire the finding but carry opposite meanings to the next
+  // reviewer, so they are separate actions.
   // `scope` distinguishes the two places a finding can appear (its turn card and
   // the pinned unresolved panel) so opening the dismiss note in one doesn't also
   // open — and autoFocus — a second input in the other.
-  const renderFinding = (f: ReviewFinding, index: number, canAct: boolean, scope = 'card') => {
+  const renderFinding = (f: ReviewFinding, index: number, canAct: boolean, scope = 'card', compact = false) => {
     const noteKey = `${scope}:${f.id}`;
     const busy = pendingFinding === f.id;
     const dismissed = f.state === 'dismissed';
+    const resolved = f.state === 'resolved';
+    const verified = f.state === 'verified';
+    const claimedFixed = f.state === 'fixed';
+    const inFlight = f.state === 'fixing';
+    const decided = f.state !== 'open';
     const noteOpen = dismissNoteFor === noteKey;
+    // In the pinned panel the bodies are clamped: reviewer findings run to a
+    // full paragraph each, and a handful at full length pushed the conversation
+    // and the composer off screen entirely.
+    const clamped = compact && !expandedFindings.has(noteKey);
 
     return (
       <div
         key={f.id}
         className={`rounded-md border p-2.5 ${
-          dismissed
+          decided
             ? 'border-gray-200 dark:border-gray-700 bg-gray-50/70 dark:bg-gray-800/40'
             : 'border-amber-200 dark:border-amber-800 bg-white/60 dark:bg-gray-900/30'
         }`}
       >
         <div className="flex items-start gap-2">
-          <span className={`text-[11px] font-semibold mt-0.5 shrink-0 ${dismissed ? 'text-gray-400 dark:text-gray-500' : 'text-amber-700 dark:text-amber-300'}`}>
+          <span className={`text-[11px] font-semibold mt-0.5 shrink-0 ${decided ? 'text-gray-400 dark:text-gray-500' : 'text-amber-700 dark:text-amber-300'}`}>
             {index + 1}.
           </span>
           <div className="flex-1 min-w-0">
-            <p className={`text-sm break-words ${
-              dismissed
+            <p className={`text-sm break-words ${clamped ? 'line-clamp-2' : ''} ${
+              decided
                 ? 'text-gray-500 dark:text-gray-400 line-through decoration-gray-400/60'
                 : 'text-amber-900 dark:text-amber-200'
             }`}>
               {f.body}
             </p>
+            {compact && (
+              <button
+                onClick={() => setExpandedFindings(prev => {
+                  const next = new Set(prev);
+                  if (next.has(noteKey)) next.delete(noteKey); else next.add(noteKey);
+                  return next;
+                })}
+                className="text-[11px] text-amber-700/70 dark:text-amber-300/70 hover:text-amber-800 dark:hover:text-amber-200 underline"
+              >
+                {clamped ? 'Show more' : 'Show less'}
+              </button>
+            )}
 
             {dismissed && (
               <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400 italic">
-                Dismissed{f.note ? ` — ${f.note}` : ''}
+                Ignored — won't be changed{f.note ? ` (${f.note})` : ''}
               </p>
             )}
-            {f.state === 'fixing' && (
+            {resolved && (
+              <p className="mt-1 text-[11px] text-green-700 dark:text-green-400 italic">
+                Marked as already fixed
+              </p>
+            )}
+            {inFlight && (
               <p className="mt-1 text-[11px] text-blue-600 dark:text-blue-400">Sent to the implementer</p>
             )}
-            {!dismissed && supersededByLaterReview(f) && (
+            {claimedFixed && (
+              <p className="mt-1 text-[11px] text-blue-600 dark:text-blue-400">
+                Implementer reports this fixed — awaiting reviewer verification
+                {f.note ? ` (${f.note})` : ''}
+              </p>
+            )}
+            {verified && (
+              <p className="mt-1 text-[11px] text-green-700 dark:text-green-400 italic">
+                Fixed and verified by a later review
+              </p>
+            )}
+            {f.revision > 0 && f.state === 'open' && (
+              <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-300">
+                Re-raised — the reviewer judged the previous fix inadequate
+              </p>
+            )}
+            {/* Why the implementer handed this back ("not_fixed"/"disagree").
+                Without it the finding returns to the user stripped of the one
+                piece of context that explains why it is theirs to decide. */}
+            {f.state === 'open' && f.note && (
+              <p className="mt-1 text-[11px] text-gray-600 dark:text-gray-400 italic">{f.note}</p>
+            )}
+            {!decided && supersededByLaterReview(f) && (
               <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">
                 A later review didn't raise this again — likely fixed, but not confirmed.
               </p>
@@ -1429,13 +1507,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
               </div>
             ) : (
               <div className="flex items-center gap-2 mt-1.5">
-                {dismissed ? (
+                {decided ? (
                   <button
                     onClick={() => handleReopenFinding(f)}
                     disabled={busy}
                     className="text-[11px] text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 underline disabled:opacity-50"
                   >
-                    {busy ? 'Reopening…' : 'Undo dismiss'}
+                    {busy ? 'Reopening…' : 'Undo'}
                   </button>
                 ) : (
                   <>
@@ -1448,6 +1526,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         {busy ? 'Sending…' : 'Fix this'}
                       </button>
                     )}
+                    <button
+                      onClick={() => handleResolveFinding(f)}
+                      disabled={busy || pendingFinding !== null}
+                      className="text-[11px] font-medium px-2 py-1 rounded border border-green-300 dark:border-green-700 text-green-700 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/30 disabled:opacity-50 transition-colors"
+                    >
+                      {busy ? 'Saving…' : 'Already fixed'}
+                    </button>
                     <button
                       onClick={() => { setDismissNoteFor(noteKey); setDismissNote(''); }}
                       disabled={busy || pendingFinding !== null}
@@ -1470,8 +1555,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
    * composer. Fixing one finding spawns a new reviewer turn, which pushes the
    * findings you were working through far up the conversation — without this
    * you have to scroll back through earlier messages to act on the rest.
-   * Expanded by default and collapsible — undecided findings are exactly what
-   * this view exists to surface, so it never hides them on its own.
+   * Collapsed by default, and when open it is capped at min(14rem, 20vh) with
+   * its own scroll and two-line clamped bodies, so it never crowds out the
+   * composer no matter how many findings accumulate. It was originally
+   * expanded by default
+   * at full body length, which on a task with several accumulated findings
+   * filled the whole modal and pushed the conversation and composer out of
+   * view. The header alone carries the signal; the detail is opt-in.
    */
   const renderUnresolvedFindingsPanel = () => {
     const unresolved = unresolvedFindings();
@@ -1498,7 +1588,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
         </button>
         {unresolvedOpen && (
           <div className="px-3 pb-3 space-y-2">
-            {unresolved.map((f, i) => renderFinding(f, i, true, 'unresolved'))}
+            <div className="max-h-[min(14rem,20vh)] overflow-y-auto space-y-2 pr-1">
+              {unresolved.map((f, i) => renderFinding(f, i, true, 'unresolved', true))}
+            </div>
             {unresolved.length > 1 && (
               <button
                 onClick={() => handleFixFindings(unresolved, 'unresolved-panel')}
@@ -1578,8 +1670,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     // only once it has been decided, not because time passed.
     const canApply = task?.status === 'awaiting_feedback';
     const turnFindings = findingsForTurn(turn.id);
-    const openCount = turnFindings.filter(f => f.state !== 'dismissed').length;
-    const dismissedCount = turnFindings.filter(f => f.state === 'dismissed').length;
+    const openCount = turnFindings.filter(f => f.state === 'open').length;
+    const decidedCount = turnFindings.length - openCount;
     return (
       <div className="space-y-2">
         <div className="flex items-center gap-2 py-1">
@@ -1623,9 +1715,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                 {applyingFixes ? 'Applying…' : 'Apply suggested fixes'}
               </button>
             )}
-            {dismissedCount > 0 && (
+            {decidedCount > 0 && (
               <span className="text-[11px] text-amber-700/70 dark:text-amber-300/70">
-                {dismissedCount} dismissed — later reviews are told not to raise {dismissedCount === 1 ? 'it' : 'them'} again
+                {decidedCount} decided — later reviews are told about {decidedCount === 1 ? 'it' : 'them'}
               </span>
             )}
             {fullReview && (

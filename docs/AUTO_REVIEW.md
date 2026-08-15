@@ -120,8 +120,19 @@ and the diff:
   bodies (the per-finding fix action and the legacy "Apply suggested fixes" button) are excluded —
   replaying those would echo the reviewer's own prior verdict back at it as if the user had asked
   for it independently.
-- `buildWaiverBlock` replays every finding the user **dismissed** (see Section 16), with the user's
-  reason, and states that re-raising one is itself a review failure.
+- `buildWaiverBlock` replays **every finding raised by an earlier pass on this task** (see Section
+  16), labelled with what happened to it — `dismissed` (never raise again), `resolved` (user says
+  it's done: verify, don't restate), `fixing` / `open` (known; don't reword into a new-looking
+  problem). It also forbids contradicting an earlier finding on the same code without saying so.
+
+  This originally replayed **only dismissed** findings, which meant the *automatic* loop got nothing
+  at all: it fires the next Reviewer seconds after the previous verdict, long before the user has
+  triaged anything, so every finding is still `open` and therefore invisible. That is the common
+  case, not the edge case — on task `a22ff87b` reviewer turn #6 ran at 14:11 and the turn #4
+  findings were not dismissed until 14:17 and 14:23. The pass had no way to know what had already
+  been said, so it restated it, and contradicted turn #4 on the same function.
+
+  A turn never sees its own findings (`getPriorFindings(taskId, excludeTurnId)`).
 
 Each block is capped at 6 000 characters; the direction block keeps the *most recent* replies when
 trimming, since later direction is what matters.
@@ -614,7 +625,7 @@ CREATE TABLE review_findings (
   turn_id TEXT NOT NULL REFERENCES task_turns(id) ON DELETE CASCADE,
   position INTEGER NOT NULL,        -- order within the verdict
   body TEXT NOT NULL,
-  state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'dismissed')),
+  state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'dismissed', 'resolved')),
   note TEXT,                        -- user's reason when dismissing
   decided_at TEXT,
   created_at TEXT NOT NULL
@@ -629,13 +640,22 @@ finding holding the summary, so a fail is never un-triageable.
 
 ### States
 
-| State | Meaning |
-|---|---|
-| `open` | Not yet decided. |
-| `fixing` | Sent to the Implementer via the fix action. |
-| `dismissed` | Waived by the user. Replayed to every later Reviewer as a waiver (Section 4). |
+| State | Meaning | Set by |
+|---|---|---|
+| `open` | Needs a human decision. **The only state in the user's inbox.** | — |
+| `fixing` | Handed to the Implementer; no report back yet. | routing / **Fix this** |
+| `fixed` | Implementer reported it fixed; awaiting Reviewer verification. | Implementer |
+| `verified` | A later Reviewer pass checked the claim and did not re-raise it. | Reviewer |
+| `dismissed` | User decided this will **not** be changed. | **Ignore** |
+| `resolved` | User asserts it is **already fixed**. | **Already fixed** |
 
-Reopening a dismissed finding clears its note and `decided_at`.
+`dismissed` and `resolved` both retire a finding but mean opposite things to the next Reviewer
+("don't change this" vs "verify this is done"), so they must not be collapsed into one action.
+Without `resolved`, users dismissed with a note of "Fixed" — which fed the Reviewer a waiver saying
+the user had decided it *would not be changed*, the exact opposite of what they meant. The migration
+that adds the state reclassifies historical dismissals whose note was `Fixed`/`Done`.
+
+**Undo** returns a decided finding to `open`, clearing its note and `decided_at`.
 
 ### Routes
 
@@ -648,13 +668,54 @@ Reopening a dismissed finding clears its note and `decided_at`.
 
 `GET /api/tasks/:taskId` gains a `findings` array.
 
+### One problem per issue
+
+`REVIEW_DECISION_FORMAT` requires each entry in `issues` to be exactly one problem, because each
+entry is a separate decision the user has to make. Two call sites needing the same guard is ONE
+issue naming both, and the remedy belongs inside that issue's text rather than as its own entry.
+On `a22ff87b` a single "wrap these two calls in try/catch" problem was emitted as three findings —
+the third being the fix instruction for the first two — tripling the triage burden.
+
 ### UI
 
-Each finding renders as its own row with **Fix this** and **Ignore**. Ignore opens an optional
+Each finding renders as its own row with **Fix this**, **Already fixed** and **Ignore**. Ignore opens an optional
 one-line reason (shown to later reviewers) before confirming. Dismissed findings render struck
 through and muted with their reason and an **Undo dismiss** link. A **Fix all N remaining** button
 appears when more than one finding is still open. Verdicts recorded before this feature have no
 finding rows and fall back to the original flat bullet list plus **Apply suggested fixes**.
+
+### The Implementer closes its own findings
+
+Triage was originally all manual, which turned the findings list into an inbox: the only signal that
+a finding had been dealt with was "a later Reviewer didn't mention it", so every already-fixed item
+still had to be hand-closed. The Implementer now reports on each finding directly and the Reviewer
+verifies, so only genuinely unresolved work reaches the user.
+
+Each finding has a short stable ref (`findingRef` — first 8 chars of its id) used by both agents.
+
+1. Reviewer fails with findings A, B, C. All three go to the Implementer, tagged with their refs and
+   marked `fixing`, along with `FINDING_REPORT_FORMAT`.
+2. The Implementer ends its turn with
+   `FINDING_REPORT: [{"ref":"...","status":"fixed|not_fixed|disagree","note":"..."}]`.
+   - `fixed` → `fixed` (a **claim**, not a conclusion — only the Reviewer can close it)
+   - `not_fixed` / `disagree` → back to `open` with the Implementer's reason in `note`, shown to the
+     user. These are exactly the calls it should not be making alone.
+   - **omitted** → `reopenUnreportedFindings` returns it to `open`. A forgotten finding must not
+     vanish.
+   Refs are only honoured for findings actually in flight, so a stale or hallucinated ref cannot
+   reopen something the user already decided.
+3. The next Reviewer pass is given every `fixed` finding as *"IMPLEMENTER CLAIMS FIXED — you must
+   verify this"*. If the fix holds it says nothing and `verifyClaimedFixes` promotes it to
+   `verified`. If the fix is inadequate it re-raises with
+   `{"text":"<why the fix doesn't work>","reraises":"<ref>"}`, and `reraiseReviewFinding` reopens
+   **that same finding** in place with the revised reasoning and `revision + 1` — so a disputed fix
+   never leaves a near-duplicate behind.
+4. At the loop cap, the user gets only `open` findings: re-raised ones (labelled *"the reviewer
+   judged the previous fix inadequate"*) and ones the Implementer handed back or skipped.
+
+`verified` is a checked result, not the old "nobody mentioned it again" guess — the Reviewer was
+explicitly instructed to verify each claim. The heuristic label is suppressed for any finding
+carrying a real verdict (`revision > 0` or an Implementer note), where it would contradict it.
 
 ### Actionability is per-finding, not per-turn
 
@@ -675,6 +736,14 @@ Because fixing one finding pushes the rest far up the conversation, every undeci
 or `fixing`, across all turns, oldest first) is also mirrored in a collapsible panel pinned directly
 above the reply composer, with the same per-finding **Fix this** / **Ignore** and a **Fix all N
 remaining**. Without it the user has to scroll back through earlier messages to act on the rest.
+
+The panel is **collapsed by default** and its body is capped at `min(14rem, 20vh)` with its own
+scroll; each body is clamped to two lines with a per-finding **Show more**. Findings accumulate
+across passes and each is a full paragraph, so an expanded, unclamped panel filled the entire modal
+on a real task — burying the conversation and the composer. The header line alone carries the
+signal (`N review findings still undecided`); all detail is opt-in. Any change here should be
+re-measured at 800px viewport height, where the composer's action row is the first thing to be
+pushed out of view.
 
 ### A pass does not resolve open findings
 

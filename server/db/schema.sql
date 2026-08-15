@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS review_findings (
   turn_id TEXT NOT NULL REFERENCES task_turns(id) ON DELETE CASCADE,
   position INTEGER NOT NULL,
   body TEXT NOT NULL,
-  state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'dismissed')),
+  state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'dismissed', 'resolved')),
   note TEXT,
   decided_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))

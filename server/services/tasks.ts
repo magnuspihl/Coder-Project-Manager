@@ -62,12 +62,26 @@ export interface ReviewFinding {
   turn_id: string;
   position: number;
   body: string;
-  /** 'fixing' = user asked the implementer to address it; 'dismissed' = waived. */
-  state: 'open' | 'fixing' | 'dismissed';
+  /**
+   * open      — needs a decision (this is the ONLY state in the user's inbox)
+   * fixing    — handed to the implementer; no report back yet
+   * fixed     — implementer reported it fixed; awaiting reviewer verification
+   * verified  — a later reviewer pass checked it and did not re-raise it
+   * dismissed — user decided this will NOT be changed (waived)
+   * resolved  — user asserts it is already addressed
+   */
+  state: FindingState;
   note: string | null;
   decided_at: string | null;
   created_at: string;
+  /** Bumped when the reviewer re-raises a finding it judged inadequately fixed. */
+  revision: number;
 }
+
+export type FindingState = 'open' | 'fixing' | 'fixed' | 'verified' | 'dismissed' | 'resolved';
+
+/** States that still need the user. Everything else is closed or in flight. */
+export const FINDING_NEEDS_USER: FindingState[] = ['open'];
 
 export interface Message {
   id: string;
@@ -556,7 +570,7 @@ export function getReviewFinding(findingId: string): ReviewFinding | undefined {
 
 export function setReviewFindingState(
   findingId: string,
-  state: 'open' | 'fixing' | 'dismissed',
+  state: FindingState,
   note?: string | null,
 ): void {
   const db = getDb();
@@ -568,15 +582,101 @@ export function setReviewFindingState(
 }
 
 /**
- * Findings the user has explicitly dismissed on this task. Fed into every later
- * reviewer prompt — the reviewer starts a fresh session each pass, so without
- * this it re-derives its opinion from the original prompt and re-raises them.
+ * Findings the user has explicitly dismissed on this task — i.e. decided will
+ * NOT be changed. Fed to the implementer as do-not-touch.
  */
 export function getDismissedFindings(taskId: string): ReviewFinding[] {
   const db = getDb();
   return db.prepare(
     "SELECT * FROM review_findings WHERE task_id = ? AND state = 'dismissed' ORDER BY decided_at"
   ).all(taskId) as ReviewFinding[];
+}
+
+/**
+ * Every finding raised on this task by an *earlier* reviewer turn, whatever its
+ * state, oldest first. The reviewer starts a fresh session each pass and sees
+ * only the original prompt plus the diff, so without this it has no idea what
+ * previous passes already said — it restates them, and sometimes contradicts
+ * itself on the same code.
+ *
+ * Only dismissed findings used to be replayed, which meant the *automatic*
+ * review loop got nothing at all: it fires the next reviewer seconds after the
+ * previous verdict, long before the user has triaged anything, so every finding
+ * is still `open` and therefore invisible. That is the common case, not the
+ * edge case.
+ */
+/**
+ * Short stable handle used to refer to a finding in prompts. Both the
+ * implementer's status report and the reviewer's re-raise reference it, so it
+ * must not change across turns — hence a slice of the id rather than an index.
+ */
+export function findingRef(f: ReviewFinding): string {
+  return f.id.slice(0, 8);
+}
+
+export function findFindingByRef(taskId: string, ref: string): ReviewFinding | undefined {
+  const clean = ref.trim().toLowerCase();
+  return getReviewFindings(taskId).find(f => findingRef(f) === clean);
+}
+
+/** Findings currently with the implementer (sent, or reported fixed but unverified). */
+export function getFindingsInFlight(taskId: string): ReviewFinding[] {
+  const db = getDb();
+  return db.prepare(
+    "SELECT * FROM review_findings WHERE task_id = ? AND state IN ('fixing', 'fixed') ORDER BY created_at, position"
+  ).all(taskId) as ReviewFinding[];
+}
+
+/**
+ * Close out every implementer-claimed fix the reviewer did not re-raise. The
+ * reviewer is explicitly told to verify each claim, so silence here is a
+ * checked result rather than an assumption — this is what keeps fixed findings
+ * out of the user's inbox.
+ */
+export function verifyClaimedFixes(taskId: string, exceptIds: string[] = []): number {
+  const db = getDb();
+  const rows = db.prepare(
+    "SELECT id FROM review_findings WHERE task_id = ? AND state = 'fixed'"
+  ).all(taskId) as Array<{ id: string }>;
+  const targets = rows.filter(r => !exceptIds.includes(r.id));
+  const now = new Date().toISOString();
+  const stmt = db.prepare("UPDATE review_findings SET state = 'verified', decided_at = ? WHERE id = ?");
+  db.transaction(() => targets.forEach(r => stmt.run(now, r.id)))();
+  return targets.length;
+}
+
+/**
+ * The reviewer judged a previous fix inadequate. The finding is reopened in
+ * place with the reviewer's revised reasoning rather than added as a new row —
+ * otherwise every disputed fix would leave a duplicate behind in the inbox.
+ */
+export function reraiseReviewFinding(findingId: string, revisedBody: string): void {
+  const db = getDb();
+  db.prepare(
+    "UPDATE review_findings SET body = ?, state = 'open', note = NULL, decided_at = NULL, revision = revision + 1 WHERE id = ?"
+  ).run(revisedBody, findingId);
+}
+
+/**
+ * Findings sent to the implementer that it never reported on — it silently
+ * skipped them. They go back to the user rather than vanishing.
+ */
+export function reopenUnreportedFindings(taskId: string): number {
+  const db = getDb();
+  const res = db.prepare(
+    "UPDATE review_findings SET state = 'open' WHERE task_id = ? AND state = 'fixing'"
+  ).run(taskId);
+  return res.changes;
+}
+
+export function getPriorFindings(taskId: string, excludeTurnId: string): ReviewFinding[] {
+  const db = getDb();
+  return db.prepare(
+    `SELECT f.* FROM review_findings f
+     JOIN task_turns t ON t.id = f.turn_id
+     WHERE f.task_id = ? AND f.turn_id != ?
+     ORDER BY t.turn_number, f.position`
+  ).all(taskId, excludeTurnId) as ReviewFinding[];
 }
 
 export function setActiveTaskTurnRole(taskId: string, role: 'implementer' | 'reviewer' | null): void {

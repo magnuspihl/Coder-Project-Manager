@@ -96,7 +96,8 @@ export interface ReviewFinding {
   turn_id: string;
   position: number;
   body: string;
-  state: 'open' | 'fixing' | 'dismissed';
+  state: 'open' | 'fixing' | 'fixed' | 'verified' | 'dismissed' | 'resolved';
+  revision: number;
   note: string | null;
   decided_at: string | null;
   created_at: string;
@@ -365,8 +366,12 @@ export interface AttachmentInfo {
 export const getTaskDetail = (taskId: string) =>
   request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[]; turns: TaskTurn[]; taskRequests: TaskRequestItem[]; findings: ReviewFinding[] }>(`/api/tasks/${taskId}`);
 
-/** Dismiss a reviewer finding (waived — replayed to later reviewers as such) or reopen it. */
-export const setFindingState = (taskId: string, findingId: string, state: 'open' | 'dismissed', note?: string) =>
+/**
+ * Triage a reviewer finding. 'dismissed' = will not be changed, 'resolved' =
+ * already fixed. Both are replayed to later reviewers, but they mean opposite
+ * things, so the distinction has to survive to the prompt.
+ */
+export const setFindingState = (taskId: string, findingId: string, state: 'open' | 'dismissed' | 'resolved', note?: string) =>
   request<{ findings: ReviewFinding[] }>(`/api/tasks/${taskId}/findings/${findingId}`, {
     method: 'PATCH',
     body: JSON.stringify({ state, note: note ?? null }),
