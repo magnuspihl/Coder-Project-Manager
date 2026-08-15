@@ -697,6 +697,15 @@ Each finding has a short stable ref (`findingRef` — first 8 chars of its id) u
    marked `fixing`, along with `FINDING_REPORT_FORMAT`.
 2. The Implementer ends its turn with
    `FINDING_REPORT: [{"ref":"...","status":"fixed|not_fixed|disagree","note":"..."}]`.
+
+   `parseFindingReport` also accepts the shapes models actually emit when only one finding is in
+   flight and the array feels like ceremony: a single object, an object with no `ref`, and a bare
+   status word (`FINDING_REPORT: fixed`). All three resolve to `ALL_IN_FLIGHT_REF` ('*'), which
+   `applyFindingReport` expands to every finding the turn was handed — so the prompt requires
+   explicit refs whenever there is more than one. The strict-array-only parser silently discarded
+   the bare form on task `6745fb16`, reopening a finding the Implementer had genuinely fixed. The
+   marker is stripped from the user-visible message **whether or not it parsed** — the array-only
+   strip left `FINDING_REPORT: fixed` in the chat when parsing failed.
    - `fixed` → `fixed` (a **claim**, not a conclusion — only the Reviewer can close it)
    - `not_fixed` / `disagree` → back to `open` with the Implementer's reason in `note`, shown to the
      user. These are exactly the calls it should not be making alone.
@@ -704,13 +713,20 @@ Each finding has a short stable ref (`findingRef` — first 8 chars of its id) u
      vanish.
    Refs are only honoured for findings actually in flight, so a stale or hallucinated ref cannot
    reopen something the user already decided.
-3. The next Reviewer pass is given every `fixed` finding as *"IMPLEMENTER CLAIMS FIXED — you must
+3. A Reviewer **pass** closes the entire outstanding set — `open`, `fixing` and `fixed` alike — via
+   `closeOutstandingOnPass`. The Reviewer is handed every prior finding with its state and told to
+   re-raise anything still present, so passing is its verdict on all of them. Only `fixed` used to
+   be promoted, so a finding that came back `open` (e.g. its report failed to parse) survived every
+   later pass and sat in the inbox permanently while the UI said "Review passed" — exactly the
+   contradiction reported on `6745fb16`. User decisions (`dismissed` / `resolved`) are never
+   overwritten by a pass.
+4. On a **fail**, the Reviewer is given every `fixed` finding as *"IMPLEMENTER CLAIMS FIXED — you must
    verify this"*. If the fix holds it says nothing and `verifyClaimedFixes` promotes it to
    `verified`. If the fix is inadequate it re-raises with
    `{"text":"<why the fix doesn't work>","reraises":"<ref>"}`, and `reraiseReviewFinding` reopens
    **that same finding** in place with the revised reasoning and `revision + 1` — so a disputed fix
    never leaves a near-duplicate behind.
-4. At the loop cap, the user gets only `open` findings: re-raised ones (labelled *"the reviewer
+5. At the loop cap, the user gets only `open` findings: re-raised ones (labelled *"the reviewer
    judged the previous fix inadequate"*) and ones the Implementer handed back or skipped.
 
 `verified` is a checked result, not the old "nobody mentioned it again" guess — the Reviewer was
