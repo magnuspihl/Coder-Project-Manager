@@ -403,7 +403,7 @@ export function getDb(): Database.Database {
     turn_id TEXT NOT NULL REFERENCES task_turns(id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
     body TEXT NOT NULL,
-    state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'dismissed', 'resolved')),
+    state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'fixed', 'verified', 'dismissed', 'resolved')),
     note TEXT,
     decided_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -416,10 +416,17 @@ export function getDb(): Database.Database {
   // will NOT be changed" — replayed to reviewers as a waiver. Users had no way to
   // say "already fixed", so they dismissed with a note of "Fixed", which told the
   // reviewer the exact opposite of what they meant.
+  const findingsCols = db.prepare("PRAGMA table_info(review_findings)").all() as Array<{ name: string }>;
+  if (!findingsCols.some(c => c.name === 'revision')) {
+    // Bumped each time the reviewer re-raises a finding it judges inadequately
+    // fixed, so the UI can show "revised" rather than a duplicate.
+    db.exec("ALTER TABLE review_findings ADD COLUMN revision INTEGER NOT NULL DEFAULT 0");
+  }
+
   const findingsSql = (db.prepare(
     "SELECT sql FROM sqlite_master WHERE type='table' AND name='review_findings'"
   ).get() as { sql: string } | undefined)?.sql ?? '';
-  if (findingsSql && !findingsSql.includes("'resolved'")) {
+  if (findingsSql && !findingsSql.includes("'verified'")) {
     db.exec(`
       CREATE TABLE review_findings_new (
         id TEXT PRIMARY KEY,
@@ -427,12 +434,15 @@ export function getDb(): Database.Database {
         turn_id TEXT NOT NULL REFERENCES task_turns(id) ON DELETE CASCADE,
         position INTEGER NOT NULL,
         body TEXT NOT NULL,
-        state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'dismissed', 'resolved')),
+        state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'fixed', 'verified', 'dismissed', 'resolved')),
         note TEXT,
         decided_at TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        revision INTEGER NOT NULL DEFAULT 0
       );
-      INSERT INTO review_findings_new SELECT * FROM review_findings;
+      INSERT INTO review_findings_new
+        SELECT id, task_id, turn_id, position, body, state, note, decided_at, created_at, revision
+        FROM review_findings;
       DROP TABLE review_findings;
       ALTER TABLE review_findings_new RENAME TO review_findings;
       CREATE INDEX IF NOT EXISTS idx_review_findings_task ON review_findings(task_id);
@@ -445,7 +455,7 @@ export function getDb(): Database.Database {
       WHERE state = 'dismissed' AND note IS NOT NULL
         AND lower(trim(note)) IN ('fixed', 'done', 'already fixed', 'fixed.', 'done.')
     `).run();
-    console.log(`[migration] review_findings gained 'resolved' state (${moved.changes} dismissal(s) reclassified)`);
+    console.log(`[migration] review_findings states widened (${moved.changes} dismissal(s) reclassified as 'resolved')`);
   }
 
   // Per-delta token usage events, so consumers can attribute tokens to a

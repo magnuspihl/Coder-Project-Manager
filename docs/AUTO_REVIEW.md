@@ -640,10 +640,12 @@ finding holding the summary, so a fail is never un-triageable.
 
 ### States
 
-| State | Meaning | UI action |
+| State | Meaning | Set by |
 |---|---|---|
-| `open` | Not yet decided. | — |
-| `fixing` | Sent to the Implementer; outcome unknown. Re-sendable. | **Fix this** |
+| `open` | Needs a human decision. **The only state in the user's inbox.** | — |
+| `fixing` | Handed to the Implementer; no report back yet. | routing / **Fix this** |
+| `fixed` | Implementer reported it fixed; awaiting Reviewer verification. | Implementer |
+| `verified` | A later Reviewer pass checked the claim and did not re-raise it. | Reviewer |
 | `dismissed` | User decided this will **not** be changed. | **Ignore** |
 | `resolved` | User asserts it is **already fixed**. | **Already fixed** |
 
@@ -681,6 +683,39 @@ one-line reason (shown to later reviewers) before confirming. Dismissed findings
 through and muted with their reason and an **Undo dismiss** link. A **Fix all N remaining** button
 appears when more than one finding is still open. Verdicts recorded before this feature have no
 finding rows and fall back to the original flat bullet list plus **Apply suggested fixes**.
+
+### The Implementer closes its own findings
+
+Triage was originally all manual, which turned the findings list into an inbox: the only signal that
+a finding had been dealt with was "a later Reviewer didn't mention it", so every already-fixed item
+still had to be hand-closed. The Implementer now reports on each finding directly and the Reviewer
+verifies, so only genuinely unresolved work reaches the user.
+
+Each finding has a short stable ref (`findingRef` — first 8 chars of its id) used by both agents.
+
+1. Reviewer fails with findings A, B, C. All three go to the Implementer, tagged with their refs and
+   marked `fixing`, along with `FINDING_REPORT_FORMAT`.
+2. The Implementer ends its turn with
+   `FINDING_REPORT: [{"ref":"...","status":"fixed|not_fixed|disagree","note":"..."}]`.
+   - `fixed` → `fixed` (a **claim**, not a conclusion — only the Reviewer can close it)
+   - `not_fixed` / `disagree` → back to `open` with the Implementer's reason in `note`, shown to the
+     user. These are exactly the calls it should not be making alone.
+   - **omitted** → `reopenUnreportedFindings` returns it to `open`. A forgotten finding must not
+     vanish.
+   Refs are only honoured for findings actually in flight, so a stale or hallucinated ref cannot
+   reopen something the user already decided.
+3. The next Reviewer pass is given every `fixed` finding as *"IMPLEMENTER CLAIMS FIXED — you must
+   verify this"*. If the fix holds it says nothing and `verifyClaimedFixes` promotes it to
+   `verified`. If the fix is inadequate it re-raises with
+   `{"text":"<why the fix doesn't work>","reraises":"<ref>"}`, and `reraiseReviewFinding` reopens
+   **that same finding** in place with the revised reasoning and `revision + 1` — so a disputed fix
+   never leaves a near-duplicate behind.
+4. At the loop cap, the user gets only `open` findings: re-raised ones (labelled *"the reviewer
+   judged the previous fix inadequate"*) and ones the Implementer handed back or skipped.
+
+`verified` is a checked result, not the old "nobody mentioned it again" guess — the Reviewer was
+explicitly instructed to verify each claim. The heuristic label is suppressed for any finding
+carrying a real verdict (`revision > 0` or an Implementer note), where it would contradict it.
 
 ### Actionability is per-finding, not per-turn
 

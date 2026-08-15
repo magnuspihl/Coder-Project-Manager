@@ -864,7 +864,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
    * these is precisely the "did it assume I wanted to ignore it?" failure.
    */
   const supersededByLaterReview = (f: ReviewFinding): boolean => {
-    if (f.state === 'dismissed' || f.state === 'resolved') return false;
+    if (f.state !== 'open') return false;
+    // A re-raised finding was explicitly looked at and objected to by a later
+    // review, so "a later review didn't raise this again" is flatly false for
+    // it. This heuristic only still applies to findings that never went through
+    // the implementer loop — anything that did now carries a real verdict
+    // (`verified`, or a re-raise) instead of this guess.
+    if (f.revision > 0 || f.note) return false;
     const raisedAt = turnNumberOf(f.turn_id);
     return turns.some(t => t.role === 'reviewer' && t.completed_at && t.turn_number > raisedAt);
   };
@@ -872,7 +878,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   // Every finding still awaiting a decision, oldest first, across all turns.
   const unresolvedFindings = (): ReviewFinding[] =>
     findings
-      .filter(f => f.state === 'open' || f.state === 'fixing')
+      .filter(f => f.state === 'open')
       .sort((a, b) => turnNumberOf(a.turn_id) - turnNumberOf(b.turn_id) || a.position - b.position);
 
   /**
@@ -884,7 +890,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     if (pendingFinding || sending || applyingFixes) return;
     // 'fixing' is re-sendable: it means "handed to the implementer, outcome
     // unknown". Only an explicit dismissal takes a finding out of play.
-    const ids = selected.filter(f => f.state === 'open' || f.state === 'fixing').map(f => f.id);
+    const ids = selected.filter(f => f.state === 'open').map(f => f.id);
     if (ids.length === 0) return;
     setPendingFinding(busyKey);
     editSeqRef.current++;
@@ -905,7 +911,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
 
   // Fix every still-open finding in this verdict in one implementer turn.
   const handleFixAllOpen = (turnId: string) =>
-    handleFixFindings(findingsForTurn(turnId).filter(f => f.state === 'open' || f.state === 'fixing'), turnId);
+    handleFixFindings(findingsForTurn(turnId).filter(f => f.state === 'open'), turnId);
 
   // Dismiss a finding. This is the durable signal: dismissed findings are
   // replayed into every later reviewer prompt as a waiver, so the reviewer
@@ -1385,7 +1391,10 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     const busy = pendingFinding === f.id;
     const dismissed = f.state === 'dismissed';
     const resolved = f.state === 'resolved';
-    const decided = dismissed || resolved;
+    const verified = f.state === 'verified';
+    const claimedFixed = f.state === 'fixed';
+    const inFlight = f.state === 'fixing';
+    const decided = f.state !== 'open';
     const noteOpen = dismissNoteFor === noteKey;
     // In the pinned panel the bodies are clamped: reviewer findings run to a
     // full paragraph each, and a handful at full length pushed the conversation
@@ -1436,8 +1445,30 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                 Marked as already fixed
               </p>
             )}
-            {f.state === 'fixing' && (
+            {inFlight && (
               <p className="mt-1 text-[11px] text-blue-600 dark:text-blue-400">Sent to the implementer</p>
+            )}
+            {claimedFixed && (
+              <p className="mt-1 text-[11px] text-blue-600 dark:text-blue-400">
+                Implementer reports this fixed — awaiting reviewer verification
+                {f.note ? ` (${f.note})` : ''}
+              </p>
+            )}
+            {verified && (
+              <p className="mt-1 text-[11px] text-green-700 dark:text-green-400 italic">
+                Fixed and verified by a later review
+              </p>
+            )}
+            {f.revision > 0 && f.state === 'open' && (
+              <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-300">
+                Re-raised — the reviewer judged the previous fix inadequate
+              </p>
+            )}
+            {/* Why the implementer handed this back ("not_fixed"/"disagree").
+                Without it the finding returns to the user stripped of the one
+                piece of context that explains why it is theirs to decide. */}
+            {f.state === 'open' && f.note && (
+              <p className="mt-1 text-[11px] text-gray-600 dark:text-gray-400 italic">{f.note}</p>
             )}
             {!decided && supersededByLaterReview(f) && (
               <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">
@@ -1639,7 +1670,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     // only once it has been decided, not because time passed.
     const canApply = task?.status === 'awaiting_feedback';
     const turnFindings = findingsForTurn(turn.id);
-    const openCount = turnFindings.filter(f => f.state === 'open' || f.state === 'fixing').length;
+    const openCount = turnFindings.filter(f => f.state === 'open').length;
     const decidedCount = turnFindings.length - openCount;
     return (
       <div className="space-y-2">
