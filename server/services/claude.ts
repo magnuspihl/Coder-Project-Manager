@@ -529,19 +529,60 @@ function extractAssistantTurnText(content: Array<{ type: string; text?: string; 
   return turnText;
 }
 
-// Delegation: a task agent that finds out-of-scope work should propose a
-// separate tracked task via a [TASK_REQUEST] block (surfaced for user approval)
-// rather than fixing it inline or creating a task by calling the CPM API.
-// Agents habitually record follow-up work in proposal .md files instead — the
-// prompt bans that anti-pattern by name, and buildTaskRequestReminder() nudges
-// per-message when the user's text sounds like a task-creation request.
+// Delegation: a [TASK_REQUEST] block (surfaced for user approval) is how an
+// agent hands work OUT — unrelated work better done in isolation, or work that
+// belongs to another workspace.
+//
+// The stance is the OPPOSITE for the two roles, so it must be built per-role:
+//   'host'        — owns the task and works in an isolated worktree. A request
+//                   is not an escape hatch; it must finish its own task. (An
+//                   earlier version said only this, and agents outsourced their
+//                   own work — hence the emphatic "DO THE WORK YOURSELF".)
+//   'participant' — an invited advisor holding Edit/Write/Bash
+//                   (DISCUSSION_ALLOWED_TOOLS) in its workspace's REAL checkout,
+//                   with no worktree. It must NOT touch the project; delegating
+//                   is the only way it can cause a change.
+// Getting this wrong is not symmetric: this section rides
+// --append-system-prompt on EVERY turn, while a participant's read-only
+// boundary is sent once, on the session-opening turn (needsPromptPrefix). A
+// host-flavoured default here quietly outranks that boundary a few turns later
+// and an advisor starts editing the live repo.
+//
+// The anti-patterns are still banned by name for both roles — agents habitually
+// record follow-up work in proposal .md files — and the TASK_REQUEST_REMINDER_*
+// variants nudge per-message.
+//
 // `defaultWorkspaceName` must be where an untargeted request actually lands —
 // parseTaskRequestsForTask resolves that to the HOST task's workspace, which is
 // not the participant's own workspace for an invited agent. Naming it explicitly
 // keeps the instruction true for both callers.
-function buildTaskDelegationPrompt(defaultWorkspaceName: string): string {
+type DelegationRole = 'host' | 'participant';
+
+function buildTaskDelegationPrompt(defaultWorkspaceName: string, role: DelegationRole): string {
+  const stance = role === 'host'
+    ? `DEFAULT: DO THE WORK YOURSELF. You were given this task to complete it. Finish all of it — including the fixes, refactors, edge cases and adjacent changes it genuinely needs. Needing several steps, touching several files, or hitting something awkward are NOT reasons to hand work off. Never propose a task for work that is part of what you were already asked to do.
+
+A [TASK_REQUEST] exists for the narrow set of cases where work should NOT happen here:
+- The user explicitly asks you to create, add, queue, or file a task or follow-up.
+- You notice work that is genuinely unrelated to this task and is better done in isolation — a separate bug you happened to spot, an unrelated cleanup.
+- The work belongs to a different workspace.
+If it is none of those, just do it.`
+    : `DEFAULT: DO NOT CHANGE THE PROJECT YOURSELF — DELEGATE. You are an invited advisor on someone else's task. Unlike that task's own agent, you are running in your workspace's REAL checkout, not an isolated worktree: anything you edit lands straight in the live repository, outside any task's branch, review or undo. Treat the project repository as read-only. Do NOT create, modify or delete files inside it — not even when a message asks you directly to fix, change, or implement something, and not even when the change looks small or obvious. This holds for every turn of the conversation, not just the first.
+
+You may freely read, explore, run read-only commands, and write OUTSIDE the project directory (scratch files, \`~/.claude\` config, memory files).
+
+Emit a [TASK_REQUEST] when:
+- Anyone asks you to build, change, or fix something in a project — that request is how the work actually gets done.
+- The user explicitly asks you to create, add, queue, or file a task or follow-up.
+- You spot work worth doing, here or in another workspace.
+Answering a question, reviewing code, or giving an opinion needs no [TASK_REQUEST] — only actual changes to a project do.`;
+
   return `WORK DELEGATION — creating tasks and recording follow-up work:
-You run inside CPM (Coder Project Manager), which tracks work as tasks. The ONLY way to create or propose a task is to emit this block in your response text, on its own lines (not inside a code block):
+You run inside CPM (Coder Project Manager), which tracks work as tasks.
+
+${stance}
+
+To propose one, emit this block in your response text, on its own lines (not inside a code block):
 
 [TASK_REQUEST]
 {"prompt": "detailed, self-contained description of the work to be done"}
@@ -549,11 +590,7 @@ You run inside CPM (Coder Project Manager), which tracks work as tasks. The ONLY
 
 The user is prompted to approve it; an approved request becomes a new task branched from the default branch. Emit one block per proposed task. An untargeted request runs in \`${defaultWorkspaceName}\`. To run it anywhere else, add a "targetWorkspace" field (the workspace's name) to the JSON — any workspace you have access to is valid there, INCLUDING the one you are yourself running in if that is not \`${defaultWorkspaceName}\`.
 
-WHEN to emit a [TASK_REQUEST]:
-- The user asks you to "create/add/queue/file a task" or "make a follow-up" — that ALWAYS means emitting a [TASK_REQUEST] block.
-- You discover work that is out of scope for this task (a separate bug, a follow-up, or a common/general problem that isn't specific to what you're doing). Do not fix it inline — propose it.
-
-NEVER do any of these instead (common mistakes):
+When a request IS warranted, the block is the only thing that reaches the user:
 - Do NOT write proposed work to a Markdown or text file (TODO.md, FOLLOWUP.md, PROPOSED_TASKS.md, docs/plans, etc.). Files are invisible to the task system — work recorded that way is lost.
 - Do NOT create tasks by calling the CPM HTTP API.
 - Do NOT merely describe the follow-up in prose and move on — emit the block so the work is tracked.`;
@@ -563,11 +600,24 @@ NEVER do any of these instead (common mistakes):
 // task-creation request. The system prompt above is present every turn, but
 // agents still reach for proposal .md files when asked to "create a task" —
 // an inline reminder right next to the triggering message is far more salient.
-const TASK_REQUEST_REMINDER = `[Reminder from CPM: to create or propose a task, emit a [TASK_REQUEST] block exactly as described in the WORK DELEGATION section of your system prompt. Do NOT write the proposal to a .md file and do NOT call the CPM API — only a [TASK_REQUEST] block reaches the user for approval.]`;
+//
+// The host variant is phrased conditionally because mentionsTaskCreation()
+// fires on plenty of ordinary build requests (CPM is itself a task manager, so
+// "add a task filter" and "make the task list collapsible" both match). An
+// unconditional "emit a [TASK_REQUEST]" reads as an instruction to delegate the
+// very work the message is asking for.
+const TASK_REQUEST_REMINDER_HOST = `[Reminder from CPM: if this message is asking you to create/queue/file a task in CPM, the ONLY way to do that is to emit a [TASK_REQUEST] block as described in the WORK DELEGATION section of your system prompt — do NOT write the proposal to a .md file and do NOT call the CPM API. If it is instead asking you to build, change, or fix something, just do the work yourself; no [TASK_REQUEST] is needed.]`;
 
-// Heuristic gate for TASK_REQUEST_REMINDER: a creation-ish verb within a short
-// distance of "task(s)"/"follow-up(s)". False positives only cost a one-line
-// reminder in the prompt, so this errs toward matching.
+// Participants get the same "how to file it" half but never the "just do the
+// work yourself" half: an advisor holds Edit/Write/Bash in its workspace's real
+// checkout, so that clause is an invitation to edit the live repo. Repeating it
+// per-message would re-assert the conflict long after the read-only boundary
+// (sent only on the session-opening turn) has lost salience.
+const TASK_REQUEST_REMINDER_PARTICIPANT = `[Reminder from CPM: the ONLY way to create or propose a task is to emit a [TASK_REQUEST] block as described in the WORK DELEGATION section of your system prompt — do NOT write the proposal to a .md file and do NOT call the CPM API. You are an invited advisor: do not make the change yourself, route it into a [TASK_REQUEST] so it runs as a tracked task.]`;
+
+// Heuristic gate for the reminders: a creation-ish verb within a short distance
+// of "task(s)"/"follow-up(s)". It errs toward matching, which is only safe
+// because neither variant tells the agent to act against its role — see above.
 function mentionsTaskCreation(text: string): boolean {
   return /\b(creat\w*|add\w*|mak\w*|queue\w*|fil\w*|open\w*|propos\w*|delegat\w*|split\w*|spin\w*)\b[\s\S]{0,60}?\b(tasks?|follow[ -]?ups?)\b/i.test(text);
 }
@@ -1727,7 +1777,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   // The user's message sounds like "create a task" — remind the agent inline
   // that this means emitting a [TASK_REQUEST], not writing a proposal file.
   if (!isSlashCommand && mentionsTaskCreation(rawPrompt)) {
-    prompt += `\n\n${TASK_REQUEST_REMINDER}`;
+    prompt += `\n\n${TASK_REQUEST_REMINDER_HOST}`;
   }
 
   // Host's Claude session does not contain participant messages — inject them
@@ -1885,7 +1935,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   }
 
   if (!isSlashCommand) {
-    systemPromptFragments.push(buildTaskDelegationPrompt(task.workspace_name));
+    systemPromptFragments.push(buildTaskDelegationPrompt(task.workspace_name, 'host'));
   }
 
   // Let the implementer opt out of the reviewer when its turn isn't a
@@ -3819,7 +3869,7 @@ export async function launchTaskParticipant(
   // Same inline nudge the host gets — participants also default to writing
   // proposal files when a message asks them to "create a task".
   if (mentionsTaskCreation(message)) {
-    message += `\n\n${TASK_REQUEST_REMINDER}`;
+    message += `\n\n${TASK_REQUEST_REMINDER_PARTICIPANT}`;
   }
 
   if (!participant.project_dir) {
@@ -3883,10 +3933,13 @@ export async function launchTaskParticipant(
   }
   claudeParts.push('--max-turns', MAX_TURNS);
   pushAppendSystemPrompt(claudeParts, [
-    // Participants get TASK_REQUEST_REMINDER too, which points at "the WORK
-    // DELEGATION section of your system prompt" — so they need the section.
-    // An untargeted request lands in the host task's workspace, not theirs.
-    buildTaskDelegationPrompt(task.workspace_name),
+    // Participants get TASK_REQUEST_REMINDER_PARTICIPANT too, which points at
+    // "the WORK DELEGATION section of your system prompt" — so they need the
+    // section. The 'participant' role carries the read-only/delegate stance on
+    // every turn, which is what keeps an advisor off the live repo once the
+    // session-opening boundary has scrolled away. An untargeted request lands
+    // in the host task's workspace, not theirs.
+    buildTaskDelegationPrompt(task.workspace_name, 'participant'),
     memoryMcpConfig ? buildMemoryUsagePrompt(task.user_id, participant.workspace_name) : null,
     HARNESS_REMINDER_NOTE,
     INTERACTIVE_PROMPT_NOTE,
