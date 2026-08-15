@@ -566,7 +566,13 @@ A [TASK_REQUEST] exists for the narrow set of cases where work should NOT happen
 - The user explicitly asks you to create, add, queue, or file a task or follow-up.
 - You notice work that is genuinely unrelated to this task and is better done in isolation — a separate bug you happened to spot, an unrelated cleanup.
 - The work belongs to a different workspace.
-If it is none of those, just do it.`
+If it is none of those, just do it.
+
+AND it must be independently solvable. An approved request becomes a NEW task branched from the default branch: it starts from a clean checkout that does NOT contain your current changes, and it can run before yours is merged. So before proposing one, ask: could someone finish it from the default branch alone, with no part of it depending on work you are doing here?
+
+If the answer is no, what to do depends on WHERE the work lives:
+- In THIS workspace — do it in THIS task instead, even if it isn't really part of the same problem. Splitting off dependent work produces a task that cannot be completed as written. (If the user explicitly asked you to file it anyway, do so, but state plainly in the request that it depends on this task's changes.)
+- In a DIFFERENT workspace — you cannot do it here at all: your worktree is a checkout of this workspace's repository only. Still emit the [TASK_REQUEST] with its "targetWorkspace", and state the dependency on this task's changes explicitly in the request prompt so whoever picks it up knows what it is waiting on. Never drop cross-workspace work just because it depends on what you are doing.`
     : `DEFAULT: DO NOT CHANGE THE PROJECT YOURSELF — DELEGATE. You are an invited advisor on someone else's task. Unlike that task's own agent, you are running in your workspace's REAL checkout, not an isolated worktree: anything you edit lands straight in the live repository, outside any task's branch, review or undo. Treat the project repository as read-only. Do NOT create, modify or delete files inside it — not even when a message asks you directly to fix, change, or implement something, and not even when the change looks small or obvious. This holds for every turn of the conversation, not just the first.
 
 You may freely read, explore, run read-only commands, and write OUTSIDE the project directory (scratch files, \`~/.claude\` config, memory files).
@@ -575,7 +581,9 @@ Emit a [TASK_REQUEST] when:
 - Anyone asks you to build, change, or fix something in a project — that request is how the work actually gets done.
 - The user explicitly asks you to create, add, queue, or file a task or follow-up.
 - You spot work worth doing, here or in another workspace.
-Answering a question, reviewing code, or giving an opinion needs no [TASK_REQUEST] — only actual changes to a project do.`;
+Answering a question, reviewing code, or giving an opinion needs no [TASK_REQUEST] — only actual changes to a project do.
+
+Make each request independently solvable: it becomes a NEW task branched from the default branch, so it starts from a clean checkout WITHOUT the changes this task is still working on. If what you are proposing depends on that in-flight work, say so explicitly in the request prompt — otherwise you hand someone a task that cannot be completed as written.`;
 
   return `WORK DELEGATION — creating tasks and recording follow-up work:
 You run inside CPM (Coder Project Manager), which tracks work as tasks.
