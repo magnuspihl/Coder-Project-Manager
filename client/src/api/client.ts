@@ -374,6 +374,7 @@ export interface AttachmentInfo {
   original_name: string;
   mime_type: string;
   size: number;
+  source: 'user' | 'agent';
   created_at: string;
 }
 

@@ -497,6 +497,27 @@ export function getDb(): Database.Database {
 
   migrateDiscussionsToTasks(db);
 
+  // Output files: an agent can hand the user a file to download via
+  // [OUTPUT_FILE], recorded in the same attachments table as user uploads.
+  const attCols = db.prepare("PRAGMA table_info(attachments)").all() as Array<{ name: string }>;
+  if (attCols.length > 0 && !attCols.some(c => c.name === 'source')) {
+    db.exec("ALTER TABLE attachments ADD COLUMN source TEXT NOT NULL DEFAULT 'user'");
+  }
+  if (attCols.length > 0 && !attCols.some(c => c.name === 'user_id')) {
+    // Nullable and never backfilled for pre-existing rows — there's no way to
+    // recover the uploader for a row that predates this column. New rows are
+    // stamped at creation from here on (see /api/uploads and
+    // createAgentOutputAttachment), which is what actually closes the gap.
+    db.exec("ALTER TABLE attachments ADD COLUMN user_id TEXT");
+  }
+  if (attCols.length > 0 && !attCols.some(c => c.name === 'content_hash')) {
+    // Dedupes an [OUTPUT_FILE] recapture (e.g. on reconnect-after-restart
+    // replay) by the file's actual bytes rather than its size, so a
+    // regenerated file that happens to match the prior capture's byte count
+    // is never mistaken for the same content and silently dropped.
+    db.exec("ALTER TABLE attachments ADD COLUMN content_hash TEXT");
+  }
+
   return db;
 }
 
