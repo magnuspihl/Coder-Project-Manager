@@ -651,8 +651,12 @@ const FINDING_REPORT_MARKER = 'FINDING_REPORT';
  * The implementer's per-finding status report. Without it, the only signal that
  * a finding was dealt with was "a later reviewer didn't mention it", which left
  * the user hand-closing an inbox of already-fixed items.
+ *
+ * Exported because the inbox "Fix" route builds its own prompt: any path that
+ * moves findings into `fixing` MUST ask for this report, or applyFindingReport
+ * sees no entries and reopens every one of them at turn end.
  */
-const FINDING_REPORT_FORMAT = `When you are done, report on EVERY finding you were given, as the last line of your response, with nothing after it:
+export const FINDING_REPORT_FORMAT = `When you are done, report on EVERY finding you were given, as the last line of your response, with nothing after it:
 
 ${FINDING_REPORT_MARKER}: [{"ref":"<ref>","status":"fixed|not_fixed|disagree","note":"<one sentence>"}]
 
@@ -749,6 +753,15 @@ const noReviewDeclared = new Set<string>();
 // by re-launching the implementer on a "fail". Stays set until the next
 // reviewer launches (launchReviewerOnTask), which clears it.
 const interruptedReviews = new Set<string>();
+
+// Task ids whose current reviewer turn was started by the user's "Review"
+// button rather than by auto-review. Its verdict still routes back to the
+// implementer once even when auto-review is off — the user asked for this pass,
+// so it behaves as it did before the setting existed. (Only once: the fix turn
+// then ends at the auto_review check in onImplementerTurnComplete, so there is
+// no second review pass.) Set/cleared at every reviewer launch, so it always
+// describes the pass in flight.
+const manualReviews = new Set<string>();
 
 // Detect and strip the implementer's NO_REVIEW_NEEDED opt-out marker. When found,
 // records it for onImplementerTurnComplete and returns the text with the marker
@@ -1023,7 +1036,7 @@ export async function triggerManualReview(task: Task): Promise<boolean> {
   resetReviewLoopCount(task.id);
   addMessage(task.id, 'system', 'Manual review requested — launching the reviewer.');
   updateTaskStatus(task.id, 'working');
-  await launchReviewerOnTask(task);
+  await launchReviewerOnTask(task, { manual: true });
   return true;
 }
 
@@ -2850,11 +2863,23 @@ async function onImplementerTurnComplete(task: Task): Promise<void> {
   const current = getTask(task.id);
   if (!current) return;
 
+  // Consume the implementer's FINDING_REPORT before ANY early return below.
+  // Findings handed to it sit in state 'fixing', which the UI treats as decided:
+  // they show in neither the unresolved panel nor the Fix action, so a 'fixing'
+  // finding nobody reopens is unreachable to the user. That happens on every
+  // path that skips the reviewer — auto-review switched off mid-fix, and the
+  // long-standing case of clicking Fix in the inbox on an auto-review-off task,
+  // which hands findings to the implementer regardless of the flag.
+  applyFindingReport(current);
+
   // No auto-review: check the flag, and also skip if no worktree (pre-worktrees task)
   if (!current.auto_review || !current.worktree_path) {
-    setActiveTaskTurnRole(task.id, null);
-    updateTaskStatus(task.id, 'awaiting_feedback');
-    processQueue(task.workspace_id).catch(() => {});
+    // settleWithUnresolvedFindings clears review_loop_count, which matters here:
+    // a manual review on an auto-review-off task increments it and its exempted
+    // fix turn ends on exactly this path, so without the reset the next failing
+    // review after auto-review is switched back on would escalate immediately
+    // instead of getting its own fix attempt.
+    settleWithUnresolvedFindings(current);
     return;
   }
 
@@ -2862,14 +2887,10 @@ async function onImplementerTurnComplete(task: Task): Promise<void> {
   // a question, gave a diagnosis, or only investigated). Honor it even if the
   // worktree is dirty from incidental noise — but NOT mid review-loop, where the
   // implementer is meant to be fixing flagged issues rather than opting out.
-  applyFindingReport(current);
-
   const declaredNoReview = noReviewDeclared.delete(task.id);
   if (declaredNoReview && current.review_loop_count === 0) {
     appendStreamLog(task.id, 'reviewer_skip', 'Implementer signalled NO_REVIEW_NEEDED — skipping review');
-    setActiveTaskTurnRole(task.id, null);
-    updateTaskStatus(task.id, 'awaiting_feedback');
-    processQueue(task.workspace_id).catch(() => {});
+    settleWithUnresolvedFindings(current);
     return;
   }
 
@@ -2887,9 +2908,7 @@ async function onImplementerTurnComplete(task: Task): Promise<void> {
         `Auto-review escalated: the implementer made no changes after reviewer feedback.\n\nUnresolved issues:\n${issueList || '(see reviewer output above)'}`
       );
     }
-    setActiveTaskTurnRole(task.id, null);
-    updateTaskStatus(task.id, 'awaiting_feedback');
-    processQueue(task.workspace_id).catch(() => {});
+    settleWithUnresolvedFindings(current);
     return;
   }
 
@@ -2994,10 +3013,12 @@ ${list}
 `;
 }
 
-async function launchReviewerOnTask(task: Task): Promise<void> {
+async function launchReviewerOnTask(task: Task, opts: { manual?: boolean } = {}): Promise<void> {
   // Fresh reviewer turn — clear any stale interrupt guard from a prior pass so
   // this run's verdict is allowed to route.
   interruptedReviews.delete(task.id);
+  if (opts.manual) manualReviews.add(task.id);
+  else manualReviews.delete(task.id);
   const reviewerSessionId = randomUUID();
   const turn = createTaskTurn({
     taskId: task.id,
@@ -3167,9 +3188,7 @@ async function executeReviewer(
       accountAuth.cleanup?.(); // launch command never ran; its in-band `rm` won't either
       stopPolling(`review:${task.id}`);
       completeTaskTurn(turnId, 'fail', `Reviewer launch failed: ${(err as Error).message}`);
-      setActiveTaskTurnRole(task.id, null);
-      updateTaskStatus(task.id, 'awaiting_feedback');
-      processQueue(task.workspace_id).catch(() => {});
+      settleWithUnresolvedFindings(task);
     });
 
     sshProcess.unref();
@@ -3179,9 +3198,7 @@ async function executeReviewer(
     console.error('[auto-review] Launch failed:', errorMsg);
     accountAuth.cleanup?.();
     completeTaskTurn(turnId, 'fail', `Reviewer launch failed: ${errorMsg}`);
-    setActiveTaskTurnRole(task.id, null);
-    updateTaskStatus(task.id, 'awaiting_feedback');
-    processQueue(task.workspace_id).catch(() => {});
+    settleWithUnresolvedFindings(task);
   }
 }
 
@@ -3279,13 +3296,7 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
         console.error(`[auto-review] Reviewer for task ${task.id} aborted: could not load the pinned subscription token`);
         completeTaskTurn(turnId, 'fail', 'Reviewer could not load the pinned Claude subscription token');
         addMessage(task.id, 'system', `Error: ${AUTH_STAGING_MESSAGE}`);
-        // Matches every other hand-back-to-user path: a residual count from
-        // earlier fail verdicts would otherwise escalate a loop early on the
-        // user's next turn.
-        resetReviewLoopCount(task.id);
-        setActiveTaskTurnRole(task.id, null);
-        updateTaskStatus(task.id, 'awaiting_feedback');
-        processQueue(task.workspace_id).catch(() => {});
+        settleWithUnresolvedFindings(task);
         return;
       }
 
@@ -3380,10 +3391,7 @@ function finalizeReviewer(
         completeTaskTurn(turnId, 'fail', 'Reviewer did not produce a structured decision');
         addMessage(task.id, 'system',
           "The reviewer completed its check but did not emit a structured verdict. See the reviewer's response above — proceed when ready or reply to ask for clarification.");
-        resetReviewLoopCount(task.id);
-        setActiveTaskTurnRole(task.id, null);
-        updateTaskStatus(task.id, 'awaiting_feedback');
-        processQueue(task.workspace_id).catch(() => {});
+        settleWithUnresolvedFindings(task);
       });
       return;
     }
@@ -3395,10 +3403,7 @@ function finalizeReviewer(
     addMessage(task.id, 'system', cutOff
       ? `The reviewer ran out of turns (limit ${REVIEWER_MAX_TURNS}) before finishing its check, so it could not emit a verdict. You can raise CLAUDE_REVIEWER_MAX_TURNS, reply to send it back, or mark the task complete.`
       : "The reviewer completed its check but did not emit a structured verdict. See the reviewer's response above — proceed when ready or reply to ask for clarification.");
-    resetReviewLoopCount(task.id);
-    setActiveTaskTurnRole(task.id, null);
-    updateTaskStatus(task.id, 'awaiting_feedback');
-    processQueue(task.workspace_id).catch(() => {});
+    settleWithUnresolvedFindings(task);
     return;
   }
 
@@ -3441,14 +3446,28 @@ function finalizeReviewer(
     const closed = closeOutstandingOnPass(task.id);
     if (closed > 0) console.log(`[auto-review] Task ${task.id}: ${closed} outstanding finding(s) closed by passing review`);
     console.log(`[auto-review] Task ${task.id} reviewer passed`);
-    resetReviewLoopCount(task.id);
-    setActiveTaskTurnRole(task.id, null);
-    updateTaskStatus(task.id, 'awaiting_feedback');
-    processQueue(task.workspace_id).catch(() => {});
+    // closeOutstandingOnPass above left nothing open, so the disarm inside the
+    // helper is a no-op here and a deferred completion still flushes — which is
+    // the whole point of "review passed, complete it".
+    settleWithUnresolvedFindings(task);
     return;
   }
 
-  // Reviewer failed — check loop limit
+  // Reviewer failed — but first, did the user switch auto-review off while this
+  // pass was running? Then the loop stops here: the findings above are already
+  // recorded and stay in the inbox, but no further implementer turn is spent on
+  // them. Read fresh, before the loop counter moves, so a disable that already
+  // reset the count doesn't leave it at 1. A manually requested review is exempt
+  // — the user asked for that pass, so its verdict still routes back once.
+  const settled = getTask(task.id);
+  if (settled && !settled.auto_review && !manualReviews.has(task.id)) {
+    addMessage(task.id, 'system',
+      'Auto-review was disabled while this review was running — its findings are listed above, but the implementer will not be resumed automatically.');
+    settleWithUnresolvedFindings(settled);
+    return;
+  }
+
+  // Check loop limit
   incrementReviewLoopCount(task.id);
   const refreshed = getTask(task.id);
   if (!refreshed) return;
@@ -3476,10 +3495,43 @@ function finalizeReviewer(
   setActiveTaskTurnRole(task.id, 'implementer');
   launchTask(refreshed, true, retryPrompt).catch(err => {
     console.error(`[auto-review] Failed to re-launch implementer for task ${task.id}:`, (err as Error).message?.slice(0, 200));
-    setActiveTaskTurnRole(task.id, null);
-    updateTaskStatus(task.id, 'awaiting_feedback');
-    processQueue(task.workspace_id).catch(() => {});
+    settleWithUnresolvedFindings(refreshed);
   });
+}
+
+/**
+ * Settle a task into awaiting_feedback: clear the review loop budget, disarm any
+ * "complete after this turn" flag when findings are still open, then hand back.
+ * USE THIS instead of the bare setActiveTaskTurnRole/updateTaskStatus/
+ * processQueue trio on every path that returns control to the user — not just
+ * the review escalations.
+ *
+ * The reset lives here rather than at each call site so the invariant "a task
+ * waiting on the user has a zero counter" holds by construction. Leaving a spent
+ * budget behind means the next failing review escalates early, with fewer fix
+ * attempts than MAX_REVIEW_LOOPS promises — which is what happened when the
+ * clean-worktree escalation and the relaunch-failure path settled without one.
+ * Every caller reads review_loop_count before settling, so resetting here cannot
+ * disturb a decision already made.
+ *
+ * The disarm matters because the pending_complete flush at the top of
+ * processQueue sees a task in awaiting_feedback and completes it, merging to the
+ * default branch carrying the very findings the user was just told to triage.
+ * The flag means "finish this once the agent is done", and an unresolved finding
+ * is exactly the case where it isn't. It is conditional on something actually
+ * being open, so an ordinary deferred completion still flushes untouched.
+ */
+function settleWithUnresolvedFindings(task: Task): void {
+  resetReviewLoopCount(task.id);
+  const current = getTask(task.id) ?? task;
+  if (current.pending_complete && getReviewFindings(task.id).some(f => f.state === 'open')) {
+    setPendingComplete(task.id, false);
+    addMessage(task.id, 'system',
+      'Pending completion cancelled — there are review findings that need your decision. Triage them, then complete the task.');
+  }
+  setActiveTaskTurnRole(task.id, null);
+  updateTaskStatus(task.id, 'awaiting_feedback');
+  processQueue(task.workspace_id).catch(() => {});
 }
 
 function escalateToUser(task: Task, issues: string[]): void {
@@ -3487,10 +3539,7 @@ function escalateToUser(task: Task, issues: string[]): void {
   addMessage(task.id, 'system',
     `Auto-review reached the loop limit (${MAX_REVIEW_LOOPS} passes) without resolving all issues. Your input is needed.\n\nUnresolved issues:\n${issueList}`
   );
-  resetReviewLoopCount(task.id);
-  setActiveTaskTurnRole(task.id, null);
-  updateTaskStatus(task.id, 'awaiting_feedback');
-  processQueue(task.workspace_id).catch(() => {});
+  settleWithUnresolvedFindings(task);
 }
 
 /** The latest implementer turn for a task if it's still open, else null. */

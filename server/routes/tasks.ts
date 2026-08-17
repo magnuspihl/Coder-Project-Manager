@@ -22,6 +22,7 @@ import {
   getWorkingTaskCount,
   getMaxConcurrent,
   setPendingComplete,
+  setTaskAutoReview,
   setTaskClaudeAccount,
   setTaskModel,
   resetTaskSession,
@@ -40,10 +41,11 @@ import {
   getReviewFinding,
   setReviewFindingState,
   getDismissedFindings,
+  findingRef,
   REVIEW_FIX_REPLY_PREFIX,
 } from '../services/tasks.js';
 import { findUserWorkspaceById } from '../services/workspace-cache.js';
-import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview } from '../services/claude.js';
+import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview, FINDING_REPORT_FORMAT } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, removeTaskWorktree } from '../services/git.js';
@@ -280,12 +282,42 @@ router.put('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
     }
   }
 
+  // Turn the reviewer on or off for the rest of this conversation. Same "applies
+  // from the next decision" contract as model/subscription: a reviewer already
+  // running finishes, but its verdict no longer bounces back to the implementer,
+  // and no further turn launches one.
+  let newAutoReview: boolean | undefined;
+  if (req.body.autoReview !== undefined) {
+    if (typeof req.body.autoReview !== 'boolean') {
+      res.status(400).json({ error: 'autoReview must be a boolean' });
+      return;
+    }
+    newAutoReview = req.body.autoReview;
+  }
+
   if (req.body.position !== undefined) {
     updateTaskPosition(task.id, req.body.position);
   }
   if (newTitle !== undefined) updateTaskTitle(task.id, newTitle);
   if (newModel !== undefined) setTaskModel(task.id, newModel);
   if (newAccountId !== undefined) setTaskClaudeAccount(task.id, newAccountId);
+  if (newAutoReview !== undefined && newAutoReview !== !!task.auto_review) {
+    setTaskAutoReview(task.id, newAutoReview);
+    // Logged to the conversation, unlike model/subscription switches: this one
+    // changes what happens when the current turn ends, so "why did the reviewer
+    // stop running?" needs an answer in the transcript.
+    addMessage(
+      task.id,
+      'system',
+      newAutoReview
+        ? 'Auto-review enabled — the reviewer will run after the next code-changing turn.'
+        : 'Auto-review disabled for this task — turns will surface to you without a review pass.',
+      undefined, undefined, undefined, req.authSource, req.clientLabel,
+    );
+    // A disabled task must not carry a stale loop count into a later re-enable:
+    // it would start partway to the escalation limit.
+    if (!newAutoReview) resetReviewLoopCount(task.id);
+  }
 
   res.json({ task: getTask(task.id) });
 });
@@ -401,14 +433,23 @@ router.post('/tasks/:taskId/findings/fix', requireAuth, (req: Request, res: Resp
     return;
   }
 
-  const issueList = selected.map((f, i) => `${i + 1}. ${f.body}`).join('\n');
+  // Tag each finding with its ref and ask for a FINDING_REPORT, exactly as the
+  // auto-review retry prompt does. This is not cosmetic: the findings below move
+  // to 'fixing', and applyFindingReport reopens everything the implementer did
+  // not report on. Without the refs and the format there is no report to parse,
+  // so every finding sent from the inbox came back 'open' with no note — and on
+  // an auto-review-off task no later reviewer pass exists to close them, leaving
+  // them un-clearable however many times the user clicked Fix.
+  const issueList = selected
+    .map(f => `[${findingRef(f)}] ${f.body}${f.revision > 0 ? '  (RE-RAISED: your previous fix was judged inadequate)' : ''}`)
+    .join('\n\n');
   const dismissed = getDismissedFindings(task.id);
   // Tell the implementer what NOT to touch as well, so it doesn't "helpfully"
   // fix a waived finding it can still see in the earlier conversation.
   const waiverNote = dismissed.length > 0
     ? `\n\nThe user has explicitly DISMISSED the following reviewer findings. Do not act on them, and do not undo or "improve" the code they refer to:\n${dismissed.map((f, i) => `${i + 1}. ${f.body}${f.note ? ` (user's reason: ${f.note})` : ''}`).join('\n')}`
     : '';
-  const body = `${REVIEW_FIX_REPLY_PREFIX}:\n\n${issueList}${waiverNote}`;
+  const body = `${REVIEW_FIX_REPLY_PREFIX}. Each is tagged with a ref you must report against.\n\n${issueList}${waiverNote}\n\n${FINDING_REPORT_FORMAT}`;
 
   addMessage(task.id, 'user', body, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
   selected.forEach(f => setReviewFindingState(f.id, 'fixing'));

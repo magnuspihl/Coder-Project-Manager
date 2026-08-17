@@ -485,6 +485,21 @@ export function setTaskClaudeAccount(taskId: string, accountId: string | null): 
   );
 }
 
+/**
+ * Turn the auto-review red-team pass on or off for an existing task.
+ *
+ * Read fresh at every decision point (`onImplementerTurnComplete` re-reads the
+ * task, and the reviewer-fail path re-reads it before looping back), so this
+ * lands from the next decision onward. A reviewer already running is not
+ * interrupted — but its verdict will no longer bounce back to the implementer.
+ */
+export function setTaskAutoReview(taskId: string, enabled: boolean): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET auto_review = ?, updated_at = ? WHERE id = ?').run(
+    enabled ? 1 : 0, new Date().toISOString(), taskId
+  );
+}
+
 export function deleteTask(taskId: string): void {
   const db = getDb();
   db.prepare('UPDATE tasks SET deleted_at = ? WHERE id = ?').run(new Date().toISOString(), taskId);

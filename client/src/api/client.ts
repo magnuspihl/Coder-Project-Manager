@@ -304,6 +304,19 @@ export const setTaskModel = (taskId: string, model: string | null) =>
     body: JSON.stringify({ model }),
   });
 
+/**
+ * Turn the auto-review pass on or off for an existing task. Applies from the
+ * next decision point — a reviewer already running finishes, but its verdict
+ * won't be sent back to the implementer, unless that reviewer was started with
+ * the Review button: a manual pass is exempt and its verdict still routes back
+ * for one fix turn.
+ */
+export const setTaskAutoReview = (taskId: string, autoReview: boolean) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}`, {
+    method: 'PUT',
+    body: JSON.stringify({ autoReview }),
+  });
+
 export const getModels = (workspaceId: string) =>
   request<{ models: ModelInfo[] }>(`/api/workspaces/${workspaceId}/models`);
 

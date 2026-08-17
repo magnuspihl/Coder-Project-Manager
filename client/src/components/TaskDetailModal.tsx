@@ -11,6 +11,7 @@ import {
   compactTaskSession,
   updateTaskTitle,
   getClaudeAccounts,
+  setTaskAutoReview,
   setTaskClaudeAccount,
   setTaskModel,
   getModels,
@@ -128,6 +129,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [switchingAccount, setSwitchingAccount] = useState(false);
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
   const [switchingModel, setSwitchingModel] = useState(false);
+  const [switchingAutoReview, setSwitchingAutoReview] = useState(false);
   const [completing, setCompleting] = useState(false);
   const [reviewing, setReviewing] = useState(false);
   const [resetSessionOpen, setResetSessionOpen] = useState(false);
@@ -1169,6 +1171,34 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     }
   };
 
+  /**
+   * Turn the auto-review pass on or off for the rest of this conversation.
+   * Applies from the next decision point: a reviewer already running finishes,
+   * but its verdict no longer bounces back to the implementer, and no later turn
+   * launches a new one. The exception is a reviewer started with the Review
+   * button — a manual pass is exempt, so its verdict still routes back for one
+   * fix turn. The server also logs the change as a system message, which the
+   * next poll picks up.
+   */
+  const handleChangeAutoReview = async (enabled: boolean) => {
+    if (!task) return;
+    setSwitchingAutoReview(true);
+    editSeqRef.current++;
+    try {
+      const { task: updated } = await setTaskAutoReview(taskId, enabled);
+      setTask(prev => (prev ? { ...prev, auto_review: updated.auto_review } : prev));
+      lastTaskJsonRef.current = '';
+      onTaskChanged?.();
+    } catch (err: any) {
+      alert(err?.message || 'Failed to change auto-review');
+    } finally {
+      // Second bump: invalidates any poll that started during the request,
+      // whose server read may still predate the commit.
+      editSeqRef.current++;
+      setSwitchingAutoReview(false);
+    }
+  };
+
   const handleTitleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') {
       e.preventDefault();
@@ -1894,6 +1924,29 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                       </select>
                     );
                   })()}
+                  {/* Auto-review, switchable mid-task like the model and the
+                      subscription. Applies from the next decision point: a
+                      reviewer already running finishes, but its verdict no longer
+                      bounces back to the implementer — unless it was started with
+                      the Review button, which is exempt and still routes its
+                      verdict back for one fix turn. Turning it back on resumes
+                      reviewing from the next code-changing turn. */}
+                  <select
+                    value={task.auto_review ? 'on' : 'off'}
+                    onChange={(e) => handleChangeAutoReview(e.target.value === 'on')}
+                    disabled={switchingAutoReview}
+                    title={task.auto_review
+                      ? 'Auto-review is on — a reviewer red-teams each code-changing turn before it surfaces to you'
+                      : 'Auto-review is off — turns surface to you without a review pass'}
+                    className={`hidden sm:inline-block text-xs px-1.5 py-0.5 rounded font-medium border-0 focus:outline-none focus:ring-1 disabled:opacity-50 cursor-pointer ${
+                      task.auto_review
+                        ? 'bg-teal-50 dark:bg-teal-900/20 text-teal-700 dark:text-teal-400 focus:ring-teal-500'
+                        : 'bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 focus:ring-gray-500'
+                    }`}
+                  >
+                    <option value="on">auto-review on</option>
+                    <option value="off">auto-review off</option>
+                  </select>
                   <button
                     onClick={() => {
                       navigator.clipboard.writeText(task.id);

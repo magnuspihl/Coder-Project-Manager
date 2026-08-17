@@ -362,8 +362,32 @@ since that constitutes a new human-directed turn.
 `auto_review` defaults to `1` (on). Users can disable it at task creation with a checkbox in the
 task creation form. This sets `tasks.auto_review = 0` and skips all review logic for that task.
 
-No workspace-level default — the per-task checkbox is the only control. The UI should default the
+No workspace-level default — the per-task setting is the only control. The UI defaults the
 checkbox to checked, so unchecking is a deliberate override.
+
+It is also switchable **mid-conversation**, alongside the model and subscription switchers in the
+task detail header (`PUT /api/tasks/:id` with `{ autoReview: boolean }`). Semantics match those
+switchers — it applies from the next decision point, not retroactively:
+
+- A reviewer already running is **not** interrupted. It finishes and records its findings, but on a
+  `fail` verdict the implementer is not resumed; the task settles into `awaiting_feedback` with the
+  findings in the inbox.
+- Later implementer turns skip the review entirely (`onImplementerTurnComplete` re-reads the task).
+- Disabling resets `review_loop_count`, and so does `settleWithUnresolvedFindings` — the single
+  helper every review-related hand-back routes through (skip, escalation, pass, no-verdict, and the
+  reviewer/implementer launch failures). Keeping the reset in that one place rather than at each
+  call site is what makes the invariant "a task waiting on the user has a zero counter" hold by
+  construction, so re-enabling always starts a fresh loop budget. Without it a spent budget survives
+  the hand-back — a manual review's exempted fix turn, or a clean-worktree escalation, would leave
+  the count at 1 and the next failing review would escalate immediately with no fix attempt.
+- The change is written to the conversation as a system message — unlike model/subscription
+  switches — because it changes what happens when the current turn ends.
+- A **manually** requested review (the "Review" button / `POST /api/tasks/:id/review`) is exempt
+  from the mid-review guard: the user asked for that pass, so a `fail` verdict still routes back to
+  the implementer once, exactly as it did before this setting existed. Only once, though — that fix
+  turn then ends at the `auto_review` check in `onImplementerTurnComplete`, so no second review pass
+  follows and `MAX_REVIEW_LOOPS` is never reached. With `auto_review = 1` the manual review behaves
+  like any other pass and loops normally.
 
 ---
 
