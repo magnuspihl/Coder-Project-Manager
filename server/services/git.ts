@@ -1,30 +1,149 @@
-import { sshExec, detectProjectDir } from './claude.js';
+import { sshExec as coderSshExec, detectProjectDir, type RemoteExecError } from './claude.js';
+import { getValidCoderTokenForUser } from './sessions.js';
 import { addMessage, getTask, type Task } from './tasks.js';
 import { getDb } from '../db/index.js';
 import { execFile } from 'child_process';
+import { AsyncLocalStorage } from 'async_hooks';
 
-// Alias to the real SSH executor. Task-scoped functions below shadow `sshExec`
-// with a local wrapper that injects the task owner's refreshable Coder token
-// (so background git ops use the user's OAuth credential, not the frozen,
+const CPM_WORKTREE_BASE = process.env.CPM_WORKTREE_BASE || '/home/coder/.cpm/worktrees';
+
+/**
+ * Per-step timeout budgets for the remote git/gh steps below.
+ *
+ * Every one of these runs through `coder ssh`, which adds connection overhead on
+ * top of the command itself, and against real repositories — the ones that fail
+ * in practice have ~100MB of git history, where `git add -A` and a first branch
+ * push are not 15-second operations. Each step is therefore generous, because the
+ * failure mode of a too-small step budget is bad in both directions: the step is
+ * reported as an unexplained failure (execFile kills the child and leaves no
+ * error text at all), and for `push` it is a *false* failure — SIGTERM to the
+ * local client does not undo a ref update the remote already accepted.
+ *
+ * Generous per-step budgets do NOT get to add up, though: `handleTaskCompletionGit`
+ * is awaited while holding the per-workspace lock (routes/tasks.ts, mcp/index.ts),
+ * which blocks processQueue and every other task on that workspace. Summing the
+ * worst-case path would hold that lock for the better part of an hour. So the whole
+ * flow also runs under one wall-clock deadline (GIT_T_COMPLETION_TOTAL) that clamps
+ * every remaining step — see `withCompletionDeadline`.
+ */
+const GIT_T_READ = 30_000;      // metadata reads: rev-parse, config, status, ls-remote
+const GIT_T_INDEX = 120_000;    // index/worktree writes: add -A, commit, checkout
+const GIT_T_NETWORK = 180_000;  // anything talking to the remote: fetch, merge, push, gh
+const GIT_T_WORKTREE = 180_000; // `git worktree add` = a full checkout
+
+/** Wall-clock ceiling on one whole completion attempt, lock included. */
+const GIT_T_COMPLETION_TOTAL = parseInt(
+  process.env.CPM_GIT_COMPLETION_BUDGET_MS || '600000', 10,
+);
+
+/** How hard to re-check the remote ref after a *killed* push (see the push step). */
+const PUSH_LANDED_ATTEMPTS = 4;
+const PUSH_LANDED_RETRY_DELAY_MS = 5_000;
+
+const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Deadline for the enclosing completion attempt, propagated through awaits by
+ * AsyncLocalStorage so that *every* remote call made below — including the ones
+ * inside helpers several frames deep (detectGitRemote, completePrGitHub, the
+ * Azure poll loop) — is clamped without threading a parameter through all of them.
+ */
+const completionDeadline = new AsyncLocalStorage<{ endsAt: number }>();
+
+/** Run `fn` under an overall wall-clock deadline for remote calls. */
+function withCompletionDeadline<T>(totalMs: number, fn: () => Promise<T>): Promise<T> {
+  return completionDeadline.run({ endsAt: Date.now() + totalMs }, fn);
+}
+
+/**
+ * Module-wide stand-in for the real `sshExec`: identical, except that inside a
+ * `withCompletionDeadline` scope it shortens each step to whatever is left of the
+ * overall budget and refuses outright once that budget is spent. Everything in
+ * this file calls remote commands through here (directly, or via sshGh/adoApi),
+ * so the deadline cannot be bypassed by adding another step.
+ */
+function sshExec(
+  workspaceName: string,
+  command: string,
+  timeout = 15000,
+  userId?: string | null,
+  maxBuffer?: number,
+): Promise<string> {
+  const ctx = completionDeadline.getStore();
+  if (!ctx) return coderSshExec(workspaceName, command, timeout, userId, maxBuffer);
+  const left = ctx.endsAt - Date.now();
+  if (left <= 0) {
+    return Promise.reject(new Error(
+      `the git completion flow ran out of its ${Math.round(GIT_T_COMPLETION_TOTAL / 1000)}s overall time budget ` +
+      `(the workspace or its git remote is responding too slowly) — retry completion`,
+    ));
+  }
+  return coderSshExec(workspaceName, command, Math.min(timeout, left), userId, maxBuffer);
+}
+
+// Alias to the deadline-aware executor above. Task-scoped functions below shadow
+// `sshExec` with a local wrapper that injects the task owner's refreshable Coder
+// token (so background git ops use the user's OAuth credential, not the frozen,
 // build-time CODER_SESSION_TOKEN that lapses with the OIDC session). That local
 // wrapper delegates here to avoid referencing the shadowed name.
 const coderSsh = sshExec;
 
-const CPM_WORKTREE_BASE = process.env.CPM_WORKTREE_BASE || '/home/coder/.cpm/worktrees';
+/**
+ * Coder external-auth provider ID that vends the GitHub token. Deployment
+ * specific — override with CPM_GITHUB_EXTERNAL_AUTH_ID.
+ */
+const GITHUB_EXTERNAL_AUTH_ID = process.env.CPM_GITHUB_EXTERNAL_AUTH_ID || 'magnuspihl';
+
+/** A resolved GitHub token, or the reason it could not be resolved. */
+interface GitHubTokenResult {
+  token: string | null;
+  /** Human-readable reason `token` is null — for surfacing in failure messages. */
+  error: string | null;
+}
+
+/**
+ * Fetch a GitHub token from Coder's external auth provider.
+ *
+ * `userId` matters: `coder external-auth` is authenticated by CODER_SESSION_TOKEN,
+ * and the ambient one is the frozen build-time token that lapses with the OIDC
+ * session. Background completion work must use the task owner's refreshable OAuth
+ * token, exactly like every `coder ssh` call here does.
+ *
+ * When this fails the `gh` CLI runs with no GH_TOKEN and — in a workspace where
+ * nobody ran `gh auth login` — exits 4, which surfaces as an opaque "PR creation
+ * failed … status 4". Hence `error`: callers report *why* there was no token.
+ */
+async function resolveGitHubToken(userId?: string | null): Promise<GitHubTokenResult> {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (userId) {
+    try {
+      const coderToken = await getValidCoderTokenForUser(userId);
+      if (coderToken) env.CODER_SESSION_TOKEN = coderToken;
+    } catch { /* fall back to the ambient token */ }
+  }
+  return new Promise((resolve) => {
+    execFile('coder', ['external-auth', 'access-token', GITHUB_EXTERNAL_AUTH_ID], {
+      timeout: 30000,
+      env,
+    }, (err, stdout, stderr) => {
+      const token = stdout?.trim();
+      if (token && !err) return resolve({ token, error: null });
+      const detail = (stderr || '').trim() || (err as any)?.message || '';
+      const reason = (err as any)?.killed
+        ? `\`coder external-auth access-token ${GITHUB_EXTERNAL_AUTH_ID}\` timed out`
+        : `\`coder external-auth access-token ${GITHUB_EXTERNAL_AUTH_ID}\` failed${detail ? `: ${detail.slice(0, 200)}` : ''}`;
+      console.error(`[git] GitHub token unavailable — ${reason}`);
+      resolve({ token: null, error: reason });
+    });
+  });
+}
 
 /**
  * Fetch a GitHub token from Coder's external auth provider.
  * Returns the token string or null if unavailable.
  */
-export function fetchGitHubToken(): Promise<string | null> {
-  return new Promise((resolve) => {
-    execFile('coder', ['external-auth', 'access-token', 'magnuspihl'], {
-      timeout: 10000,
-    }, (err, stdout) => {
-      if (err || !stdout?.trim()) resolve(null);
-      else resolve(stdout.trim());
-    });
-  });
+export async function fetchGitHubToken(userId?: string | null): Promise<string | null> {
+  return (await resolveGitHubToken(userId)).token;
 }
 
 /**
@@ -59,10 +178,22 @@ function stripAnsi(s: string): string {
  * `stripAnsi` scrubs anything that still slips through.
  */
 const GH_NONINTERACTIVE_ENV = 'TERM=dumb NO_COLOR=1 CLICOLOR=0 GH_PROMPT_DISABLED=1 GH_PAGER=cat';
-async function sshGh(workspaceName: string, command: string, timeout = 30000, userId?: string | null): Promise<string> {
-  const token = await fetchGitHubToken();
-  const assignments = token
-    ? `GH_TOKEN=${shellEscape(token)} ${GH_NONINTERACTIVE_ENV}`
+async function sshGh(
+  workspaceName: string,
+  command: string,
+  timeout = GIT_T_NETWORK,
+  userId?: string | null,
+  /**
+   * Pre-resolved GitHub token. Pass `undefined` to resolve one per call; pass an
+   * explicit `string | null` to reuse a token already resolved for this flow, so
+   * a multi-step gh sequence doesn't re-shell out to `coder external-auth` for
+   * every command (and can't have some steps authenticated and others not).
+   */
+  token?: string | null,
+): Promise<string> {
+  const resolved = token === undefined ? await fetchGitHubToken(userId) : token;
+  const assignments = resolved
+    ? `GH_TOKEN=${shellEscape(resolved)} ${GH_NONINTERACTIVE_ENV}`
     : GH_NONINTERACTIVE_ENV;
   const out = await sshExec(workspaceName, `export ${assignments} && ${command}`, timeout, userId);
   return stripAnsi(out);
@@ -110,7 +241,7 @@ async function adoApi(ws: string, method: string, url: string, body?: unknown, u
 
   let out: string;
   try {
-    out = await sshExec(ws, cmd, 60000, userId);
+    out = await sshExec(ws, cmd, GIT_T_NETWORK, userId);
   } catch (e: any) {
     const msg = String(e?.message || e);
     if (/curl: (command )?not found|not recognized|No such file/i.test(msg)) {
@@ -150,7 +281,7 @@ async function resolveProjectDir(task: Task): Promise<string | null> {
  */
 async function getDefaultBranch(workspaceName: string, projectDir: string, userId?: string | null): Promise<string> {
   try {
-    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify origin/main`, 15000, userId);
+    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify origin/main`, GIT_T_READ, userId);
     return 'main';
   } catch {
     return 'master';
@@ -163,7 +294,7 @@ async function getDefaultBranch(workspaceName: string, projectDir: string, userI
  */
 async function getLocalDefaultBranch(workspaceName: string, projectDir: string, userId?: string | null): Promise<string> {
   try {
-    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify main`, 15000, userId);
+    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify main`, GIT_T_READ, userId);
     return 'main';
   } catch {
     return 'master';
@@ -238,7 +369,7 @@ export function parseAzureRemote(remoteUrl: string): { orgUrl: string; project: 
  */
 async function detectGitRemote(workspaceName: string, projectDir: string, userId?: string | null): Promise<GitRemoteInfo | null> {
   try {
-    const remoteUrl = await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git config --get remote.origin.url`, 15000, userId);
+    const remoteUrl = await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git config --get remote.origin.url`, GIT_T_READ, userId);
     if (!remoteUrl) return null;
     const url = remoteUrl.trim();
 
@@ -262,6 +393,38 @@ async function detectGitRemote(workspaceName: string, projectDir: string, userId
 }
 
 /**
+ * Read the commit a branch points at on `origin`, or null if the branch does not
+ * exist there (or the query itself failed). Used to tell a push that genuinely
+ * failed from one whose client was killed after the remote accepted the ref.
+ *
+ * The output is parsed line by line and matched against the ref we asked for,
+ * never by taking the first whitespace-delimited token: `coder ssh` runs this
+ * under a PTY, so ssh/git diagnostics (host-key notices, credential-helper
+ * chatter, progress) merge into stdout ahead of the answer. Grabbing the first
+ * token would then miss the SHA and report a landed push as a failure.
+ */
+async function remoteBranchTip(
+  workspaceName: string, projectDir: string, branchName: string, userId?: string | null,
+): Promise<string | null> {
+  try {
+    const out = await sshExec(
+      workspaceName,
+      `cd ${shellEscape(projectDir)} && git ls-remote origin ${shellEscape(`refs/heads/${branchName}`)}`,
+      GIT_T_NETWORK,
+      userId,
+    );
+    const wanted = `refs/heads/${branchName}`;
+    for (const line of stripAnsi(out).split(/\r?\n/)) {
+      const m = /^([0-9a-f]{40})\s+(\S+)\s*$/i.exec(line.trim());
+      if (m && m[2] === wanted) return m[1].toLowerCase();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Store the repo web URL and provider on a task in the database.
  */
 function storeTaskRepo(taskId: string, url: string | null, provider: GitProvider): void {
@@ -273,7 +436,7 @@ function storeTaskRepo(taskId: string, url: string | null, provider: GitProvider
  */
 async function hasGitRepo(workspaceName: string, projectDir: string, userId?: string | null): Promise<boolean> {
   try {
-    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --is-inside-work-tree`, 15000, userId);
+    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --is-inside-work-tree`, GIT_T_READ, userId);
     return true;
   } catch {
     return false;
@@ -285,7 +448,7 @@ async function hasGitRepo(workspaceName: string, projectDir: string, userId?: st
  */
 async function hasCommits(workspaceName: string, projectDir: string, userId?: string | null): Promise<boolean> {
   try {
-    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify HEAD`, 15000, userId);
+    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify HEAD`, GIT_T_READ, userId);
     return true;
   } catch {
     return false;
@@ -346,7 +509,7 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
         `mkdir -p ${shellEscape(CPM_WORKTREE_BASE)} && cd ${shellEscape(dir)} && ` +
         `git fetch origin ${defaultBranch} 2>/dev/null || true && ` +
         `git worktree add ${shellEscape(worktreePath)} -b ${shellEscape(branchName)} origin/${defaultBranch}`,
-        60000,
+        GIT_T_WORKTREE,
       );
     } else {
       // Remote disabled: the user manages git locally and origin may be stale or
@@ -355,7 +518,7 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
       await sshExec(ws,
         `mkdir -p ${shellEscape(CPM_WORKTREE_BASE)} && cd ${shellEscape(dir)} && ` +
         `git worktree add ${shellEscape(worktreePath)} -b ${shellEscape(branchName)} ${shellEscape(defaultBranch)}`,
-        60000,
+        GIT_T_WORKTREE,
       );
     }
 
@@ -408,19 +571,19 @@ export async function removeTaskWorktree(task: Task): Promise<boolean> {
   // Try to remove; on failure prune stale metadata and retry once.
   let removed = false;
   try {
-    await sshExec(ws, `${gitRoot}git worktree remove ${shellEscape(wt)} --force`, 15000);
+    await sshExec(ws, `${gitRoot}git worktree remove ${shellEscape(wt)} --force`, GIT_T_INDEX);
     removed = true;
   } catch {
     try {
-      await sshExec(ws, `${gitRoot}git worktree prune`, 10000).catch(() => {});
+      await sshExec(ws, `${gitRoot}git worktree prune`, GIT_T_READ).catch(() => {});
       // If the directory is already gone, pruning the metadata alone resolves it.
       // Distinguish "confirmed gone" from "couldn't check" (workspace stopped,
       // SSH failure): only a confirmed 'no' counts as removed. Treating an
       // unreachable workspace as removed would NULL worktree_path below and leak
       // the directory forever once the workspace comes back.
-      const check = (await sshExec(ws, `test -d ${shellEscape(wt)} && echo yes || echo no`).catch(() => 'unknown')).trim();
+      const check = (await sshExec(ws, `test -d ${shellEscape(wt)} && echo yes || echo no`, GIT_T_READ).catch(() => 'unknown')).trim();
       if (check === 'yes') {
-        await sshExec(ws, `${gitRoot}git worktree remove ${shellEscape(wt)} --force`, 15000);
+        await sshExec(ws, `${gitRoot}git worktree remove ${shellEscape(wt)} --force`, GIT_T_INDEX);
         removed = true;
       } else if (check === 'no') {
         removed = true;
@@ -445,7 +608,7 @@ export async function removeTaskWorktree(task: Task): Promise<boolean> {
   if (task.git_branch && dir) {
     await sshExec(ws,
       `cd ${shellEscape(dir)} && git branch -D ${shellEscape(task.git_branch)} 2>/dev/null || true`,
-      10000,
+      GIT_T_READ,
     ).catch(() => {});
   }
   getDb().prepare('UPDATE tasks SET worktree_path = NULL WHERE id = ?').run(task.id);
@@ -531,7 +694,15 @@ export function startWorktreeReconciler(): void {
  * workspace with uncommitted changes — user must commit manually), or 'git_error' if an actual
  * git operation failed (push, PR, merge, etc.) and the task should be marked failed.
  */
-export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> {
+export function handleTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> {
+  // Bound the whole attempt, not just its individual steps: the caller holds the
+  // per-workspace lock for the duration, so an unbounded sum of generous per-step
+  // budgets would stall processQueue and every other task on that workspace long
+  // after the HTTP request or MCP call that started it has given up.
+  return withCompletionDeadline(GIT_T_COMPLETION_TOTAL, () => runTaskCompletionGit(task));
+}
+
+async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> {
   // Use worktree path if available, else fall back to project_dir
   const dir = task.worktree_path || await resolveProjectDir(task);
   if (!dir) return true;
@@ -545,7 +716,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
     if (!await hasCommits(ws, dir, userId)) return true;
 
     const remoteAllowed = isRemoteAllowed(task.workspace_id);
-    const status = await sshExec(ws, `cd ${shellEscape(dir)} && git status --porcelain`);
+    const status = await sshExec(ws, `cd ${shellEscape(dir)} && git status --porcelain`, GIT_T_READ);
     const hasChanges = !!status.trim();
 
     if (!remoteAllowed) {
@@ -575,7 +746,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
 
     // For worktree tasks: verify we're on the task branch (sanity check)
     if (task.worktree_path) {
-      const currentBranch = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse --abbrev-ref HEAD`)).trim();
+      const currentBranch = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse --abbrev-ref HEAD`, GIT_T_READ)).trim();
       if (currentBranch !== branchName) {
         // Before failing, check whether all commits are already on origin/main —
         // if so, the work is done regardless of branch name.
@@ -585,7 +756,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
           await sshExec(ws,
             `cd ${shellEscape(dir)} && git fetch origin ${shellEscape(defaultBranchCheck)} && ` +
             `git merge-base --is-ancestor HEAD origin/${shellEscape(defaultBranchCheck)}`,
-            30000,
+            GIT_T_NETWORK,
           );
           alreadyLanded = true;
         } catch { /* HEAD is not on origin/<default> yet */ }
@@ -611,7 +782,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
     } else {
       // Legacy non-worktree path: check we're on default branch and create task branch
       const defaultBranch = await getDefaultBranch(ws, dir, userId);
-      const currentBranch = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse --abbrev-ref HEAD`)).trim();
+      const currentBranch = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse --abbrev-ref HEAD`, GIT_T_READ)).trim();
       if (currentBranch !== defaultBranch) {
         addMessage(task.id, 'system',
           `Cannot complete: workspace is on branch \`${currentBranch}\` instead of \`${defaultBranch}\`. ` +
@@ -621,7 +792,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
       }
       if (!hasChanges) return true;
       try {
-        await sshExec(ws, `cd ${shellEscape(dir)} && git checkout -b ${shellEscape(branchName)}`, 15000);
+        await sshExec(ws, `cd ${shellEscape(dir)} && git checkout -b ${shellEscape(branchName)}`, GIT_T_INDEX);
       } catch (err: any) {
         addMessage(task.id, 'system',
           `Cannot complete: could not create branch \`${branchName}\`: ${err.message}.`
@@ -646,7 +817,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
         await sshExec(ws,
           `cd ${shellEscape(dir)} && git fetch origin ${shellEscape(defaultBranch)} && ` +
           `git merge-base --is-ancestor HEAD origin/${shellEscape(defaultBranch)}`,
-          30000,
+          GIT_T_NETWORK,
         );
         landed = true;
       } catch { /* HEAD is not on origin/<default> yet → there is unmerged work */ }
@@ -668,13 +839,13 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
 
     // Commit
     try {
-      await sshExec(ws, `cd ${shellEscape(dir)} && git add -A`);
-      const staged = await sshExec(ws, `cd ${shellEscape(dir)} && git diff --cached --name-only`);
+      await sshExec(ws, `cd ${shellEscape(dir)} && git add -A`, GIT_T_INDEX);
+      const staged = await sshExec(ws, `cd ${shellEscape(dir)} && git diff --cached --name-only`, GIT_T_INDEX);
       if (staged.trim()) {
         const freshTask = getTask(task.id) || task;
         await sshExec(ws,
           `cd ${shellEscape(dir)} && git commit -m ${shellEscape(freshTask.title || 'Task changes')}`,
-          30000,
+          GIT_T_INDEX,
         );
       }
     } catch (err: any) {
@@ -691,7 +862,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
           `cd ${shellEscape(dir)} && ` +
           `git fetch origin ${shellEscape(defaultForMerge)} && ` +
           `git merge origin/${shellEscape(defaultForMerge)} --no-edit`,
-          60000,
+          GIT_T_NETWORK,
         );
       } catch (mergeErr: any) {
         addMessage(task.id, 'system',
@@ -706,7 +877,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
     // (used by the post-merge ancestor check on origin/<default>).
     let branchTip = '';
     try {
-      branchTip = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse HEAD`)).trim();
+      branchTip = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse HEAD`, GIT_T_READ)).trim();
     } catch { /* validation is skipped if we couldn't capture the tip */ }
 
     // Detect the git host so the PR flow can be routed to the right provider
@@ -717,15 +888,38 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
       storeTaskRepo(task.id, remote.webUrl ?? task.github_repo_url, remote.provider);
     }
 
-    // Push
+    // Push. A push that reports failure has NOT necessarily failed: if the client
+    // is killed (timeout) or the connection drops after the remote accepted the
+    // objects, the ref is already updated on the server and only the local client
+    // died. Re-checking the remote ref before failing the task turns those false
+    // negatives — which previously stranded completed work with an unexplained
+    // "push failed" — into a successful completion.
     try {
-      await sshExec(ws, `cd ${shellEscape(dir)} && git push -u origin ${shellEscape(branchName)}`, 30000);
+      await sshExec(ws, `cd ${shellEscape(dir)} && git push -u origin ${shellEscape(branchName)}`, GIT_T_NETWORK);
     } catch (pushErr: any) {
-      addMessage(task.id, 'system',
-        `Cannot complete: changes committed on branch \`${branchName}\` but push failed: ${pushErr.message}. ` +
-        `Resolve the push issue and retry completion.`
-      );
-      return 'git_error';
+      // When the push was *killed* rather than rejected, the remote side may still
+      // be finishing: killing the local client does not abort a transfer the server
+      // already has. Poll the ref a few times before concluding it never landed —
+      // a single immediate read can catch the pre-push tip and fail a task whose
+      // work is on its way to origin.
+      const attempts = (pushErr as RemoteExecError).timedOut ? PUSH_LANDED_ATTEMPTS : 1;
+      let remoteTip: string | null = null;
+      for (let i = 0; i < attempts && branchTip; i++) {
+        if (i > 0) await delay(PUSH_LANDED_RETRY_DELAY_MS);
+        remoteTip = await remoteBranchTip(ws, dir, branchName, userId);
+        if (remoteTip === branchTip) break;
+      }
+      if (remoteTip && remoteTip === branchTip) {
+        addMessage(task.id, 'system',
+          `Push reported an error (${truncate(pushErr.message, 300)}), but \`origin/${branchName}\` is already at \`${branchTip.slice(0, 8)}\` — the push landed. Continuing.`
+        );
+      } else {
+        addMessage(task.id, 'system',
+          `Cannot complete: changes committed on branch \`${branchName}\` but push failed: ${pushErr.message}. ` +
+          `Resolve the push issue and retry completion.`
+        );
+        return 'git_error';
+      }
     }
 
     const defaultBranch = await getDefaultBranch(ws, dir, userId);
@@ -751,7 +945,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
         await sshExec(ws,
           `cd ${shellEscape(dir)} && git fetch origin ${shellEscape(defaultBranch)} && ` +
           `git merge-base --is-ancestor ${shellEscape(branchTip)} origin/${shellEscape(defaultBranch)}`,
-          30000,
+          GIT_T_NETWORK,
         );
         alreadyLanded = true;
       } catch { /* tip not on origin/<default> yet → real work to merge */ }
@@ -807,7 +1001,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
         await sshExec(ws,
           `cd ${shellEscape(dir)} && git fetch origin ${shellEscape(defaultBranch)} && ` +
           `git merge-base --is-ancestor ${shellEscape(branchTip)} origin/${shellEscape(defaultBranch)}`,
-          30000,
+          GIT_T_NETWORK,
         );
       } catch {
         addMessage(task.id, 'system',
@@ -828,7 +1022,7 @@ export async function handleTaskCompletionGit(task: Task): Promise<boolean | 'gi
       try {
         await sshExec(ws,
           `cd ${shellEscape(task.project_dir)} && git pull --ff-only origin ${shellEscape(defaultBranch)}`,
-          30000,
+          GIT_T_NETWORK,
         );
       } catch (pullErr: any) {
         addMessage(task.id, 'system', `Warning: post-merge pull failed: ${pullErr.message}.`);
@@ -860,6 +1054,25 @@ type PrOutcome =
   | { kind: 'blocked' };
 
 /**
+ * Does a `gh` failure look like an authentication problem rather than a merge
+ * one? gh exits 4 specifically for auth errors; the API surfaces 401/403 and
+ * phrases like "requires authentication" / "Bad credentials" / "gh auth login".
+ * Everything else (conflicts, required checks, branch protection) must NOT be
+ * attributed to auth.
+ */
+function isGhAuthFailure(failure: string): boolean {
+  const s = failure.toLowerCase();
+  return /exited with status 4(?!\d)/.test(s)
+    || /\b(401|403)\b/.test(s)
+    || s.includes('authentication')
+    || s.includes('unauthorized')
+    || s.includes('bad credentials')
+    || s.includes('gh auth login')
+    || s.includes('not logged in')
+    || s.includes('permission denied');
+}
+
+/**
  * GitHub PR flow via the `gh` CLI: reuse an OPEN PR or open a fresh one, then
  * merge it by identity (number/URL, never branch name, so a stale MERGED PR for
  * the same branch can't be re-targeted).
@@ -868,8 +1081,26 @@ async function completePrGitHub(
   ws: string, dir: string, taskId: string, branchName: string,
   defaultBranch: string, prTitle: string, prBody: string, userId?: string | null,
 ): Promise<PrOutcome> {
+  // Resolve the GitHub token ONCE for the whole flow rather than per gh call, so
+  // every step is authenticated identically and `coder external-auth` is shelled
+  // out to once. When it can't be resolved, `gh` falls back to whatever auth the
+  // workspace itself has — usually none, giving an opaque exit 4 — so keep the
+  // reason around and append it to any gh failure below.
+  const { token: ghToken, error: ghTokenError } = await resolveGitHubToken(userId);
+  /**
+   * Note appended to a gh failure — but ONLY when that failure actually looks
+   * like an auth problem. `gh` can still authenticate from the workspace's own
+   * credentials, so a missing CPM token does not mean the next failure is an auth
+   * failure: blaming it beside a `mergeable: CONFLICTING` detail would be exactly
+   * the misdirected blame this flow is supposed to stop producing.
+   */
+  const authNoteIf = (looksLikeAuth: boolean): string =>
+    ghTokenError && looksLikeAuth
+      ? ` No GitHub token could be provided to \`gh\` for this workspace (${ghTokenError}), which is the likely cause — reconnect the GitHub external auth provider in Coder.`
+      : '';
+  const authNoteFor = (failure: string): string => authNoteIf(isGhAuthFailure(failure));
   // Shadow sshGh to inject the task owner's token (see coderSsh note above).
-  const sshGh = (w: string, cmd: string, timeout?: number) => coderSshGh(w, cmd, timeout, userId);
+  const sshGh = (w: string, cmd: string, timeout?: number) => coderSshGh(w, cmd, timeout, userId, ghToken);
   let mergeTarget: string;
   let existingPr: { url?: string; state?: string; number?: number } | null = null;
   try {
@@ -912,7 +1143,7 @@ async function completePrGitHub(
         return { kind: 'nothing-to-merge' };
       }
       addMessage(taskId, 'system',
-        `Cannot complete: PR creation failed for branch \`${branchName}\`: ${msg}. Resolve the issue and retry completion.`
+        `Cannot complete: PR creation failed for branch \`${branchName}\`: ${msg}.${authNoteFor(msg)} Resolve the issue and retry completion.`
       );
       return { kind: 'blocked' };
     }
@@ -952,8 +1183,14 @@ async function completePrGitHub(
     const detail = (mergeable || mergeStateStatus)
       ? ` (PR state: ${state || 'unknown'}, mergeable: ${mergeable || 'unknown'}, status: ${mergeStateStatus || 'unknown'})`
       : '';
+    // Only blame the missing token when the failure looks like auth, or when even
+    // the state re-query came back empty — i.e. we can't see the PR at all, which
+    // is what a tokenless `gh` looks like. When the re-query DID answer, its
+    // mergeable/mergeStateStatus is the real reason and must not be contradicted.
+    const stateQueryFailed = !state && !mergeable && !mergeStateStatus;
     addMessage(taskId, 'system',
-      `Cannot complete: PR merge failed for \`${branchName}\`${detail}: ${mergeErr.message}. ` +
+      `Cannot complete: PR merge failed for \`${branchName}\`${detail}: ${mergeErr.message}.` +
+      `${authNoteIf(stateQueryFailed || isGhAuthFailure(String(mergeErr?.message || '')))} ` +
       `Resolve any conflicts / required checks / branch-protection rules on the PR and retry completion.`
     );
     return { kind: 'blocked' };
@@ -1124,15 +1361,15 @@ export async function checkoutTaskBranch(task: Task): Promise<string> {
   const ws = task.workspace_name;
   const userId = task.user_id;
   const sshExec = (w: string, cmd: string, timeout?: number) => coderSsh(w, cmd, timeout, userId);
-  const currentBranch = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse --abbrev-ref HEAD`)).trim();
+  const currentBranch = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse --abbrev-ref HEAD`, GIT_T_READ)).trim();
   if (currentBranch === task.git_branch) {
     return `Already on branch \`${task.git_branch}\``;
   }
-  const status = await sshExec(ws, `cd ${shellEscape(dir)} && git status --porcelain`);
+  const status = await sshExec(ws, `cd ${shellEscape(dir)} && git status --porcelain`, GIT_T_READ);
   if (status.trim()) {
-    await sshExec(ws, `cd ${shellEscape(dir)} && git stash push --include-untracked -m "auto-stash before switching to ${task.git_branch}"`, 15000);
+    await sshExec(ws, `cd ${shellEscape(dir)} && git stash push --include-untracked -m "auto-stash before switching to ${task.git_branch}"`, GIT_T_INDEX);
   }
-  await sshExec(ws, `cd ${shellEscape(dir)} && git checkout ${shellEscape(task.git_branch)}`, 15000);
+  await sshExec(ws, `cd ${shellEscape(dir)} && git checkout ${shellEscape(task.git_branch)}`, GIT_T_INDEX);
   return `Switched to branch \`${task.git_branch}\``;
 }
 

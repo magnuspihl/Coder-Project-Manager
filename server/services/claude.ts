@@ -1301,6 +1301,139 @@ function isLocalWorkspace(workspaceName: string): boolean {
 }
 
 /**
+ * An error from a shell/SSH command, carrying the output that actually explains it.
+ *
+ * `err.message` on its own is close to useless for diagnosing a failed remote
+ * command — see `buildExecError` for why — so callers that surface a failure to
+ * the user should use `err.message` (which now embeds the output) and may branch
+ * on `timedOut` / `exitCode`.
+ */
+export interface RemoteExecError extends Error {
+  /** The command that failed (untruncated), for logging. */
+  command?: string;
+  /** Combined, scrubbed output of the failed command — stdout first, then stderr. */
+  output?: string;
+  /** True when the command exceeded its timeout and was killed. */
+  timedOut?: boolean;
+  /** True when the command was killed for exceeding its `maxBuffer` (not a timeout). */
+  bufferExceeded?: boolean;
+  /** Exit status of the command that failed — the *remote* one for `coder ssh`. */
+  exitCode?: number | null;
+}
+
+/** Max characters of command output to embed in an error message. */
+const EXEC_OUTPUT_LIMIT = 2000;
+
+/**
+ * Lines emitted by the `coder` CLI itself rather than by the command we ran.
+ * They carry no diagnostic value and are actively misleading: a plain git
+ * conflict surfaces as `Encountered an error running "coder ssh"`, which is what
+ * made failing git steps look like Coder outages.
+ */
+const CODER_NOISE = [
+  /^Encountered an error running "coder ssh"/,
+  /^error: run command: Process exited with status \d+/,
+  /^==> ⧗ /,
+  /^⧗ /,
+];
+
+/** Strip PTY decoration (ANSI escapes, CR) and coder-CLI noise from command output. */
+function scrubExecOutput(s: string): string {
+  return s
+    // OSC (ESC ] … BEL/ST) first, then CSI/other ESC-introduced sequences, then lone ESC.
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?/g, '')
+    .replace(/\u001b[@-_][0-?]*[ -\/]*[@-~]?/g, '')
+    .replace(/\u001b/g, '')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map((l) => l.trimEnd())
+    .filter((l) => l.trim() && !CODER_NOISE.some((re) => re.test(l)))
+    .join('\n')
+    .trim();
+}
+
+/**
+ * Turn a raw `execFile` failure into an error that says what actually went wrong.
+ *
+ * Two things make the raw error useless on its own:
+ *
+ * 1. `coder ssh` allocates a PTY for the remote command, so the remote's stderr
+ *    is merged into its **stdout**. Everything git and gh say about a failure
+ *    ("CONFLICT (content): Merge conflict in …", "remote: Repository not found",
+ *    "! [rejected]") therefore arrives on stdout, while `err.message` only ever
+ *    carries the coder CLI's own generic wrapper. Even locally this matters:
+ *    `git merge` writes conflict details to stdout and nothing to stderr.
+ * 2. On timeout `execFile` SIGTERMs the child, leaving an error whose message is
+ *    a bare "Command failed: …" with no reason attached at all. A `maxBuffer`
+ *    overflow looks identical at the signal level and must be told apart.
+ *
+ * All of it is folded into `message` here so a single `${err.message}` in a
+ * user-facing string reports the real cause.
+ */
+function buildExecError(
+  err: Error & { killed?: boolean; signal?: NodeJS.Signals | null; code?: number | string | null },
+  command: string,
+  stdout: string,
+  stderr: string,
+  timeout: number,
+): RemoteExecError {
+  const combined = [scrubExecOutput(stdout || ''), scrubExecOutput(stderr || '')]
+    .filter(Boolean)
+    .join('\n');
+  const output = combined.length > EXEC_OUTPUT_LIMIT
+    ? `…${combined.slice(-EXEC_OUTPUT_LIMIT)}`
+    : combined;
+
+  // Node kills the child with SIGTERM for a maxBuffer overflow too, so `killed`
+  // and `signal` alone cannot distinguish "ran too long" from "produced too much
+  // output" — and calling the latter a timeout would tell a user whose file was
+  // merely too big that their command "may still be running in the workspace".
+  const bufferExceeded = err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+  const timedOut = !bufferExceeded
+    && (err.killed === true || err.signal === 'SIGTERM' || err.code === 'ETIMEDOUT');
+  // The coder CLI exits 1 whatever the remote command returned, and reports the
+  // real status in its own stderr — prefer that when present.
+  const remoteStatus = /Process exited with status (\d+)/.exec(stderr || '');
+  const exitCode = remoteStatus
+    ? parseInt(remoteStatus[1], 10)
+    : (typeof err.code === 'number' ? err.code : null);
+
+  let reason: string;
+  if (bufferExceeded) {
+    reason = 'produced more output than the caller allowed and was killed (maxBuffer exceeded)';
+  } else if (timedOut) {
+    reason = `timed out after ${Math.round(timeout / 1000)}s and was killed — the command may still be running in the workspace, so its effects (e.g. a push) may have landed anyway`;
+  } else if (typeof exitCode === 'number') {
+    reason = `exited with status ${exitCode}`;
+  } else if (typeof err.code === 'string' && err.code) {
+    // Spawn-level failure (ENOENT for a missing `coder`/`bash`, EACCES, …).
+    reason = `could not be run (${err.code})`;
+  } else {
+    reason = 'failed';
+  }
+
+  // Never emit a reason with nothing behind it. When the command produced no
+  // output we fall back to Node's own message (which at least names the command)
+  // rather than shipping a bare "exited with status unknown" — the opaque
+  // failure this whole function exists to eliminate.
+  const raw = (err.message || '').trim();
+  const detail = output || (raw ? truncateForMessage(raw) : '');
+
+  const e = new Error(detail ? `${reason}: ${detail}` : reason) as RemoteExecError;
+  e.command = command;
+  e.output = output;
+  e.timedOut = timedOut;
+  e.bufferExceeded = bufferExceeded;
+  e.exitCode = exitCode;
+  return e;
+}
+
+/** Clamp a fallback error string so a long command line can't flood a task message. */
+function truncateForMessage(s: string): string {
+  return s.length > 500 ? `${s.slice(0, 500)}…` : s;
+}
+
+/**
  * Run a shell command locally, returning stdout.
  */
 function localExec(command: string, timeout = 15000, maxBuffer?: number): Promise<string> {
@@ -1309,8 +1442,8 @@ function localExec(command: string, timeout = 15000, maxBuffer?: number): Promis
       timeout,
       env: { ...process.env },
       ...(maxBuffer ? { maxBuffer } : {}),
-    }, (err, stdout) => {
-      if (err) reject(err);
+    }, (err, stdout, stderr) => {
+      if (err) reject(buildExecError(err, command, stdout || '', stderr || '', timeout));
       else resolve(stdout?.trim() || '');
     });
   });
@@ -1358,7 +1491,15 @@ export async function sshExec(
     }
   }
 
-  if (err) throw err; // execFile already appends stderr to err.message
+  if (err) {
+    // NOT `throw err`: the coder CLI's stderr (all execFile puts in err.message)
+    // only ever says "Process exited with status N". The remote command's own
+    // output — which is what explains the failure — arrives on stdout, because
+    // `coder ssh` runs it under a PTY. buildExecError folds both in.
+    const wrapped = buildExecError(err, command, stdout, stderr, timeout);
+    console.error(`[ssh] ${workspaceName}: ${wrapped.message.slice(0, 500)}`);
+    throw wrapped;
+  }
   return stdout.trim();
 }
 
@@ -4471,7 +4612,7 @@ export async function launchTaskParticipant(
         15000, task.user_id);
     } catch { /* */ }
 
-    const ghToken = await fetchGitHubToken().catch(() => null);
+    const ghToken = await fetchGitHubToken(task.user_id).catch(() => null);
     // An advisor on the CPM host runs locally, like launchTask/executeReviewer, so
     // it can inherit the pinned token from its environment. Routing it through
     // `coder ssh` instead would force file delivery into a shared /tmp for no gain.
