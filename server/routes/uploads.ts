@@ -51,6 +51,7 @@ router.post('/uploads', requireAuth, upload.array('files', MAX_FILES), (req: Req
     attachments.push({
       id,
       task_id: null,
+      message_id: null,
       filename: file.filename,
       original_name: file.originalname,
       mime_type: file.mimetype,
@@ -101,6 +102,7 @@ router.get('/uploads/:id', requireAuth, (req: Request, res: Response) => {
 export interface Attachment {
   id: string;
   task_id: string | null;
+  message_id: string | null;
   filename: string;
   original_name: string;
   mime_type: string;
@@ -109,17 +111,27 @@ export interface Attachment {
   created_at: string;
 }
 
-export function linkAttachmentsToTask(attachmentIds: string[], taskId: string) {
+/**
+ * Link freshly uploaded attachments to the task AND the specific message that
+ * sent them, so a later turn can tell "sent just now" apart from "sent in an
+ * earlier turn" instead of treating every attachment the task ever received
+ * as part of the current prompt.
+ */
+export function linkAttachmentsToTask(attachmentIds: string[], taskId: string, messageId?: string | null) {
   const db = getDb();
-  const stmt = db.prepare('UPDATE attachments SET task_id = ? WHERE id = ? AND task_id IS NULL');
+  const stmt = db.prepare('UPDATE attachments SET task_id = ?, message_id = ? WHERE id = ? AND task_id IS NULL');
   for (const id of attachmentIds) {
-    stmt.run(taskId, id);
+    stmt.run(taskId, messageId ?? null, id);
   }
   return db.prepare('SELECT * FROM attachments WHERE task_id = ? ORDER BY created_at ASC').all(taskId);
 }
 
 export function getAttachmentsByTask(taskId: string): any[] {
   return getDb().prepare('SELECT * FROM attachments WHERE task_id = ? ORDER BY created_at ASC').all(taskId);
+}
+
+export function getAttachmentsByMessage(messageId: string): any[] {
+  return getDb().prepare('SELECT * FROM attachments WHERE message_id = ? ORDER BY created_at ASC').all(messageId);
 }
 
 export function getAttachment(id: string): any {

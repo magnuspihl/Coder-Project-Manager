@@ -262,20 +262,26 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_workspace_deleted ON tasks(workspace_id, deleted_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
--- Attachments: files uploaded with task prompts or replies
+-- Attachments: files uploaded with task prompts or replies. message_id scopes
+-- an attachment to the specific turn that sent it (NULL for attachments
+-- uploaded before that linkage existed) — without it, every turn re-announced
+-- every attachment ever sent on the task as if it had just arrived.
 CREATE TABLE IF NOT EXISTS attachments (
   id TEXT PRIMARY KEY,
   task_id TEXT,
+  message_id TEXT,
   filename TEXT NOT NULL,
   original_name TEXT NOT NULL,
   mime_type TEXT NOT NULL,
   size INTEGER NOT NULL,
   storage_path TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+  FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+  FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_attachments_task ON attachments(task_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 
 -- Rate limit tracking, keyed by the SUBSCRIPTION the usage was billed to
 -- (persists across server restarts). Session (five_hour) and weekly (seven_day)

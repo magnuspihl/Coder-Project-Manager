@@ -369,6 +369,7 @@ export const createTask = (workspaceId: string, prompt: string, opts: CreateTask
 export interface AttachmentInfo {
   id: string;
   task_id: string | null;
+  message_id: string | null;
   filename: string;
   original_name: string;
   mime_type: string;
