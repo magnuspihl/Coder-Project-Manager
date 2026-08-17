@@ -2167,6 +2167,27 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                       </div>
                     </div>
                     <Markdown content={msg.role === 'assistant' ? collapseOutputFileBlocks(collapseTaskRequestBlocks(msg.content)) : msg.content} breaks={msg.role === 'user'} />
+                    {(() => {
+                      const msgAttachments = attachments.filter(att => att.message_id === msg.id);
+                      if (msgAttachments.length === 0) return null;
+                      return (
+                        <div className="flex flex-wrap gap-1.5 mt-2 pt-2 border-t border-black/5 dark:border-white/5">
+                          {msgAttachments.map(att => (
+                            <a
+                              key={att.id}
+                              href={`/api/uploads/${att.id}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-white/70 dark:bg-black/20 text-gray-600 dark:text-gray-400 border border-gray-200 dark:border-gray-700 hover:border-blue-300 dark:hover:border-blue-600 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
+                              title={`${att.original_name} (${(att.size / 1024).toFixed(1)} KB) — sent with this message`}
+                            >
+                              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
+                              {att.original_name}
+                            </a>
+                          ))}
+                        </div>
+                      );
+                    })()}
                   </div>
                     </React.Fragment>
                   );
@@ -2192,9 +2213,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                 </div>
               )}
 
-              {attachments.length > 0 && (
+              {/* Task-level files with no specific message bubble to render under:
+                  agent-generated [OUTPUT_FILE] downloads (never linked to a message) and
+                  attachments uploaded before message-level linkage existed. User uploads
+                  going forward render inline under the message that sent them, above. */}
+              {attachments.some(att => !att.message_id) && (
                 <div className="flex flex-wrap gap-1.5 px-1">
-                  {attachments.map(att => (
+                  {attachments.filter(att => !att.message_id).map(att => (
                     <a
                       key={att.id}
                       href={`/api/uploads/${att.id}`}

@@ -2,6 +2,7 @@ import { getDb } from '../db/index.js';
 import { v4 as uuid } from 'uuid';
 import { execFile } from 'child_process';
 import { getDefaultAccountId } from './claude-accounts.js';
+import { linkAttachmentsToTask } from '../routes/uploads.js';
 
 export interface Task {
   id: string;
@@ -391,6 +392,7 @@ export function createTask(params: {
   source?: string | null;
   clientLabel?: string | null;
   autoReview?: boolean;
+  attachmentIds?: string[];
 }): Task {
   const db = getDb();
   const id = uuid();
@@ -417,7 +419,13 @@ export function createTask(params: {
   ).run(id, params.workspaceId, params.workspaceName, params.userId, title, params.prompt, position, params.projectDir || null, claudeSessionId, params.model || null, claudeAccountId, params.caveman || null, params.source || null, params.clientLabel || null, autoReview);
 
   // Store the initial prompt as a user message (inherits provenance from the task creation call)
-  addMessage(id, 'user', params.prompt, undefined, params.username, undefined, params.source || null, params.clientLabel || null);
+  const initialMessage = addMessage(id, 'user', params.prompt, undefined, params.username, undefined, params.source || null, params.clientLabel || null);
+
+  // Tie any attachments uploaded alongside this prompt to that first message, so
+  // later turns can tell they were sent now rather than re-announcing them forever.
+  if (params.attachmentIds && params.attachmentIds.length > 0) {
+    linkAttachmentsToTask(params.attachmentIds, id, initialMessage.id);
+  }
 
   // Fire off async LLM title generation (updates DB when ready)
   generateTitleAsync(id, params.prompt);

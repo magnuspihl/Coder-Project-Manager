@@ -153,11 +153,10 @@ router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, 
       source: req.authSource,
       clientLabel: req.clientLabel,
       autoReview: autoReview === false ? false : true,
+      attachmentIds: Array.isArray(attachmentIds)
+        ? attachmentIds.filter((id: unknown) => typeof id === 'string')
+        : undefined,
     });
-
-    if (Array.isArray(attachmentIds) && attachmentIds.length > 0) {
-      linkAttachmentsToTask(attachmentIds.filter((id: unknown) => typeof id === 'string'), task.id);
-    }
 
     // Respond as soon as the task row exists — launching it involves SSH
     // round-trips (worktree creation, spawning Claude) that the client observes
@@ -341,7 +340,7 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
     return;
   }
 
-  addMessage(task.id, 'user', message, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
+  const userMessage = addMessage(task.id, 'user', message, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
 
   // User reply resets the review loop so the next implementer turn gets a fresh review
   resetReviewLoopCount(task.id);
@@ -360,7 +359,7 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
   }
 
   if (Array.isArray(attachmentIds) && attachmentIds.length > 0) {
-    linkAttachmentsToTask(attachmentIds.filter((a: unknown) => typeof a === 'string'), task.id);
+    linkAttachmentsToTask(attachmentIds.filter((a: unknown) => typeof a === 'string'), task.id, userMessage.id);
   }
 
   // Queue and let processQueue handle concurrency — it will resume immediately

@@ -6,7 +6,7 @@ import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } 
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, fetchGitHubToken, isRemoteAllowed } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
-import { getAttachmentsByTask, createAgentOutputAttachment, hasAgentOutputAttachment, sha256Hex, MAX_FILE_SIZE, type Attachment } from '../routes/uploads.js';
+import { getAttachmentsByTask, getAttachmentsByMessage, createAgentOutputAttachment, hasAgentOutputAttachment, sha256Hex, MAX_FILE_SIZE, type Attachment } from '../routes/uploads.js';
 import { writeCpmGuidelines } from './workspace-memory.js';
 import { buildMemoryMcpConfig, MEMORY_MCP_ALLOWED_TOOL, buildMemoryUsagePrompt } from './memory-mcp.js';
 import { getValidCoderTokenForUser, forceRefreshCoderTokenForUser } from './sessions.js';
@@ -1764,7 +1764,7 @@ export async function processQueue(workspaceId: string): Promise<void> {
         const msgs = getMessages(next.id);
         const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
         if (lastMsg && lastMsg.role === 'user' && msgs.some(m => m.role === 'assistant')) {
-          await launchTask(next, true, lastMsg.content);
+          await launchTask(next, true, lastMsg.content, lastMsg.id);
           continue;
         }
       }
@@ -1780,7 +1780,7 @@ export async function processQueue(workspaceId: string): Promise<void> {
  * Uses detached: true + stdio: 'ignore' so the SSH process survives server restarts.
  * Output is written directly to a remote file which we poll via startFilePolling().
  */
-async function launchTask(task: Task, isResume = false, feedback?: string): Promise<void> {
+async function launchTask(task: Task, isResume = false, feedback?: string, messageId?: string): Promise<void> {
   // Re-read the fields the user can change between turns, so "applies from the
   // next turn" is a guarantee rather than a side effect of every caller happening
   // to load the row fresh. resumeTask, for instance, re-reads the row for its
@@ -1918,30 +1918,6 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
     await handleTaskLaunchGit(task);
   }
 
-  // Transfer any attached files to the remote workspace (skip for slash commands)
-  const attachments = isSlashCommand ? [] : getAttachmentsByTask(task.id);
-  if (attachments.length > 0) {
-    const remoteAttachDir = `/tmp/cpm-attachments-${task.id}`;
-    try {
-      const pathMap = await transferFilesToWorkspace(task.workspace_name, attachments, remoteAttachDir, task.user_id);
-      if (pathMap.size > 0) {
-        const fileList = Array.from(pathMap.values())
-          .map(p => `- ${p}`)
-          .join('\n');
-        prompt += `\n\nReference files have been provided and placed on this workspace. Use the Read tool to examine them:\n${fileList}`;
-        console.log(`[file-transfer] Transferred ${pathMap.size} file(s) for task ${task.id}`);
-      }
-    } catch (err) {
-      console.error('[file-transfer] Failed:', (err as Error).message?.slice(0, 100));
-      addMessage(task.id, 'system', `Warning: Failed to transfer some attached files to workspace`);
-    }
-  }
-
-  // Build the claude command
-  const claudeParts: string[] = [];
-  claudeParts.push('claude');
-  claudeParts.push('-p', shellEscape(prompt));
-
   // Use --resume only when the current session_id has actually been created
   // by a prior Claude run. After a session reset, session_initialized=0 forces
   // --session-id (creates a fresh session on disk) even though we have a
@@ -1961,6 +1937,10 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
   // then exits with the same "No conversation found" error despite the file
   // existing. When the session is found under a different project folder, copy
   // it into the current workDir's folder so the conversation context survives.
+  //
+  // Computed before the attachment-transfer step below, which needs to know
+  // whether Claude's own context (and therefore its memory of previously
+  // transferred files) actually survives into this turn.
   let canResume = isResume && !!task.claude_session_id && task.session_initialized !== 0;
   if (canResume) {
     try {
@@ -1995,6 +1975,45 @@ async function launchTask(task: Task, isResume = false, feedback?: string): Prom
       // Claude report any real error rather than silently dropping context.
     }
   }
+
+  // Transfer attachments to the remote workspace (skip for slash commands).
+  // Attachments are scoped to the specific message that sent them: when the
+  // session is genuinely resuming (canResume), Claude's own transcript already
+  // contains whatever earlier turn introduced a given file — including the
+  // path it was placed at — so re-fetching every attachment the task has ever
+  // received and re-announcing them here made each turn look like the file had
+  // just been sent again. Only THIS turn's new attachments need transferring.
+  //
+  // When context was lost instead (canResume false — first launch, or a
+  // vanished remote session), Claude has no memory of earlier turns at all, so
+  // every attachment the task has received is redelivered and re-announced.
+  const attachments = isSlashCommand
+    ? []
+    : canResume
+      ? (messageId ? getAttachmentsByMessage(messageId) : [])
+      : getAttachmentsByTask(task.id);
+  if (attachments.length > 0) {
+    const remoteAttachDir = `/tmp/cpm-attachments-${task.id}`;
+    try {
+      const pathMap = await transferFilesToWorkspace(task.workspace_name, attachments, remoteAttachDir, task.user_id);
+      if (pathMap.size > 0) {
+        const fileList = Array.from(pathMap.values())
+          .map(p => `- ${p}`)
+          .join('\n');
+        prompt += `\n\nReference files have been provided and placed on this workspace. Use the Read tool to examine them:\n${fileList}`;
+        console.log(`[file-transfer] Transferred ${pathMap.size} file(s) for task ${task.id}`);
+      }
+    } catch (err) {
+      console.error('[file-transfer] Failed:', (err as Error).message?.slice(0, 100));
+      addMessage(task.id, 'system', `Warning: Failed to transfer some attached files to workspace`);
+    }
+  }
+
+  // Build the claude command
+  const claudeParts: string[] = [];
+  claudeParts.push('claude');
+  claudeParts.push('-p', shellEscape(prompt));
+
   if (canResume) {
     claudeParts.push('--resume', shellEscape(task.claude_session_id!));
   } else if (task.claude_session_id) {

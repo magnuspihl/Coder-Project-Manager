@@ -485,6 +485,16 @@ export function getDb(): Database.Database {
       AND verification_url != rtrim(verification_url, '*\`.,!?')
   `);
 
+  // Scope attachments to the message that sent them, not just the task, so a
+  // turn only re-delivers/announces files sent THIS turn instead of every
+  // attachment the task has ever received. Existing rows get message_id = NULL
+  // (rendered/handled as task-level, same as before this migration).
+  const attachmentCols = db.prepare("PRAGMA table_info(attachments)").all() as Array<{ name: string }>;
+  if (!attachmentCols.some(c => c.name === 'message_id')) {
+    db.exec("ALTER TABLE attachments ADD COLUMN message_id TEXT REFERENCES messages(id)");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id)");
+  }
+
   migrateDiscussionsToTasks(db);
 
   // Output files: an agent can hand the user a file to download via

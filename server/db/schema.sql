@@ -264,12 +264,17 @@ CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
 -- Attachments: files uploaded with task prompts/replies ('user'), or produced
 -- by an agent via an [OUTPUT_FILE] block for the user to download ('agent').
--- user_id is set at creation time (the uploader, or the task owner for an
--- agent-produced file) so /api/uploads/:id can enforce ownership even during
--- the brief window before task_id is linked — see the download route.
+-- message_id scopes a 'user' attachment to the specific turn that sent it
+-- (NULL for attachments uploaded before that linkage existed, or for
+-- agent-produced files, which link directly to task_id) — without it, every
+-- turn re-announced every attachment ever sent on the task as if it had just
+-- arrived. user_id is set at creation time (the uploader, or the task owner
+-- for an agent-produced file) so /api/uploads/:id can enforce ownership even
+-- during the brief window before task_id is linked — see the download route.
 CREATE TABLE IF NOT EXISTS attachments (
   id TEXT PRIMARY KEY,
   task_id TEXT,
+  message_id TEXT,
   user_id TEXT,
   filename TEXT NOT NULL,
   original_name TEXT NOT NULL,
@@ -282,10 +287,12 @@ CREATE TABLE IF NOT EXISTS attachments (
   -- hasAgentOutputAttachment in uploads.ts.
   content_hash TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+  FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+  FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_attachments_task ON attachments(task_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 
 -- Rate limit tracking, keyed by the SUBSCRIPTION the usage was billed to
 -- (persists across server restarts). Session (five_hour) and weekly (seven_day)
