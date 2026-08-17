@@ -2,10 +2,12 @@ import { Router, Request, Response } from 'express';
 import multer from 'multer';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { mkdirSync, existsSync, createReadStream } from 'fs';
+import { mkdirSync, existsSync, createReadStream, writeFileSync } from 'fs';
+import { createHash } from 'crypto';
 import { v4 as uuid } from 'uuid';
 import { requireAuth } from '../middleware/auth.js';
 import { getDb } from '../db/index.js';
+import { getTask } from '../services/tasks.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = join(__dirname, '../../data/uploads');
@@ -14,7 +16,7 @@ if (!existsSync(UPLOAD_DIR)) {
   mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
-const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20MB
+export const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20MB
 const MAX_FILES = 10;
 
 const storage = multer.diskStorage({
@@ -45,17 +47,19 @@ router.post('/uploads', requireAuth, upload.array('files', MAX_FILES), (req: Req
   for (const file of files) {
     const id = uuid();
     db.prepare(
-      'INSERT INTO attachments (id, filename, original_name, mime_type, size, storage_path) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(id, file.filename, file.originalname, file.mimetype, file.size, file.path);
+      'INSERT INTO attachments (id, user_id, filename, original_name, mime_type, size, storage_path) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(id, req.user!.id, file.filename, file.originalname, file.mimetype, file.size, file.path);
 
     attachments.push({
       id,
       task_id: null,
+      user_id: req.user!.id,
       filename: file.filename,
       original_name: file.originalname,
       mime_type: file.mimetype,
       size: file.size,
       storage_path: file.path,
+      source: 'user',
       created_at: new Date().toISOString(),
     });
   }
@@ -69,6 +73,25 @@ router.get('/uploads/:id', requireAuth, (req: Request, res: Response) => {
   if (!attachment) {
     res.status(404).json({ error: 'Attachment not found' });
     return;
+  }
+  // Attachment data is CPM's to scope, not Coder's — a missing owner and one
+  // owned by someone else both 404, so ownership can't be probed by guessing
+  // attachment ids the way task ids already can't (see requireTaskAccess).
+  // user_id is stamped at creation time (upload or [OUTPUT_FILE] capture), so
+  // this covers the brief pre-link window too, not just linked attachments.
+  // Pre-existing rows from before that column existed fall back to the
+  // task_id check, same as before.
+  if (attachment.user_id) {
+    if (!req.user || attachment.user_id !== req.user.id) {
+      res.status(404).json({ error: 'Attachment not found' });
+      return;
+    }
+  } else if (attachment.task_id) {
+    const task = getTask(attachment.task_id);
+    if (!task || !req.user || task.user_id !== req.user.id) {
+      res.status(404).json({ error: 'Attachment not found' });
+      return;
+    }
   }
   if (!existsSync(attachment.storage_path)) {
     res.status(404).json({ error: 'File not found on disk' });
@@ -101,12 +124,83 @@ router.get('/uploads/:id', requireAuth, (req: Request, res: Response) => {
 export interface Attachment {
   id: string;
   task_id: string | null;
+  user_id: string | null;
   filename: string;
   original_name: string;
   mime_type: string;
   size: number;
   storage_path: string;
+  source: 'user' | 'agent';
+  content_hash: string | null;
   created_at: string;
+}
+
+export function sha256Hex(content: Buffer): string {
+  return createHash('sha256').update(content).digest('hex');
+}
+
+/**
+ * Record a file an agent produced for the user to download (an [OUTPUT_FILE]
+ * block — see claude.ts's parseOutputFilesForTask), already fetched from the
+ * workspace into `content`. Stored the same way as a user upload — same
+ * directory, same table, same /api/uploads/:id download route — just with
+ * task_id set immediately instead of linked later, and source='agent' so the
+ * UI can tell the two apart. `userId` is the task's owner, not the agent —
+ * it's what lets the download route enforce ownership.
+ */
+export function createAgentOutputAttachment(
+  taskId: string,
+  userId: string,
+  content: Buffer,
+  originalName: string,
+  mimeType: string,
+): Attachment {
+  const id = uuid();
+  const ext = originalName.includes('.') ? '.' + originalName.split('.').pop() : '';
+  const filename = uuid() + ext;
+  const storagePath = join(UPLOAD_DIR, filename);
+  writeFileSync(storagePath, content);
+  const contentHash = sha256Hex(content);
+
+  getDb().prepare(
+    'INSERT INTO attachments (id, task_id, user_id, filename, original_name, mime_type, size, storage_path, source, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, taskId, userId, filename, originalName, mimeType, content.length, storagePath, 'agent', contentHash);
+
+  return {
+    id,
+    task_id: taskId,
+    user_id: userId,
+    filename,
+    original_name: originalName,
+    mime_type: mimeType,
+    size: content.length,
+    storage_path: storagePath,
+    source: 'agent',
+    content_hash: contentHash,
+    created_at: new Date().toISOString(),
+  };
+}
+
+/**
+ * Has this task already captured an [OUTPUT_FILE] with this exact name and
+ * content? Used to skip re-transferring a file whose block gets re-parsed —
+ * e.g. every reconnect-after-restart replay of a task's current-session
+ * stream_log hits the same [OUTPUT_FILE] blocks again, and without this each
+ * replay would re-run the SSH transfer and add another duplicate attachment
+ * row + file on disk for something already captured.
+ *
+ * Keyed on a content hash rather than size: two different regenerations of
+ * the same file could coincidentally land on the same byte count, and a
+ * size-only match would then silently discard a real, different file the
+ * agent just produced. A hash match means the bytes are actually identical,
+ * so there is nothing new for the user to see and staying silent is correct;
+ * anything else is a genuinely new attachment.
+ */
+export function hasAgentOutputAttachment(taskId: string, originalName: string, contentHash: string): boolean {
+  const row = getDb().prepare(
+    "SELECT 1 FROM attachments WHERE task_id = ? AND source = 'agent' AND original_name = ? AND content_hash = ? LIMIT 1"
+  ).get(taskId, originalName, contentHash);
+  return !!row;
 }
 
 export function linkAttachmentsToTask(attachmentIds: string[], taskId: string) {
