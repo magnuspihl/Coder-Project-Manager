@@ -152,7 +152,7 @@ router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, 
       caveman: typeof caveman === 'string' && ['lite', 'full', 'ultra'].includes(caveman) ? caveman : undefined,
       source: req.authSource,
       clientLabel: req.clientLabel,
-      autoReview: autoReview === false ? false : true,
+      autoReview: autoReview === true,
       attachmentIds: Array.isArray(attachmentIds)
         ? attachmentIds.filter((id: unknown) => typeof id === 'string')
         : undefined,
