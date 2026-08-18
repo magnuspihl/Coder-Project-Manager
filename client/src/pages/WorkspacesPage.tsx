@@ -289,7 +289,7 @@ export default function WorkspacesPage() {
   const [newTaskPrompt, setNewTaskPrompt, clearNewTaskPrompt] = useDraft('newTaskPrompt');
   const [newTaskModel, setNewTaskModel] = useState('');
   const [newTaskCaveman, setNewTaskCaveman] = useState('');
-  const [newTaskAutoReview, setNewTaskAutoReview] = useState(true);
+  const [newTaskAutoReview, setNewTaskAutoReview] = useState(false);
   // '' means "not resolved yet" — createTask then omits the field so the server
   // applies the user's default account.
   const [newTaskClaudeAccount, setNewTaskClaudeAccount] = useState('');

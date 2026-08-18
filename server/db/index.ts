@@ -364,7 +364,7 @@ export function getDb(): Database.Database {
   // Auto-review migrations
   const tasksCols5 = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
   if (!tasksCols5.some(c => c.name === 'auto_review')) {
-    db.exec("ALTER TABLE tasks ADD COLUMN auto_review INTEGER NOT NULL DEFAULT 1");
+    db.exec("ALTER TABLE tasks ADD COLUMN auto_review INTEGER NOT NULL DEFAULT 0");
   }
   if (!tasksCols5.some(c => c.name === 'review_loop_count')) {
     db.exec("ALTER TABLE tasks ADD COLUMN review_loop_count INTEGER NOT NULL DEFAULT 0");

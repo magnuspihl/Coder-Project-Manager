@@ -357,13 +357,15 @@ since that constitutes a new human-directed turn.
 
 ---
 
-## 8. Opt-Out
+## 8. Opt-In
 
-`auto_review` defaults to `1` (on). Users can disable it at task creation with a checkbox in the
-task creation form. This sets `tasks.auto_review = 0` and skips all review logic for that task.
+`auto_review` defaults to `0` (off). Users can enable it at task creation with a checkbox in the
+task creation form. Left unchecked, `tasks.auto_review = 0` and all review logic is skipped for
+that task.
 
 No workspace-level default — the per-task setting is the only control. The UI defaults the
-checkbox to checked, so unchecking is a deliberate override.
+checkbox to unchecked, so checking it is a deliberate opt-in. Callers that don't mention
+`autoReview` at all (MCP `create_task`, task-request approval) get it off.
 
 It is also switchable **mid-conversation**, alongside the model and subscription switchers in the
 task detail header (`PUT /api/tasks/:id` with `{ autoReview: boolean }`). Semantics match those
@@ -418,8 +420,8 @@ queued → working[implementer] → (files changed?) → working[reviewer]
 ### New columns on `tasks`
 
 ```sql
-ALTER TABLE tasks ADD COLUMN auto_review INTEGER NOT NULL DEFAULT 1;
--- 1 = auto-review on, 0 = opted out
+ALTER TABLE tasks ADD COLUMN auto_review INTEGER NOT NULL DEFAULT 0;
+-- 1 = auto-review opted in, 0 = off (the default)
 
 ALTER TABLE tasks ADD COLUMN review_loop_count INTEGER NOT NULL DEFAULT 0;
 -- Counts completed Reviewer passes since last user reply
@@ -545,7 +547,7 @@ mid-turn).
 
 ### `tasks.ts`
 
-- `createTask` gains `autoReview?: boolean` parameter (defaults to `true`)
+- `createTask` gains `autoReview?: boolean` parameter (defaults to `false`)
 - `Task` type gains `auto_review`, `review_loop_count`, `active_turn_role` fields
 
 ---
@@ -557,10 +559,10 @@ mid-turn).
 A checkbox below the task prompt textarea:
 
 ```
-[✓] Auto-review  — A separate agent will verify implementation before surfacing to you
+[ ] Auto-review  — A separate agent will verify implementation before surfacing to you
 ```
 
-Checked by default. Unchecking sets `auto_review: false` in the POST body.
+Unchecked by default. Checking it sets `auto_review: true` in the POST body.
 
 ### Task detail / chat view
 

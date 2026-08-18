@@ -411,7 +411,9 @@ export function createTask(params: {
   // Immediate heuristic title; LLM will refine it async
   const title = generateTitleFallback(params.prompt);
 
-  const autoReview = params.autoReview === false ? 0 : 1;
+  // Off unless the caller explicitly asks for it — a red-team pass costs an extra
+  // agent round-trip per turn, so callers that say nothing get the cheap path.
+  const autoReview = params.autoReview === true ? 1 : 0;
 
   db.prepare(
     `INSERT INTO tasks (id, workspace_id, workspace_name, user_id, title, prompt, status, position, project_dir, claude_session_id, model, claude_account_id, caveman, source, client_label, auto_review)

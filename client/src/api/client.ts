@@ -356,7 +356,7 @@ export const createTask = (workspaceId: string, prompt: string, opts: CreateTask
       ...(opts.model ? { model: opts.model } : {}),
       ...(opts.caveman ? { caveman: opts.caveman } : {}),
       ...(opts.attachmentIds?.length ? { attachmentIds: opts.attachmentIds } : {}),
-      ...(opts.autoReview === false ? { autoReview: false } : {}),
+      ...(opts.autoReview === true ? { autoReview: true } : {}),
       // Only sent when the caller actually knows the user's choice. Omitting the
       // key makes the server apply the user's default account; sending
       // WORKSPACE_CLAUDE_ACCOUNT is an explicit "use the workspace's own login".
