@@ -1,7 +1,7 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { createReadStream, createWriteStream, promises as fsPromises } from 'fs';
 import { randomUUID } from 'crypto';
-import { updateTaskStatus, addMessage, addTokenUsage, recordContextTokens, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, getLatestTaskTurn, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, createReviewFindings, getReviewFindings, getFindingsInFlight, closeOutstandingOnPass, getDismissedFindings, getPriorFindings, getUserReplies, findingRef, findFindingByRef, verifyClaimedFixes, reraiseReviewFinding, reopenUnreportedFindings, setReviewFindingState, type Task, type TaskParticipant } from './tasks.js';
+import { updateTaskStatus, addMessage, addTokenUsage, recordContextTokens, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, getLatestTaskTurn, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, createReviewFindings, getReviewFindings, getFindingsInFlight, closeOutstandingOnPass, getDismissedFindings, getPriorFindings, getUserReplies, findingRef, findFindingByRef, verifyClaimedFixes, reraiseReviewFinding, reopenUnreportedFindings, setReviewFindingState, setTaskWake, clearTaskWake, incrementTaskWakeCount, getTasksWithPendingWake, type Task, type TaskParticipant } from './tasks.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, fetchGitHubToken, isRemoteAllowed } from './git.js';
@@ -691,6 +691,56 @@ When a request IS warranted, the block is the only thing that reaches the user:
 - Do NOT create tasks by calling the CPM HTTP API.
 - Do NOT merely describe the follow-up in prose and move on — emit the block so the work is tracked.`;
 }
+
+/**
+ * Long-running work, and the [WAKE] self-resume mechanism.
+ *
+ * Two facts about CPM's execution model were invisible to agents, and both bit
+ * hard on any task with work that outlasts a turn:
+ *
+ *  1. A turn IS the process. `claude -p` exits when the model stops writing, so
+ *     background Bash jobs and subagents attached to that session die with it.
+ *  2. A finished turn is the agent's last word. Nothing in CPM lets it speak
+ *     again unsolicited, so "I'll report back when it lands" was a promise the
+ *     agent could not keep — leaving the user to poll ("Any news?"), and each
+ *     poll costs a full resume turn that usually just restates the last one.
+ *
+ * Agents worked around this by trying to hold the turn open (sleep/poll
+ * in-session), which burns tokens, occupies the workspace's task slot, and
+ * still dies on a CPM restart.
+ *
+ * [WAKE] closes the loop: detach the work so it survives, end the turn so the
+ * slot frees, and let CPM resume the same session when the work is done (or on
+ * a timer). See parseWakeRequestForTask and processPendingWakes.
+ */
+const BACKGROUND_WORK_PROMPT = `LONG-RUNNING WORK, AND GETTING BACK TO THE USER LATER:
+
+Your turn IS your process. The moment you stop writing, CPM's \`claude -p\` run exits and the task drops to "awaiting feedback". So:
+- Anything still attached to your session dies with it — background Bash jobs, subagents, unfinished commands.
+- You cannot spontaneously message the user afterwards. A finished turn is your last word until the user replies, or until a wake-up you scheduled fires.
+- Never say "I'll report back when it's done" unless you actually scheduled a wake-up. Otherwise the user is left polling you, and every "any news?" costs a whole turn.
+- Do NOT try to hold the turn open by sleeping or polling in-session. It burns tokens, holds the workspace's task slot against other tasks, and dies anyway if CPM restarts.
+
+To run something that outlives your turn, do BOTH of these:
+
+1. Detach it, and have it drop a sentinel file when it finishes:
+
+   setsid nohup bash -c 'YOUR_COMMAND > /tmp/job.log 2>&1; echo $? > /tmp/job.done' > /dev/null 2>&1 < /dev/null &
+
+   \`setsid\` is the load-bearing part — without it the job shares the SSH session's process group and is killed when your turn ends. \`nohup\` alone is not enough. Write output to a file; nothing is capturing its stdout once you are gone.
+
+2. Schedule a wake-up before you stop writing, by emitting this block on its own lines (not inside a code block):
+
+[WAKE]
+{"after": "15m", "when_file": "/tmp/job.done", "note": "read /tmp/job.log for the disassembly result and report it to the user"}
+[/WAKE]
+
+CPM then resumes THIS session automatically — as soon as \`when_file\` appears, or after \`after\` at the latest, whichever comes first.
+- \`after\` (required): how long to wait at most. "45s", "20m", "2h", "1h30m"; a bare number means minutes. Minimum 30 seconds, maximum 12 hours.
+- \`when_file\` (optional): an absolute path on this workspace. Omit it for a plain timer.
+- \`note\` (recommended): what you'll be handed on waking. Write it for your future self — where the output is and what to do with it.
+
+On waking you get a normal turn, and what you write DOES reach the user — that is the message you promised them. If the work still is not finished, keep it to ONE short line (never re-send a status update you already sent) and emit a fresh [WAKE]; the block is not sticky and must be re-emitted every turn you want another. Consecutive wake-ups without the user saying anything are capped, and you are told how many remain — when they run out, stop and tell the user where things stand.`;
 
 /**
  * Gives an agent a way to hand the user an actual file — a generated report,
@@ -2338,6 +2388,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
   if (!isSlashCommand) {
     systemPromptFragments.push(buildTaskDelegationPrompt(task.workspace_name, 'host'));
     systemPromptFragments.push(OUTPUT_FILE_PROMPT);
+    systemPromptFragments.push(BACKGROUND_WORK_PROMPT);
   }
 
   // Let the implementer opt out of the reviewer when its turn isn't a
@@ -2435,6 +2486,12 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
 
     updateTaskStatus(task.id, 'working');
     setActiveTaskTurnRole(task.id, 'implementer');
+    // A pending wake-up has now been consumed — by this very launch, or by the
+    // user replying first. Either way it must not fire again: [WAKE] is armed
+    // per turn and the agent re-emits it if it still needs one. Clearing here
+    // (rather than only in the wake poller) is what makes a user reply
+    // implicitly cancel the wake.
+    clearTaskWake(task.id);
     // Clear any opt-out flag from a prior turn before this one starts streaming.
     noReviewDeclared.delete(task.id);
     findingReports.delete(task.id);
@@ -2616,6 +2673,11 @@ export function interruptTask(taskId: string): void {
     .get(taskId) as { id: string; workspace_name: string; ssh_pid: number | null; claude_session_id: string | null; active_turn_role: string | null; user_id: string } | undefined;
 
   if (!partial) return;
+
+  // An interrupt is the user saying "stop". A wake-up armed earlier in this task
+  // would otherwise restart the agent on its own a few minutes later. Cleared
+  // before the reviewer branch below so it applies to both phases.
+  clearTaskWake(partial.id);
 
   // Reviewer phase: the auto-reviewer runs as a detached process polled under a
   // separate `review:<id>` key, with its own session id on the open turn — none
@@ -2980,6 +3042,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
           lastSavedMessageId = msg.id;
           lastSavedMessageText = turnText;
           parseTaskRequestsForTask(task, turnText);
+          parseWakeRequestForTask(task, turnText);
           parseOutputFilesForTask(task, turnText, task.workspace_name, outputFileBaseDir).catch(err =>
             console.error(`[output-file] task ${task.id}:`, (err as Error).message?.slice(0, 200)));
           parseTaskMentions(task, turnText, null);
@@ -3008,6 +3071,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
           lastSavedMessageId = msg.id;
           lastSavedMessageText = resultText;
           parseTaskRequestsForTask(task, resultText);
+          parseWakeRequestForTask(task, resultText);
           parseOutputFilesForTask(task, resultText, task.workspace_name, outputFileBaseDir).catch(err =>
             console.error(`[output-file] task ${task.id}:`, (err as Error).message?.slice(0, 200)));
           parseTaskMentions(task, resultText, null);
@@ -4312,6 +4376,257 @@ function parseTaskRequestsForTask(task: Task, text: string): void {
       console.log(`[task] Failed to parse task request JSON`);
     }
   }
+}
+
+// ─── Agent-scheduled wake-ups ───────────────────────────────────────────
+
+/** Shortest wake-up CPM will honour. Below this the poller can't resolve it anyway. */
+const WAKE_MIN_MS = 30_000;
+/** Longest. A task that needs more than this should be told to the user, not slept on. */
+const WAKE_MAX_MS = 12 * 60 * 60 * 1000;
+/** How often the poller re-evaluates pending wake-ups (and probes `when_file`). */
+const WAKE_POLL_INTERVAL_MS = parseInt(process.env.CPM_WAKE_POLL_INTERVAL_MS || '30000', 10);
+/**
+ * Consecutive automatic wake-ups allowed without the user saying anything.
+ *
+ * The real backstop is that [WAKE] is not sticky — each wake buys exactly one
+ * turn, and the agent has to deliberately re-arm for another. This cap exists
+ * for the case that backstop doesn't cover: an agent that re-arms reflexively
+ * every time, waiting on something that is never going to happen. Reset
+ * whenever the user replies (see resetTaskWakeCount).
+ */
+export const MAX_AUTO_WAKES = parseInt(process.env.CPM_MAX_AUTO_WAKES || '12', 10);
+/**
+ * How long to stop probing a task's sentinel after a failed probe.
+ *
+ * A stopped or unreachable workspace makes `coder ssh` hang for the full 15s
+ * timeout, and the poller probes serially — so without a backoff, one asleep
+ * workspace would stall every tick. The `after` deadline is unaffected: a wake
+ * that can't be resolved early just fires on time instead.
+ */
+const WAKE_PROBE_BACKOFF_MS = 5 * 60 * 1000;
+/** taskId → epoch ms before which the sentinel must not be probed again. */
+const wakeProbeBackoff = new Map<string, number>();
+
+const WAKE_UNIT_MS: Record<string, number> = {
+  s: 1000, sec: 1000, secs: 1000, second: 1000, seconds: 1000,
+  m: 60_000, min: 60_000, mins: 60_000, minute: 60_000, minutes: 60_000,
+  h: 3_600_000, hr: 3_600_000, hrs: 3_600_000, hour: 3_600_000, hours: 3_600_000,
+};
+
+/**
+ * Parse an `after` value into milliseconds, clamped to [WAKE_MIN_MS, WAKE_MAX_MS].
+ * Accepts a number (minutes) or a duration string like "45s", "20m", "1h30m".
+ * Returns null when nothing parseable was given — the caller then ignores the
+ * whole block rather than guessing an interval on the agent's behalf.
+ */
+function parseWakeDuration(raw: unknown): number | null {
+  const clamp = (ms: number) => Math.min(WAKE_MAX_MS, Math.max(WAKE_MIN_MS, Math.round(ms)));
+
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) && raw > 0 ? clamp(raw * 60_000) : null;
+  }
+  if (typeof raw !== 'string') return null;
+
+  const s = raw.trim().toLowerCase();
+  if (!s) return null;
+  // Bare number means minutes, matching the numeric form above.
+  if (/^\d+(\.\d+)?$/.test(s)) {
+    const n = parseFloat(s);
+    return n > 0 ? clamp(n * 60_000) : null;
+  }
+
+  // Sum every <number><unit> pair, so "1h30m" works as well as "90m".
+  const re = /(\d+(?:\.\d+)?)\s*([a-z]+)/g;
+  let total = 0;
+  let match: RegExpExecArray | null;
+  let matched = false;
+  while ((match = re.exec(s)) !== null) {
+    const unit = WAKE_UNIT_MS[match[2]];
+    if (unit === undefined) return null; // unknown unit — don't silently mis-schedule
+    total += parseFloat(match[1]) * unit;
+    matched = true;
+  }
+  return matched && total > 0 ? clamp(total) : null;
+}
+
+/**
+ * Validate a `when_file` sentinel path. Must be absolute and made of ordinary
+ * path characters — it is interpolated into a remote `test -e`, and while
+ * shellEscape would contain it anyway, a path this constrained can't be
+ * mistaken for anything but a path.
+ */
+function parseWakeFile(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const p = raw.trim();
+  if (!p.startsWith('/') || p.length > 300) return null;
+  return /^[\w\-./ ]+$/.test(p) ? p : null;
+}
+
+/**
+ * Arm a wake-up from a `[WAKE]` block in the agent's own output. Later blocks
+ * in the same turn overwrite earlier ones — the last thing the agent said about
+ * when it wants to be woken is the thing it meant.
+ */
+function parseWakeRequestForTask(task: Task, text: string): void {
+  const regex = /\[WAKE\]\s*([\s\S]*?)\s*\[\/WAKE\]/g;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    try {
+      const data = JSON.parse(match[1]);
+      const ms = parseWakeDuration(data.after);
+      if (ms === null) {
+        console.log(`[wake] Task ${task.id}: unparseable "after" value — ignoring block`);
+        continue;
+      }
+      const file = parseWakeFile(data.when_file ?? data.whenFile);
+      const note = typeof data.note === 'string' && data.note.trim()
+        ? data.note.trim().slice(0, 2000)
+        : null;
+      const wakeAt = new Date(Date.now() + ms).toISOString();
+      setTaskWake(task.id, wakeAt, note, file);
+      console.log(`[wake] Task ${task.id} armed for ${wakeAt}${file ? ` (or when ${file} appears)` : ''}`);
+    } catch {
+      console.log(`[wake] Task ${task.id}: failed to parse wake request JSON`);
+    }
+  }
+}
+
+/**
+ * The prompt an automatic wake-up resumes the session with.
+ *
+ * Written to head off the two failure modes seen before this existed: the agent
+ * treating the wake as a user message and answering it conversationally, and
+ * the agent with nothing new to say re-sending its previous status update
+ * verbatim (which is what "Any news?" polling produced — the same 966-character
+ * update twice, ten minutes apart).
+ */
+function buildWakeNudge(task: Task, reason: string, remaining: number): string {
+  const parts: string[] = [];
+  parts.push(`[Automatic wake-up from CPM — the user did not send this. It fired because ${reason}.]`);
+  parts.push(
+    task.wake_note
+      ? `You scheduled this wake-up with a [WAKE] block. The note you left yourself was:\n\n${task.wake_note}`
+      : `You scheduled this wake-up with a [WAKE] block, without leaving yourself a note.`,
+  );
+  if (task.wake_file) {
+    parts.push(`The sentinel path you were waiting on was \`${task.wake_file}\`.`);
+  }
+  parts.push(
+    `Check whether the work you were waiting on has actually finished, then write the user a real answer — what you say now DOES reach them, and it is the report you promised.`,
+  );
+  parts.push(
+    remaining > 0
+      ? `If it still is not finished: reply with ONE short line (do not re-send a status update you have already sent) and emit a fresh [WAKE] block to check again. You have ${remaining} automatic wake-up${remaining === 1 ? '' : 's'} left before CPM stops resuming you on its own.`
+      : `This was your last automatic wake-up — CPM will not resume you again until the user replies. If the work is unfinished, tell them plainly where it stands, where the output will land, and what you need from them.`,
+  );
+  return parts.join('\n\n');
+}
+
+/**
+ * Fire any wake-ups that have come due. Tasks are triaged rather than filtered
+ * in SQL because a pending wake outlives the status it was armed in: the task
+ * may have been completed, cancelled or failed since, in which case the wake is
+ * simply dropped.
+ */
+export async function processPendingWakes(): Promise<void> {
+  for (const task of getTasksWithPendingWake()) {
+    try {
+      if (task.status === 'completed' || task.status === 'cancelled' || task.status === 'failed') {
+        clearTaskWake(task.id);
+        continue;
+      }
+      // queued/working: a turn is already starting, and launchTask clears the
+      // wake itself. Nothing to do but stay out of the way.
+      if (task.status !== 'awaiting_feedback') continue;
+
+      if (task.wake_count >= MAX_AUTO_WAKES) {
+        clearTaskWake(task.id);
+        addMessage(task.id, 'system',
+          `Automatic wake-ups paused after ${MAX_AUTO_WAKES} in a row without a reply. Send a message to let the agent keep checking.`);
+        console.log(`[wake] Task ${task.id} hit the auto-wake cap (${MAX_AUTO_WAKES})`);
+        continue;
+      }
+
+      const due = Date.parse(task.wake_at!) <= Date.now();
+      let fileReady = false;
+      if (task.wake_file && (wakeProbeBackoff.get(task.id) ?? 0) <= Date.now()) {
+        try {
+          const out = await sshExec(task.workspace_name,
+            `test -e ${shellEscape(task.wake_file)} && echo CPM_WAKE_READY || true`,
+            15000, task.user_id);
+          fileReady = out.includes('CPM_WAKE_READY');
+          wakeProbeBackoff.delete(task.id);
+        } catch (err) {
+          wakeProbeBackoff.set(task.id, Date.now() + WAKE_PROBE_BACKOFF_MS);
+          console.log(`[wake] Task ${task.id}: sentinel probe failed, backing off:`, (err as Error).message?.slice(0, 120));
+        }
+      }
+      if (!due && !fileReady) continue;
+      wakeProbeBackoff.delete(task.id);
+
+      // Workspace is at its concurrency limit. Leave the wake armed and retry
+      // next tick rather than routing through the queue: a queued task whose
+      // last message isn't a user message would be relaunched with its ORIGINAL
+      // prompt, replaying the whole task instead of resuming it.
+      if (getWorkingTaskCount(task.workspace_id) >= getMaxConcurrent(task.workspace_id)) {
+        console.log(`[wake] Task ${task.id} due but workspace busy — retrying next tick`);
+        continue;
+      }
+
+      // Consume the wake before resuming, not after. If the resume throws or
+      // races a status change we lose one wake-up; if we deferred this, a
+      // failing resume would retry every tick forever.
+      clearTaskWake(task.id);
+      incrementTaskWakeCount(task.id);
+      const count = task.wake_count + 1;
+      const remaining = Math.max(0, MAX_AUTO_WAKES - count);
+      const reason = fileReady && task.wake_file
+        ? `\`${task.wake_file}\` appeared`
+        : 'the timer you set elapsed';
+
+      addMessage(task.id, 'system',
+        `⏰ Automatic wake-up ${count}/${MAX_AUTO_WAKES} — ${fileReady && task.wake_file ? `${task.wake_file} appeared` : 'timer elapsed'}.` +
+        (task.wake_note ? ` ${task.wake_note}` : ''));
+
+      const fresh = getTask(task.id);
+      if (!fresh || fresh.status !== 'awaiting_feedback') continue;
+      console.log(`[wake] Resuming task ${task.id} (${count}/${MAX_AUTO_WAKES}) — ${reason}`);
+      await resumeTask(fresh, buildWakeNudge(task, reason, remaining));
+    } catch (err) {
+      console.error(`[wake] Error processing wake for task ${task.id}:`, (err as Error).message?.slice(0, 200));
+    }
+  }
+}
+
+/**
+ * Fire a pending wake-up immediately, on the user's say-so ("Wake now").
+ * Returns false when there was nothing armed or the task isn't resumable.
+ */
+export async function wakeTaskNow(taskId: string): Promise<boolean> {
+  const task = getTask(taskId);
+  if (!task || !task.wake_at || task.status !== 'awaiting_feedback') return false;
+  clearTaskWake(task.id);
+  incrementTaskWakeCount(task.id);
+  const remaining = Math.max(0, MAX_AUTO_WAKES - (task.wake_count + 1));
+  addMessage(task.id, 'system', `⏰ Wake-up triggered manually.${task.wake_note ? ` ${task.wake_note}` : ''}`);
+  const fresh = getTask(task.id);
+  if (!fresh || fresh.status !== 'awaiting_feedback') return false;
+  await resumeTask(fresh, buildWakeNudge(task, 'the user asked to check now', remaining));
+  return true;
+}
+
+let wakeTimer: NodeJS.Timeout | null = null;
+
+export function startWakePoller(): void {
+  if (wakeTimer) return;
+  wakeTimer = setInterval(() => {
+    processPendingWakes().catch(err => {
+      console.error('[wake] Poller error:', (err as Error).message?.slice(0, 200));
+    });
+  }, WAKE_POLL_INTERVAL_MS);
+  wakeTimer.unref?.();
+  console.log(`[wake] Wake-up poller started (every ${Math.round(WAKE_POLL_INTERVAL_MS / 1000)}s, cap ${MAX_AUTO_WAKES})`);
 }
 
 // ─── Agent-produced output files ────────────────────────────────────────

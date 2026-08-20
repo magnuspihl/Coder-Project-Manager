@@ -18,6 +18,8 @@ import {
   getModels,
   WORKSPACE_CLAUDE_ACCOUNT,
   interruptTask,
+  wakeTaskNow,
+  cancelTaskWake,
   cancelTask,
   deleteTask,
   addTaskParticipant,
@@ -110,6 +112,37 @@ function collapseOutputFileBlocks(content: string): string {
     }
     return `\n\n> 📎 **Generated file:** ${name}\n\n`;
   });
+}
+
+// Assistant messages keep the raw [WAKE] block the server parsed into the
+// task's scheduled wake-up (the banner above the composer). Collapse it to a
+// one-line note so the chat records that the agent armed one, without showing
+// the raw directive — and so it still reads sensibly after the wake has fired
+// and the banner is gone.
+function collapseWakeBlocks(content: string): string {
+  return content.replace(/\[WAKE\]\s*([\s\S]*?)\s*\[\/WAKE\]/g, (block, body) => {
+    try {
+      const data = JSON.parse(body);
+      const after = typeof data.after === 'string' ? data.after : typeof data.after === 'number' ? `${data.after}m` : '';
+      if (!after) return block;
+      const file = typeof data.when_file === 'string' ? data.when_file : '';
+      return `\n\n> ⏰ **Wake-up scheduled:** in ${after}${file ? `, or as soon as \`${file}\` appears` : ''}\n\n`;
+    } catch {
+      return block;
+    }
+  });
+}
+
+/** "in 12m" / "in 2h 5m" / "any moment now" for a future ISO timestamp. */
+function timeUntil(iso: string): string {
+  const seconds = Math.round((new Date(iso).getTime() - Date.now()) / 1000);
+  if (seconds <= 5) return 'any moment now';
+  if (seconds < 60) return `in ${seconds}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `in ${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const rem = minutes % 60;
+  return `in ${hours}h${rem ? ` ${rem}m` : ''}`;
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -221,6 +254,11 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [switchingAutoReview, setSwitchingAutoReview] = useState(false);
   const [completing, setCompleting] = useState(false);
   const [reviewing, setReviewing] = useState(false);
+  const [wakeBusy, setWakeBusy] = useState(false);
+  // Ticks only while a wake-up is armed, so the "waking in 12m" countdown keeps
+  // moving. The task row itself doesn't change while sleeping, so the normal
+  // poll — which only re-renders on a changed row — would leave it frozen.
+  const [, setWakeClockTick] = useState(0);
   const [resetSessionOpen, setResetSessionOpen] = useState(false);
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
   const [resetSessionPrompt, setResetSessionPrompt] = useState('');
@@ -445,6 +483,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     tick(); // Initial load + start chain
     return () => { cancelled = true; clearTimeout(timer); };
   }, [taskId]);
+
+  // Keep the wake-up countdown honest while nothing else is changing.
+  useEffect(() => {
+    if (!task?.wake_at || task.status !== 'awaiting_feedback') return;
+    const id = setInterval(() => setWakeClockTick(t => t + 1), 15000);
+    return () => clearInterval(id);
+  }, [task?.wake_at, task?.status]);
 
   // CPM-held Claude subscriptions, so the header can offer a switch. Fetched once
   // per open — the list changes only when the user edits it in settings.
@@ -1153,6 +1198,28 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     await interruptTask(taskId);
     if (onTaskChanged) onTaskChanged();
     await loadData();
+  };
+
+  const handleWakeNow = async () => {
+    setWakeBusy(true);
+    try {
+      await wakeTaskNow(taskId);
+      if (onTaskChanged) onTaskChanged();
+      await loadData();
+    } finally {
+      setWakeBusy(false);
+    }
+  };
+
+  const handleCancelWake = async () => {
+    setWakeBusy(true);
+    try {
+      await cancelTaskWake(taskId);
+      if (onTaskChanged) onTaskChanged();
+      await loadData();
+    } finally {
+      setWakeBusy(false);
+    }
   };
 
   const handleCancel = async () => {
@@ -2298,7 +2365,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         )}
                       </div>
                     </div>
-                    <Markdown content={msg.role === 'assistant' ? collapseOutputFileBlocks(collapseTaskRequestBlocks(msg.content)) : msg.content} breaks={msg.role === 'user'} />
+                    <Markdown content={msg.role === 'assistant' ? collapseWakeBlocks(collapseOutputFileBlocks(collapseTaskRequestBlocks(msg.content))) : msg.content} breaks={msg.role === 'user'} />
                     {(() => {
                       const msgAttachments = attachments.filter(att => att.message_id === msg.id);
                       if (msgAttachments.length === 0) return null;
@@ -2595,6 +2662,36 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
               {task.status === 'awaiting_feedback' && (
                 <div className="space-y-3">
                   {renderUnresolvedFindingsPanel()}
+                  {task.wake_at && (
+                    <div className="text-xs px-3 py-2 rounded-md bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800 text-indigo-700 dark:text-indigo-300">
+                      <div className="flex items-start gap-2">
+                        <span className="shrink-0">⏰</span>
+                        <div className="flex-1 min-w-0">
+                          <div>
+                            <span className="font-medium">The agent will pick this up again on its own {timeUntil(task.wake_at)}</span>
+                            {task.wake_file && <> — or sooner, as soon as <code className="text-[11px]">{task.wake_file}</code> appears.</>}
+                          </div>
+                          {task.wake_note && <div className="mt-0.5 opacity-80">{task.wake_note}</div>}
+                          <div className="mt-1.5 flex gap-3">
+                            <button
+                              onClick={handleWakeNow}
+                              disabled={wakeBusy}
+                              className="underline hover:no-underline disabled:opacity-50"
+                            >
+                              Check now
+                            </button>
+                            <button
+                              onClick={handleCancelWake}
+                              disabled={wakeBusy}
+                              className="underline hover:no-underline disabled:opacity-50"
+                            >
+                              Cancel wake-up
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                   {!!task.pending_complete && (
                     <div className="text-xs px-3 py-2 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-300">
                       Completion is queued — will finalize once the working task on this workspace finishes. Replying below will cancel the pending completion.

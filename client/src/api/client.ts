@@ -136,6 +136,14 @@ export interface Task {
   /** Per-task auto-reviewer model; null inherits the deployment default, then the task's model. */
   reviewer_model?: string | null;
   total_cost_usd?: number;
+  /**
+   * Agent-scheduled self-resume. When set, the agent asked CPM to wake it — at
+   * `wake_at` at the latest, or as soon as `wake_file` appears on the workspace.
+   */
+  wake_at?: string | null;
+  wake_note?: string | null;
+  wake_file?: string | null;
+  wake_count?: number;
   source?: string | null;
   client_label?: string | null;
   created_at: string;
@@ -504,6 +512,14 @@ export const interruptTask = (taskId: string) =>
 
 export const cancelTask = (taskId: string) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/cancel`, { method: 'POST' });
+
+/** Fire a scheduled wake-up now instead of waiting for its timer/sentinel file. */
+export const wakeTaskNow = (taskId: string) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}/wake`, { method: 'POST' });
+
+/** Disarm a scheduled wake-up without replying to the task. */
+export const cancelTaskWake = (taskId: string) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}/wake`, { method: 'DELETE' });
 
 export const deleteTask = (taskId: string) =>
   request<{ ok: boolean; taskId: string }>(`/api/tasks/${taskId}`, { method: 'DELETE' });
