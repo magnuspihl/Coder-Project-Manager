@@ -221,6 +221,12 @@ export function hasAgentOutputAttachment(taskId: string, originalName: string, c
   return true;
 }
 
+/**
+ * Link freshly uploaded attachments to the task AND the specific message that
+ * sent them, so a later turn can tell "sent just now" apart from "sent in an
+ * earlier turn" instead of treating every attachment the task ever received
+ * as part of the current prompt.
+ */
 export function linkAttachmentsToTask(attachmentIds: string[], taskId: string, messageId?: string | null) {
   const db = getDb();
   const stmt = db.prepare('UPDATE attachments SET task_id = ?, message_id = ? WHERE id = ? AND task_id IS NULL');
@@ -232,6 +238,10 @@ export function linkAttachmentsToTask(attachmentIds: string[], taskId: string, m
 
 export function getAttachmentsByTask(taskId: string): any[] {
   return getDb().prepare('SELECT * FROM attachments WHERE task_id = ? ORDER BY created_at ASC').all(taskId);
+}
+
+export function getAttachmentsByMessage(messageId: string): any[] {
+  return getDb().prepare('SELECT * FROM attachments WHERE message_id = ? ORDER BY created_at ASC').all(messageId);
 }
 
 export function getAttachment(id: string): any {

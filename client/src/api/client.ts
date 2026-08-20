@@ -131,7 +131,19 @@ export interface Task {
   session_initialized?: number;
   total_input_tokens: number;
   total_output_tokens: number;
+  /** Live context size in tokens — what the last request actually sent, not a running total. */
+  context_tokens?: number;
+  /** Per-task auto-reviewer model; null inherits the deployment default, then the task's model. */
+  reviewer_model?: string | null;
   total_cost_usd?: number;
+  /**
+   * Agent-scheduled self-resume. When set, the agent asked CPM to wake it — at
+   * `wake_at` at the latest, or as soon as `wake_file` appears on the workspace.
+   */
+  wake_at?: string | null;
+  wake_note?: string | null;
+  wake_file?: string | null;
+  wake_count?: number;
   source?: string | null;
   client_label?: string | null;
   created_at: string;
@@ -305,6 +317,17 @@ export const setTaskModel = (taskId: string, model: string | null) =>
   });
 
 /**
+ * Pin the auto-reviewer to its own model. Applies from the next review pass;
+ * null clears the override, falling back to the deployment default and then to
+ * the task's own model.
+ */
+export const setTaskReviewerModel = (taskId: string, reviewerModel: string | null) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}`, {
+    method: 'PUT',
+    body: JSON.stringify({ reviewerModel }),
+  });
+
+/**
  * Turn the auto-review pass on or off for an existing task. Applies from the
  * next decision point — a reviewer already running finishes, but its verdict
  * won't be sent back to the implementer, unless that reviewer was started with
@@ -356,7 +379,7 @@ export const createTask = (workspaceId: string, prompt: string, opts: CreateTask
       ...(opts.model ? { model: opts.model } : {}),
       ...(opts.caveman ? { caveman: opts.caveman } : {}),
       ...(opts.attachmentIds?.length ? { attachmentIds: opts.attachmentIds } : {}),
-      ...(opts.autoReview === false ? { autoReview: false } : {}),
+      ...(opts.autoReview === true ? { autoReview: true } : {}),
       // Only sent when the caller actually knows the user's choice. Omitting the
       // key makes the server apply the user's default account; sending
       // WORKSPACE_CLAUDE_ACCOUNT is an explicit "use the workspace's own login".
@@ -489,6 +512,14 @@ export const interruptTask = (taskId: string) =>
 
 export const cancelTask = (taskId: string) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/cancel`, { method: 'POST' });
+
+/** Fire a scheduled wake-up now instead of waiting for its timer/sentinel file. */
+export const wakeTaskNow = (taskId: string) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}/wake`, { method: 'POST' });
+
+/** Disarm a scheduled wake-up without replying to the task. */
+export const cancelTaskWake = (taskId: string) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}/wake`, { method: 'DELETE' });
 
 export const deleteTask = (taskId: string) =>
   request<{ ok: boolean; taskId: string }>(`/api/tasks/${taskId}`, { method: 'DELETE' });

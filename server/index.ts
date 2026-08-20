@@ -16,7 +16,7 @@ import { handleMcpRequest, handleMcpMethodNotAllowed } from './mcp/index.js';
 
 // Initialize database on import
 import './db/index.js';
-import { reconnectWorkingTasks, startRateLimitRetryPoller } from './services/claude.js';
+import { reconnectWorkingTasks, startRateLimitRetryPoller, startWakePoller } from './services/claude.js';
 import { startWorktreeReconciler } from './services/git.js';
 import { startPortJanitor } from './services/port-janitor.js';
 
@@ -60,6 +60,10 @@ app.listen(PORT, '0.0.0.0', () => {
   // Periodically re-queue tasks that failed on a usage/token limit once their
   // reset window has passed, so the user doesn't have to retry them by hand.
   startRateLimitRetryPoller();
+  // Resume tasks whose agent scheduled its own wake-up ([WAKE]) — either when
+  // the sentinel file it was waiting on appears, or when its timer elapses.
+  // Survives restarts: the schedule lives in the tasks table, not in a timer.
+  startWakePoller();
   // Periodically reap orphaned dev servers and attribute drifted ports to their
   // owning task (see services/port-janitor.ts).
   startPortJanitor();

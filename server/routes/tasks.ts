@@ -25,6 +25,7 @@ import {
   setTaskAutoReview,
   setTaskClaudeAccount,
   setTaskModel,
+  setTaskReviewerModel,
   resetTaskSession,
   addTaskParticipant,
   removeTaskParticipant,
@@ -42,10 +43,12 @@ import {
   setReviewFindingState,
   getDismissedFindings,
   findingRef,
+  clearTaskWake,
+  resetTaskWakeCount,
   REVIEW_FIX_REPLY_PREFIX,
 } from '../services/tasks.js';
 import { findUserWorkspaceById } from '../services/workspace-cache.js';
-import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview, FINDING_REPORT_FORMAT } from '../services/claude.js';
+import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview, wakeTaskNow, FINDING_REPORT_FORMAT } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, removeTaskWorktree } from '../services/git.js';
@@ -152,16 +155,11 @@ router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, 
       caveman: typeof caveman === 'string' && ['lite', 'full', 'ultra'].includes(caveman) ? caveman : undefined,
       source: req.authSource,
       clientLabel: req.clientLabel,
-      autoReview: autoReview === false ? false : true,
+      autoReview: autoReview === true,
+      attachmentIds: Array.isArray(attachmentIds)
+        ? attachmentIds.filter((id: unknown) => typeof id === 'string')
+        : undefined,
     });
-
-    if (Array.isArray(attachmentIds) && attachmentIds.length > 0) {
-      // createTask() already saved `prompt` as the task's first (only, at this
-      // point) message — attribute the upload to it so the UI can render the
-      // download inline with that message instead of in a separate list.
-      const initialMessageId = getMessages(task.id)[0]?.id ?? null;
-      linkAttachmentsToTask(attachmentIds.filter((id: unknown) => typeof id === 'string'), task.id, initialMessageId);
-    }
 
     // Respond as soon as the task row exists — launching it involves SSH
     // round-trips (worktree creation, spawning Claude) that the client observes
@@ -266,6 +264,25 @@ router.put('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
     }
   }
 
+  // Per-task reviewer model. Same shape and limits as `model` above; null/''
+  // clears the override so the task falls back to CLAUDE_REVIEWER_MODEL and
+  // then to its own model. Not validated against the workspace's model list for
+  // the same reason `model` isn't — the list is advisory and the CLI is the
+  // authority on what it accepts.
+  let newReviewerModel: string | null | undefined;
+  if (req.body.reviewerModel !== undefined) {
+    const value = req.body.reviewerModel;
+    const trimmed = typeof value === 'string' ? value.trim() : value;
+    if (trimmed === null || trimmed === '') {
+      newReviewerModel = null;
+    } else if (typeof trimmed !== 'string' || trimmed.length > 120) {
+      res.status(400).json({ error: 'reviewerModel must be a string of 120 characters or fewer' });
+      return;
+    } else {
+      newReviewerModel = trimmed;
+    }
+  }
+
   // Re-point the task at a different Claude subscription. Takes effect on the
   // next turn (resume, reviewer, or advisor) — the currently running process
   // keeps the token it launched with. This is the escape hatch for "this
@@ -304,6 +321,7 @@ router.put('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
   }
   if (newTitle !== undefined) updateTaskTitle(task.id, newTitle);
   if (newModel !== undefined) setTaskModel(task.id, newModel);
+  if (newReviewerModel !== undefined) setTaskReviewerModel(task.id, newReviewerModel);
   if (newAccountId !== undefined) setTaskClaudeAccount(task.id, newAccountId);
   if (newAutoReview !== undefined && newAutoReview !== !!task.auto_review) {
     setTaskAutoReview(task.id, newAutoReview);
@@ -347,8 +365,15 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
 
   const userMessage = addMessage(task.id, 'user', message, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
 
-  // User reply resets the review loop so the next implementer turn gets a fresh review
-  resetReviewLoopCount(task.id);
+  // The auto-wake budget bounds wake-ups taken *without* user input, so a reply
+  // refills it. The armed wake itself is cleared by launchTask when this turn
+  // starts, which is what makes replying implicitly cancel a pending wake-up.
+  resetTaskWakeCount(task.id);
+
+  // Deliberately does NOT reset review_loop_count. The budget is cumulative per
+  // task (see MAX_REVIEW_LOOPS): refilling it on every reply is what let a
+  // conversational task rack up unbounded automated review rounds. Explicit
+  // "review again" / "fix these" actions still refill it.
 
   // `completeAfter` (used by "resolve git issues & complete"): finalize the task
   // automatically once this turn lands in awaiting_feedback. The pending_complete
@@ -795,6 +820,42 @@ router.post('/tasks/:taskId/interrupt', requireAuth, (req: Request, res: Respons
 
   interruptTask(task.id);
 
+  res.json({ task: getTask(task.id) });
+});
+
+// Fire an agent-scheduled wake-up now instead of waiting for its timer/sentinel.
+router.post('/tasks/:taskId/wake', requireAuth, async (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  if (!task.wake_at) {
+    res.status(400).json({ error: 'No wake-up is scheduled for this task' });
+    return;
+  }
+  if (task.status !== 'awaiting_feedback') {
+    res.status(400).json({ error: 'Task is not awaiting feedback' });
+    return;
+  }
+
+  // Respond before the resume: launching goes through SSH and the client polls
+  // the awaiting_feedback→working transition anyway.
+  res.json({ task: { ...getTask(task.id)!, wake_at: null } });
+  runInBackground(`wake-now ${task.id}`, async () => { await wakeTaskNow(task.id); });
+});
+
+// Cancel an agent-scheduled wake-up without replying.
+router.delete('/tasks/:taskId/wake', requireAuth, (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  if (task.wake_at) {
+    clearTaskWake(task.id);
+    addMessage(task.id, 'system', 'Scheduled wake-up cancelled.', undefined, undefined, undefined, req.authSource, req.clientLabel);
+  }
   res.json({ task: getTask(task.id) });
 });
 

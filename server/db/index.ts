@@ -57,6 +57,33 @@ export function getDb(): Database.Database {
     if (!cols.some(c => c.name === 'total_cache_creation_tokens')) {
       db.exec("ALTER TABLE tasks ADD COLUMN total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0");
     }
+    // Live context size (see recordContextTokens). Distinct from the cumulative
+    // total_* columns above: those only grow, this one tracks what is actually
+    // being sent right now and drops back after a compaction.
+    if (!cols.some(c => c.name === 'context_tokens')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0");
+    }
+    // Per-task override for the auto-reviewer's model. NULL = fall back to the
+    // CLAUDE_REVIEWER_MODEL env default, then to the task's own model.
+    if (!cols.some(c => c.name === 'reviewer_model')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN reviewer_model TEXT");
+    }
+    // Agent-scheduled self-resume. wake_at is the earliest UTC instant the wake
+    // poller may resume the task; wake_file, when set, lets it fire earlier as
+    // soon as that path exists on the workspace. wake_count bounds how many
+    // consecutive wake-ups can happen without the user saying anything.
+    if (!cols.some(c => c.name === 'wake_at')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN wake_at TEXT");
+    }
+    if (!cols.some(c => c.name === 'wake_note')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN wake_note TEXT");
+    }
+    if (!cols.some(c => c.name === 'wake_file')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN wake_file TEXT");
+    }
+    if (!cols.some(c => c.name === 'wake_count')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN wake_count INTEGER NOT NULL DEFAULT 0");
+    }
 
     // Migrate tasks CHECK constraint to include 'cancelled' status
     const tableInfo = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'").get() as { sql: string } | undefined;
@@ -364,7 +391,7 @@ export function getDb(): Database.Database {
   // Auto-review migrations
   const tasksCols5 = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
   if (!tasksCols5.some(c => c.name === 'auto_review')) {
-    db.exec("ALTER TABLE tasks ADD COLUMN auto_review INTEGER NOT NULL DEFAULT 1");
+    db.exec("ALTER TABLE tasks ADD COLUMN auto_review INTEGER NOT NULL DEFAULT 0");
   }
   if (!tasksCols5.some(c => c.name === 'review_loop_count')) {
     db.exec("ALTER TABLE tasks ADD COLUMN review_loop_count INTEGER NOT NULL DEFAULT 0");
@@ -484,6 +511,25 @@ export function getDb(): Database.Database {
     WHERE verification_url IS NOT NULL
       AND verification_url != rtrim(verification_url, '*\`.,!?')
   `);
+
+  // Scope attachments to the message that sent them, not just the task, so a
+  // turn only re-delivers/announces files sent THIS turn instead of every
+  // attachment the task has ever received. Existing rows get message_id = NULL
+  // (rendered/handled as task-level, same as before this migration).
+  //
+  // ON DELETE SET NULL, not the FK's implicit NO ACTION: a reconnect-after-
+  // restart replay deletes and recreates the current turn's assistant
+  // messages (deleteCurrentSessionAssistantMessages) — verified empirically
+  // that without an explicit delete action, that DELETE throws "FOREIGN KEY
+  // constraint failed" the moment the message has a linked attachment,
+  // breaking reconnect for every task that ever received one. SET NULL lets
+  // the delete succeed; hasAgentOutputAttachment then re-points a recaptured
+  // attachment at the replayed message's new id.
+  const attachmentCols = db.prepare("PRAGMA table_info(attachments)").all() as Array<{ name: string }>;
+  if (!attachmentCols.some(c => c.name === 'message_id')) {
+    db.exec("ALTER TABLE attachments ADD COLUMN message_id TEXT REFERENCES messages(id) ON DELETE SET NULL");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id)");
+  }
 
   migrateDiscussionsToTasks(db);
 

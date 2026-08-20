@@ -29,6 +29,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   pending_complete INTEGER NOT NULL DEFAULT 0,
   source TEXT,
   client_label TEXT,
+  -- Agent-scheduled self-resume ("wake-up"). See parseWakeRequestForTask.
+  wake_at TEXT,
+  wake_note TEXT,
+  wake_file TEXT,
+  wake_count INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT,
@@ -264,21 +269,25 @@ CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
 -- Attachments: files uploaded with task prompts/replies ('user'), or produced
 -- by an agent via an [OUTPUT_FILE] block for the user to download ('agent').
+-- message_id scopes an attachment (either source) to the specific message
+-- that sent or produced it — without it, every turn re-announced every
+-- attachment the task had ever received/generated as if it had just arrived,
+-- and the UI piled every download into one growing list instead of showing it
+-- next to the message it belongs to. NULL for attachments uploaded before
+-- that linkage existed. ON DELETE SET NULL rather than CASCADE: a
+-- reconnect-after-restart replay deletes and recreates the current turn's
+-- assistant messages (see deleteCurrentSessionAssistantMessages), and an
+-- attachment must survive that — hasAgentOutputAttachment re-points a
+-- recaptured file at the replayed message's new id rather than losing the
+-- link (or, worse, being cascade-deleted along with the old message row).
 -- user_id is set at creation time (the uploader, or the task owner for an
 -- agent-produced file) so /api/uploads/:id can enforce ownership even during
 -- the brief window before task_id is linked — see the download route.
 CREATE TABLE IF NOT EXISTS attachments (
   id TEXT PRIMARY KEY,
   task_id TEXT,
-  user_id TEXT,
-  -- The message this file was attached to (a user upload) or produced by (an
-  -- agent's [OUTPUT_FILE] block). Deliberately NOT a foreign key: a
-  -- reconnect-after-restart replay deletes and recreates the current turn's
-  -- assistant messages (see deleteCurrentSessionAssistantMessages), and an
-  -- attachment must survive that — hasAgentOutputAttachment re-points it at
-  -- the replayed message's new id rather than losing the link. NULL for
-  -- attachments predating this column, or if somehow never associated.
   message_id TEXT,
+  user_id TEXT,
   filename TEXT NOT NULL,
   original_name TEXT NOT NULL,
   mime_type TEXT NOT NULL,
@@ -290,10 +299,12 @@ CREATE TABLE IF NOT EXISTS attachments (
   -- hasAgentOutputAttachment in uploads.ts.
   content_hash TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+  FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+  FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_attachments_task ON attachments(task_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 
 -- Rate limit tracking, keyed by the SUBSCRIPTION the usage was billed to
 -- (persists across server restarts). Session (five_hour) and weekly (seven_day)

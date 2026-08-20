@@ -2,6 +2,7 @@ import { getDb } from '../db/index.js';
 import { v4 as uuid } from 'uuid';
 import { execFile } from 'child_process';
 import { getDefaultAccountId } from './claude-accounts.js';
+import { linkAttachmentsToTask } from '../routes/uploads.js';
 
 export interface Task {
   id: string;
@@ -31,11 +32,25 @@ export interface Task {
   total_output_tokens: number;
   total_cache_read_tokens: number;
   total_cache_creation_tokens: number;
+  /** Live context size in tokens — see recordContextTokens. */
+  context_tokens: number;
+  /** Per-task auto-reviewer model; null inherits (env default, then the task's model). */
+  reviewer_model: string | null;
   source: string | null;
   client_label: string | null;
   auto_review: number;
   review_loop_count: number;
   active_turn_role: string | null;
+  /**
+   * Agent-scheduled self-resume. `wake_at` is the earliest UTC instant the wake
+   * poller may resume this task; `wake_file`, when set, lets it fire earlier as
+   * soon as that path exists on the workspace. `wake_count` counts consecutive
+   * automatic wake-ups since the user last said anything, and bounds them.
+   */
+  wake_at: string | null;
+  wake_note: string | null;
+  wake_file: string | null;
+  wake_count: number;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
@@ -391,6 +406,7 @@ export function createTask(params: {
   source?: string | null;
   clientLabel?: string | null;
   autoReview?: boolean;
+  attachmentIds?: string[];
 }): Task {
   const db = getDb();
   const id = uuid();
@@ -409,7 +425,9 @@ export function createTask(params: {
   // Immediate heuristic title; LLM will refine it async
   const title = generateTitleFallback(params.prompt);
 
-  const autoReview = params.autoReview === false ? 0 : 1;
+  // Off unless the caller explicitly asks for it — a red-team pass costs an extra
+  // agent round-trip per turn, so callers that say nothing get the cheap path.
+  const autoReview = params.autoReview === true ? 1 : 0;
 
   db.prepare(
     `INSERT INTO tasks (id, workspace_id, workspace_name, user_id, title, prompt, status, position, project_dir, claude_session_id, model, claude_account_id, caveman, source, client_label, auto_review)
@@ -417,7 +435,13 @@ export function createTask(params: {
   ).run(id, params.workspaceId, params.workspaceName, params.userId, title, params.prompt, position, params.projectDir || null, claudeSessionId, params.model || null, claudeAccountId, params.caveman || null, params.source || null, params.clientLabel || null, autoReview);
 
   // Store the initial prompt as a user message (inherits provenance from the task creation call)
-  addMessage(id, 'user', params.prompt, undefined, params.username, undefined, params.source || null, params.clientLabel || null);
+  const initialMessage = addMessage(id, 'user', params.prompt, undefined, params.username, undefined, params.source || null, params.clientLabel || null);
+
+  // Tie any attachments uploaded alongside this prompt to that first message, so
+  // later turns can tell they were sent now rather than re-announcing them forever.
+  if (params.attachmentIds && params.attachmentIds.length > 0) {
+    linkAttachmentsToTask(params.attachmentIds, id, initialMessage.id);
+  }
 
   // Fire off async LLM title generation (updates DB when ready)
   generateTitleAsync(id, params.prompt);
@@ -469,6 +493,21 @@ export function updateTaskTitle(taskId: string, newTitle: string): void {
 export function setTaskModel(taskId: string, model: string | null): void {
   const db = getDb();
   db.prepare('UPDATE tasks SET model = ?, updated_at = ? WHERE id = ?').run(
+    model, new Date().toISOString(), taskId
+  );
+}
+
+/**
+ * Pin the auto-reviewer to its own model, or NULL to inherit.
+ *
+ * Separate from setTaskModel because the reviewer is a different job from the
+ * implementer: it reads a capped diff and emits a fixed verdict format, and a
+ * stronger model there is not straightforwardly better — it surfaces more
+ * true-but-pedantic findings, and each one costs a fix round.
+ */
+export function setTaskReviewerModel(taskId: string, model: string | null): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET reviewer_model = ?, updated_at = ? WHERE id = ?').run(
     model, new Date().toISOString(), taskId
   );
 }
@@ -728,6 +767,45 @@ export function resetReviewLoopCount(taskId: string): void {
   db.prepare('UPDATE tasks SET review_loop_count = 0, updated_at = ? WHERE id = ?').run(new Date().toISOString(), taskId);
 }
 
+/**
+ * Arm (or re-arm) an agent-scheduled wake-up. Deliberately does NOT touch
+ * `wake_count`: the cap it enforces is on consecutive wake-ups without user
+ * input, so re-arming inside an already-woken turn must not refill the budget.
+ */
+export function setTaskWake(taskId: string, wakeAt: string, note: string | null, file: string | null): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET wake_at = ?, wake_note = ?, wake_file = ?, updated_at = ? WHERE id = ?').run(
+    wakeAt, note, file, new Date().toISOString(), taskId
+  );
+}
+
+/** Disarm a pending wake-up. Leaves `wake_count` alone — see resetTaskWakeCount. */
+export function clearTaskWake(taskId: string): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET wake_at = NULL, wake_note = NULL, wake_file = NULL, updated_at = ? WHERE id = ?').run(
+    new Date().toISOString(), taskId
+  );
+}
+
+/** Refill the auto-wake budget. Called when the user actually says something. */
+export function resetTaskWakeCount(taskId: string): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET wake_count = 0, updated_at = ? WHERE id = ?').run(new Date().toISOString(), taskId);
+}
+
+export function incrementTaskWakeCount(taskId: string): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET wake_count = wake_count + 1, updated_at = ? WHERE id = ?').run(new Date().toISOString(), taskId);
+}
+
+/** Every task with a pending wake-up, regardless of status (the poller triages). */
+export function getTasksWithPendingWake(): Task[] {
+  const db = getDb();
+  return db
+    .prepare('SELECT * FROM tasks WHERE wake_at IS NOT NULL AND deleted_at IS NULL')
+    .all() as Task[];
+}
+
 export function getNextQueuedTask(workspaceId: string): Task | undefined {
   const db = getDb();
   return db
@@ -889,6 +967,19 @@ export function addTokenUsage(taskId: string, inputTokens: number, outputTokens:
      SELECT ?, id, workspace_id, ?, ?, ?, ? FROM tasks WHERE id = ?`
   ).run(uuid(), inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, taskId);
   invalidateTokenTotalsCache();
+}
+
+/**
+ * Record the live context size for a task — the tokens actually sent on the
+ * most recent request, not a running total.
+ *
+ * Deliberately "latest observed" rather than a high-water mark: compaction
+ * genuinely shrinks the context, and a max would keep displaying the
+ * pre-compaction figure, telling the user their compaction achieved nothing.
+ */
+export function recordContextTokens(taskId: string, tokens: number): void {
+  if (tokens <= 0) return;
+  getDb().prepare('UPDATE tasks SET context_tokens = ? WHERE id = ?').run(tokens, taskId);
 }
 
 export function getMessages(taskId: string, limit?: number, offset?: number): Message[] {

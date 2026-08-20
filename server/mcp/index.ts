@@ -14,6 +14,7 @@ import {
   updateTaskTitle,
   deleteTask,
   setPendingComplete,
+  resetTaskWakeCount,
   getWorkingTask,
   getWorkingTaskCount,
   getMaxConcurrent,
@@ -312,6 +313,9 @@ function buildServer(ctx: AuthCtx): McpServer {
         return errorResult(`Task is not awaiting feedback (current status: ${task.status})`);
       }
       addMessage(task.id, 'user', message, undefined, ctx.username, undefined, ctx.authSource, ctx.clientLabel);
+      // Mirrors the REST reply route: a reply refills the auto-wake budget, and
+      // the armed wake itself is cleared when launchTask starts the turn.
+      resetTaskWakeCount(task.id);
       if (task.pending_complete) {
         setPendingComplete(task.id, false);
         addMessage(task.id, 'system', 'Pending completion cancelled — reply received.', undefined, undefined, undefined, ctx.authSource, ctx.clientLabel);
