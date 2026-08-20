@@ -507,6 +507,14 @@ export function getDb(): Database.Database {
     // is never mistaken for the same content and silently dropped.
     db.exec("ALTER TABLE attachments ADD COLUMN content_hash TEXT");
   }
+  if (attCols.length > 0 && !attCols.some(c => c.name === 'message_id')) {
+    // Ties an attachment to the specific message it was uploaded with or
+    // produced by, so the UI can render it inline with that message instead
+    // of in one growing pile at the bottom of the chat. Never backfilled for
+    // pre-existing rows — there's no reliable way to attribute an old
+    // attachment to a specific historical message.
+    db.exec("ALTER TABLE attachments ADD COLUMN message_id TEXT");
+  }
 
   return db;
 }

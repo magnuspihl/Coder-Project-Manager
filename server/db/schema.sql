@@ -271,6 +271,14 @@ CREATE TABLE IF NOT EXISTS attachments (
   id TEXT PRIMARY KEY,
   task_id TEXT,
   user_id TEXT,
+  -- The message this file was attached to (a user upload) or produced by (an
+  -- agent's [OUTPUT_FILE] block). Deliberately NOT a foreign key: a
+  -- reconnect-after-restart replay deletes and recreates the current turn's
+  -- assistant messages (see deleteCurrentSessionAssistantMessages), and an
+  -- attachment must survive that — hasAgentOutputAttachment re-points it at
+  -- the replayed message's new id rather than losing the link. NULL for
+  -- attachments predating this column, or if somehow never associated.
+  message_id TEXT,
   filename TEXT NOT NULL,
   original_name TEXT NOT NULL,
   mime_type TEXT NOT NULL,
