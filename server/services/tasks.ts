@@ -41,6 +41,16 @@ export interface Task {
   auto_review: number;
   review_loop_count: number;
   active_turn_role: string | null;
+  /**
+   * Agent-scheduled self-resume. `wake_at` is the earliest UTC instant the wake
+   * poller may resume this task; `wake_file`, when set, lets it fire earlier as
+   * soon as that path exists on the workspace. `wake_count` counts consecutive
+   * automatic wake-ups since the user last said anything, and bounds them.
+   */
+  wake_at: string | null;
+  wake_note: string | null;
+  wake_file: string | null;
+  wake_count: number;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
@@ -755,6 +765,45 @@ export function incrementReviewLoopCount(taskId: string): void {
 export function resetReviewLoopCount(taskId: string): void {
   const db = getDb();
   db.prepare('UPDATE tasks SET review_loop_count = 0, updated_at = ? WHERE id = ?').run(new Date().toISOString(), taskId);
+}
+
+/**
+ * Arm (or re-arm) an agent-scheduled wake-up. Deliberately does NOT touch
+ * `wake_count`: the cap it enforces is on consecutive wake-ups without user
+ * input, so re-arming inside an already-woken turn must not refill the budget.
+ */
+export function setTaskWake(taskId: string, wakeAt: string, note: string | null, file: string | null): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET wake_at = ?, wake_note = ?, wake_file = ?, updated_at = ? WHERE id = ?').run(
+    wakeAt, note, file, new Date().toISOString(), taskId
+  );
+}
+
+/** Disarm a pending wake-up. Leaves `wake_count` alone — see resetTaskWakeCount. */
+export function clearTaskWake(taskId: string): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET wake_at = NULL, wake_note = NULL, wake_file = NULL, updated_at = ? WHERE id = ?').run(
+    new Date().toISOString(), taskId
+  );
+}
+
+/** Refill the auto-wake budget. Called when the user actually says something. */
+export function resetTaskWakeCount(taskId: string): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET wake_count = 0, updated_at = ? WHERE id = ?').run(new Date().toISOString(), taskId);
+}
+
+export function incrementTaskWakeCount(taskId: string): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET wake_count = wake_count + 1, updated_at = ? WHERE id = ?').run(new Date().toISOString(), taskId);
+}
+
+/** Every task with a pending wake-up, regardless of status (the poller triages). */
+export function getTasksWithPendingWake(): Task[] {
+  const db = getDb();
+  return db
+    .prepare('SELECT * FROM tasks WHERE wake_at IS NOT NULL AND deleted_at IS NULL')
+    .all() as Task[];
 }
 
 export function getNextQueuedTask(workspaceId: string): Task | undefined {

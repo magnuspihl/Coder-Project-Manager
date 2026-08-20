@@ -125,6 +125,33 @@ Coder Project Manager is a web application that provides a task queue and conver
 - Users can reorder `queued` tasks.
 - Users can cancel a `queued` task (deletes it) or cancel a `working` task (kills the process, sets to `failed`).
 
+### Scheduled wake-ups (long-running work)
+
+A turn *is* the process: `claude -p` exits when the agent stops writing, so anything still attached to that
+session (background shells, subagents) dies with it, and a finished turn is the agent's last word until
+someone speaks to it. That made "I'll report back when the build finishes" impossible to honour — the user
+had to poll, and every poll cost a full resume turn.
+
+An agent can therefore schedule its own resume by emitting a `[WAKE]` block (see `BACKGROUND_WORK_PROMPT`):
+
+```
+[WAKE]
+{"after": "15m", "when_file": "/tmp/job.done", "note": "read /tmp/job.log and report to the user"}
+[/WAKE]
+```
+
+- Parsed out of the agent's own output into `tasks.wake_at` / `wake_note` / `wake_file`.
+- `processPendingWakes` (every `CPM_WAKE_POLL_INTERVAL_MS`, default 30s) resumes the task from
+  `awaiting_feedback` once `wake_file` exists on the workspace, or `wake_at` passes — whichever is first.
+  A failed sentinel probe (workspace stopped) backs off for 5 minutes; the `after` deadline still applies.
+- The wake is **not sticky**: it is cleared when the turn starts, so the agent must re-emit it each turn it
+  wants another. `wake_count` additionally caps consecutive wake-ups taken without user input
+  (`CPM_MAX_AUTO_WAKES`, default 12) and is reset whenever the user replies.
+- Replying implicitly cancels a pending wake-up. The user can also fire it early or cancel it outright
+  (`POST` / `DELETE /api/tasks/:taskId/wake`).
+- Work that must survive the turn has to be detached with `setsid` — `nohup` alone leaves it in the SSH
+  session's process group, which is torn down when the turn ends.
+
 ---
 
 ## 4. Coder API Integration
@@ -444,6 +471,8 @@ CREATE TABLE sessions (
 | `POST` | `/api/tasks/:taskId/reply` | Sends follow-up message (resumes Claude) |
 | `POST` | `/api/tasks/:taskId/complete` | Marks task as completed |
 | `POST` | `/api/tasks/:taskId/retry` | Retries a failed task |
+| `POST` | `/api/tasks/:taskId/wake` | Fires a scheduled wake-up now instead of waiting |
+| `DELETE` | `/api/tasks/:taskId/wake` | Cancels a scheduled wake-up without replying |
 | `DELETE` | `/api/tasks/:taskId` | Cancels/deletes a task |
 
 ### WebSocket
@@ -528,6 +557,8 @@ The app is configured via environment variables:
 | `DATABASE_PATH` | No | Path to SQLite database file (default: `./data/cpm.db`) |
 | `CLAUDE_MAX_TURNS` | No | Max agentic turns per Claude execution (default: 200) |
 | `CLAUDE_ALLOWED_TOOLS` | No | Comma-separated list of tools Claude can use (default: `Read,Edit,Write,Bash,Glob,Grep`) |
+| `CPM_WAKE_POLL_INTERVAL_MS` | No | How often to check for due `[WAKE]` wake-ups and probe sentinel files (default: 30000) |
+| `CPM_MAX_AUTO_WAKES` | No | Consecutive agent-scheduled wake-ups allowed without a user reply (default: 12) |
 | `CPM_MEMORY_MCP_URL_TEMPLATE` | No | URL with `{username}` / `{workspace}` placeholders; auto-derives each user's memory endpoint. See below. |
 | `CPM_MEMORY_MCP_URLS` | No | Explicit per-user memory endpoint map (overrides the template). See below. |
 

@@ -29,6 +29,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   pending_complete INTEGER NOT NULL DEFAULT 0,
   source TEXT,
   client_label TEXT,
+  -- Agent-scheduled self-resume ("wake-up"). See parseWakeRequestForTask.
+  wake_at TEXT,
+  wake_note TEXT,
+  wake_file TEXT,
+  wake_count INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT,

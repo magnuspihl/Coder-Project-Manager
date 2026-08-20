@@ -68,6 +68,22 @@ export function getDb(): Database.Database {
     if (!cols.some(c => c.name === 'reviewer_model')) {
       db.exec("ALTER TABLE tasks ADD COLUMN reviewer_model TEXT");
     }
+    // Agent-scheduled self-resume. wake_at is the earliest UTC instant the wake
+    // poller may resume the task; wake_file, when set, lets it fire earlier as
+    // soon as that path exists on the workspace. wake_count bounds how many
+    // consecutive wake-ups can happen without the user saying anything.
+    if (!cols.some(c => c.name === 'wake_at')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN wake_at TEXT");
+    }
+    if (!cols.some(c => c.name === 'wake_note')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN wake_note TEXT");
+    }
+    if (!cols.some(c => c.name === 'wake_file')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN wake_file TEXT");
+    }
+    if (!cols.some(c => c.name === 'wake_count')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN wake_count INTEGER NOT NULL DEFAULT 0");
+    }
 
     // Migrate tasks CHECK constraint to include 'cancelled' status
     const tableInfo = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'").get() as { sql: string } | undefined;

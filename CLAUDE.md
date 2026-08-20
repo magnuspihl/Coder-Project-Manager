@@ -86,6 +86,9 @@ queued → working → awaiting_feedback → working → ... → completed
 - When a task finishes, its status becomes `awaiting_feedback`
 - The user can reply (resumes the session) or mark it complete
 - When complete, the next queued task starts automatically
+- A turn *is* the `claude -p` process — it exits when the agent stops writing, killing anything still
+  attached to that session. An agent that needs to report back later emits a `[WAKE]` block, which CPM
+  turns into an automatic resume (on a timer, or when a sentinel file appears)
 - See SPEC.md Section 3 for the full state machine
 
 ### Database

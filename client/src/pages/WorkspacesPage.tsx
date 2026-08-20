@@ -49,6 +49,18 @@ function timeAgo(iso: string): string {
   return `${Math.floor(minutes / 60)}h ago`;
 }
 
+/** "12m" / "2h 5m" until a future ISO timestamp — for the scheduled-wake badge. */
+function timeUntil(iso: string): string {
+  const seconds = Math.round((new Date(iso).getTime() - Date.now()) / 1000);
+  if (seconds <= 5) return 'now';
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const rem = minutes % 60;
+  return `${hours}h${rem ? ` ${rem}m` : ''}`;
+}
+
 // Coder build statuses that mean the workspace is spinning up (not yet usable, not stopped)
 const STARTING_STATUSES = ['starting', 'pending'];
 
@@ -989,6 +1001,14 @@ export default function WorkspacesPage() {
               className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 border border-purple-200 dark:border-purple-800"
             >
               {task.client_label || 'API'}
+            </span>
+          )}
+          {task.status === 'awaiting_feedback' && task.wake_at && (
+            <span
+              title={`The agent scheduled its own follow-up${task.wake_note ? `: ${task.wake_note}` : ''}`}
+              className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 whitespace-nowrap"
+            >
+              ⏰ {timeUntil(task.wake_at)}
             </span>
           )}
           <span className={`text-xs px-2 py-0.5 rounded-full whitespace-nowrap ${STATUS_COLORS[task.status] || ''}`}>

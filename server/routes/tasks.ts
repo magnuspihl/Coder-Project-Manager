@@ -43,10 +43,12 @@ import {
   setReviewFindingState,
   getDismissedFindings,
   findingRef,
+  clearTaskWake,
+  resetTaskWakeCount,
   REVIEW_FIX_REPLY_PREFIX,
 } from '../services/tasks.js';
 import { findUserWorkspaceById } from '../services/workspace-cache.js';
-import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview, FINDING_REPORT_FORMAT } from '../services/claude.js';
+import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview, wakeTaskNow, FINDING_REPORT_FORMAT } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, removeTaskWorktree } from '../services/git.js';
@@ -362,6 +364,11 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
   }
 
   const userMessage = addMessage(task.id, 'user', message, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
+
+  // The auto-wake budget bounds wake-ups taken *without* user input, so a reply
+  // refills it. The armed wake itself is cleared by launchTask when this turn
+  // starts, which is what makes replying implicitly cancel a pending wake-up.
+  resetTaskWakeCount(task.id);
 
   // Deliberately does NOT reset review_loop_count. The budget is cumulative per
   // task (see MAX_REVIEW_LOOPS): refilling it on every reply is what let a
@@ -813,6 +820,42 @@ router.post('/tasks/:taskId/interrupt', requireAuth, (req: Request, res: Respons
 
   interruptTask(task.id);
 
+  res.json({ task: getTask(task.id) });
+});
+
+// Fire an agent-scheduled wake-up now instead of waiting for its timer/sentinel.
+router.post('/tasks/:taskId/wake', requireAuth, async (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  if (!task.wake_at) {
+    res.status(400).json({ error: 'No wake-up is scheduled for this task' });
+    return;
+  }
+  if (task.status !== 'awaiting_feedback') {
+    res.status(400).json({ error: 'Task is not awaiting feedback' });
+    return;
+  }
+
+  // Respond before the resume: launching goes through SSH and the client polls
+  // the awaiting_feedback→working transition anyway.
+  res.json({ task: { ...getTask(task.id)!, wake_at: null } });
+  runInBackground(`wake-now ${task.id}`, async () => { await wakeTaskNow(task.id); });
+});
+
+// Cancel an agent-scheduled wake-up without replying.
+router.delete('/tasks/:taskId/wake', requireAuth, (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  if (task.wake_at) {
+    clearTaskWake(task.id);
+    addMessage(task.id, 'system', 'Scheduled wake-up cancelled.', undefined, undefined, undefined, req.authSource, req.clientLabel);
+  }
   res.json({ task: getTask(task.id) });
 });
 
