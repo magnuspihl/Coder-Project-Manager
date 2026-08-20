@@ -57,6 +57,17 @@ export function getDb(): Database.Database {
     if (!cols.some(c => c.name === 'total_cache_creation_tokens')) {
       db.exec("ALTER TABLE tasks ADD COLUMN total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0");
     }
+    // Live context size (see recordContextTokens). Distinct from the cumulative
+    // total_* columns above: those only grow, this one tracks what is actually
+    // being sent right now and drops back after a compaction.
+    if (!cols.some(c => c.name === 'context_tokens')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0");
+    }
+    // Per-task override for the auto-reviewer's model. NULL = fall back to the
+    // CLAUDE_REVIEWER_MODEL env default, then to the task's own model.
+    if (!cols.some(c => c.name === 'reviewer_model')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN reviewer_model TEXT");
+    }
 
     // Migrate tasks CHECK constraint to include 'cancelled' status
     const tableInfo = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'").get() as { sql: string } | undefined;
