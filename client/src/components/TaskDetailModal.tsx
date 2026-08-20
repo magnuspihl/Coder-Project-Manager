@@ -14,6 +14,7 @@ import {
   setTaskAutoReview,
   setTaskClaudeAccount,
   setTaskModel,
+  setTaskReviewerModel,
   getModels,
   WORKSPACE_CLAUDE_ACCOUNT,
   interruptTask,
@@ -120,6 +121,74 @@ const STATUS_COLORS: Record<string, string> = {
   cancelled: 'bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-400',
 };
 
+/**
+ * Assumed model context window, for turning a raw token count into a
+ * proportion. Every Claude model CPM offers is 200k; Ollama models vary, so the
+ * tooltip states the assumption rather than presenting the percentage as fact.
+ */
+const CONTEXT_WINDOW_TOKENS = 200_000;
+/** Amber from here — enough headroom left to compact deliberately. */
+const CONTEXT_WARN_RATIO = 0.6;
+/** Red from here — compact now or the next turn may not fit. */
+const CONTEXT_DANGER_RATIO = 0.8;
+
+/**
+ * Live context usage for the task's Claude session.
+ *
+ * Exists because running out of context is CPM's most disorienting failure: the
+ * task simply stops responding, and the only signal today is the
+ * `context_window_exceeded` error AFTER it has already happened — typically
+ * with uncommitted work stranded in the worktree. This makes the approach
+ * visible while there is still room to act, and doubles as the shortcut for
+ * acting on it.
+ *
+ * Hidden until a session has actually reported usage (tokens === 0), so tasks
+ * that have never run don't show a meaningless empty gauge.
+ */
+function ContextMeter({ tokens, onCompact, compacting }: {
+  tokens: number;
+  onCompact: () => void;
+  compacting: boolean;
+}) {
+  if (!tokens) return null;
+  const ratio = Math.min(tokens / CONTEXT_WINDOW_TOKENS, 1);
+  const pct = Math.round(ratio * 100);
+  const danger = ratio >= CONTEXT_DANGER_RATIO;
+  const warn = !danger && ratio >= CONTEXT_WARN_RATIO;
+
+  const tone = danger
+    ? 'border-red-300 dark:border-red-700 text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-900/20'
+    : warn
+      ? 'border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-900/20'
+      : 'border-gray-300 dark:border-gray-600 text-gray-500 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800';
+  const barTone = danger ? 'bg-red-500' : warn ? 'bg-amber-500' : 'bg-gray-400 dark:bg-gray-500';
+
+  const label = tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : String(tokens);
+
+  return (
+    <button
+      type="button"
+      onClick={onCompact}
+      disabled={compacting}
+      className={`inline-flex items-center gap-2 text-xs px-3 py-2 border rounded-md transition-colors disabled:opacity-50 ${tone}`}
+      title={
+        `Context: ${tokens.toLocaleString()} tokens (~${pct}% of an assumed ${CONTEXT_WINDOW_TOKENS / 1000}k window).\n` +
+        (danger
+          ? 'Close to the limit — compact now to avoid the session failing mid-turn.'
+          : warn
+            ? 'Growing large. Compacting now summarizes prior turns and frees room.'
+            : 'Click to compact: summarizes prior turns and frees room. The session is preserved.')
+      }
+    >
+      <span className="hidden sm:inline">Context</span>
+      <span className="w-12 h-1.5 rounded-full bg-gray-200 dark:bg-gray-700 overflow-hidden" aria-hidden="true">
+        <span className={`block h-full rounded-full ${barTone}`} style={{ width: `${Math.max(pct, 3)}%` }} />
+      </span>
+      <span className="font-medium tabular-nums">{compacting ? '…' : label}</span>
+    </button>
+  );
+}
+
 interface TaskDetailModalProps {
   taskId: string;
   onClose: () => void;
@@ -148,6 +217,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [switchingAccount, setSwitchingAccount] = useState(false);
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
   const [switchingModel, setSwitchingModel] = useState(false);
+  const [switchingReviewerModel, setSwitchingReviewerModel] = useState(false);
   const [switchingAutoReview, setSwitchingAutoReview] = useState(false);
   const [completing, setCompleting] = useState(false);
   const [reviewing, setReviewing] = useState(false);
@@ -1191,6 +1261,30 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   };
 
   /**
+   * Pin the auto-reviewer to its own model, independent of the implementer's.
+   * Applies from the next review pass; a reviewer already running keeps the
+   * model it launched with. Empty value clears the override.
+   */
+  const handleChangeReviewerModel = async (value: string) => {
+    if (!task) return;
+    setSwitchingReviewerModel(true);
+    editSeqRef.current++;
+    try {
+      const { task: updated } = await setTaskReviewerModel(taskId, value || null);
+      setTask(prev => (prev ? { ...prev, reviewer_model: updated.reviewer_model } : prev));
+      lastTaskJsonRef.current = '';
+      onTaskChanged?.();
+    } catch (err: any) {
+      alert(err?.message || 'Failed to change reviewer model');
+    } finally {
+      // Second bump: invalidates any poll that started during the request,
+      // whose server read may still predate the commit.
+      editSeqRef.current++;
+      setSwitchingReviewerModel(false);
+    }
+  };
+
+  /**
    * Turn the auto-review pass on or off for the rest of this conversation.
    * Applies from the next decision point: a reviewer already running finishes,
    * but its verdict no longer bounces back to the implementer, and no later turn
@@ -1966,6 +2060,44 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                     <option value="on">auto-review on</option>
                     <option value="off">auto-review off</option>
                   </select>
+                  {/* Reviewer model — only meaningful while auto-review is on, so
+                      it stays hidden otherwise rather than adding a dead control
+                      to an already-busy header. Defaults to "same as task", which
+                      is the previous behaviour. A stronger reviewer is not simply
+                      better: it raises more true-but-pedantic findings, and each
+                      one costs a fix round. */}
+                  {!!task.auto_review && availableModels.length > 0 && (
+                    <select
+                      value={task.reviewer_model ?? ''}
+                      onChange={(e) => handleChangeReviewerModel(e.target.value)}
+                      disabled={switchingReviewerModel}
+                      title={task.reviewer_model
+                        ? `Reviewer runs on ${task.reviewer_model} — applies from the next review pass`
+                        : 'Reviewer runs on the same model as the task — applies from the next review pass'}
+                      className={`hidden sm:inline-block text-xs px-1.5 py-0.5 rounded font-medium border-0 focus:outline-none focus:ring-1 disabled:opacity-50 cursor-pointer ${
+                        task.reviewer_model
+                          ? 'bg-teal-50 dark:bg-teal-900/20 text-teal-700 dark:text-teal-400 focus:ring-teal-500'
+                          : 'bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 focus:ring-gray-500'
+                      }`}
+                    >
+                      <option value="">reviewer: same as task</option>
+                      {(['anthropic', 'ollama-local', 'ollama-cloud'] as const)
+                        .filter(p => availableModels.some(m => m.provider === p))
+                        .map(p => (
+                          <optgroup key={p} label={p === 'anthropic' ? 'Claude' : p === 'ollama-local' ? 'Ollama (local)' : 'Ollama (cloud)'}>
+                            {availableModels.filter(m => m.provider === p).map(m => (
+                              <option key={m.id} value={m.id}>reviewer: {m.display_name}</option>
+                            ))}
+                          </optgroup>
+                        ))}
+                      {/* Same reasoning as the task model select: a pinned model
+                          that is no longer offered must stay selectable, or the
+                          control would silently reset itself to "same as task". */}
+                      {task.reviewer_model && !availableModels.some(m => m.id === task.reviewer_model) && (
+                        <option value={task.reviewer_model}>reviewer: {task.reviewer_model} (unavailable)</option>
+                      )}
+                    </select>
+                  )}
                   <button
                     onClick={() => {
                       navigator.clipboard.writeText(task.id);
@@ -2729,6 +2861,11 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         {reviewing ? 'Starting review…' : 'Review'}
                       </button>
                     )}
+                    <ContextMeter
+                      tokens={task.context_tokens ?? 0}
+                      onCompact={handleCompactSession}
+                      compacting={compactingSession}
+                    />
                     {/* Session maintenance — rarely used, tucked into a dropdown */}
                     <div className="relative">
                       <button

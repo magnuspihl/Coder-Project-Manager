@@ -32,6 +32,10 @@ export interface Task {
   total_output_tokens: number;
   total_cache_read_tokens: number;
   total_cache_creation_tokens: number;
+  /** Live context size in tokens — see recordContextTokens. */
+  context_tokens: number;
+  /** Per-task auto-reviewer model; null inherits (env default, then the task's model). */
+  reviewer_model: string | null;
   source: string | null;
   client_label: string | null;
   auto_review: number;
@@ -484,6 +488,21 @@ export function setTaskModel(taskId: string, model: string | null): void {
 }
 
 /**
+ * Pin the auto-reviewer to its own model, or NULL to inherit.
+ *
+ * Separate from setTaskModel because the reviewer is a different job from the
+ * implementer: it reads a capped diff and emits a fixed verdict format, and a
+ * stronger model there is not straightforwardly better — it surfaces more
+ * true-but-pedantic findings, and each one costs a fix round.
+ */
+export function setTaskReviewerModel(taskId: string, model: string | null): void {
+  const db = getDb();
+  db.prepare('UPDATE tasks SET reviewer_model = ?, updated_at = ? WHERE id = ?').run(
+    model, new Date().toISOString(), taskId
+  );
+}
+
+/**
  * Pin the task to a CPM-held Claude subscription, or NULL to use the target
  * workspace's own `claude login`. Read fresh at each launch, so a change applies
  * from the next turn onward.
@@ -899,6 +918,19 @@ export function addTokenUsage(taskId: string, inputTokens: number, outputTokens:
      SELECT ?, id, workspace_id, ?, ?, ?, ? FROM tasks WHERE id = ?`
   ).run(uuid(), inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, taskId);
   invalidateTokenTotalsCache();
+}
+
+/**
+ * Record the live context size for a task — the tokens actually sent on the
+ * most recent request, not a running total.
+ *
+ * Deliberately "latest observed" rather than a high-water mark: compaction
+ * genuinely shrinks the context, and a max would keep displaying the
+ * pre-compaction figure, telling the user their compaction achieved nothing.
+ */
+export function recordContextTokens(taskId: string, tokens: number): void {
+  if (tokens <= 0) return;
+  getDb().prepare('UPDATE tasks SET context_tokens = ? WHERE id = ?').run(tokens, taskId);
 }
 
 export function getMessages(taskId: string, limit?: number, offset?: number): Message[] {

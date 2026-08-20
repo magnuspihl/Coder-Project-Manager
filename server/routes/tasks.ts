@@ -25,6 +25,7 @@ import {
   setTaskAutoReview,
   setTaskClaudeAccount,
   setTaskModel,
+  setTaskReviewerModel,
   resetTaskSession,
   addTaskParticipant,
   removeTaskParticipant,
@@ -261,6 +262,25 @@ router.put('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
     }
   }
 
+  // Per-task reviewer model. Same shape and limits as `model` above; null/''
+  // clears the override so the task falls back to CLAUDE_REVIEWER_MODEL and
+  // then to its own model. Not validated against the workspace's model list for
+  // the same reason `model` isn't — the list is advisory and the CLI is the
+  // authority on what it accepts.
+  let newReviewerModel: string | null | undefined;
+  if (req.body.reviewerModel !== undefined) {
+    const value = req.body.reviewerModel;
+    const trimmed = typeof value === 'string' ? value.trim() : value;
+    if (trimmed === null || trimmed === '') {
+      newReviewerModel = null;
+    } else if (typeof trimmed !== 'string' || trimmed.length > 120) {
+      res.status(400).json({ error: 'reviewerModel must be a string of 120 characters or fewer' });
+      return;
+    } else {
+      newReviewerModel = trimmed;
+    }
+  }
+
   // Re-point the task at a different Claude subscription. Takes effect on the
   // next turn (resume, reviewer, or advisor) — the currently running process
   // keeps the token it launched with. This is the escape hatch for "this
@@ -299,6 +319,7 @@ router.put('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
   }
   if (newTitle !== undefined) updateTaskTitle(task.id, newTitle);
   if (newModel !== undefined) setTaskModel(task.id, newModel);
+  if (newReviewerModel !== undefined) setTaskReviewerModel(task.id, newReviewerModel);
   if (newAccountId !== undefined) setTaskClaudeAccount(task.id, newAccountId);
   if (newAutoReview !== undefined && newAutoReview !== !!task.auto_review) {
     setTaskAutoReview(task.id, newAutoReview);
@@ -342,8 +363,10 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
 
   const userMessage = addMessage(task.id, 'user', message, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
 
-  // User reply resets the review loop so the next implementer turn gets a fresh review
-  resetReviewLoopCount(task.id);
+  // Deliberately does NOT reset review_loop_count. The budget is cumulative per
+  // task (see MAX_REVIEW_LOOPS): refilling it on every reply is what let a
+  // conversational task rack up unbounded automated review rounds. Explicit
+  // "review again" / "fix these" actions still refill it.
 
   // `completeAfter` (used by "resolve git issues & complete"): finalize the task
   // automatically once this turn lands in awaiting_feedback. The pending_complete

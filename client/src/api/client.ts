@@ -131,6 +131,10 @@ export interface Task {
   session_initialized?: number;
   total_input_tokens: number;
   total_output_tokens: number;
+  /** Live context size in tokens — what the last request actually sent, not a running total. */
+  context_tokens?: number;
+  /** Per-task auto-reviewer model; null inherits the deployment default, then the task's model. */
+  reviewer_model?: string | null;
   total_cost_usd?: number;
   source?: string | null;
   client_label?: string | null;
@@ -302,6 +306,17 @@ export const setTaskModel = (taskId: string, model: string | null) =>
   request<{ task: Task }>(`/api/tasks/${taskId}`, {
     method: 'PUT',
     body: JSON.stringify({ model }),
+  });
+
+/**
+ * Pin the auto-reviewer to its own model. Applies from the next review pass;
+ * null clears the override, falling back to the deployment default and then to
+ * the task's own model.
+ */
+export const setTaskReviewerModel = (taskId: string, reviewerModel: string | null) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}`, {
+    method: 'PUT',
+    body: JSON.stringify({ reviewerModel }),
   });
 
 /**
