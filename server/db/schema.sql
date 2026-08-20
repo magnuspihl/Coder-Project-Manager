@@ -269,13 +269,20 @@ CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
 -- Attachments: files uploaded with task prompts/replies ('user'), or produced
 -- by an agent via an [OUTPUT_FILE] block for the user to download ('agent').
--- message_id scopes a 'user' attachment to the specific turn that sent it
--- (NULL for attachments uploaded before that linkage existed, or for
--- agent-produced files, which link directly to task_id) — without it, every
--- turn re-announced every attachment ever sent on the task as if it had just
--- arrived. user_id is set at creation time (the uploader, or the task owner
--- for an agent-produced file) so /api/uploads/:id can enforce ownership even
--- during the brief window before task_id is linked — see the download route.
+-- message_id scopes an attachment (either source) to the specific message
+-- that sent or produced it — without it, every turn re-announced every
+-- attachment the task had ever received/generated as if it had just arrived,
+-- and the UI piled every download into one growing list instead of showing it
+-- next to the message it belongs to. NULL for attachments uploaded before
+-- that linkage existed. ON DELETE SET NULL rather than CASCADE: a
+-- reconnect-after-restart replay deletes and recreates the current turn's
+-- assistant messages (see deleteCurrentSessionAssistantMessages), and an
+-- attachment must survive that — hasAgentOutputAttachment re-points a
+-- recaptured file at the replayed message's new id rather than losing the
+-- link (or, worse, being cascade-deleted along with the old message row).
+-- user_id is set at creation time (the uploader, or the task owner for an
+-- agent-produced file) so /api/uploads/:id can enforce ownership even during
+-- the brief window before task_id is linked — see the download route.
 CREATE TABLE IF NOT EXISTS attachments (
   id TEXT PRIMARY KEY,
   task_id TEXT,

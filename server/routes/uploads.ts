@@ -53,8 +53,8 @@ router.post('/uploads', requireAuth, upload.array('files', MAX_FILES), (req: Req
     attachments.push({
       id,
       task_id: null,
-      message_id: null,
       user_id: req.user!.id,
+      message_id: null, // set once linkAttachmentsToTask ties it to the prompt/reply message
       filename: file.filename,
       original_name: file.originalname,
       mime_type: file.mimetype,
@@ -125,8 +125,8 @@ router.get('/uploads/:id', requireAuth, (req: Request, res: Response) => {
 export interface Attachment {
   id: string;
   task_id: string | null;
-  message_id: string | null;
   user_id: string | null;
+  message_id: string | null;
   filename: string;
   original_name: string;
   mime_type: string;
@@ -148,11 +148,15 @@ export function sha256Hex(content: Buffer): string {
  * directory, same table, same /api/uploads/:id download route — just with
  * task_id set immediately instead of linked later, and source='agent' so the
  * UI can tell the two apart. `userId` is the task's owner, not the agent —
- * it's what lets the download route enforce ownership.
+ * it's what lets the download route enforce ownership. `messageId` is the
+ * assistant message whose [OUTPUT_FILE] block produced this file, so the UI
+ * can render the download inline with that message instead of in a separate
+ * task-wide list.
  */
 export function createAgentOutputAttachment(
   taskId: string,
   userId: string,
+  messageId: string | null,
   content: Buffer,
   originalName: string,
   mimeType: string,
@@ -165,14 +169,14 @@ export function createAgentOutputAttachment(
   const contentHash = sha256Hex(content);
 
   getDb().prepare(
-    'INSERT INTO attachments (id, task_id, user_id, filename, original_name, mime_type, size, storage_path, source, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(id, taskId, userId, filename, originalName, mimeType, content.length, storagePath, 'agent', contentHash);
+    'INSERT INTO attachments (id, task_id, user_id, message_id, filename, original_name, mime_type, size, storage_path, source, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, taskId, userId, messageId, filename, originalName, mimeType, content.length, storagePath, 'agent', contentHash);
 
   return {
     id,
     task_id: taskId,
-    message_id: null,
     user_id: userId,
+    message_id: messageId,
     filename,
     original_name: originalName,
     mime_type: mimeType,
@@ -198,12 +202,23 @@ export function createAgentOutputAttachment(
  * agent just produced. A hash match means the bytes are actually identical,
  * so there is nothing new for the user to see and staying silent is correct;
  * anything else is a genuinely new attachment.
+ *
+ * A replay also deletes and recreates the message the block lived in (see
+ * deleteCurrentSessionAssistantMessages), so a found duplicate is re-pointed
+ * at the freshly-passed `messageId` — otherwise the attachment would keep
+ * pointing at a message row that no longer exists and disappear from the UI
+ * even though the file itself is still there.
  */
-export function hasAgentOutputAttachment(taskId: string, originalName: string, contentHash: string): boolean {
-  const row = getDb().prepare(
-    "SELECT 1 FROM attachments WHERE task_id = ? AND source = 'agent' AND original_name = ? AND content_hash = ? LIMIT 1"
-  ).get(taskId, originalName, contentHash);
-  return !!row;
+export function hasAgentOutputAttachment(taskId: string, originalName: string, contentHash: string, messageId: string | null): boolean {
+  const db = getDb();
+  const row = db.prepare(
+    "SELECT id FROM attachments WHERE task_id = ? AND source = 'agent' AND original_name = ? AND content_hash = ? LIMIT 1"
+  ).get(taskId, originalName, contentHash) as { id: string } | undefined;
+  if (!row) return false;
+  if (messageId) {
+    db.prepare('UPDATE attachments SET message_id = ? WHERE id = ?').run(messageId, row.id);
+  }
+  return true;
 }
 
 /**

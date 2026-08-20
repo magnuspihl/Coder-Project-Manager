@@ -516,9 +516,18 @@ export function getDb(): Database.Database {
   // turn only re-delivers/announces files sent THIS turn instead of every
   // attachment the task has ever received. Existing rows get message_id = NULL
   // (rendered/handled as task-level, same as before this migration).
+  //
+  // ON DELETE SET NULL, not the FK's implicit NO ACTION: a reconnect-after-
+  // restart replay deletes and recreates the current turn's assistant
+  // messages (deleteCurrentSessionAssistantMessages) — verified empirically
+  // that without an explicit delete action, that DELETE throws "FOREIGN KEY
+  // constraint failed" the moment the message has a linked attachment,
+  // breaking reconnect for every task that ever received one. SET NULL lets
+  // the delete succeed; hasAgentOutputAttachment then re-points a recaptured
+  // attachment at the replayed message's new id.
   const attachmentCols = db.prepare("PRAGMA table_info(attachments)").all() as Array<{ name: string }>;
   if (!attachmentCols.some(c => c.name === 'message_id')) {
-    db.exec("ALTER TABLE attachments ADD COLUMN message_id TEXT REFERENCES messages(id)");
+    db.exec("ALTER TABLE attachments ADD COLUMN message_id TEXT REFERENCES messages(id) ON DELETE SET NULL");
     db.exec("CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id)");
   }
 
@@ -543,6 +552,14 @@ export function getDb(): Database.Database {
     // regenerated file that happens to match the prior capture's byte count
     // is never mistaken for the same content and silently dropped.
     db.exec("ALTER TABLE attachments ADD COLUMN content_hash TEXT");
+  }
+  if (attCols.length > 0 && !attCols.some(c => c.name === 'message_id')) {
+    // Ties an attachment to the specific message it was uploaded with or
+    // produced by, so the UI can render it inline with that message instead
+    // of in one growing pile at the bottom of the chat. Never backfilled for
+    // pre-existing rows — there's no reliable way to attribute an old
+    // attachment to a specific historical message.
+    db.exec("ALTER TABLE attachments ADD COLUMN message_id TEXT");
   }
 
   return db;

@@ -3043,7 +3043,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
           lastSavedMessageText = turnText;
           parseTaskRequestsForTask(task, turnText);
           parseWakeRequestForTask(task, turnText);
-          parseOutputFilesForTask(task, turnText, task.workspace_name, outputFileBaseDir).catch(err =>
+          parseOutputFilesForTask(task, turnText, task.workspace_name, outputFileBaseDir, msg.id).catch(err =>
             console.error(`[output-file] task ${task.id}:`, (err as Error).message?.slice(0, 200)));
           parseTaskMentions(task, turnText, null);
         }
@@ -3072,7 +3072,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
           lastSavedMessageText = resultText;
           parseTaskRequestsForTask(task, resultText);
           parseWakeRequestForTask(task, resultText);
-          parseOutputFilesForTask(task, resultText, task.workspace_name, outputFileBaseDir).catch(err =>
+          parseOutputFilesForTask(task, resultText, task.workspace_name, outputFileBaseDir, msg.id).catch(err =>
             console.error(`[output-file] task ${task.id}:`, (err as Error).message?.slice(0, 200)));
           parseTaskMentions(task, resultText, null);
         } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
@@ -4834,13 +4834,16 @@ async function fetchRemoteFileForOutput(
  *
  * `baseDir` doubles as the containment root (see checkOutputFileContainment):
  * resolved once here since every block in one turn's text shares it, rather
- * than re-resolving per block.
+ * than re-resolving per block. `messageId` is the assistant message `text`
+ * came from — every captured attachment is tied to it so the UI can render
+ * the download inline with that message instead of in a task-wide list.
  */
 async function parseOutputFilesForTask(
   task: Task,
   text: string,
   workspaceName: string,
   baseDir: string | null,
+  messageId: string | null,
 ): Promise<void> {
   const regex = /\[OUTPUT_FILE\]\s*([\s\S]*?)\s*\[\/OUTPUT_FILE\]/g;
   if (!regex.test(text)) return; // Cheap bail-out before paying for a root resolve nothing will use.
@@ -4903,7 +4906,7 @@ async function parseOutputFilesForTask(
       workspaceName,
       containment.realPath,
       task.user_id,
-      (contentHash) => hasAgentOutputAttachment(task.id, displayName, contentHash),
+      (contentHash) => hasAgentOutputAttachment(task.id, displayName, contentHash, messageId),
     );
     if (result.ok === 'duplicate') {
       // A content-hash match, not just a size match — the bytes are actually
@@ -4919,7 +4922,7 @@ async function parseOutputFilesForTask(
       continue;
     }
 
-    const attachment = createAgentOutputAttachment(task.id, task.user_id, result.content, displayName, guessMimeType(displayName));
+    const attachment = createAgentOutputAttachment(task.id, task.user_id, messageId, result.content, displayName, guessMimeType(displayName));
     console.log(`[output-file] Task ${task.id}: captured ${displayName} (${result.content.length} bytes) as attachment ${attachment.id}`);
   }
 }
@@ -5241,7 +5244,7 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant, b
             const saved = addMessage(task.id, 'assistant', block.text, undefined, participant.workspace_name, participant.id);
             lastSavedMessageId = saved.id; lastSavedMessageText = block.text;
             parseTaskRequestsForTask(task, block.text);
-            parseOutputFilesForTask(task, block.text, participant.workspace_name, baseDir).catch(err =>
+            parseOutputFilesForTask(task, block.text, participant.workspace_name, baseDir, saved.id).catch(err =>
               console.error(`[output-file] task ${task.id} participant ${participant.id}:`, (err as Error).message?.slice(0, 200)));
             parseTaskMentions(task, block.text, participant.id);
           } else if (block.type === 'tool_use' && block.name === 'AskUserQuestion') {
@@ -5262,7 +5265,7 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant, b
           const saved = addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined, participant.workspace_name, participant.id);
           lastSavedMessageId = saved.id; lastSavedMessageText = resultText;
           parseTaskRequestsForTask(task, resultText);
-          parseOutputFilesForTask(task, resultText, participant.workspace_name, baseDir).catch(err =>
+          parseOutputFilesForTask(task, resultText, participant.workspace_name, baseDir, saved.id).catch(err =>
             console.error(`[output-file] task ${task.id} participant ${participant.id}:`, (err as Error).message?.slice(0, 200)));
           parseTaskMentions(task, resultText, participant.id);
         } else if (typeof event.total_cost_usd === 'number' && lastSavedMessageId) {
