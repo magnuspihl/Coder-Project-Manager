@@ -682,6 +682,35 @@ export function startWorktreeReconciler(): void {
 // ─── Task Completion ─────────────────────────────────────────────────────────
 
 /**
+ * Is HEAD already contained in origin/<defaultBranch>?
+ *
+ * This is the only provider-agnostic "there is genuinely nothing left to ship"
+ * signal completion has, and it is what makes agent-made commits safe: a clean
+ * working tree means either the work already landed (true here → complete) or
+ * the agent committed locally and it still needs a push + PR (false → carry on).
+ * Any failure — no network, no such remote branch — answers false, i.e. assume
+ * there is still work to ship rather than completing a task silently.
+ */
+async function isLandedOnDefault(
+  ws: string,
+  dir: string,
+  defaultBranch: string,
+  userId: string | null,
+): Promise<boolean> {
+  try {
+    await coderSsh(ws,
+      `cd ${shellEscape(dir)} && git fetch origin ${shellEscape(defaultBranch)} && ` +
+      `git merge-base --is-ancestor HEAD origin/${shellEscape(defaultBranch)}`,
+      GIT_T_NETWORK,
+      userId,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * After a task is marked complete:
  * - Remote allowed: commit in worktree, push, open PR, merge, verify merge landed, pull main.
  * - Remote disabled: refuse if uncommitted changes; otherwise pass through.
@@ -751,15 +780,7 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
         // Before failing, check whether all commits are already on origin/main —
         // if so, the work is done regardless of branch name.
         const defaultBranchCheck = await getDefaultBranch(ws, dir, userId);
-        let alreadyLanded = false;
-        try {
-          await sshExec(ws,
-            `cd ${shellEscape(dir)} && git fetch origin ${shellEscape(defaultBranchCheck)} && ` +
-            `git merge-base --is-ancestor HEAD origin/${shellEscape(defaultBranchCheck)}`,
-            GIT_T_NETWORK,
-          );
-          alreadyLanded = true;
-        } catch { /* HEAD is not on origin/<default> yet */ }
+        const alreadyLanded = await isLandedOnDefault(ws, dir, defaultBranchCheck, userId);
 
         if (alreadyLanded && !hasChanges) {
           // Committed work is already on origin/main AND the working tree is clean —
@@ -790,7 +811,12 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
         );
         return 'git_error';
       }
-      if (!hasChanges) return true;
+      // A clean tree here does not mean there is nothing to do: the agent is
+      // allowed to commit locally, which on this path leaves those commits
+      // sitting on the default branch, unpushed. Only stop if HEAD is already
+      // contained in origin/<default>; otherwise fall through so the commits get
+      // their own branch, a push and a PR like any other work.
+      if (!hasChanges && await isLandedOnDefault(ws, dir, defaultBranch, userId)) return true;
       try {
         await sshExec(ws, `cd ${shellEscape(dir)} && git checkout -b ${shellEscape(branchName)}`, GIT_T_INDEX);
       } catch (err: any) {
@@ -812,15 +838,7 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
       // task completed even when an Azure PR was still open and unmerged. The git
       // ancestry check below works identically for every provider.
       const defaultBranch = await getDefaultBranch(ws, dir, userId);
-      let landed = false;
-      try {
-        await sshExec(ws,
-          `cd ${shellEscape(dir)} && git fetch origin ${shellEscape(defaultBranch)} && ` +
-          `git merge-base --is-ancestor HEAD origin/${shellEscape(defaultBranch)}`,
-          GIT_T_NETWORK,
-        );
-        landed = true;
-      } catch { /* HEAD is not on origin/<default> yet → there is unmerged work */ }
+      const landed = await isLandedOnDefault(ws, dir, defaultBranch, userId);
 
       if (landed) {
         // The committed work is already integrated into the default branch — there
