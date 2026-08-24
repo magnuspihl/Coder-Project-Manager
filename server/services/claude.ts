@@ -496,26 +496,44 @@ export function getTaskActivity(taskId: string): TaskActivity | undefined {
   return taskActivity.get(taskId);
 }
 
-// CPM owns git for tasks: completion creates a fresh task branch, commits the
-// working tree, pushes, and opens+merges a PR. If the agent branches/commits
-// on its own, that flow falls apart (HEAD on a non-default branch blocks
-// completion). This prompt is appended whenever the workspace has remote
-// pushes enabled.
-const CPM_GIT_OWNERSHIP_PROMPT = `MANDATORY GIT RULE — CPM OWNS THE GIT WORKFLOW:
-This task runs inside the Coder Project Manager (CPM). The user reviews your work and clicks a "Mark Complete" button when they are satisfied. That button — NOT you — triggers the entire git flow: CPM creates a fresh branch off the default branch, commits your working-tree changes, pushes, opens a pull request, and merges it. This is the expected, normal end of every task. You must not pre-empt any of it.
+// CPM owns the ship-it half of git: completion commits the working tree, merges
+// the default branch in, pushes the task branch, and opens+merges a PR. This
+// prompt is appended whenever the workspace has remote pushes enabled.
+//
+// Scope note — this used to ban *every* mutating git command, including local
+// `git add`/`commit`/`merge`/`stash`. That was broader than the machinery
+// requires and agents read it as "I am locked out of git", so they stopped
+// rather than fixing an ordinary conflict or index problem. What completion
+// actually depends on (see runTaskCompletionGit):
+//   - the worktree stays on the task branch — whatever branch HEAD points at is
+//     what gets pushed, so a checkout/detached HEAD pushes the wrong ref;
+//   - nothing has already pushed the branch or opened the PR out from under it;
+//   - the work still exists (a hard reset or an unpopped stash silently ships
+//     less than the user reviewed).
+// Local commits are fine: the clean-tree path checks whether HEAD is already on
+// origin/<default> and pushes + PRs the commits when it isn't. So the rule is
+// "don't take the remote/branching decisions", not "don't touch git".
+const CPM_GIT_OWNERSHIP_PROMPT = `GIT — CPM OWNS BRANCHING AND SHIPPING (you are NOT locked out of git):
+This task runs inside the Coder Project Manager (CPM), in a dedicated worktree already checked out on this task's own branch. When the user is satisfied they click "Mark Complete", and THAT button — not you — ships the work: it commits whatever is in the working tree, merges the default branch in, pushes the branch, opens a pull request, and merges it. This is the normal end of every task, so don't pre-empt it.
 
-Do NOT run any git command that mutates state:
-- git branch / checkout / switch (no creating, deleting, or switching branches)
-- git add / commit / commit --amend
-- git push / pull / fetch (with refspec) / merge / rebase / reset / revert / cherry-pick / stash
+DEFAULT: just edit files and leave your changes uncommitted on the branch that is already checked out. You never have to commit to get your work shipped.
 
-Do NOT run gh pr commands (create, merge, edit, close, comment).
+NEVER do these — they break completion or take a decision that is the user's:
+- git push, or anything else that writes to the remote.
+- gh pr / az repos pr create, merge, close, edit, comment. CPM opens and merges the PR.
+- Moving HEAD off this task's branch: git checkout <branch> / switch / detaching HEAD, or creating and deleting branches. Completion pushes whichever branch the worktree is on, so leaving it elsewhere pushes the wrong ref.
+- Destroying work the user hasn't seen: git reset --hard, git clean, git checkout/restore over their edits, or rewriting commits that are already pushed.
+- Touching the main checkout or another task's worktree. Stay inside your own.
 
-Just edit files and leave the working tree dirty on whatever branch is currently checked out. CPM handles all git operations at completion.
+DO use git when there is an actual git problem to solve — that is expected, not a violation:
+- git add / git commit inside your worktree. Completion handles commits you made yourself: it pushes them and opens the PR as usual. Commit when it helps (checkpointing, an operation that needs a clean tree, recording a conflict resolution) — just never push.
+- git fetch, and merging or rebasing the default branch into your branch to resolve conflicts. Completion performs that merge anyway, so doing it early is safe.
+- Resolving conflicts, repairing the index (git restore --staged, git rm --cached), .gitignore fixes, git stash — as long as you pop it before your turn ends.
+- Anything read-only: status, diff, log, show, blame, rev-parse, gh pr view / list / diff.
 
-CRITICAL — DO NOT ASK ABOUT COMMITTING: When you finish, do NOT ask the user whether they want you to commit, push, open a PR, or merge — and do NOT offer to do any of those. Committing and merging happen automatically when the user marks the task complete; that is the agreed workflow and the user already knows it. Asking wrongly implies the changes might get committed some other way, which just creates confusion. Simply summarize what you changed and stop — the user will mark the task complete (or send more feedback) when ready.
+If one of the NEVER rules genuinely blocks you from fixing something, say so in plain text and let the user decide — don't route around it silently. When you do run mutating git commands, name them in your summary.
 
-Read-only inspection commands are fine: git status, git diff, git log, git show, git rev-parse, gh pr view, gh pr list, gh pr diff.`;
+CRITICAL — DO NOT ASK ABOUT COMMITTING: do not ask the user whether they want you to commit, push, open a PR, or merge, and do not offer to. That happens when they mark the task complete; that is the agreed workflow and they already know it. Asking wrongly implies the changes might get committed some other way, which just creates confusion. Summarize what you changed and stop — the user will mark the task complete (or send more feedback) when ready.`;
 
 // Claude Code's harness appends a <system-reminder> after every Read tool
 // result, asking the model to assess file contents for malware. Opus 4.7

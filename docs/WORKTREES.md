@@ -70,6 +70,35 @@ The provider is detected from `git config remote.origin.url` and stored on the t
 The main checkout does not need to be touched. It stays on its branch. The `git pull` step that
 currently follows merge is removed — the main checkout is managed separately (see Section 6).
 
+### What the agent may do with git
+
+`CPM_GIT_OWNERSHIP_PROMPT` (`claude.ts`) is appended to every task turn on a workspace with remote
+pushes enabled. It splits git into two halves rather than banning it outright — an earlier version
+banned *every* mutating command, and agents correctly reported that they were locked out of
+resolving an ordinary conflict.
+
+| Agent may not | Why |
+|---|---|
+| `git push`, or any other write to the remote | Pre-empts the user's "Mark Complete" decision |
+| `gh pr` / `az repos pr` create · merge · close · edit | CPM opens and merges the PR itself |
+| `checkout`/`switch` to another branch, detach HEAD, create or delete branches | Completion pushes **whatever branch the worktree is on** — moving HEAD pushes the wrong ref |
+| `reset --hard`, `clean`, restore over the user's edits, rewriting pushed commits | Silently ships less than the user reviewed |
+| Touching the main checkout or another task's worktree | Breaks isolation |
+
+| Agent may (and is expected to, when there's a git problem) | Why it's safe |
+|---|---|
+| `git add` / `git commit` in its own worktree | The clean-tree path checks whether HEAD is already on `origin/{default}` and pushes + PRs the commits when it isn't |
+| `git fetch`, merge/rebase the default branch in to resolve conflicts | Completion runs that merge anyway — doing it early only removes work from step 2 |
+| Fixing the index, `.gitignore`, `git stash` (popped before the turn ends) | Never leaves the remote or moves HEAD |
+| Read-only: `status`, `diff`, `log`, `show`, `rev-parse`, `gh pr view/list/diff` | — |
+
+The prompt is guidance only, not enforcement: `Bash` is allowed, so an agent *can* run any of these.
+The completion flow is written to tolerate what it reasonably can — an unexpected branch is used
+instead of the recorded one, and already-committed work is pushed and PR'd rather than dropped.
+
+Remote-disabled workspaces (`git_push_enabled = 0`) get no such prompt at all: the user owns git
+there, and completion refuses while the tree is dirty, telling them to integrate it themselves.
+
 ### Cancellation
 
 ```bash
