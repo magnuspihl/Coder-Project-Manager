@@ -1,0 +1,155 @@
+import { getDb } from '../db/index.js';
+
+/**
+ * Midjourney image generation exposed to agents as an MCP server, backed by
+ * `mj-bridge` — a standalone service (see `mj-bridge/README.md`) that holds a
+ * real Discord account and drives the Midjourney bot, since Midjourney still
+ * has no official API.
+ *
+ * Same shape as [[memory-mcp.ts]]'s Mem0/OpenMemory wiring on purpose: the
+ * bridge is USER-SPECIFIC (each Coder user resolves to their own endpoint —
+ * there is no shared default), configured via two sources checked in order:
+ *
+ * 1. CPM_MIDJOURNEY_MCP_URLS — JSON object mapping Coder username → endpoint.
+ *    Value is the URL string, or `{ "url": "...", "token": "..." }` when the
+ *    bridge is token-protected (sent as `Authorization: Bearer <token>`).
+ *
+ *      CPM_MIDJOURNEY_MCP_URLS={"magnus":{"url":"http://192.168.1.199:8901/mcp","token":"..."}}
+ *
+ * 2. CPM_MIDJOURNEY_MCP_URL_TEMPLATE / CPM_MIDJOURNEY_MCP_TOKEN — a single
+ *    shared bridge (there's normally only one Midjourney account, so unlike
+ *    memory this is usually the same endpoint for every user who's enabled).
+ *    Template supports `{username}` only if you're actually running one
+ *    bridge per user; a plain fixed URL with no placeholders is the common
+ *    case:
+ *
+ *      CPM_MIDJOURNEY_MCP_URL_TEMPLATE=http://192.168.1.199:8901/mcp
+ *      CPM_MIDJOURNEY_MCP_TOKEN=...
+ *
+ * Users without a configured endpoint simply get no Midjourney MCP.
+ */
+
+export const MIDJOURNEY_MCP_SERVER_NAME = 'midjourney';
+export const MIDJOURNEY_MCP_ALLOWED_TOOL = `mcp__${MIDJOURNEY_MCP_SERVER_NAME}`;
+
+interface MjEndpoint {
+  url: string;
+  token: string | null;
+}
+
+let parsed: Record<string, MjEndpoint> | null = null;
+let parsedRaw: string | undefined;
+
+function getConfig(): Record<string, MjEndpoint> {
+  const raw = process.env.CPM_MIDJOURNEY_MCP_URLS;
+  if (parsed && raw === parsedRaw) return parsed;
+  parsedRaw = raw;
+  parsed = {};
+  if (!raw || !raw.trim()) return parsed;
+
+  try {
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      console.warn('[midjourney-mcp] CPM_MIDJOURNEY_MCP_URLS is not a JSON object — ignoring');
+      return parsed;
+    }
+    for (const [username, value] of Object.entries(obj)) {
+      let url: string | undefined;
+      let token: string | null = null;
+      if (typeof value === 'string') {
+        url = value;
+      } else if (value && typeof value === 'object') {
+        const v = value as { url?: unknown; token?: unknown };
+        if (typeof v.url === 'string') url = v.url;
+        if (typeof v.token === 'string') token = v.token;
+      }
+      if (!url) {
+        console.warn(`[midjourney-mcp] Skipping entry for user "${username}" — no URL`);
+        continue;
+      }
+      parsed[username] = { url, token };
+    }
+  } catch (err) {
+    console.warn('[midjourney-mcp] Failed to parse CPM_MIDJOURNEY_MCP_URLS:', (err as Error).message?.slice(0, 120));
+  }
+  return parsed;
+}
+
+function usernameForUserId(userId: string | null | undefined): string | null {
+  if (!userId) return null;
+  try {
+    const row = getDb().prepare('SELECT username FROM users WHERE id = ?').get(userId) as { username?: string } | undefined;
+    return row?.username ?? null;
+  } catch {
+    return null;
+  }
+}
+
+const URL_SAFE = /^[a-zA-Z0-9_-]+$/;
+
+function resolveUrl(rawUrl: string, username: string): string | null {
+  let url = rawUrl;
+  if (url.includes('{username}')) {
+    if (!URL_SAFE.test(username)) {
+      console.warn(`[midjourney-mcp] Username "${username}" is not URL-safe — skipping`);
+      return null;
+    }
+    url = url.replaceAll('{username}', username);
+  }
+  if (!/^https?:\/\//.test(url)) {
+    console.warn('[midjourney-mcp] Midjourney bridge URL did not resolve to an http(s) URL — ignoring');
+    return null;
+  }
+  return url;
+}
+
+function endpointFromTemplate(username: string): MjEndpoint | null {
+  const template = process.env.CPM_MIDJOURNEY_MCP_URL_TEMPLATE;
+  if (!template) return null;
+  const url = resolveUrl(template, username);
+  return url ? { url, token: process.env.CPM_MIDJOURNEY_MCP_TOKEN || null } : null;
+}
+
+/** Resolve the configured Midjourney bridge endpoint for a user, or null if none. */
+export function getMidjourneyEndpointForUser(userId: string | null | undefined): MjEndpoint | null {
+  const username = usernameForUserId(userId);
+  if (!username) return null;
+  const mapEntry = getConfig()[username];
+  if (mapEntry) {
+    const url = resolveUrl(mapEntry.url, username);
+    return url ? { url, token: mapEntry.token } : null;
+  }
+  return endpointFromTemplate(username);
+}
+
+/**
+ * Build the `--mcp-config` fragment (as a plain object, merged with other MCP
+ * servers by the caller) registering the user's Midjourney bridge, or null
+ * when there's no configured endpoint for them.
+ */
+export function buildMidjourneyMcpServerEntry(userId: string | null | undefined): Record<string, unknown> | null {
+  const endpoint = getMidjourneyEndpointForUser(userId);
+  if (!endpoint) return null;
+  return {
+    [MIDJOURNEY_MCP_SERVER_NAME]: {
+      type: 'http',
+      url: endpoint.url,
+      ...(endpoint.token ? { headers: { Authorization: `Bearer ${endpoint.token}` } } : {}),
+    },
+  };
+}
+
+/**
+ * System-prompt fragment teaching the agent the generate → judge → iterate →
+ * curate loop. Only appended when the user has a configured endpoint.
+ */
+export function buildMidjourneyUsagePrompt(): string {
+  return `MIDJOURNEY IMAGE GENERATION — you have access to a real Midjourney account via the \`${MIDJOURNEY_MCP_SERVER_NAME}\` MCP server (tools prefixed \`mcp__${MIDJOURNEY_MCP_SERVER_NAME}__\`: \`mj_imagine\`, \`mj_upscale\`, \`mj_variation\`, \`mj_reroll\`). Use it as a tool on the user's behalf, not just a single call:
+
+- GENERATE: call mj_imagine with a well-formed prompt for the user's brief. It returns a 2x2 grid as an inline preview image plus job metadata (id/hash/flags).
+- JUDGE: actually look at the returned preview image with your own vision before deciding anything. Compare each quadrant against the brief — composition, subject fidelity, artifacts, whether it matches what was asked.
+- ITERATE: based on that judgment, either (a) mj_upscale the best quadrant, (b) mj_variation to explore near a promising quadrant, (c) mj_reroll for a fresh grid on the same prompt, or (d) refine the prompt text and mj_imagine again. Keep the loop bounded — a handful of rounds is normally enough; don't spin indefinitely chasing marginal improvement.
+- CURATE: once you have image(s) worth keeping, mj_upscale them, then download the full-resolution file into your working directory (curl the \`full_resolution_url\` from the tool result — the preview image is deliberately downscaled and not the deliverable). Present the final picks to the user with a short rationale for why each was chosen, and hand off the file(s) via the OUTPUT_FILE convention described elsewhere in this prompt.
+
+Never claim an image was generated, upscaled, or varied unless a tool call actually returned it.`;
+}
