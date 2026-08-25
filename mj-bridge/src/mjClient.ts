@@ -94,19 +94,31 @@ export function reroll(prompt: string, msgId: string, hash: string, flags: numbe
  * then post it as a real channel message so it gets a stable CDN URL back
  * (`MJApi.upImageApi` does the post but discards the response body, so this
  * redoes that call directly to capture the URL).
+ *
+ * The `midjourney` package's DiscordImage type names the reserved-slot path
+ * `upload_filename`, but Discord's message-create payload requires that same
+ * value under the key `uploaded_filename` — passing the object straight
+ * through (as the package's own `upImageApi` does) sends a malformed
+ * attachments descriptor and Discord 400s unconditionally, before it ever
+ * looks at the image bytes. Rebuild the descriptor with the right key.
  */
 export function uploadReferenceImage(buf: Buffer, mimeType: string, filename = 'reference.png'): Promise<string> {
   return serialize(async () => {
     const c = await getClient();
     const blob = new Blob([Uint8Array.from(buf)], { type: mimeType });
     const image = await c.MJApi.UploadImageByBole(blob, filename);
+    const attachment = { id: image.id, filename: image.filename, uploaded_filename: image.upload_filename };
     const url = new URL(`${c.config.DiscordBaseUrl}/api/v9/channels/${c.config.ChannelId}/messages`);
     const resp = await c.config.fetch(url, {
       method: 'POST',
       headers: { Authorization: c.config.SalaiToken, 'content-type': 'application/json' },
-      body: JSON.stringify({ content: '', nonce: Date.now().toString(), channel_id: c.config.ChannelId, type: 0, sticker_ids: [], attachments: [image] }),
+      body: JSON.stringify({ content: '', nonce: Date.now().toString(), channel_id: c.config.ChannelId, type: 0, sticker_ids: [], attachments: [attachment] }),
     });
-    if (!resp.ok) throw new Error(`Failed to post reference image message (${resp.status})`);
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      console.error(`[mj-bridge] reference image message create failed (${resp.status}): ${body}`);
+      throw new Error(`Failed to post reference image message (${resp.status}): ${body}`);
+    }
     const data = (await resp.json()) as { attachments?: Array<{ url?: string }> };
     const cdnUrl = data.attachments?.[0]?.url;
     if (!cdnUrl) throw new Error('Discord did not return a CDN URL for the uploaded reference image.');
