@@ -1,0 +1,24 @@
+services:
+  mj-bridge:
+    build: .
+    container_name: mj-bridge
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8901}:8901"
+    environment:
+      MJ_SALAI_TOKEN: ${MJ_SALAI_TOKEN:?Set MJ_SALAI_TOKEN in .env}
+      MJ_SERVER_ID: ${MJ_SERVER_ID:?Set MJ_SERVER_ID in .env}
+      MJ_CHANNEL_ID: ${MJ_CHANNEL_ID:?Set MJ_CHANNEL_ID in .env}
+      MJ_BOT_ID: ${MJ_BOT_ID:-mj}
+      MJ_REMIX: ${MJ_REMIX:-false}
+      MJ_DEBUG: ${MJ_DEBUG:-false}
+      MJ_BRIDGE_TOKEN: ${MJ_BRIDGE_TOKEN:-}
+      MJ_PREVIEW_MAX_EDGE: ${MJ_PREVIEW_MAX_EDGE:-1024}
+      MJ_PREVIEW_QUALITY: ${MJ_PREVIEW_QUALITY:-82}
+      PORT: 8901
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8901/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
