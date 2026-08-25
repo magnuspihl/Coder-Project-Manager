@@ -9,6 +9,8 @@ import { getOllamaBaseUrl } from './models.js';
 import { getAttachmentsByTask, getAttachmentsByMessage, createAgentOutputAttachment, hasAgentOutputAttachment, sha256Hex, MAX_FILE_SIZE, type Attachment } from '../routes/uploads.js';
 import { writeCpmGuidelines } from './workspace-memory.js';
 import { buildMemoryMcpConfig, MEMORY_MCP_ALLOWED_TOOL, buildMemoryUsagePrompt } from './memory-mcp.js';
+import { buildMidjourneyMcpServerEntry, MIDJOURNEY_MCP_ALLOWED_TOOL, buildMidjourneyUsagePrompt } from './midjourney-mcp.js';
+import { buildMeshyMcpServerEntry, MESHY_MCP_ALLOWED_TOOL, buildMeshyUsagePrompt } from './meshy-mcp.js';
 import { getValidCoderTokenForUser, forceRefreshCoderTokenForUser } from './sessions.js';
 import { resolveAccountToken, markAccountUsed } from './claude-accounts.js';
 import { writeRemoteStdin } from './ssh-stdin.js';
@@ -110,6 +112,24 @@ function pushDisallowedTools(claudeParts: string[], allowedTools: string): void 
   const deny = DISALLOWED_TOOLS.filter(t => !allowed.has(t));
   if (deny.length === 0) return;
   claudeParts.push('--disallowedTools', shellEscape(deny.join(',')));
+}
+
+/** Extract the `mcpServers` object out of a `--mcp-config` JSON string (e.g. from buildMemoryMcpConfig). */
+function mcpServerEntryFromConfig(configJson: string | null): Record<string, unknown> | null {
+  if (!configJson) return null;
+  try {
+    const parsed = JSON.parse(configJson) as { mcpServers?: Record<string, unknown> };
+    return parsed.mcpServers ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Merge multiple MCP server entries into a single `--mcp-config` JSON string, or null if none. */
+function mergeMcpServers(...entries: Array<Record<string, unknown> | null>): string | null {
+  const mcpServers: Record<string, unknown> = {};
+  for (const e of entries) if (e) Object.assign(mcpServers, e);
+  return Object.keys(mcpServers).length ? JSON.stringify({ mcpServers }) : null;
 }
 
 /**
@@ -2360,14 +2380,24 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
   // Only present when the task owner has a configured endpoint; slash commands
   // run bare. Allowing mcp__openmemory auto-approves its tools in headless mode.
   const memoryMcpConfig = isSlashCommand ? null : buildMemoryMcpConfig(task.user_id, task.workspace_name);
+  // Same idea for the Midjourney bridge (see midjourney-mcp.ts) — a separate,
+  // self-hosted MCP server, not a CPM-owned credential.
+  const midjourneyMcpEntry = isSlashCommand ? null : buildMidjourneyMcpServerEntry(task.user_id);
+  // Meshy's own official stdio MCP server (see meshy-mcp.ts) — no bridge needed.
+  const meshyMcpEntry = isSlashCommand ? null : buildMeshyMcpServerEntry(task.user_id);
+  const mcpConfig = mergeMcpServers(mcpServerEntryFromConfig(memoryMcpConfig), midjourneyMcpEntry, meshyMcpEntry);
 
   claudeParts.push('--output-format', 'stream-json');
   claudeParts.push('--verbose');
-  const allowedTools = memoryMcpConfig ? `${ALLOWED_TOOLS},${MEMORY_MCP_ALLOWED_TOOL}` : ALLOWED_TOOLS;
+  const allowedToolNames = [ALLOWED_TOOLS];
+  if (memoryMcpConfig) allowedToolNames.push(MEMORY_MCP_ALLOWED_TOOL);
+  if (midjourneyMcpEntry) allowedToolNames.push(MIDJOURNEY_MCP_ALLOWED_TOOL);
+  if (meshyMcpEntry) allowedToolNames.push(MESHY_MCP_ALLOWED_TOOL);
+  const allowedTools = allowedToolNames.join(',');
   claudeParts.push('--allowedTools', shellEscape(allowedTools));
   pushDisallowedTools(claudeParts, allowedTools);
-  if (memoryMcpConfig) {
-    claudeParts.push('--mcp-config', shellEscape(memoryMcpConfig));
+  if (mcpConfig) {
+    claudeParts.push('--mcp-config', shellEscape(mcpConfig));
   }
   if (MAX_TURNS) claudeParts.push('--max-turns', MAX_TURNS);
 
@@ -2418,6 +2448,14 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
 
   if (memoryMcpConfig) {
     systemPromptFragments.push(buildMemoryUsagePrompt(task.user_id, task.workspace_name));
+  }
+
+  if (midjourneyMcpEntry) {
+    systemPromptFragments.push(buildMidjourneyUsagePrompt());
+  }
+
+  if (meshyMcpEntry) {
+    systemPromptFragments.push(buildMeshyUsagePrompt());
   }
 
   systemPromptFragments.push(HARNESS_REMINDER_NOTE);
@@ -5097,12 +5135,19 @@ export async function launchTaskParticipant(
     claudeParts.push('--session-id', shellEscape(participant.claude_session_id));
   }
   const memoryMcpConfig = buildMemoryMcpConfig(task.user_id, participant.workspace_name);
+  const midjourneyMcpEntry = buildMidjourneyMcpServerEntry(task.user_id);
+  const meshyMcpEntry = buildMeshyMcpServerEntry(task.user_id);
+  const participantMcpConfig = mergeMcpServers(mcpServerEntryFromConfig(memoryMcpConfig), midjourneyMcpEntry, meshyMcpEntry);
   claudeParts.push('--output-format', 'stream-json', '--verbose');
-  const participantAllowedTools = memoryMcpConfig ? `${DISCUSSION_ALLOWED_TOOLS},${MEMORY_MCP_ALLOWED_TOOL}` : DISCUSSION_ALLOWED_TOOLS;
+  const participantAllowedToolNames = [DISCUSSION_ALLOWED_TOOLS];
+  if (memoryMcpConfig) participantAllowedToolNames.push(MEMORY_MCP_ALLOWED_TOOL);
+  if (midjourneyMcpEntry) participantAllowedToolNames.push(MIDJOURNEY_MCP_ALLOWED_TOOL);
+  if (meshyMcpEntry) participantAllowedToolNames.push(MESHY_MCP_ALLOWED_TOOL);
+  const participantAllowedTools = participantAllowedToolNames.join(',');
   claudeParts.push('--allowedTools', shellEscape(participantAllowedTools));
   pushDisallowedTools(claudeParts, participantAllowedTools);
-  if (memoryMcpConfig) {
-    claudeParts.push('--mcp-config', shellEscape(memoryMcpConfig));
+  if (participantMcpConfig) {
+    claudeParts.push('--mcp-config', shellEscape(participantMcpConfig));
   }
   if (MAX_TURNS) claudeParts.push('--max-turns', MAX_TURNS);
   pushAppendSystemPrompt(claudeParts, [
@@ -5115,6 +5160,8 @@ export async function launchTaskParticipant(
     buildTaskDelegationPrompt(task.workspace_name, 'participant'),
     OUTPUT_FILE_PROMPT,
     memoryMcpConfig ? buildMemoryUsagePrompt(task.user_id, participant.workspace_name) : null,
+    midjourneyMcpEntry ? buildMidjourneyUsagePrompt() : null,
+    meshyMcpEntry ? buildMeshyUsagePrompt() : null,
     HARNESS_REMINDER_NOTE,
     INTERACTIVE_PROMPT_NOTE,
   ]);

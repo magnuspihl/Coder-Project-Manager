@@ -561,6 +561,11 @@ The app is configured via environment variables:
 | `CPM_MAX_AUTO_WAKES` | No | Consecutive agent-scheduled wake-ups allowed without a user reply (default: 12) |
 | `CPM_MEMORY_MCP_URL_TEMPLATE` | No | URL with `{username}` / `{workspace}` placeholders; auto-derives each user's memory endpoint. See below. |
 | `CPM_MEMORY_MCP_URLS` | No | Explicit per-user memory endpoint map (overrides the template). See below. |
+| `CPM_MIDJOURNEY_MCP_URL_TEMPLATE` | No | URL (optionally with `{username}`) for the shared Midjourney bridge. See below. |
+| `CPM_MIDJOURNEY_MCP_TOKEN` | No | Bearer token for the template endpoint, if the bridge is token-protected. |
+| `CPM_MIDJOURNEY_MCP_URLS` | No | Explicit per-user Midjourney bridge endpoint map (overrides the template). See below. |
+| `CPM_MESHY_API_KEY` | No | Shared Meshy API key applied to every user with no per-user override. See below. |
+| `CPM_MESHY_API_KEYS` | No | Explicit per-user Meshy API key map (overrides the shared key). See below. |
 
 ### Per-user memory store
 
@@ -615,6 +620,97 @@ owner; other users get the generic prompt without it. Because CPM agents write
 curated, the store's `custom_instructions` (which govern *inferred* extraction)
 don't affect CPM's writes — they're an operator-managed setting for other tools
 that write in inferred mode.
+
+### Per-user Midjourney bridge
+
+Midjourney has no official API — the only way to drive it programmatically is
+by automating a real Discord account against the Midjourney bot, which is
+against Midjourney's ToS and carries an account-ban risk the operator has
+explicitly accepted. `mj-bridge/` (a sibling directory to `server/`/`client/`,
+**not** part of the CPM app itself) is a standalone MCP server that holds that
+Discord automation and exposes it as four tools: `mj_imagine`, `mj_upscale`,
+`mj_variation`, `mj_reroll`. It's deployed as its own long-lived container
+(same pattern as the Qwen TTS backend) since it needs a persistent Discord
+connection — see `mj-bridge/README.md` for credentials and deployment.
+
+When configured, CPM registers a user's bridge endpoint as an MCP server
+(`midjourney`) on every task and advisory-agent session that user owns, and
+appends a system prompt describing the intended workflow: generate a grid,
+judge it with the agent's own vision using the returned preview image,
+iterate (upscale / variation / reroll / refined re-prompt) within a bounded
+number of rounds, then curate — download the full-resolution pick(s) and hand
+them to the user via the `[OUTPUT_FILE]` convention with a short rationale.
+
+Unlike the memory store, there is normally only **one** Midjourney account
+(and therefore one bridge) shared across whichever users are allowed to use
+it — the per-user map exists for the case where more than one bridge exists,
+not because every user needs their own:
+
+1. **`CPM_MIDJOURNEY_MCP_URL_TEMPLATE`** (+ optional `CPM_MIDJOURNEY_MCP_TOKEN`)
+   — a fixed bridge URL (or one with a `{username}` placeholder, for the rarer
+   multi-bridge case), applied to every user who doesn't have an explicit map
+   entry:
+
+   ```
+   CPM_MIDJOURNEY_MCP_URL_TEMPLATE=http://192.168.1.199:8901/mcp
+   CPM_MIDJOURNEY_MCP_TOKEN=...
+   ```
+
+2. **`CPM_MIDJOURNEY_MCP_URLS`** — a JSON object mapping Coder username →
+   endpoint, for opting specific users in/out or pointing them at a different
+   bridge. Each value is a URL string, or `{ "url": "...", "token": "..." }`:
+
+   ```
+   CPM_MIDJOURNEY_MCP_URLS={"magnus":{"url":"http://192.168.1.199:8901/mcp","token":"..."}}
+   ```
+
+Users with no configured endpoint simply get no Midjourney MCP. Preview
+images returned by the tools are downscaled JPEGs (judging quality doesn't
+need full resolution); each result also carries a direct URL to the original
+so the agent can download the actual file when it wants to keep or deliver
+it. The bridge has no CPM-specific code or dependency, so agent-box (or
+anything else) can register the same running container without redeploying
+anything.
+
+### Per-user Meshy (3D/image generation)
+
+Unlike Midjourney, [Meshy](https://meshy.ai) ships an official REST API *and*
+an official MCP server (`@meshy-ai/meshy-mcp-server`), so there is no
+unofficial-automation risk and no standalone service to host — CPM registers
+it as a local `stdio` MCP server (`server/services/meshy-mcp.ts`), which
+Claude Code spawns via `npx -y @meshy-ai/meshy-mcp-server` directly inside the
+target workspace, with the user's API key passed through its env. The key
+never touches the workspace's disk or CPM's database — it rides the
+`--mcp-config` argument for that one launch only (same exposure profile as
+the memory/Midjourney bearer tokens: visible via `ps aux` on the workspace to
+anyone with shell access there, which is an accepted tradeoff already made
+for those).
+
+Configuration mirrors the Midjourney bridge (one shared key is the normal
+case, since it's usually one paid account):
+
+1. **`CPM_MESHY_API_KEY`** — applied to every user with no per-user override:
+
+   ```
+   CPM_MESHY_API_KEY=msy_...
+   ```
+
+2. **`CPM_MESHY_API_KEYS`** — a JSON object mapping Coder username → API key,
+   for opting specific users in/out or giving someone their own key:
+
+   ```
+   CPM_MESHY_API_KEYS={"magnus":"msy_..."}
+   ```
+
+Users with no resolved key simply get no Meshy MCP. Meshy's 24 tools
+(`meshy_text-to-3d`, `meshy_image-to-3d`, `meshy_remesh`, `meshy_retexture`,
+`meshy_rig`, `meshy_animate`, `meshy_text-to-image`, task management,
+`meshy_check-balance`, etc.) are self-described by the server itself; CPM
+only adds a short system-prompt fragment covering what the tool descriptions
+can't know — that generation is async (create → poll `get-task-status` →
+download) and spends real credits, so the agent should judge each result
+before spending more, same generate → judge → iterate → curate discipline as
+the Midjourney workflow above.
 
 ---
 
