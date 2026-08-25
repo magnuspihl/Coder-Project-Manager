@@ -2451,7 +2451,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
   }
 
   if (midjourneyMcpEntry) {
-    systemPromptFragments.push(buildMidjourneyUsagePrompt());
+    systemPromptFragments.push(buildMidjourneyUsagePrompt(task.user_id));
   }
 
   if (meshyMcpEntry) {
@@ -5160,7 +5160,7 @@ export async function launchTaskParticipant(
     buildTaskDelegationPrompt(task.workspace_name, 'participant'),
     OUTPUT_FILE_PROMPT,
     memoryMcpConfig ? buildMemoryUsagePrompt(task.user_id, participant.workspace_name) : null,
-    midjourneyMcpEntry ? buildMidjourneyUsagePrompt() : null,
+    midjourneyMcpEntry ? buildMidjourneyUsagePrompt(task.user_id) : null,
     meshyMcpEntry ? buildMeshyUsagePrompt() : null,
     HARNESS_REMINDER_NOTE,
     INTERACTIVE_PROMPT_NOTE,

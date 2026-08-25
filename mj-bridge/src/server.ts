@@ -3,7 +3,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { config } from './config.js';
-import { imagine, upscale, variation, reroll, type MjResult } from './mjClient.js';
+import { imagine, upscale, variation, reroll, uploadReferenceImage, type MjResult } from './mjClient.js';
 import { fetchPreview } from './image.js';
 
 const IndexSchema = z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]);
@@ -43,13 +43,21 @@ function buildServer(): McpServer {
         'Generate a new Midjourney image from a text prompt. Returns a 2x2 grid as an inline preview image, ' +
         'plus job metadata (id/hash/flags) needed for mj_upscale, mj_variation, or mj_reroll on this job. ' +
         'Judge the grid yourself using the preview image before deciding whether to upscale a quadrant, ' +
-        'request a variation, reroll, or refine the prompt and try again.',
-      inputSchema: { prompt: z.string().min(1).describe('The Midjourney prompt, including any parameters like --ar or --v') },
+        'request a variation, reroll, or refine the prompt and try again. ' +
+        'To use an image as a reference (style, composition, character, etc.), pass its URL(s) via ' +
+        'reference_image_urls — Midjourney only accepts image input as a URL prepended to the prompt, not a file. ' +
+        'For a local file (no public URL yet), first POST its raw bytes to this bridge\'s /upload-reference ' +
+        'endpoint to mint a URL, then pass that URL here.',
+      inputSchema: {
+        prompt: z.string().min(1).describe('The Midjourney prompt, including any parameters like --ar or --v'),
+        reference_image_urls: z.array(z.string().url()).max(5).optional().describe('Public image URLs to use as image references, prepended to the prompt exactly as Midjourney expects.'),
+      },
       annotations: { readOnlyHint: false },
     },
-    async ({ prompt }) => {
+    async ({ prompt, reference_image_urls }) => {
       try {
-        const r = await imagine(prompt);
+        const fullPrompt = reference_image_urls?.length ? `${reference_image_urls.join(' ')} ${prompt}` : prompt;
+        const r = await imagine(fullPrompt);
         return await toolResult(r, 'This is a 2x2 grid. Use mj_upscale(index 1-4) for a single full-size image, mj_variation(index 1-4) for variants of one quadrant, or mj_reroll for a fresh grid with the same prompt.');
       } catch (err) {
         return errorResult(`mj_imagine failed: ${(err as Error).message}`);
@@ -140,6 +148,27 @@ export function createApp() {
   app.use(express.json({ limit: '2mb' }));
 
   app.get('/healthz', (_req, res) => res.json({ ok: true }));
+
+  // Plain HTTP upload — deliberately NOT an MCP tool. A base64 image passed
+  // as an MCP tool argument would flow through the calling agent's context
+  // (a few-MB photo becomes hundreds of thousands of tokens as base64); this
+  // lets an agent `curl --data-binary` the raw bytes straight to the bridge
+  // and get back only a small URL string to use in mj_imagine.
+  app.post('/upload-reference', requireToken, express.raw({ type: '*/*', limit: '15mb' }), async (req, res) => {
+    try {
+      const buf = req.body as Buffer;
+      if (!buf || !Buffer.isBuffer(buf) || buf.length === 0) {
+        res.status(400).json({ error: 'Empty body — send the raw image bytes with an image Content-Type.' });
+        return;
+      }
+      const mimeType = req.header('content-type') || 'image/png';
+      const filename = typeof req.query.filename === 'string' ? req.query.filename : 'reference.png';
+      const url = await uploadReferenceImage(buf, mimeType, filename);
+      res.json({ url });
+    } catch (err) {
+      res.status(500).json({ error: `upload-reference failed: ${(err as Error).message}` });
+    }
+  });
 
   app.post('/mcp', requireToken, async (req, res) => {
     const server = buildServer();

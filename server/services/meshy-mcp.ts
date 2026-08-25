@@ -106,7 +106,7 @@ export function buildMeshyUsagePrompt(): string {
 - Generation tasks are async — create the task, then poll get-task-status (or list-tasks) until it completes before acting on the result.
 - JUDGE before committing further credits: once a task completes, look at the preview/thumbnail it returns and assess it against the brief before refining, retexturing, rigging, or spending more credits on it.
 - ITERATE with intent — refine the prompt or inputs based on what you saw, rather than repeatedly regenerating from scratch.
-- CURATE: once you have result(s) worth keeping, download-model (or the equivalent for images) into your working directory and hand them to the user via the OUTPUT_FILE convention, with a short rationale for what you picked.
+- CURATE: once you have result(s) worth keeping, use download-model (or the equivalent for images) to save into a path INSIDE your current working directory — a relative path or an explicit \`$(pwd)/...\` path. NEVER an absolute path outside it (e.g. \`/home/coder/...\`) — CPM's OUTPUT_FILE delivery rejects anything outside your task's working directory. Then hand the file(s) to the user via the OUTPUT_FILE convention, with a short rationale for what you picked.
 - If a call fails or balance looks low, check-balance and surface that to the user rather than silently retrying.
 
 Never claim a model/image was generated or modified unless a tool call actually returned it.`;
