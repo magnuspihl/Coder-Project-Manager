@@ -65,11 +65,22 @@ npm start
 npm run dev
 ```
 
-### Docker (Odin deployment)
+### Docker Compose (Odin deployment — recommended)
+
+```bash
+cp .env.example .env   # fill in MJ_SALAI_TOKEN / MJ_SERVER_ID / MJ_CHANNEL_ID / MJ_BRIDGE_TOKEN
+docker compose up -d --build
+```
+
+`docker-compose.yml` builds the image, restarts it automatically, and runs a
+`GET /healthz` healthcheck. To update after a code change: `docker compose up
+-d --build` again. Logs: `docker compose logs -f`.
+
+### Plain `docker run` (equivalent, no compose)
 
 ```bash
 docker build -t mj-bridge .
-docker run -d --name mj-bridge \
+docker run -d --name mj-bridge --restart unless-stopped \
   -p 8901:8901 \
   -e MJ_SALAI_TOKEN=... \
   -e MJ_SERVER_ID=... \
