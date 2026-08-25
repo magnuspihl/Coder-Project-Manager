@@ -55,6 +55,30 @@ plus the original's direct URL (`full_resolution_url` in the tool result) so
 the agent can `curl` down the real file only for the image(s) it actually
 wants to keep.
 
+## Image references (using an image as input, not just text)
+
+Midjourney only accepts image input as a URL prepended to the prompt text —
+the same thing you'd get by dragging an image into Discord and copying its
+link. There's no way to hand it a local file directly.
+
+`mj_imagine` takes an optional `reference_image_urls` array for when you
+already have a public URL. For a local file, first mint a URL with a plain
+HTTP upload (deliberately **not** an MCP tool — piping image bytes through an
+MCP tool argument would mean base64-encoding them into the calling agent's
+context, and a multi-MB photo becomes hundreds of thousands of tokens that
+way):
+
+```bash
+curl -X POST --data-binary @photo.png \
+  -H "Content-Type: image/png" \
+  "http://localhost:8901/upload-reference?filename=ref.png"
+# => {"url": "https://cdn.discordapp.com/attachments/..."}
+```
+
+Pass the returned URL into `mj_imagine`'s `reference_image_urls`. (CPM's
+system-prompt fragment for agents already includes this exact flow — see
+`server/services/midjourney-mcp.ts`.)
+
 ## Running
 
 ```bash

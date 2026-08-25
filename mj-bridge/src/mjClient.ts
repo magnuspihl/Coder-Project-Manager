@@ -83,3 +83,33 @@ export function reroll(prompt: string, msgId: string, hash: string, flags: numbe
     return toResult(prompt, msg);
   });
 }
+
+/**
+ * Upload raw image bytes to Discord and return a durable CDN URL, so it can
+ * be prepended to an mj_imagine prompt as an image reference (that's the
+ * only way Midjourney accepts image input — a URL at the start of the
+ * prompt text, the same as pasting a link after dragging an image into
+ * Discord). Two-step under the hood, replicating what the Discord client
+ * itself does: reserve an upload slot + PUT the bytes (MJApi.UploadImageByBole),
+ * then post it as a real channel message so it gets a stable CDN URL back
+ * (`MJApi.upImageApi` does the post but discards the response body, so this
+ * redoes that call directly to capture the URL).
+ */
+export function uploadReferenceImage(buf: Buffer, mimeType: string, filename = 'reference.png'): Promise<string> {
+  return serialize(async () => {
+    const c = await getClient();
+    const blob = new Blob([Uint8Array.from(buf)], { type: mimeType });
+    const image = await c.MJApi.UploadImageByBole(blob, filename);
+    const url = new URL(`${c.config.DiscordBaseUrl}/api/v9/channels/${c.config.ChannelId}/messages`);
+    const resp = await c.config.fetch(url, {
+      method: 'POST',
+      headers: { Authorization: c.config.SalaiToken, 'content-type': 'application/json' },
+      body: JSON.stringify({ content: '', nonce: Date.now().toString(), channel_id: c.config.ChannelId, type: 0, sticker_ids: [], attachments: [image] }),
+    });
+    if (!resp.ok) throw new Error(`Failed to post reference image message (${resp.status})`);
+    const data = (await resp.json()) as { attachments?: Array<{ url?: string }> };
+    const cdnUrl = data.attachments?.[0]?.url;
+    if (!cdnUrl) throw new Error('Discord did not return a CDN URL for the uploaded reference image.');
+    return cdnUrl;
+  });
+}
