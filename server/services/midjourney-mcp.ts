@@ -26,7 +26,17 @@ import { getDb } from '../db/index.js';
  *      CPM_MIDJOURNEY_MCP_URL_TEMPLATE=http://192.168.1.199:8901/mcp
  *      CPM_MIDJOURNEY_MCP_TOKEN=...
  *
- * Users without a configured endpoint simply get no Midjourney MCP.
+ *    Falls back to MJ_BRIDGE_TOKEN (the bridge's own auth env var, see
+ *    mj-bridge/README.md) if CPM_MIDJOURNEY_MCP_TOKEN isn't set — the two are
+ *    almost always the same value, and it's an easy var to set once for the
+ *    bridge deployment and forget to also mirror into CPM's config.
+ *
+ * A bridge whose token can't be resolved is treated as unconfigured (no MCP
+ * entry, no `authenticate`-only tool stub, no system-prompt fragment) rather
+ * than wired up without a credential — mj-bridge rejects unauthenticated
+ * requests outright, so an entry with no `headers` would just hand the agent
+ * broken tools. Users without a configured endpoint simply get no Midjourney
+ * MCP.
  */
 
 export const MIDJOURNEY_MCP_SERVER_NAME = 'midjourney';
@@ -34,13 +44,20 @@ export const MIDJOURNEY_MCP_ALLOWED_TOOL = `mcp__${MIDJOURNEY_MCP_SERVER_NAME}`;
 
 interface MjEndpoint {
   url: string;
+  /** Never null — an endpoint with no resolvable token is treated as unconfigured (see getConfig/endpointFromTemplate). */
+  token: string;
+}
+
+/** Raw CPM_MIDJOURNEY_MCP_URLS entry, before the missing-token check that turns it into (or drops) an MjEndpoint. */
+interface RawMjEndpoint {
+  url: string;
   token: string | null;
 }
 
-let parsed: Record<string, MjEndpoint> | null = null;
+let parsed: Record<string, RawMjEndpoint> | null = null;
 let parsedRaw: string | undefined;
 
-function getConfig(): Record<string, MjEndpoint> {
+function getConfig(): Record<string, RawMjEndpoint> {
   const raw = process.env.CPM_MIDJOURNEY_MCP_URLS;
   if (parsed && raw === parsedRaw) return parsed;
   parsedRaw = raw;
@@ -107,7 +124,14 @@ function endpointFromTemplate(username: string): MjEndpoint | null {
   const template = process.env.CPM_MIDJOURNEY_MCP_URL_TEMPLATE;
   if (!template) return null;
   const url = resolveUrl(template, username);
-  return url ? { url, token: process.env.CPM_MIDJOURNEY_MCP_TOKEN || null } : null;
+  if (!url) return null;
+  const token = process.env.CPM_MIDJOURNEY_MCP_TOKEN || process.env.MJ_BRIDGE_TOKEN || null;
+  if (!token) {
+    console.warn('[midjourney-mcp] CPM_MIDJOURNEY_MCP_URL_TEMPLATE is set but no token was found ' +
+      '(CPM_MIDJOURNEY_MCP_TOKEN / MJ_BRIDGE_TOKEN) — treating the bridge as unconfigured');
+    return null;
+  }
+  return { url, token };
 }
 
 /** Resolve the configured Midjourney bridge endpoint for a user, or null if none. */
@@ -117,7 +141,12 @@ export function getMidjourneyEndpointForUser(userId: string | null | undefined):
   const mapEntry = getConfig()[username];
   if (mapEntry) {
     const url = resolveUrl(mapEntry.url, username);
-    return url ? { url, token: mapEntry.token } : null;
+    if (!url) return null;
+    if (!mapEntry.token) {
+      console.warn(`[midjourney-mcp] CPM_MIDJOURNEY_MCP_URLS entry for "${username}" has no token — treating as unconfigured`);
+      return null;
+    }
+    return { url, token: mapEntry.token };
   }
   return endpointFromTemplate(username);
 }
@@ -125,7 +154,7 @@ export function getMidjourneyEndpointForUser(userId: string | null | undefined):
 /**
  * Build the `--mcp-config` fragment (as a plain object, merged with other MCP
  * servers by the caller) registering the user's Midjourney bridge, or null
- * when there's no configured endpoint for them.
+ * when there's no configured (and authenticated) endpoint for them.
  */
 export function buildMidjourneyMcpServerEntry(userId: string | null | undefined): Record<string, unknown> | null {
   const endpoint = getMidjourneyEndpointForUser(userId);
@@ -134,7 +163,7 @@ export function buildMidjourneyMcpServerEntry(userId: string | null | undefined)
     [MIDJOURNEY_MCP_SERVER_NAME]: {
       type: 'http',
       url: endpoint.url,
-      ...(endpoint.token ? { headers: { Authorization: `Bearer ${endpoint.token}` } } : {}),
+      headers: { Authorization: `Bearer ${endpoint.token}` },
     },
   };
 }
