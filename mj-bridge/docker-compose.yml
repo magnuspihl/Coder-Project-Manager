@@ -5,6 +5,8 @@ services:
     restart: unless-stopped
     ports:
       - "${PORT:-8901}:8901"
+    volumes:
+      - ./data:/app/data
     environment:
       MJ_SALAI_TOKEN: ${MJ_SALAI_TOKEN:?Set MJ_SALAI_TOKEN in .env}
       MJ_SERVER_ID: ${MJ_SERVER_ID:?Set MJ_SERVER_ID in .env}
@@ -12,6 +14,7 @@ services:
       MJ_BOT_ID: ${MJ_BOT_ID:-mj}
       MJ_REMIX: ${MJ_REMIX:-false}
       MJ_DEBUG: ${MJ_DEBUG:-false}
+      MJ_PUBLIC_BASE_URL: ${MJ_PUBLIC_BASE_URL:-}
       MJ_BRIDGE_TOKEN: ${MJ_BRIDGE_TOKEN:-}
       MJ_PREVIEW_MAX_EDGE: ${MJ_PREVIEW_MAX_EDGE:-1024}
       MJ_PREVIEW_QUALITY: ${MJ_PREVIEW_QUALITY:-82}

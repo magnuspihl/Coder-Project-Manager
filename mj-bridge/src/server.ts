@@ -3,8 +3,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { config } from './config.js';
-import { imagine, upscale, variation, reroll, uploadReferenceImage, type MjResult } from './mjClient.js';
+import { imagine, upscale, variation, reroll, type MjResult } from './mjClient.js';
 import { fetchPreview } from './image.js';
+import { saveReferenceImage, referenceFilePath, ReferenceStoreConfigError } from './referenceStore.js';
 
 const IndexSchema = z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]);
 
@@ -154,6 +155,11 @@ export function createApp() {
   // (a few-MB photo becomes hundreds of thousands of tokens as base64); this
   // lets an agent `curl --data-binary` the raw bytes straight to the bridge
   // and get back only a small URL string to use in mj_imagine.
+  //
+  // Saved to local disk and served back via /references/* below, rather than
+  // uploaded to Discord — the Discord attachment-upload flow under a
+  // personal user token is a self-bot detection trigger and got this
+  // bridge's account banned after three uploads.
   app.post('/upload-reference', requireToken, express.raw({ type: '*/*', limit: '15mb' }), async (req, res) => {
     try {
       const buf = req.body as Buffer;
@@ -162,12 +168,28 @@ export function createApp() {
         return;
       }
       const mimeType = req.header('content-type') || 'image/png';
-      const filename = typeof req.query.filename === 'string' ? req.query.filename : 'reference.png';
-      const url = await uploadReferenceImage(buf, mimeType, filename);
+      const url = await saveReferenceImage(buf, mimeType);
       res.json({ url });
     } catch (err) {
-      res.status(500).json({ error: `upload-reference failed: ${(err as Error).message}` });
+      const status = err instanceof ReferenceStoreConfigError ? 500 : 400;
+      res.status(status).json({ error: `upload-reference failed: ${(err as Error).message}` });
     }
+  });
+
+  // Deliberately unauthenticated, unlike every other route here — Midjourney's
+  // bot fetches this as a plain GET and has no way to send a bearer token. The
+  // filename is the only gate: it must be an exact, unguessable UUID minted by
+  // /upload-reference, so this is no more exposed than a Discord CDN link was.
+  app.get('/references/:filename', (req, res) => {
+    const filePath = referenceFilePath(req.params.filename);
+    if (!filePath) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.sendFile(filePath, (err) => {
+      if (err && !res.headersSent) res.status(404).json({ error: 'Not found' });
+    });
   });
 
   app.post('/mcp', requireToken, async (req, res) => {

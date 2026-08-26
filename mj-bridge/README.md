@@ -20,6 +20,17 @@ against Midjourney's Terms of Service and carries a real account-ban risk.
 There is no way around this until Midjourney ships an official API. Only run
 this against an account you're comfortable putting at risk.
 
+This has already happened once: an earlier version of `/upload-reference`
+uploaded reference images to Discord under the account's own user token
+(reserve an attachment slot, PUT the bytes, post a message — replicating
+what the Discord client does). That specific pattern is a well-known
+self-bot detection trigger, and it got the account **banned outright** after
+three uploads — not just booted from one session. Reference images are no
+longer uploaded to Discord at all (see "Image references" below); the
+remaining ToS risk is Discord/Midjourney flagging the automated `Imagine` /
+`Upscale` / etc. traffic itself, which is the risk this section already
+warned about.
+
 ## Getting credentials
 
 1. **SalaiToken** — your Discord account's auth token. Open Discord in a
@@ -39,7 +50,8 @@ this against an account you're comfortable putting at risk.
 | `MJ_CHANNEL_ID` | Yes | Discord channel ID where the MJ bot is present |
 | `MJ_BOT_ID` | No | `mj` (default) or `niji` |
 | `MJ_REMIX` | No | `true` to enable remix mode (requires it be enabled in Discord settings too) |
-| `MJ_BRIDGE_TOKEN` | No | If set, `/mcp` requires `Authorization: Bearer <token>`. Recommended even on a private LAN — this endpoint can spend real quota and post to a real Discord account. |
+| `MJ_PUBLIC_BASE_URL` | Yes, for `/upload-reference` | The public URL this bridge itself is reachable at (e.g. `https://mj-bridge.example.com`), used to build the URLs `/upload-reference` hands back. Midjourney's bot fetches those URLs directly from the open internet — a LAN-only address (like a bare `192.168.x.x` IP) won't be reachable by it. |
+| `MJ_BRIDGE_TOKEN` | No | If set, `/mcp` and `/upload-reference` require `Authorization: Bearer <token>`. Was "recommended even on a LAN" before; now that the bridge needs a public URL for `MJ_PUBLIC_BASE_URL`, treat it as required — without it, anyone who finds the URL can spend real Midjourney quota and post to your Discord channel. (`GET /references/*` is intentionally left unauthenticated regardless, since Midjourney's bot has no way to send a bearer token — see "Image references" below for why that's still safe.) |
 | `MJ_PREVIEW_MAX_EDGE` | No | Long edge (px) of the inline preview image returned to agents (default `1024`) |
 | `MJ_PREVIEW_QUALITY` | No | JPEG quality of the preview (default `82`) |
 | `PORT` | No | Listen port (default `8901`) |
@@ -71,13 +83,25 @@ way):
 ```bash
 curl -X POST --data-binary @photo.png \
   -H "Content-Type: image/png" \
-  "http://localhost:8901/upload-reference?filename=ref.png"
-# => {"url": "https://cdn.discordapp.com/attachments/..."}
+  -H "Authorization: Bearer $MJ_BRIDGE_TOKEN" \
+  "https://mj-bridge.example.com/upload-reference"
+# => {"url": "https://mj-bridge.example.com/references/<uuid>.png"}
 ```
 
 Pass the returned URL into `mj_imagine`'s `reference_image_urls`. (CPM's
 system-prompt fragment for agents already includes this exact flow — see
 `server/services/midjourney-mcp.ts`.)
+
+The bridge saves the bytes to local disk (`./data/references`, bind-mounted
+by `docker-compose.yml`) and serves them back itself at `GET
+/references/<uuid>.png` — it no longer uploads anything to Discord to do
+this (see "Risk" above for why). That serving route is intentionally left
+unauthenticated even though everything else requires `MJ_BRIDGE_TOKEN`:
+Midjourney's bot fetches it as a plain GET with no way to attach a bearer
+token, and the filename is an unguessable random UUID minted only by
+`/upload-reference`, so it's no more exposed than a Discord CDN link was.
+This only works end-to-end if `MJ_PUBLIC_BASE_URL` (above) is actually
+reachable from the open internet, not just your LAN.
 
 ## Running
 

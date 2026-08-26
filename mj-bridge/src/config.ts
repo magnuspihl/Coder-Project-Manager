@@ -14,6 +14,12 @@ export const config = {
   // (qwen-tts, mem0) that assume a private network boundary.
   bridgeToken: process.env.MJ_BRIDGE_TOKEN || null,
 
+  // Public URL this bridge itself is reachable at (e.g. https://mj-bridge.example.com),
+  // used to build URLs for /references/*. Required for /upload-reference to work at
+  // all — Midjourney's bot fetches those URLs directly, so they have to resolve from
+  // the open internet, not just this bridge's own LAN.
+  publicBaseUrl: process.env.MJ_PUBLIC_BASE_URL || null,
+
   salaiToken: required('MJ_SALAI_TOKEN'),
   serverId: required('MJ_SERVER_ID'),
   channelId: required('MJ_CHANNEL_ID'),
