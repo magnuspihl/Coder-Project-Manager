@@ -562,7 +562,7 @@ The app is configured via environment variables:
 | `CPM_MEMORY_MCP_URL_TEMPLATE` | No | URL with `{username}` / `{workspace}` placeholders; auto-derives each user's memory endpoint. See below. |
 | `CPM_MEMORY_MCP_URLS` | No | Explicit per-user memory endpoint map (overrides the template). See below. |
 | `CPM_MIDJOURNEY_MCP_URL_TEMPLATE` | No | URL (optionally with `{username}`) for the shared Midjourney bridge. See below. |
-| `CPM_MIDJOURNEY_MCP_TOKEN` | No | Bearer token for the template endpoint, if the bridge is token-protected. |
+| `CPM_MIDJOURNEY_MCP_TOKEN` | No | Bearer token for the template endpoint. Falls back to `MJ_BRIDGE_TOKEN` if unset. Required in practice — mj-bridge rejects unauthenticated requests, so a template with no resolvable token is treated as unconfigured (no MCP entry, no `authenticate`-only tool stub). |
 | `CPM_MIDJOURNEY_MCP_URLS` | No | Explicit per-user Midjourney bridge endpoint map (overrides the template). See below. |
 | `CPM_MESHY_API_KEY` | No | Shared Meshy API key applied to every user with no per-user override. See below. |
 | `CPM_MESHY_API_KEYS` | No | Explicit per-user Meshy API key map (overrides the shared key). See below. |

@@ -2044,6 +2044,54 @@ function remoteAuthTokenPath(scope: string): string {
 }
 
 /**
+ * Remote path where the merged `--mcp-config` JSON is staged before launch.
+ * Unique per launch, same reasoning as remoteAuthTokenPath: the JSON can carry
+ * bearer tokens (memory/Midjourney/Meshy), and passing it inline on the
+ * `claude` command line would put those in argv — readable by any process on
+ * the box via /proc/<pid>/cmdline. `--mcp-config` accepts a file path or an
+ * inline JSON string, so writing it to a file and passing the path avoids
+ * that. Short-lived: the launch command deletes it once `claude` has exited.
+ */
+function remoteMcpConfigPath(scope: string): string {
+  return `/tmp/cpm-mcp-${scope}-${randomUUID()}.json`;
+}
+
+/** Stage `mcpConfigJson` at `filePath` on `workspaceName` — a local write for launches that spawn on this host, an SSH stdin round trip otherwise (see writeRemoteStdin). */
+async function stageMcpConfigFile(
+  workspaceName: string,
+  mcpConfigJson: string,
+  filePath: string,
+  ownerUserId: string,
+): Promise<void> {
+  if (isLocalWorkspace(workspaceName)) {
+    await fsPromises.writeFile(filePath, mcpConfigJson, { mode: 0o600 });
+    return;
+  }
+  const coderEnv = await buildCoderEnv(ownerUserId);
+  const bytes = Buffer.byteLength(mcpConfigJson, 'utf8');
+  await writeRemoteStdin({
+    workspaceName,
+    remoteScript: `umask 077; head -c ${bytes} > ${shellEscape(filePath)}`,
+    source: Buffer.from(mcpConfigJson, 'utf8'),
+    env: coderEnv,
+    timeoutMs: 30_000,
+  });
+}
+
+/**
+ * Fire-and-forget removal of a staged mcp-config file after a launch that
+ * staged it failed before `claude` ever ran (so the launch command's own
+ * in-band `rm -f` never runs either). Mirrors accountAuth's cleanup.
+ */
+function cleanupMcpConfigFile(workspaceName: string, filePath: string, ownerUserId: string): void {
+  if (isLocalWorkspace(workspaceName)) {
+    fsPromises.unlink(filePath).catch(() => {});
+  } else {
+    sshExec(workspaceName, `rm -f ${shellEscape(filePath)}`, 10000, ownerUserId).catch(() => {});
+  }
+}
+
+/**
  * Auto-detect the primary project directory in a workspace.
  */
 export async function detectProjectDir(workspaceName: string, userId?: string | null): Promise<string | null> {
@@ -2386,6 +2434,10 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
   // Meshy's own official stdio MCP server (see meshy-mcp.ts) — no bridge needed.
   const meshyMcpEntry = isSlashCommand ? null : buildMeshyMcpServerEntry(task.user_id);
   const mcpConfig = mergeMcpServers(mcpServerEntryFromConfig(memoryMcpConfig), midjourneyMcpEntry, meshyMcpEntry);
+  // Staged to disk (see stageMcpConfigFile below, inside the launch try/catch)
+  // rather than passed inline — the merged config can carry bearer tokens and
+  // must not land in this process's argv.
+  const mcpConfigFile = mcpConfig ? remoteMcpConfigPath(`task-${task.id}`) : null;
 
   claudeParts.push('--output-format', 'stream-json');
   claudeParts.push('--verbose');
@@ -2396,8 +2448,8 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
   const allowedTools = allowedToolNames.join(',');
   claudeParts.push('--allowedTools', shellEscape(allowedTools));
   pushDisallowedTools(claudeParts, allowedTools);
-  if (mcpConfig) {
-    claudeParts.push('--mcp-config', shellEscape(mcpConfig));
+  if (mcpConfigFile) {
+    claudeParts.push('--mcp-config', shellEscape(mcpConfigFile));
   }
   if (MAX_TURNS) claudeParts.push('--max-turns', MAX_TURNS);
 
@@ -2492,6 +2544,12 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
   remoteCmd += `rm -f ${shellEscape(exitFile)} && `;
   remoteCmd += `${claudeCmd} > ${shellEscape(outputFile)} 2>&1; `;
   remoteCmd += `echo $? > ${shellEscape(exitFile)}`;
+  // The mcp-config file (see mcpConfigFile above) is only needed for `claude`'s
+  // own startup; clean it up once it's exited so the token(s) inside it don't
+  // sit on disk for the rest of the task's lifetime.
+  if (mcpConfigFile) {
+    remoteCmd += `; rm -f ${shellEscape(mcpConfigFile)}`;
+  }
 
   console.log('[claude-executor] Launching on workspace:', task.workspace_name);
   console.log('[claude-executor] Project dir:', (task.worktree_path || task.project_dir) || '(none - home dir)');
@@ -2517,6 +2575,20 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
     if (workingCount >= maxConcurrent) {
       console.log(`[claude-executor] Refusing to launch ${task.id}: workspace at concurrency limit ${maxConcurrent}`);
       return;
+    }
+
+    // Stage the merged MCP config (if any) to disk before spawning — see
+    // mcpConfigFile / stageMcpConfigFile above. Same "commit before staging"
+    // reasoning as the account-token staging just below: the aborts above
+    // already returned, and the launch command's own `rm -f` is what cleans
+    // this up, so staging any earlier would strand a credential-bearing file
+    // on the workspace for a launch that never happens.
+    if (mcpConfig && mcpConfigFile) {
+      try {
+        await stageMcpConfigFile(task.workspace_name, mcpConfig, mcpConfigFile, task.user_id);
+      } catch (err) {
+        throw new Error(`Could not stage MCP config on ${task.workspace_name}: ${(err as Error).message}`);
+      }
     }
 
     // Override which Claude subscription this task authenticates with, if one is
@@ -2602,6 +2674,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
       console.error('[claude-executor] Spawn error:', (err as Error).message);
       // The launch command never ran, so its in-band `rm` never will either.
       accountAuth.cleanup?.();
+      if (mcpConfigFile) cleanupMcpConfigFile(task.workspace_name, mcpConfigFile, task.user_id);
       activeProcesses.delete(task.id);
       stopPolling(task.id);
       addMessage(task.id, 'system', `Error: failed to start Claude process: ${(err as Error).message}`);
@@ -2632,6 +2705,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
     // Anything staged before the failure would otherwise linger until some later
     // pinned launch to the same workspace happened to sweep it.
     accountAuth.cleanup?.();
+    if (mcpConfigFile) cleanupMcpConfigFile(task.workspace_name, mcpConfigFile, task.user_id);
     addMessage(task.id, 'system', `Error: ${errorMsg}`);
     updateTaskStatus(task.id, 'failed', errorMsg);
     processQueue(task.workspace_id).catch(() => {});
@@ -5138,6 +5212,9 @@ export async function launchTaskParticipant(
   const midjourneyMcpEntry = buildMidjourneyMcpServerEntry(task.user_id);
   const meshyMcpEntry = buildMeshyMcpServerEntry(task.user_id);
   const participantMcpConfig = mergeMcpServers(mcpServerEntryFromConfig(memoryMcpConfig), midjourneyMcpEntry, meshyMcpEntry);
+  // Staged to disk (see stageMcpConfigFile), not passed inline — same argv
+  // exposure reasoning as the main task launch above.
+  const participantMcpConfigFile = participantMcpConfig ? remoteMcpConfigPath(`task-p-${participant.id}`) : null;
   claudeParts.push('--output-format', 'stream-json', '--verbose');
   const participantAllowedToolNames = [DISCUSSION_ALLOWED_TOOLS];
   if (memoryMcpConfig) participantAllowedToolNames.push(MEMORY_MCP_ALLOWED_TOOL);
@@ -5146,8 +5223,8 @@ export async function launchTaskParticipant(
   const participantAllowedTools = participantAllowedToolNames.join(',');
   claudeParts.push('--allowedTools', shellEscape(participantAllowedTools));
   pushDisallowedTools(claudeParts, participantAllowedTools);
-  if (participantMcpConfig) {
-    claudeParts.push('--mcp-config', shellEscape(participantMcpConfig));
+  if (participantMcpConfigFile) {
+    claudeParts.push('--mcp-config', shellEscape(participantMcpConfigFile));
   }
   if (MAX_TURNS) claudeParts.push('--max-turns', MAX_TURNS);
   pushAppendSystemPrompt(claudeParts, [
@@ -5174,6 +5251,9 @@ export async function launchTaskParticipant(
   remoteCmd += `rm -f ${shellEscape(exitFile)} && `;
   remoteCmd += `${claudeParts.join(' ')} > ${shellEscape(outputFile)} 2>&1; `;
   remoteCmd += `echo $? > ${shellEscape(exitFile)}`;
+  if (participantMcpConfigFile) {
+    remoteCmd += `; rm -f ${shellEscape(participantMcpConfigFile)}`;
+  }
 
   console.log('[task-participant] Launching on workspace:', participant.workspace_name, 'for task:', task.id);
 
@@ -5183,6 +5263,17 @@ export async function launchTaskParticipant(
   try {
     const pollKey = `task-p:${participant.id}`;
     taskActivity.set(pollKey, { timestamp: new Date().toISOString(), summary: 'Starting advisory session' });
+
+    // Stage the merged MCP config (if any) before spawning — see
+    // participantMcpConfigFile above and the main task launch's identical
+    // comment for why this must happen after the launch is committed.
+    if (participantMcpConfig && participantMcpConfigFile) {
+      try {
+        await stageMcpConfigFile(participant.workspace_name, participantMcpConfig, participantMcpConfigFile, task.user_id);
+      } catch (err) {
+        throw new Error(`Could not stage MCP config on ${participant.workspace_name}: ${(err as Error).message}`);
+      }
+    }
 
     // Advisors run on a different workspace than the task, but the subscription
     // override belongs to CPM rather than the workspace — so it follows the task.
@@ -5235,6 +5326,7 @@ export async function launchTaskParticipant(
     sshProcess.on('error', (err) => {
       console.error('[task-participant] Spawn error:', (err as Error).message);
       accountAuth.cleanup?.(); // launch command never ran; its in-band `rm` won't either
+      if (participantMcpConfigFile) cleanupMcpConfigFile(participant.workspace_name, participantMcpConfigFile, task.user_id);
       activeProcesses.delete(pollKey);
       stopPolling(pollKey);
       addMessage(task.id, 'system', `Error launching ${participant.workspace_name}: ${(err as Error).message}`);
@@ -5244,6 +5336,7 @@ export async function launchTaskParticipant(
     startTaskParticipantPolling(task, participant, sessionWorkDir);
   } catch (err) {
     accountAuth.cleanup?.();
+    if (participantMcpConfigFile) cleanupMcpConfigFile(participant.workspace_name, participantMcpConfigFile, task.user_id);
     addMessage(task.id, 'system', `Error launching ${participant.workspace_name}: ${(err as Error).message}`);
   }
 }
