@@ -633,13 +633,33 @@ Discord automation and exposes it as four tools: `mj_imagine`, `mj_upscale`,
 (same pattern as the Qwen TTS backend) since it needs a persistent Discord
 connection — see `mj-bridge/README.md` for credentials and deployment.
 
-When configured, CPM registers a user's bridge endpoint as an MCP server
-(`midjourney`) on every task and advisory-agent session that user owns, and
-appends a system prompt describing the intended workflow: generate a grid,
-judge it with the agent's own vision using the returned preview image,
+The same process also optionally exposes **FLUX** (Black Forest Labs' real,
+official, paid API — no Discord automation, no ban risk) as `flux_generate`
+(text + up to 8 reference images, one full-resolution result, no grid) and
+`flux_edit` (source image + a short imperative instruction, everything else
+preserved). This covers what Midjourney structurally cannot: its
+`--iw`/`--sref`/`--ow` parameters are global similarity leashes on the whole
+re-sampled image, not per-attribute controls, so there's no way to hold
+geometry fixed while freeing material/lighting (or vice versa) with MJ alone.
+FLUX is enabled per-deployment by setting `BFL_API_KEY` on the bridge — when
+unset, `flux_generate`/`flux_edit` are simply not registered, and Midjourney
+keeps working as before. Unlike Midjourney's calls, FLUX calls aren't
+serialized through the bridge's Discord-session queue (BFL's API is a normal
+rate-limited REST API), so they can't wedge or be wedged by MJ traffic. See
+`mj-bridge/README.md` ("FLUX (Black Forest Labs)") for details, including the
+per-call cost log and optional monthly spend cap.
+
+When configured, CPM registers a user's bridge endpoint as a single MCP
+server (`midjourney`) on every task and advisory-agent session that user
+owns — this covers whichever tools the bridge itself has enabled, Midjourney
+and/or FLUX, with no separate CPM-side config for FLUX — and appends a system
+prompt describing the intended workflow for each: for Midjourney, generate a
+grid, judge it with the agent's own vision using the returned preview image,
 iterate (upscale / variation / reroll / refined re-prompt) within a bounded
-number of rounds, then curate — download the full-resolution pick(s) and hand
-them to the user via the `[OUTPUT_FILE]` convention with a short rationale.
+number of rounds; for FLUX, generate or edit directly to a full-resolution
+result (no grid/upscale step). Either way, finish by curating — download the
+full-resolution pick(s) and hand them to the user via the `[OUTPUT_FILE]`
+convention with a short rationale.
 
 Unlike the memory store, there is normally only **one** Midjourney account
 (and therefore one bridge) shared across whichever users are allowed to use

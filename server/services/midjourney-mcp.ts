@@ -171,25 +171,43 @@ export function buildMidjourneyMcpServerEntry(userId: string | null | undefined)
 /**
  * System-prompt fragment teaching the agent the generate → judge → iterate →
  * curate loop, plus the two things that don't work by default: image
- * references (Midjourney needs a URL, not a file) and where downloaded files
- * must land (CPM's OUTPUT_FILE delivery refuses paths outside the task's own
- * working directory). Only appended when the user has a configured endpoint.
+ * references (neither backend accepts a local file, only a URL) and where
+ * downloaded files must land (CPM's OUTPUT_FILE delivery refuses paths
+ * outside the task's own working directory). Only appended when the user has
+ * a configured endpoint. Covers both tools this MCP server may expose —
+ * Midjourney (always, if the endpoint is configured) and FLUX
+ * (flux_generate/flux_edit, only if the bridge itself has BFL_API_KEY set —
+ * there's no separate CPM-side signal for that, so this fragment just
+ * describes both and lets the agent notice which tools are actually present).
  */
 export function buildMidjourneyUsagePrompt(userId: string | null | undefined): string {
   const endpoint = getMidjourneyEndpointForUser(userId);
   const bridgeBase = endpoint ? endpoint.url.replace(/\/mcp\/?$/, '') : null;
+  const uploadCmd = (filename: string) =>
+    `curl -s -X POST --data-binary @<local-file-path> -H "Content-Type: image/png"${bridgeBase ? ` "${bridgeBase}/upload-reference?filename=${filename}"` : ` "<bridge-base-url>/upload-reference?filename=${filename}"`}`;
 
-  return `MIDJOURNEY IMAGE GENERATION — you have access to a real Midjourney account via the \`${MIDJOURNEY_MCP_SERVER_NAME}\` MCP server (tools prefixed \`mcp__${MIDJOURNEY_MCP_SERVER_NAME}__\`: \`mj_imagine\`, \`mj_upscale\`, \`mj_variation\`, \`mj_reroll\`). Use it as a tool on the user's behalf, not just a single call:
+  return `IMAGE GENERATION — you have access to a real Midjourney account, and possibly also Black Forest Labs' FLUX, via the \`${MIDJOURNEY_MCP_SERVER_NAME}\` MCP server (tools prefixed \`mcp__${MIDJOURNEY_MCP_SERVER_NAME}__\`). Check which of the following tools actually show up in your tool list before using them — FLUX is only present when the operator has enabled it on the bridge.
 
+CHOOSING A BACKEND:
+- Use Midjourney (mj_imagine) for open-ended aesthetic exploration — you don't have a fixed source image, or you're fine with the whole image being resampled together.
+- Use FLUX (flux_generate / flux_edit) when something has to be held fixed while something else changes — geometry, a specific mark, a palette, a character's identity across shots — or when you're editing an existing image and want everything NOT mentioned in the instruction left alone. Midjourney's \`--iw\`/\`--sref\`/\`--ow\` are global similarity leashes on the whole re-sampled image, not per-attribute controls, so it structurally cannot do this; FLUX can.
+
+MIDJOURNEY (mj_imagine, mj_upscale, mj_variation, mj_reroll):
 - GENERATE: call mj_imagine with a well-formed prompt for the user's brief. It returns a 2x2 grid as an inline preview image plus job metadata (id/hash/flags).
 - REFERENCE IMAGES: if the user attaches an image, points at an existing file, or asks you to match a style/composition/character, ALWAYS consider passing it to mj_imagine as an image reference via its \`reference_image_urls\` parameter — don't silently skip this because you only have a local file. Midjourney only accepts image input as a URL prepended to the prompt, never a file, so for a local file mint one first:
   \`\`\`
-  curl -s -X POST --data-binary @<local-file-path> -H "Content-Type: image/png"${bridgeBase ? ` "${bridgeBase}/upload-reference?filename=ref.png"` : ' "<bridge-base-url>/upload-reference?filename=ref.png"'}
+  ${uploadCmd('ref.png')}
   \`\`\`
   This returns \`{"url": "..."}\` — pass that URL in \`reference_image_urls\`. Do this instead of trying to inline the image bytes anywhere; only the small resulting URL should ever appear in a tool call.
 - JUDGE: actually look at the returned preview image with your own vision before deciding anything. Compare each quadrant against the brief — composition, subject fidelity, artifacts, whether it matches what was asked.
 - ITERATE: based on that judgment, either (a) mj_upscale the best quadrant, (b) mj_variation to explore near a promising quadrant, (c) mj_reroll for a fresh grid on the same prompt, or (d) refine the prompt text and mj_imagine again. Keep the loop bounded — a handful of rounds is normally enough; don't spin indefinitely chasing marginal improvement.
-- CURATE: once you have image(s) worth keeping, mj_upscale them, then download the full-resolution file into a path INSIDE your current working directory — e.g. \`curl -o result.png "<full_resolution_url>"\` run from your working directory (the \`full_resolution_url\` field in the tool result — the preview image is deliberately downscaled and not the deliverable). Use a relative path or an explicit \`$(pwd)/...\` path — NEVER an absolute path like \`/home/coder/...\`, which is outside your task's working directory and will be rejected when you try to hand it off. Present the final picks to the user with a short rationale for why each was chosen, and hand off the file(s) via the OUTPUT_FILE convention described elsewhere in this prompt.
 
-Never claim an image was generated, upscaled, or varied unless a tool call actually returned it.`;
+FLUX (flux_generate, flux_edit) — if present:
+- flux_generate takes a prompt plus up to 8 \`reference_image_urls\` (refer to them by number in the prompt, e.g. "the subject from image 1 in the environment from image 2"). Same local-file rule as Midjourney — mint a URL first via \`${bridgeBase ? `${bridgeBase}/upload-reference` : '/upload-reference'}\` (\`${uploadCmd('ref.png')}\`).
+- flux_edit takes a \`source_image_url\` plus a short, specific imperative \`instruction\` describing only the change to make ("cool the stone to bone-white, add fine hairline cracks, change nothing else") — vague instructions get vague preservation, so be precise about what should and shouldn't change.
+- Both return one full-resolution image directly per call — no grid, no separate upscale step. Judge the result the same way (compare against the brief, and for flux_edit specifically compare against the source to confirm only the instructed change happened) before treating it as final; re-run with a refined prompt/instruction if it's off.
+
+CURATE (either backend): once you have image(s) worth keeping, download the full-resolution file into a path INSIDE your current working directory — e.g. \`curl -o result.png "<full_resolution_url>"\` run from your working directory (the \`full_resolution_url\` field in the tool result — the preview image is deliberately downscaled and not the deliverable). Use a relative path or an explicit \`$(pwd)/...\` path — NEVER an absolute path like \`/home/coder/...\`, which is outside your task's working directory and will be rejected when you try to hand it off. Present the final picks to the user with a short rationale for why each was chosen, and hand off the file(s) via the OUTPUT_FILE convention described elsewhere in this prompt.
+
+Never claim an image was generated, upscaled, varied, or edited unless a tool call actually returned it.`;
 }

@@ -1,11 +1,22 @@
 # mj-bridge
 
-A standalone MCP server that drives a real Midjourney account through Discord
-(there is still no official Midjourney API). It exposes `mj_imagine`,
-`mj_upscale`, `mj_variation`, and `mj_reroll` as MCP tools so any Claude Code
-agent — a CPM task, an agent-box agent, anything that can register an MCP
-server — can generate, judge, and iterate on Midjourney images as part of a
-normal tool-use loop.
+A standalone MCP server exposing two image backends to any Claude Code agent
+— a CPM task, an agent-box agent, anything that can register an MCP server —
+as part of a normal tool-use loop:
+
+- **Midjourney**, driven through Discord (there is still no official
+  Midjourney API): `mj_imagine`, `mj_upscale`, `mj_variation`, `mj_reroll`.
+  Best for open-ended aesthetic exploration — every call resamples the whole
+  image, so there's no way to hold one part of it fixed while changing
+  another.
+- **FLUX** (Black Forest Labs' official, paid API — no Discord automation
+  involved): `flux_generate` (multi-reference generation, up to 8 images) and
+  `flux_edit` (instruction-based editing that preserves everything not
+  mentioned). Best for targeted work — holding geometry, a mark, or a palette
+  fixed while changing material, lighting, or one specific attribute, which
+  Midjourney's `--iw`/`--sref`/`--ow` global similarity controls cannot do.
+  See "FLUX (Black Forest Labs)" below. Optional — only registered when
+  `BFL_API_KEY` is set.
 
 This is deliberately **not** part of the CPM app itself. It's a separate
 long-lived process (it holds a persistent Discord connection) meant to run as
@@ -56,6 +67,10 @@ warned about.
 | `MJ_PREVIEW_QUALITY` | No | JPEG quality of the preview (default `82`) |
 | `MJ_JOB_TIMEOUT_MS` | No | Max time (ms) to wait on a single Imagine/Upscale/Variation/Reroll round-trip before giving up (default `360000` = 6 min). See "Queueing and timeouts" below. |
 | `PORT` | No | Listen port (default `8901`) |
+| `BFL_API_KEY` | No | Black Forest Labs API key. Enables `flux_generate`/`flux_edit`; unset means those two tools just aren't registered. Get one at [dashboard.bfl.ai](https://dashboard.bfl.ai/get-started). See "FLUX (Black Forest Labs)" below. |
+| `FLUX_MODEL` | No | Which FLUX.2 model backs both FLUX tools: `flux-2-pro` (default), `flux-2-max`, `flux-2-flex`, `flux-2-klein-4b`, `flux-2-klein-9b` |
+| `FLUX_JOB_TIMEOUT_MS` | No | Max time (ms) for a single flux_generate/flux_edit submit+poll round-trip (default `180000` = 3 min) |
+| `FLUX_MONTHLY_CAP_USD` | No | If set, flux_generate/flux_edit are refused once this bridge's own cost log shows the current UTC month has reached this (estimated, not billing-accurate) total. Unset = no cap. |
 
 ## Queueing and timeouts
 
@@ -127,6 +142,54 @@ token, and the filename is an unguessable random UUID minted only by
 This only works end-to-end if `MJ_PUBLIC_BASE_URL` (above) is actually
 reachable from the open internet, not just your LAN.
 
+## FLUX (Black Forest Labs)
+
+Unlike Midjourney, FLUX is a real, official, paid API (`https://api.bfl.ai`)
+— no Discord automation, no account-ban risk, no queueing needed (BFL's API
+has its own rate limits and every call has an explicit timeout, so unlike
+Midjourney, a slow FLUX call can't wedge anything else). Set `BFL_API_KEY` to
+enable `flux_generate` and `flux_edit`; leave it unset to run Midjourney-only.
+
+Both tools are built on FLUX.2 — BFL's own guidance is that FLUX.2's native
+image-to-image editing (a single `input_image` on the same generation
+endpoint) is now recommended over the older, separate FLUX.1 Kontext
+endpoints, so there's one model family and one client (`src/fluxClient.ts`)
+behind both tools:
+
+- **`flux_generate`** — text prompt plus up to 8 `reference_image_urls`,
+  referenced by number in the prompt ("the subject from image 1 in the
+  environment from image 2"). Returns one full-resolution image directly —
+  no grid, no separate upscale step like Midjourney.
+- **`flux_edit`** — a source image URL plus a short imperative instruction
+  ("cool the stone to bone-white, add fine hairline cracks, change nothing
+  else"). Everything not covered by the instruction is preserved. This is
+  the capability Midjourney fundamentally can't offer: `--iw`/`--sref`/`--ow`
+  are global similarity leashes on the *whole* re-sampled image, not
+  per-attribute controls, so there's no MJ setting that holds geometry fixed
+  while freeing material/lighting (or vice versa).
+
+Both take image input the same way `mj_imagine` does — a public URL, minted
+via `/upload-reference` for local files (see "Image references" above).
+
+**Result URLs expire.** BFL's own result URL is only valid for about 10
+minutes after generation. To avoid handing an agent a link that might die
+before it gets around to downloading it, this bridge downloads the result
+itself and re-hosts it through the same local reference store
+`/upload-reference` uses, so `full_resolution_url` in the tool result is a
+durable link on this bridge — not BFL's transient one — as long as
+`MJ_PUBLIC_BASE_URL` is configured. Without it, the tools still work, but
+`full_resolution_url` falls back to BFL's own (expiring) link and the tool
+result says so.
+
+**Cost.** Pay-as-you-go, priced per megapixel — roughly $0.03/image for
+FLUX.2 [pro] (the default), up to $0.07-0.10 for [max]. A typical art-
+direction session (10-30 calls) costs well under a dollar. Every successful
+call is appended to `data/flux-cost-log.jsonl` (timestamp, tool, model,
+estimated cost — not a real invoice figure) as a lightweight spend trail;
+set `FLUX_MONTHLY_CAP_USD` if you want calls refused once the current UTC
+month's logged total reaches a cap (catches a runaway agent loop, not meant
+to reconcile against a bill).
+
 ## Running
 
 ```bash
@@ -141,6 +204,7 @@ npm run dev
 
 ```bash
 cp .env.example .env   # fill in MJ_SALAI_TOKEN / MJ_SERVER_ID / MJ_CHANNEL_ID / MJ_BRIDGE_TOKEN
+                        # (optionally BFL_API_KEY too, to enable flux_generate/flux_edit)
 docker compose up -d --build
 ```
 
@@ -168,9 +232,12 @@ stateless — same transport CPM's own `/mcp` uses).
 
 See `docs/SPEC.md` §9 ("Per-user Midjourney bridge") — set
 `CPM_MIDJOURNEY_MCP_URL` (or the per-user map/template variant) to this
-service's `/mcp` URL and restart CPM. Task agents then get the four tools
-above plus a system-prompt fragment describing the generate → judge → iterate
-→ curate workflow.
+service's `/mcp` URL and restart CPM. Task agents then get all the tools
+above (Midjourney's four, plus `flux_generate`/`flux_edit` if `BFL_API_KEY`
+is set on this bridge — no separate CPM config needed for FLUX, it rides the
+same `midjourney` MCP server entry and the same `mcp__midjourney` tool-name
+allowlist) plus a system-prompt fragment describing when to use which
+backend and the generate → judge → iterate → curate workflow.
 
 ## Reuse in agent-box
 
