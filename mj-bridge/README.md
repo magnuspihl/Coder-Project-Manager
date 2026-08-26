@@ -54,7 +54,31 @@ warned about.
 | `MJ_BRIDGE_TOKEN` | No | If set, `/mcp` and `/upload-reference` require `Authorization: Bearer <token>`. Was "recommended even on a LAN" before; now that the bridge needs a public URL for `MJ_PUBLIC_BASE_URL`, treat it as required — without it, anyone who finds the URL can spend real Midjourney quota and post to your Discord channel. (`GET /references/*` is intentionally left unauthenticated regardless, since Midjourney's bot has no way to send a bearer token — see "Image references" below for why that's still safe.) |
 | `MJ_PREVIEW_MAX_EDGE` | No | Long edge (px) of the inline preview image returned to agents (default `1024`) |
 | `MJ_PREVIEW_QUALITY` | No | JPEG quality of the preview (default `82`) |
+| `MJ_JOB_TIMEOUT_MS` | No | Max time (ms) to wait on a single Imagine/Upscale/Variation/Reroll round-trip before giving up (default `360000` = 6 min). See "Queueing and timeouts" below. |
 | `PORT` | No | Listen port (default `8901`) |
+
+## Queueing and timeouts
+
+A single Discord account can only do one thing at a time, so every
+Imagine/Upscale/Variation/Reroll call is serialized through one in-process
+queue — callers waiting behind another job get a `notifications/progress`
+update saying so (if their MCP client sent a `progressToken`; this is a
+no-op otherwise), and each job also reports Midjourney's own generation
+percentage via the same channel.
+
+Every job is bounded by `MJ_JOB_TIMEOUT_MS`. This matters more than it might
+look: nothing upstream (the `midjourney` npm client, Discord's websocket) has
+its own timeout, and because calls are serialized, one job that never
+resolves would otherwise wedge the queue **forever** — every later call, from
+every task or agent sharing this bridge, would hang indefinitely with no
+error and no way to recover short of restarting the process. This happened
+for real on 2026-08-26: the bridge went silently unresponsive to every
+caller for hours, invisible to `/healthz` because the old health check never
+touched the queue at all. `/healthz` now reports the live queue depth and
+current job, and returns `503` if a job is somehow still running past its
+timeout (shouldn't happen, but flags it if it does). A timeout also drops
+and reconnects the Discord client, since a connection that failed to
+complete one round-trip may be in a bad state for the next one.
 
 ## Why previews are downscaled
 

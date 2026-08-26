@@ -1,9 +1,11 @@
 import express, { Request, Response, NextFunction } from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
+import type { ServerRequest, ServerNotification } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { config } from './config.js';
-import { imagine, upscale, variation, reroll, type MjResult } from './mjClient.js';
+import { imagine, upscale, variation, reroll, getQueueStatus, type MjResult, type ProgressReporter } from './mjClient.js';
 import { fetchPreview } from './image.js';
 import { saveReferenceImage, referenceFilePath, ReferenceStoreConfigError } from './referenceStore.js';
 
@@ -34,6 +36,24 @@ function errorResult(message: string) {
   return { isError: true, content: [{ type: 'text' as const, text: message }] };
 }
 
+// Forwards queue/generation status as MCP progress notifications, so a
+// caller waiting on a long-running job sees "queued behind 2 jobs" / "45%"
+// instead of total silence. Per spec, progress notifications are only sent
+// if the caller opted in with a progressToken — most don't, so this is a
+// no-op for them, not a behavior change.
+function makeProgressReporter(extra: RequestHandlerExtra<ServerRequest, ServerNotification>): ProgressReporter | undefined {
+  const progressToken = extra._meta?.progressToken;
+  if (progressToken === undefined) return undefined;
+  let progress = 0;
+  return (message: string) => {
+    progress += 1;
+    extra.sendNotification({
+      method: 'notifications/progress',
+      params: { progressToken, progress, message },
+    }).catch(() => { /* best effort — a dead notification channel shouldn't fail the job */ });
+  };
+}
+
 function buildServer(): McpServer {
   const server = new McpServer({ name: 'midjourney', version: '0.1.0' }, { capabilities: {} });
 
@@ -55,10 +75,10 @@ function buildServer(): McpServer {
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ prompt, reference_image_urls }) => {
+    async ({ prompt, reference_image_urls }, extra) => {
       try {
         const fullPrompt = reference_image_urls?.length ? `${reference_image_urls.join(' ')} ${prompt}` : prompt;
-        const r = await imagine(fullPrompt);
+        const r = await imagine(fullPrompt, makeProgressReporter(extra));
         return await toolResult(r, 'This is a 2x2 grid. Use mj_upscale(index 1-4) for a single full-size image, mj_variation(index 1-4) for variants of one quadrant, or mj_reroll for a fresh grid with the same prompt.');
       } catch (err) {
         return errorResult(`mj_imagine failed: ${(err as Error).message}`);
@@ -79,9 +99,9 @@ function buildServer(): McpServer {
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ prompt, id, hash, flags, index }) => {
+    async ({ prompt, id, hash, flags, index }, extra) => {
       try {
-        const r = await upscale(prompt, id, hash, flags, index);
+        const r = await upscale(prompt, id, hash, flags, index, makeProgressReporter(extra));
         return await toolResult(r, 'Full-resolution single image. Download it (curl the full_resolution_url) if you want to keep or deliver it.');
       } catch (err) {
         return errorResult(`mj_upscale failed: ${(err as Error).message}`);
@@ -102,9 +122,9 @@ function buildServer(): McpServer {
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ prompt, id, hash, flags, index }) => {
+    async ({ prompt, id, hash, flags, index }, extra) => {
       try {
-        const r = await variation(prompt, id, hash, flags, index);
+        const r = await variation(prompt, id, hash, flags, index, makeProgressReporter(extra));
         return await toolResult(r, 'This is a new 2x2 grid. Use mj_upscale(index 1-4) on it once you find a quadrant worth keeping.');
       } catch (err) {
         return errorResult(`mj_variation failed: ${(err as Error).message}`);
@@ -124,9 +144,9 @@ function buildServer(): McpServer {
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ prompt, id, hash, flags }) => {
+    async ({ prompt, id, hash, flags }, extra) => {
       try {
-        const r = await reroll(prompt, id, hash, flags);
+        const r = await reroll(prompt, id, hash, flags, makeProgressReporter(extra));
         return await toolResult(r, 'This is a new 2x2 grid from the same prompt.');
       } catch (err) {
         return errorResult(`mj_reroll failed: ${(err as Error).message}`);
@@ -148,7 +168,17 @@ export function createApp() {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
 
-  app.get('/healthz', (_req, res) => res.json({ ok: true }));
+  // Reflects the actual job queue, not just that Express is up — a static
+  // `{ ok: true }` here is what let this bridge report "healthy" for hours
+  // while every real call was silently wedged behind a hung job (see
+  // mj-bridge incident, 2026-08-26). `wedged` should never be true now that
+  // every job is timeout-bounded (see mjClient.ts), but stays as a signal in
+  // case a future call path bypasses that guard.
+  app.get('/healthz', (_req, res) => {
+    const queue = getQueueStatus();
+    const wedged = queue.currentJob !== null && queue.currentJob.elapsedMs > config.jobTimeoutMs + 30_000;
+    res.status(wedged ? 503 : 200).json({ ok: !wedged, queue });
+  });
 
   // Plain HTTP upload — deliberately NOT an MCP tool. A base64 image passed
   // as an MCP tool argument would flow through the calling agent's context
