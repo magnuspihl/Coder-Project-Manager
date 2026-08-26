@@ -35,4 +35,12 @@ export const config = {
   // who wants to download the real file.
   previewMaxEdge: Number(process.env.MJ_PREVIEW_MAX_EDGE ?? 1024),
   previewQuality: Number(process.env.MJ_PREVIEW_QUALITY ?? 82),
+
+  // Hard ceiling on a single Imagine/Upscale/Variation/Reroll round-trip.
+  // Nothing upstream (the `midjourney` npm client, Discord's websocket) has
+  // its own timeout, and every call is serialized through one queue — a
+  // single call that never resolves would otherwise wedge every future call,
+  // from every task, forever. 6 minutes comfortably covers normal Midjourney
+  // generation time (usually well under 2 minutes) with headroom.
+  jobTimeoutMs: Number(process.env.MJ_JOB_TIMEOUT_MS ?? 6 * 60 * 1000),
 } as const;

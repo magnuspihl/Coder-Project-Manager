@@ -14,7 +14,7 @@ export interface PreviewImage {
  * no benefit, since judging composition/quality doesn't need full res.
  */
 export async function fetchPreview(uri: string): Promise<PreviewImage> {
-  const res = await fetch(uri);
+  const res = await fetch(uri, { signal: AbortSignal.timeout(30_000) });
   if (!res.ok) throw new Error(`Failed to fetch image (${res.status}): ${uri}`);
   const buf = Buffer.from(await res.arrayBuffer());
   const jpeg = await sharp(buf)
