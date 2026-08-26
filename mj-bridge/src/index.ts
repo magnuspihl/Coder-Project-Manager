@@ -7,4 +7,5 @@ app.listen(config.port, () => {
   if (!config.publicBaseUrl) {
     console.warn('[mj-bridge] MJ_PUBLIC_BASE_URL is not set — /upload-reference will fail until it is set to this bridge\'s public URL.');
   }
+  console.log(`[mj-bridge] FLUX tools (flux_generate/flux_edit): ${config.bflApiKey ? `enabled, model=${config.fluxModel}` : 'disabled — set BFL_API_KEY to enable'}`);
 });

@@ -6,8 +6,10 @@ import type { ServerRequest, ServerNotification } from '@modelcontextprotocol/sd
 import { z } from 'zod';
 import { config } from './config.js';
 import { imagine, upscale, variation, reroll, getQueueStatus, type MjResult, type ProgressReporter } from './mjClient.js';
-import { fetchPreview } from './image.js';
-import { saveReferenceImage, referenceFilePath, ReferenceStoreConfigError } from './referenceStore.js';
+import { generateImage, editImage, type FluxResult } from './fluxClient.js';
+import { checkMonthlyCap, estimateCostUsd, logCost } from './fluxCostLog.js';
+import { fetchPreview, previewFromBuffer } from './image.js';
+import { saveReferenceImage, referenceFilePath, EXT_BY_MIME, ReferenceStoreConfigError } from './referenceStore.js';
 
 const IndexSchema = z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]);
 
@@ -34,6 +36,41 @@ async function toolResult(r: MjResult, note: string) {
 
 function errorResult(message: string) {
   return { isError: true, content: [{ type: 'text' as const, text: message }] };
+}
+
+async function downloadImage(url: string): Promise<{ buf: Buffer; mimeType: string }> {
+  const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+  if (!res.ok) throw new Error(`Failed to download FLUX result (${res.status}): ${url}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  const mimeType = res.headers.get('content-type')?.split(';')[0] || 'image/png';
+  return { buf, mimeType };
+}
+
+// BFL's own result URL (r.imageUrl) expires ~10 minutes after generation —
+// unlike Midjourney's CDN links, it's not safe to just hand back as
+// full_resolution_url for an agent that might curl it later in a longer
+// session. So this re-hosts the bytes through the same local reference store
+// /upload-reference already uses, and only falls back to BFL's transient URL
+// when this bridge has no MJ_PUBLIC_BASE_URL configured to re-host under.
+async function fluxToolResult(r: FluxResult, note: string) {
+  const { buf, mimeType } = await downloadImage(r.imageUrl);
+  const hostedMime = EXT_BY_MIME[mimeType] ? mimeType : 'image/png';
+  const hostedUrl = config.publicBaseUrl ? await saveReferenceImage(buf, hostedMime) : null;
+  const preview = await previewFromBuffer(buf);
+  const meta = {
+    model: r.model,
+    seed: r.seed,
+    full_resolution_url: hostedUrl ?? r.imageUrl,
+    note: hostedUrl
+      ? note
+      : `${note} NOTE: this bridge has no MJ_PUBLIC_BASE_URL configured, so full_resolution_url is BFL's own result link, which expires ~10 minutes after generation — curl it now if you want to keep the file.`,
+  };
+  return {
+    content: [
+      { type: 'image' as const, data: preview.base64, mimeType: preview.mimeType },
+      { type: 'text' as const, text: JSON.stringify(meta, null, 2) },
+    ],
+  };
 }
 
 // Forwards queue/generation status as MCP progress notifications, so a
@@ -153,6 +190,69 @@ function buildServer(): McpServer {
       }
     },
   );
+
+  // Only registered when a BFL API key is configured, so a bridge that
+  // hasn't opted into FLUX yet just doesn't offer these tools rather than
+  // offering broken ones (same pattern CPM itself uses for "unconfigured"
+  // MCP entries — see server/services/midjourney-mcp.ts).
+  if (config.bflApiKey) {
+    server.registerTool(
+      'flux_generate',
+      {
+        description:
+          'Generate a new image with FLUX.2 from a text prompt, optionally guided by up to 8 reference images ' +
+          '(pass their URLs via reference_image_urls, referencing them by number in the prompt e.g. "the subject ' +
+          'from image 1 in the environment from image 2"). Unlike mj_imagine, this returns one full-resolution ' +
+          'image directly — no grid, no upscale step. Use this over Midjourney when you need to hold specific ' +
+          'elements (geometry, a mark, a palette) fixed across multiple references while generating everything ' +
+          'else; use mj_imagine when you want open-ended aesthetic exploration. For a local reference file, ' +
+          'first mint a URL via this bridge\'s /upload-reference endpoint, same as mj_imagine.',
+        inputSchema: {
+          prompt: z.string().min(1).describe('The generation prompt. When passing multiple reference_image_urls, refer to them by number ("image 1", "image 2", ...).'),
+          reference_image_urls: z.array(z.string().url()).max(8).optional().describe('Public URLs of up to 8 reference images to guide subject/style/composition.'),
+        },
+        annotations: { readOnlyHint: false },
+      },
+      async ({ prompt, reference_image_urls }) => {
+        try {
+          await checkMonthlyCap();
+          const r = await generateImage(prompt, reference_image_urls);
+          await logCost('flux_generate', r.model, estimateCostUsd(r.model, !!reference_image_urls?.length));
+          return await fluxToolResult(r, 'Full-resolution FLUX.2 image. Re-run flux_generate (refine the prompt/references) or flux_edit (targeted change) to iterate — there is no separate upscale step, this is already the real file.');
+        } catch (err) {
+          return errorResult(`flux_generate failed: ${(err as Error).message}`);
+        }
+      },
+    );
+
+    server.registerTool(
+      'flux_edit',
+      {
+        description:
+          'Edit an existing image with a short imperative instruction using FLUX.2 (e.g. "cool the stone to ' +
+          'bone-white, add fine hairline cracks, change nothing else") — everything not covered by the ' +
+          'instruction is preserved. This is the tool for targeted edits that mj_imagine/mj_variation cannot do: ' +
+          'Midjourney always resamples the whole image, so holding geometry fixed while changing only material ' +
+          'or lighting (or vice versa) is not achievable with it. For a local source file, first mint a URL via ' +
+          'this bridge\'s /upload-reference endpoint, same as mj_imagine.',
+        inputSchema: {
+          source_image_url: z.string().url().describe('Public URL of the image to edit.'),
+          instruction: z.string().min(1).describe('A short, specific imperative instruction describing only the change to make.'),
+        },
+        annotations: { readOnlyHint: false },
+      },
+      async ({ source_image_url, instruction }) => {
+        try {
+          await checkMonthlyCap();
+          const r = await editImage(instruction, source_image_url);
+          await logCost('flux_edit', r.model, estimateCostUsd(r.model, true));
+          return await fluxToolResult(r, 'Full-resolution edited image. Compare it against the source to confirm only the instructed change happened before using it.');
+        } catch (err) {
+          return errorResult(`flux_edit failed: ${(err as Error).message}`);
+        }
+      },
+    );
+  }
 
   return server;
 }
