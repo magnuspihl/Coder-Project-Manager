@@ -29,6 +29,8 @@ import {
   PORT_RANGE_SIZE,
   PORT_RANGE_SLOTS,
 } from './claude.js';
+import { getValidCoderTokenForUser } from './sessions.js';
+import { getWorkspaceStatusByName } from './coder.js';
 
 const CPM_WORKTREE_BASE = process.env.CPM_WORKTREE_BASE || '/home/coder/.cpm/worktrees';
 const SWEEP_INTERVAL_MS = parseInt(process.env.CPM_PORT_JANITOR_INTERVAL_MS || '30000');
@@ -140,11 +142,36 @@ interface TaskRow {
   deleted: boolean;
 }
 
+/** Same fallback `buildCoderEnv` uses: the user's own token, else the ambient one. */
+async function resolveToken(userId: string): Promise<string | null> {
+  try {
+    const token = await getValidCoderTokenForUser(userId);
+    if (token) return token;
+  } catch {
+    // fall through to ambient token
+  }
+  return process.env.CODER_SESSION_TOKEN || null;
+}
+
 /**
  * Sweep one workspace. Always attributes active-owned ports (non-destructive).
  * Only when reaping is enabled does it additionally SIGTERM orphaned servers.
  */
 async function sweepWorkspace(workspaceName: string, userId: string, tasksById: Map<string, TaskRow>): Promise<void> {
+  // `coder ssh` auto-starts a stopped workspace, so a task left in
+  // awaiting_feedback would otherwise keep the workspace running forever —
+  // every sweep would wake it back up seconds after the user stops it.
+  // Check status over the REST API first; that alone never starts anything.
+  const token = await resolveToken(userId);
+  if (!token) return; // can't verify status without a token — skip rather than risk waking it
+  try {
+    const status = await getWorkspaceStatusByName(token, workspaceName);
+    if (status !== 'running') return; // stopped/starting/stopping/etc — leave it alone
+  } catch (err) {
+    console.warn(`[port-janitor] status check failed for ${workspaceName}: ${(err as Error).message?.slice(0, 150)}`);
+    return;
+  }
+
   let out: string;
   try {
     out = await sshExec(workspaceName, buildScanCommand(), 25000, userId);
