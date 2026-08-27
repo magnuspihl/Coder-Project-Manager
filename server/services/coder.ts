@@ -324,3 +324,23 @@ export async function getWorkspace(token: string, workspaceId: string): Promise<
   await enrichWorkspaceWithPortsAndApps(token, ws);
   return ws;
 }
+
+/**
+ * Cheap build-status lookup by workspace name, scoped to the calling token's
+ * own user (`users/me`) so no owner-name resolution is needed. Unlike
+ * `coder ssh`, this never starts a stopped workspace — callers that need to
+ * avoid waking one up (e.g. the port janitor) should check this first.
+ * Returns null if the workspace doesn't exist (e.g. it was deleted).
+ */
+export async function getWorkspaceStatusByName(token: string, workspaceName: string): Promise<string | null> {
+  const res = await fetch(`${CODER_URL}/api/v2/users/me/workspace/${encodeURIComponent(workspaceName)}`, {
+    headers: { 'Coder-Session-Token': token },
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    if (res.status === 401) throw new CoderAuthError('Coder token expired');
+    throw new Error(`Failed to get workspace status: ${res.status}`);
+  }
+  const ws = await res.json() as CoderWorkspace;
+  return ws.latest_build?.status ?? null;
+}
