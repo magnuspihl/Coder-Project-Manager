@@ -3,6 +3,7 @@ import { getMe, type User } from './api/client';
 import LoginPage from './pages/LoginPage';
 import WorkspacesPage from './pages/WorkspacesPage';
 import Layout from './components/Layout';
+import { ImageLightboxProvider } from './components/ImageLightbox';
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -35,8 +36,10 @@ export default function App() {
   }
 
   return (
-    <Layout>
-      <WorkspacesPage />
-    </Layout>
+    <ImageLightboxProvider>
+      <Layout>
+        <WorkspacesPage />
+      </Layout>
+    </ImageLightboxProvider>
   );
 }

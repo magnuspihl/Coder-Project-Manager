@@ -55,6 +55,8 @@ import { useWorkspacePreview } from '../hooks/useWorkspacePreview';
 import WorkspacePreviewPanel, { PreviewToggleButton } from './WorkspacePreviewPanel';
 import { linkify } from '../utils/linkify';
 import Markdown from './Markdown';
+import { useLightbox, type LightboxImage } from './ImageLightbox';
+import PendingFiles from './PendingFiles';
 import MarkdownComposer, { type ComposerHandle, type ComposerKeyEvent } from './MarkdownComposer';
 import { useTTSVoice } from '../hooks/useTTSVoice';
 import { useVoiceRecorder } from '../hooks/useVoiceRecorder';
@@ -100,7 +102,11 @@ function collapseTaskRequestBlocks(content: string): string {
 // Collapse it to a short note here so the user sees the intent, not the raw
 // JSON directive — the actual download link is the pill, tied to the message
 // by id server-side rather than matched by filename.
-function collapseOutputFileBlocks(content: string): string {
+//
+// `previewedNames` are files already shown as inline thumbnails under this
+// message; for those the note is dropped entirely, since the image itself
+// (captioned with the same filename) says everything the note would.
+function collapseOutputFileBlocks(content: string, previewedNames?: Set<string>): string {
   return content.replace(/\[OUTPUT_FILE\]\s*([\s\S]*?)\s*\[\/OUTPUT_FILE\]/g, (block, body) => {
     let name: string;
     try {
@@ -111,8 +117,110 @@ function collapseOutputFileBlocks(content: string): string {
     } catch {
       return block;
     }
+    if (previewedNames?.has(name)) return '\n\n';
     return `\n\n> 📎 **Generated file:** ${name}\n\n`;
   });
+}
+
+// Mime types the download route is willing to serve inline (see the
+// INLINE_IMAGE_TYPES allow-list in server/routes/uploads.ts). Anything else —
+// including SVG — comes back as an octet-stream attachment and can't be shown
+// in an <img>, so it stays a download pill.
+const PREVIEWABLE_IMAGE_TYPES = new Set([
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp', 'image/x-icon', 'image/vnd.microsoft.icon',
+]);
+
+function isPreviewableImage(att: AttachmentInfo): boolean {
+  const type = (att.mime_type || '').split(';')[0].trim().toLowerCase();
+  return PREVIEWABLE_IMAGE_TYPES.has(type);
+}
+
+const attachmentUrl = (att: AttachmentInfo) => `/api/uploads/${att.id}`;
+
+function formatSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+/**
+ * Inline thumbnail for an image attachment — an agent-generated image is
+ * usually the whole point of the message, so showing it beats a pill that has
+ * to be clicked to find out what it is. Clicking opens the shared lightbox
+ * rather than navigating away to a bare image tab.
+ *
+ * Falls back to the plain pill if the bytes don't decode as an image (a wrong
+ * mime type on the attachment shouldn't leave a broken-image icon with no way
+ * to get at the file).
+ */
+function AttachmentImage({ att, onOpen }: { att: AttachmentInfo; onOpen: () => void }) {
+  const [broken, setBroken] = useState(false);
+  if (broken) return <AttachmentPill att={att} />;
+  return (
+    <figure className="m-0 inline-block max-w-full">
+      <button
+        type="button"
+        onClick={onOpen}
+        className={`block overflow-hidden rounded-lg border transition-colors ${
+          att.source === 'agent'
+            ? 'border-green-200 dark:border-green-800 hover:border-green-400 dark:hover:border-green-600'
+            : 'border-gray-200 dark:border-gray-700 hover:border-blue-300 dark:hover:border-blue-600'
+        }`}
+        title={`${att.original_name} (${formatSize(att.size)}) — click to enlarge`}
+      >
+        <img
+          src={attachmentUrl(att)}
+          alt={att.original_name}
+          loading="lazy"
+          onError={() => setBroken(true)}
+          className="block max-h-64 max-w-full object-contain bg-gray-50 dark:bg-gray-800"
+        />
+      </button>
+      <figcaption className="mt-1 flex items-center gap-1.5 text-[11px] text-gray-500 dark:text-gray-400">
+        {att.source === 'agent' && (
+          <svg className="w-3 h-3 shrink-0 text-green-600 dark:text-green-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M12 4v12m0 0l-4-4m4 4l4-4M4 20h16" /></svg>
+        )}
+        <span className="truncate max-w-[16rem]">{att.original_name}</span>
+        <a
+          href={attachmentUrl(att)}
+          download={att.original_name}
+          className="shrink-0 underline hover:text-blue-600 dark:hover:text-blue-400"
+        >
+          Download
+        </a>
+      </figcaption>
+    </figure>
+  );
+}
+
+/**
+ * The attachments belonging to one message: images as inline thumbnails (all
+ * of them opening into the same lightbox so arrow keys page through the set),
+ * everything else as download pills.
+ */
+function AttachmentGroup({ attachments }: { attachments: AttachmentInfo[] }) {
+  const lightbox = useLightbox();
+  const images = attachments.filter(isPreviewableImage);
+  const files = attachments.filter(a => !isPreviewableImage(a));
+  const gallery: LightboxImage[] = images.map(a => ({ src: attachmentUrl(a), name: a.original_name }));
+
+  return (
+    <div className="mt-2 space-y-2">
+      {images.length > 0 && (
+        <div className="flex flex-wrap items-start gap-2">
+          {images.map((att, i) =>
+            lightbox
+              ? <AttachmentImage key={att.id} att={att} onOpen={() => lightbox.open(gallery, i)} />
+              : <AttachmentPill key={att.id} att={att} />
+          )}
+        </div>
+      )}
+      {files.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {files.map(att => <AttachmentPill key={att.id} att={att} />)}
+        </div>
+      )}
+    </div>
+  );
 }
 
 // A single downloadable attachment pill — a green download icon for a file
@@ -121,7 +229,7 @@ function collapseOutputFileBlocks(content: string): string {
 function AttachmentPill({ att }: { att: AttachmentInfo }) {
   return (
     <a
-      href={`/api/uploads/${att.id}`}
+      href={attachmentUrl(att)}
       target="_blank"
       rel="noopener noreferrer"
       className={`inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full border transition-colors ${
@@ -129,7 +237,7 @@ function AttachmentPill({ att }: { att: AttachmentInfo }) {
           ? 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400 border-green-200 dark:border-green-800 hover:border-green-400 dark:hover:border-green-600'
           : 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 border-gray-200 dark:border-gray-700 hover:border-blue-300 dark:hover:border-blue-600 hover:text-blue-600 dark:hover:text-blue-400'
       }`}
-      title={`${att.source === 'agent' ? 'Generated by the agent — ' : ''}${att.original_name} (${(att.size / 1024).toFixed(1)} KB)`}
+      title={`${att.source === 'agent' ? 'Generated by the agent — ' : ''}${att.original_name} (${formatSize(att.size)})`}
     >
       {att.source === 'agent' ? (
         <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M12 4v12m0 0l-4-4m4 4l4-4M4 20h16" /></svg>
@@ -2317,6 +2425,13 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   const turn = msg.turn_id ? turnMap.get(msg.turn_id) : undefined;
                   const isReviewerMsg = turn?.role === 'reviewer';
 
+                  const msgAttachments = attachmentsByMessage.get(msg.id);
+                  // Files that render as their own thumbnail below don't also
+                  // need the "Generated file: …" line in the prose.
+                  const previewedNames = new Set(
+                    (msgAttachments ?? []).filter(isPreviewableImage).map(a => a.original_name)
+                  );
+
                   // Reviewer turns collapse into a single compact summary card
                   // (rendered once, at the turn boundary). Skip the verbose
                   // per-message bubbles entirely.
@@ -2400,16 +2515,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         )}
                       </div>
                     </div>
-                    <Markdown content={msg.role === 'assistant' ? collapseWakeBlocks(collapseOutputFileBlocks(collapseTaskRequestBlocks(msg.content))) : msg.content} breaks={msg.role === 'user'} />
-                    {(() => {
-                      const msgAttachments = attachmentsByMessage.get(msg.id);
-                      if (!msgAttachments?.length) return null;
-                      return (
-                        <div className="flex flex-wrap gap-1.5 mt-2">
-                          {msgAttachments.map(att => <AttachmentPill key={att.id} att={att} />)}
-                        </div>
-                      );
-                    })()}
+                    <Markdown content={msg.role === 'assistant' ? collapseWakeBlocks(collapseOutputFileBlocks(collapseTaskRequestBlocks(msg.content), previewedNames)) : msg.content} breaks={msg.role === 'user'} />
+                    {msgAttachments?.length ? <AttachmentGroup attachments={msgAttachments} /> : null}
                   </div>
                     </React.Fragment>
                   );
@@ -2439,8 +2546,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   uploaded/produced it and renders inline with it above. This
                   catches legacy attachments from before that link existed. */}
               {attachments.some(a => !a.message_id) && (
-                <div className="flex flex-wrap gap-1.5 px-1">
-                  {attachments.filter(a => !a.message_id).map(att => <AttachmentPill key={att.id} att={att} />)}
+                <div className="px-1">
+                  <AttachmentGroup attachments={attachments.filter(a => !a.message_id)} />
                 </div>
               )}
 
@@ -2836,17 +2943,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         />
                         {mentionDropdown}
                       </div>
-                      {pendingFiles.length > 0 && (
-                        <div className="flex flex-wrap gap-1.5">
-                          {pendingFiles.map((f, i) => (
-                            <span key={i} className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
-                              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
-                              {f.name}
-                              <button type="button" onClick={() => handleRemovePendingFile(i)} className="ml-0.5 text-blue-400 hover:text-red-500">&times;</button>
-                            </span>
-                          ))}
-                        </div>
-                      )}
+                      <PendingFiles files={pendingFiles} onRemove={handleRemovePendingFile} />
                       <div className="flex items-center gap-2">
                         <input
                           ref={fileInputRef}

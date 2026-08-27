@@ -2,6 +2,7 @@ import { useState, memo, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
+import { useLightbox } from './ImageLightbox';
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -20,6 +21,7 @@ function CopyButton({ text }: { text: string }) {
 }
 
 export default memo(function Markdown({ content, breaks = false }: { content: string; breaks?: boolean }) {
+  const lightbox = useLightbox();
   return (
     <div className="markdown-body text-sm">
       <ReactMarkdown
@@ -85,6 +87,31 @@ export default memo(function Markdown({ content, breaks = false }: { content: st
               <td className="px-3 py-2 border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300">
                 {children}
               </td>
+            );
+          },
+          // Markdown images (e.g. an agent pasting a generated image URL) are
+          // capped to the bubble width and open in the lightbox rather than a
+          // new tab. Without a provider they stay plain, uncapped-but-bounded
+          // images.
+          img({ src, alt, title }) {
+            const url = typeof src === 'string' ? src : '';
+            const common = {
+              src: url,
+              alt: alt || '',
+              title,
+              loading: 'lazy' as const,
+              className: 'block max-h-80 max-w-full rounded border border-gray-200 dark:border-gray-700 object-contain my-2',
+            };
+            if (!lightbox || !url) return <img {...common} />;
+            return (
+              <button
+                type="button"
+                onClick={() => lightbox.open([{ src: url, name: alt || title || undefined }])}
+                className="block max-w-full cursor-zoom-in"
+                title={title || alt || 'Click to enlarge'}
+              >
+                <img {...common} />
+              </button>
             );
           },
           a({ href, children }) {
