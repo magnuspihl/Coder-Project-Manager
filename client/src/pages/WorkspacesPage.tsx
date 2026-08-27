@@ -39,6 +39,7 @@ import { playChime } from '../utils/chime';
 import { useDraft, useSessionState } from '../hooks/useDraft';
 import TaskDetailModal from '../components/TaskDetailModal';
 import MarkdownComposer from '../components/MarkdownComposer';
+import PendingFiles from '../components/PendingFiles';
 
 function timeAgo(iso: string): string {
   const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -1590,14 +1591,8 @@ export default function WorkspacesPage() {
                 <span className="text-xs text-gray-600 dark:text-gray-400">Auto-review — red-team pass before surfacing to you</span>
               </label>
               {newTaskFiles.length > 0 && (
-                <div className="flex flex-wrap gap-1 mt-1">
-                  {newTaskFiles.map((f, i) => (
-                    <span key={i} className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
-                      <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
-                      <span className="truncate max-w-[120px]">{f.name}</span>
-                      <button type="button" onClick={() => handleRemoveNewTaskFile(i)} className="text-blue-400 hover:text-red-500">&times;</button>
-                    </span>
-                  ))}
+                <div className="mt-1">
+                  <PendingFiles files={newTaskFiles} onRemove={handleRemoveNewTaskFile} />
                 </div>
               )}
               <div className="flex gap-2 mt-1 items-center">
