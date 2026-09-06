@@ -34,6 +34,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   wake_note TEXT,
   wake_file TEXT,
   wake_count INTEGER NOT NULL DEFAULT 0,
+  -- Set by a rollback (see task_checkpoints below) with a note for the agent
+  -- explaining that its worktree was restored to an earlier state. Injected
+  -- into the prompt on the task's next resume, then cleared — see
+  -- consumePendingRollbackNote / launchTask.
+  pending_rollback_note TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT,
@@ -91,11 +96,33 @@ CREATE TABLE IF NOT EXISTS messages (
   source TEXT,
   client_label TEXT,
   turn_id TEXT REFERENCES task_turns(id),
+  -- Set when a later rollback restores the worktree to a point before this
+  -- message — the message stays in the transcript for the record, but no
+  -- longer reflects the task's current file state. See task_checkpoints.
+  stale_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id, created_at);
+
+-- Task checkpoints: a full snapshot of the task worktree's file contents taken
+-- after every agent turn, recorded in a separate bare git repo outside the
+-- worktree (see services/git.ts). message_id anchors the checkpoint to the
+-- end-of-turn assistant message the chat UI attaches a "Roll back to here"
+-- button to. commit_hash is a commit in that snapshot repo, NOT the
+-- worktree's own branch history.
+CREATE TABLE IF NOT EXISTS task_checkpoints (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+  commit_hash TEXT NOT NULL,
+  turn_number INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_checkpoints_task ON task_checkpoints(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_task_checkpoints_message ON task_checkpoints(message_id);
 
 -- Token events table: one row per token-usage delta as a Claude session
 -- streams, so consumers can attribute tokens to a rolling time window instead

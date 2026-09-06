@@ -33,6 +33,7 @@ import {
   approveTaskRequestForTask,
   dismissTaskRequestForTask,
   updateTaskRequestTargetForTask,
+  rollbackTaskToCheckpoint,
   type Task,
   type ClaudeAccount,
   type ModelInfo,
@@ -44,6 +45,7 @@ import {
   type AttachmentInfo,
   type TaskRequestItem,
   type ReviewFinding,
+  type TaskCheckpoint,
   setFindingState,
   fixFindings,
 } from '../api/client';
@@ -428,6 +430,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   // dismissable. `pendingFinding` marks the row whose request is in flight.
   const [findings, setFindings] = useState<ReviewFinding[]>([]);
   const [pendingFinding, setPendingFinding] = useState<string | null>(null);
+  const [checkpoints, setCheckpoints] = useState<TaskCheckpoint[]>([]);
+  const [rollingBack, setRollingBack] = useState<string | null>(null);
   const [dismissNoteFor, setDismissNoteFor] = useState<string | null>(null);
   const [dismissNote, setDismissNote] = useState('');
   const [unresolvedOpen, setUnresolvedOpen] = useState(false);
@@ -532,7 +536,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     // the commit even though it began after the pre-bump.
     const seqAtStart = editSeqRef.current;
     try {
-      const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments, turns: newTurns, taskRequests: newTaskRequests, findings: newFindings } = await getTaskDetail(taskId);
+      const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments, turns: newTurns, taskRequests: newTaskRequests, findings: newFindings, checkpoints: newCheckpoints } = await getTaskDetail(taskId);
       setTaskRequests(newTaskRequests || []);
       if (prevStatusRef.current && prevStatusRef.current !== 'awaiting_feedback' && newTask.status === 'awaiting_feedback') {
         playChime();
@@ -561,6 +565,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       // Don't clobber an in-flight local triage decision with a poll response
       // that predates it — same hazard as the task row above.
       if (newFindings && editSeqRef.current === seqAtStart) setFindings(newFindings);
+      if (newCheckpoints) setCheckpoints(newCheckpoints);
     } catch {
       // ignore
     } finally {
@@ -1259,6 +1264,26 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       alert(err?.message || 'Failed to send request');
     } finally {
       setResolvingGitIssues(false);
+    }
+  };
+
+  const handleRollback = async (checkpoint: TaskCheckpoint) => {
+    if (rollingBack) return;
+    if (!confirm(
+      `Roll the worktree back to the state right after turn ${checkpoint.turn_number}? ` +
+      `Later messages will stay in this conversation but will be marked stale — this lands as a new commit, nothing is deleted.`
+    )) return;
+    setRollingBack(checkpoint.id);
+    try {
+      const { messages: newMessages, checkpoints: newCheckpoints } = await rollbackTaskToCheckpoint(taskId, checkpoint.id);
+      setMessages(newMessages);
+      lastMessagesJsonRef.current = JSON.stringify(newMessages);
+      setCheckpoints(newCheckpoints);
+      onTaskChanged?.();
+    } catch (err: any) {
+      alert(err?.message || 'Rollback failed');
+    } finally {
+      setRollingBack(null);
     }
   };
 
@@ -2401,6 +2426,15 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   const arr = attachmentsByMessage.get(att.message_id);
                   if (arr) arr.push(att); else attachmentsByMessage.set(att.message_id, [att]);
                 }
+                // Each end-of-turn assistant message that has a worktree
+                // checkpoint gets a "Roll back to here" button. Disabled once
+                // the task is completed (its branch may already be merged —
+                // out of scope, see rollbackTaskToCheckpoint).
+                const checkpointByMessage = new Map<string, TaskCheckpoint>();
+                for (const cp of checkpoints) {
+                  if (cp.message_id) checkpointByMessage.set(cp.message_id, cp);
+                }
+                const rollbackAllowed = task.status !== 'completed';
                 // Concatenate each reviewer turn's prose so it can be revealed
                 // behind the per-turn "details" toggle on its summary card.
                 const reviewerContentByTurn = new Map<string, string>();
@@ -2444,6 +2478,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                     );
                   }
 
+                  const checkpoint = msg.role === 'assistant' ? checkpointByMessage.get(msg.id) : undefined;
+                  const isStale = !!msg.stale_at;
+
                   return (
                     <React.Fragment key={msg.id}>
                       {turnChanged && turn && (
@@ -2469,7 +2506,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         : msg.content.startsWith('Error:')
                         ? 'bg-red-50 dark:bg-red-900/20 border border-red-100 dark:border-red-800 text-red-700 dark:text-red-400 text-sm'
                         : 'bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 text-sm'
-                    }`}
+                    } ${isStale ? 'opacity-50 saturate-[.4]' : ''}`}
                   >
                     <div className="flex items-center justify-between mb-1">
                       <span className={`text-xs font-medium uppercase ${isParticipantMsg ? 'text-teal-600 dark:text-teal-400' : 'text-gray-500 dark:text-gray-400'}`}>
@@ -2485,8 +2522,29 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                             via {msg.client_label || 'API'}
                           </span>
                         )}
+                        {isStale && (
+                          <span
+                            title="A later rollback restored the worktree to a point before this message — it no longer reflects the task's current file state."
+                            className="ml-2 inline-block px-1.5 py-0.5 rounded text-[10px] font-medium normal-case bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-300"
+                          >
+                            stale
+                          </span>
+                        )}
                       </span>
                       <div className="flex items-center gap-2">
+                        {checkpoint && rollbackAllowed && (
+                          <button
+                            onClick={() => handleRollback(checkpoint)}
+                            disabled={!!rollingBack || sending || task.status === 'working'}
+                            className="text-xs text-gray-400 dark:text-gray-500 hover:text-amber-600 dark:hover:text-amber-400 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                            title="Restore the worktree to the state right after this turn (lands as a new commit; nothing is deleted)"
+                          >
+                            <svg xmlns="http://www.w3.org/2000/svg" className={`h-3 w-3 ${rollingBack === checkpoint.id ? 'animate-spin' : ''}`} viewBox="0 0 20 20" fill="currentColor">
+                              <path fillRule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clipRule="evenodd" />
+                            </svg>
+                            {rollingBack === checkpoint.id ? 'Rolling back…' : 'Roll back to here'}
+                          </button>
+                        )}
                         {msg.cost && (
                           <span className="text-xs text-gray-400 dark:text-gray-500">${msg.cost.toFixed(4)}</span>
                         )}
