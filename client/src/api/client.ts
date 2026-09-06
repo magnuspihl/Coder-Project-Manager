@@ -164,6 +164,17 @@ export interface Message {
   turn_id: string | null;
   source?: string | null;
   client_label?: string | null;
+  /** Set once a rollback restored the worktree to a point before this message. */
+  stale_at?: string | null;
+  created_at: string;
+}
+
+export interface TaskCheckpoint {
+  id: string;
+  task_id: string;
+  message_id: string | null;
+  commit_hash: string;
+  turn_number: number;
   created_at: string;
 }
 
@@ -402,7 +413,18 @@ export interface AttachmentInfo {
 }
 
 export const getTaskDetail = (taskId: string) =>
-  request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[]; turns: TaskTurn[]; taskRequests: TaskRequestItem[]; findings: ReviewFinding[] }>(`/api/tasks/${taskId}`);
+  request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[]; turns: TaskTurn[]; taskRequests: TaskRequestItem[]; findings: ReviewFinding[]; checkpoints: TaskCheckpoint[] }>(`/api/tasks/${taskId}`);
+
+/**
+ * Roll the task's worktree back to the state right after an earlier turn.
+ * Lands as a new forward commit on the task's own branch — never a history
+ * rewrite — and marks every later message stale rather than deleting it.
+ */
+export const rollbackTaskToCheckpoint = (taskId: string, checkpointId: string) =>
+  request<{ task: Task; messages: Message[]; checkpoints: TaskCheckpoint[] }>(
+    `/api/tasks/${taskId}/checkpoints/${checkpointId}/rollback`,
+    { method: 'POST' },
+  );
 
 /**
  * Triage a reviewer finding. 'dismissed' = will not be changed, 'resolved' =

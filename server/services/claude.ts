@@ -1,10 +1,10 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { createReadStream, createWriteStream, promises as fsPromises } from 'fs';
 import { randomUUID } from 'crypto';
-import { updateTaskStatus, addMessage, addTokenUsage, recordContextTokens, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, getLatestTaskTurn, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, createReviewFindings, getReviewFindings, getFindingsInFlight, closeOutstandingOnPass, getDismissedFindings, getPriorFindings, getUserReplies, findingRef, findFindingByRef, verifyClaimedFixes, reraiseReviewFinding, reopenUnreportedFindings, setReviewFindingState, setTaskWake, clearTaskWake, incrementTaskWakeCount, getTasksWithPendingWake, type Task, type TaskParticipant } from './tasks.js';
+import { updateTaskStatus, addMessage, addTokenUsage, recordContextTokens, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, getLatestTaskTurn, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, createReviewFindings, getReviewFindings, getFindingsInFlight, closeOutstandingOnPass, getDismissedFindings, getPriorFindings, getUserReplies, findingRef, findFindingByRef, verifyClaimedFixes, reraiseReviewFinding, reopenUnreportedFindings, setReviewFindingState, setTaskWake, clearTaskWake, incrementTaskWakeCount, getTasksWithPendingWake, consumePendingRollbackNote, type Task, type TaskParticipant } from './tasks.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
-import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, fetchGitHubToken, isRemoteAllowed } from './git.js';
+import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, fetchGitHubToken, isRemoteAllowed, recordTurnCheckpoint } from './git.js';
 import { getOllamaBaseUrl } from './models.js';
 import { getAttachmentsByTask, getAttachmentsByMessage, createAgentOutputAttachment, hasAgentOutputAttachment, sha256Hex, MAX_FILE_SIZE, type Attachment } from '../routes/uploads.js';
 import { writeCpmGuidelines } from './workspace-memory.js';
@@ -2306,6 +2306,16 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
     }
   }
 
+  // A "Roll back to here" restored this task's worktree to an earlier turn
+  // since the agent last ran — tell it before it resumes, so it doesn't get
+  // confused finding files different from what it last wrote, or reference
+  // conversation state that no longer matches the current file state.
+  // Consumed here (read-and-clear), so it is only ever injected once.
+  if (isResume && !isSlashCommand) {
+    const rollbackNote = consumePendingRollbackNote(task.id);
+    if (rollbackNote) prompt = `${rollbackNote}\n\n${prompt}`;
+  }
+
   // Auto-detect project directory if not already set
   if (!task.project_dir) {
     const detected = await detectProjectDir(task.workspace_name, task.user_id);
@@ -2824,6 +2834,7 @@ export function interruptTask(taskId: string): void {
     'Task was interrupted by user. Note: token usage and cost for the in-flight turn may not be fully reflected — Claude only reports final totals at the end of a turn.'
   );
   updateTaskStatus(partial.id, 'awaiting_feedback');
+  fireCheckpoint(partial.id);
 }
 
 /**
@@ -2863,6 +2874,7 @@ function interruptReviewer(taskId: string, workspaceName: string, userId?: strin
   resetReviewLoopCount(taskId);
   setActiveTaskTurnRole(taskId, null);
   updateTaskStatus(taskId, 'awaiting_feedback');
+  fireCheckpoint(taskId);
   // Keep the guard set until the next reviewer launches (cleared in
   // launchReviewerOnTask). Deleting it here would race a reviewer poll already
   // mid-flight: interruptReviewer runs to completion in one synchronous tick, so
@@ -2967,6 +2979,7 @@ export async function reconnectWorkingTasks(): Promise<void> {
               const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
               if (hasResponse) {
                 updateTaskStatus(task.id, 'awaiting_feedback');
+                fireCheckpoint(task.id);
               } else {
                 // No response captured — task was likely interrupted. Re-queue for retry.
                 console.log(`[recovery] Task "${task.title}" exited with no response — re-queuing`);
@@ -2999,6 +3012,7 @@ export async function reconnectWorkingTasks(): Promise<void> {
               } else {
                 console.log(`[recovery] Task "${task.title}" produced a result before SSH died — finalizing as awaiting_feedback`);
                 updateTaskStatus(task.id, 'awaiting_feedback');
+                fireCheckpoint(task.id);
               }
             } else {
               console.log(`[recovery] Task "${task.title}" SSH process gone, no exit code, no result — re-queuing for automatic retry`);
@@ -3340,6 +3354,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
           const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
           if (hasResponse) {
             updateTaskStatus(task.id, 'awaiting_feedback');
+            fireCheckpoint(task.id);
           } else {
             console.log(`[claude-poller] Task ${task.id} finished with no response — re-queuing`);
             addMessage(task.id, 'system', 'Claude exited without producing a response. Re-queued for automatic retry.');
@@ -4116,6 +4131,7 @@ function settleWithUnresolvedFindings(task: Task): void {
   }
   setActiveTaskTurnRole(task.id, null);
   updateTaskStatus(task.id, 'awaiting_feedback');
+  fireCheckpoint(task.id);
   processQueue(task.workspace_id).catch(() => {});
 }
 
@@ -4139,6 +4155,19 @@ function activeImplementerTurnId(taskId: string): string | null {
 function completeImplementerTurn(taskId: string): void {
   const id = activeImplementerTurnId(taskId);
   if (id) completeTaskTurn(id);
+}
+
+/**
+ * Fire off a worktree checkpoint for "Roll back to here" — called at every
+ * point a task settles into `awaiting_feedback`. Fire-and-forget: a snapshot
+ * failure (unreachable workspace, no worktree, a transient git error) must
+ * never hold up or fail the turn that just legitimately completed.
+ */
+function fireCheckpoint(taskId: string): void {
+  const t = getTask(taskId);
+  if (!t) return;
+  recordTurnCheckpoint(t).catch(err =>
+    console.error(`[checkpoint] snapshot failed for task ${taskId}:`, (err as Error).message?.slice(0, 200)));
 }
 
 /**
@@ -4180,6 +4209,7 @@ function finalizeTask(task: Task, resultError: string | null): void {
         console.error(`[auto-review] Error in post-implementer hook for task ${task.id}:`, (err as Error).message?.slice(0, 200));
         setActiveTaskTurnRole(task.id, null);
         updateTaskStatus(task.id, 'awaiting_feedback');
+        fireCheckpoint(task.id);
         processQueue(task.workspace_id).catch(() => {});
       });
     } else {

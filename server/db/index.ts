@@ -562,6 +562,26 @@ export function getDb(): Database.Database {
     db.exec("ALTER TABLE attachments ADD COLUMN message_id TEXT");
   }
 
+  // Per-turn worktree checkpoints ("Roll back to here"). See services/git.ts.
+  const tasksCols6 = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+  if (!tasksCols6.some(c => c.name === 'pending_rollback_note')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN pending_rollback_note TEXT");
+  }
+  const msgCols3 = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
+  if (!msgCols3.some(c => c.name === 'stale_at')) {
+    db.exec("ALTER TABLE messages ADD COLUMN stale_at TEXT");
+  }
+  db.exec(`CREATE TABLE IF NOT EXISTS task_checkpoints (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+    commit_hash TEXT NOT NULL,
+    turn_number INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_task_checkpoints_task ON task_checkpoints(task_id, created_at)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_task_checkpoints_message ON task_checkpoints(message_id)");
+
   return db;
 }
 

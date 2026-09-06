@@ -46,12 +46,14 @@ import {
   clearTaskWake,
   resetTaskWakeCount,
   REVIEW_FIX_REPLY_PREFIX,
+  getTaskCheckpoints,
+  getTaskCheckpoint,
 } from '../services/tasks.js';
 import { findUserWorkspaceById } from '../services/workspace-cache.js';
 import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview, wakeTaskNow, FINDING_REPORT_FORMAT } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
-import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, removeTaskWorktree } from '../services/git.js';
+import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, removeTaskWorktree, rollbackTaskToCheckpoint } from '../services/git.js';
 import { linkAttachmentsToTask, getAttachmentsByTask } from './uploads.js';
 import { getDb } from '../db/index.js';
 
@@ -195,7 +197,8 @@ router.get('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
   const turns = getTaskTurns(task.id);
   const taskRequests = getPendingTaskRequestsForTask(task.id);
   const findings = getReviewFindings(task.id);
-  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages, participants, attachments, turns, taskRequests, findings });
+  const checkpoints = getTaskCheckpoints(task.id);
+  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages, participants, attachments, turns, taskRequests, findings, checkpoints });
 });
 
 // Get stream log for a task (loaded on demand)
@@ -667,6 +670,47 @@ router.post('/tasks/:taskId/review', requireAuth, async (req: Request, res: Resp
     res.json({ task: getTask(task.id) });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to launch reviewer' });
+  }
+});
+
+// Roll the task's worktree back to an earlier turn's checkpoint. Lands the
+// restored state as a new forward commit on the task's own branch — see
+// rollbackTaskToCheckpoint for why this is never a history rewrite.
+router.post('/tasks/:taskId/checkpoints/:checkpointId/rollback', requireAuth, async (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  // Out of scope: a completed task's branch may already be merged into the
+  // default branch, which makes rolling it back a much higher-stakes,
+  // cross-branch problem. Everything else (queued/working aside/failed/
+  // cancelled/awaiting_feedback) still owns its worktree and branch outright.
+  if (task.status === 'completed') {
+    res.status(400).json({ error: 'This task has already been completed and merged — it can no longer be rolled back.' });
+    return;
+  }
+  if (task.status === 'working') {
+    res.status(409).json({ error: 'Interrupt the task before rolling it back.' });
+    return;
+  }
+  const checkpoint = getTaskCheckpoint(req.params.checkpointId);
+  if (!checkpoint || checkpoint.task_id !== task.id) {
+    res.status(404).json({ error: 'Checkpoint not found' });
+    return;
+  }
+  try {
+    // Holds the same per-workspace lock a launch would, so this can't race a
+    // concurrently-starting task on the same workspace touching the same worktree.
+    const summary = await withWorkspaceLock(task.workspace_id, () => rollbackTaskToCheckpoint(task, checkpoint));
+    addMessage(task.id, 'system', `🔙 ${summary}`, undefined, undefined, undefined, req.authSource, req.clientLabel);
+    res.json({
+      task: getTask(task.id),
+      messages: getMessages(task.id),
+      checkpoints: getTaskCheckpoints(task.id),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Rollback failed' });
   }
 });
 

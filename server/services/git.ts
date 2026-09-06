@@ -1,11 +1,22 @@
 import { sshExec as coderSshExec, detectProjectDir, type RemoteExecError } from './claude.js';
 import { getValidCoderTokenForUser } from './sessions.js';
-import { addMessage, getTask, type Task } from './tasks.js';
+import {
+  addMessage, getTask, getMessages, createTaskCheckpoint,
+  markMessagesStaleAfter, setPendingRollbackNote, type Task, type TaskCheckpoint,
+} from './tasks.js';
 import { getDb } from '../db/index.js';
 import { execFile } from 'child_process';
 import { AsyncLocalStorage } from 'async_hooks';
 
 const CPM_WORKTREE_BASE = process.env.CPM_WORKTREE_BASE || '/home/coder/.cpm/worktrees';
+
+/**
+ * Base dir (on the remote workspace, alongside CPM_WORKTREE_BASE) for a task's
+ * checkpoint snapshot repo — a bare git repo, wholly separate from the
+ * worktree's own `.git`, that CPM commits a full snapshot of the worktree's
+ * file contents into after every turn. See createCheckpointRepo/snapshotTaskTurn.
+ */
+const CPM_CHECKPOINTS_BASE = process.env.CPM_CHECKPOINTS_BASE || '/home/coder/.cpm/checkpoints';
 
 /**
  * Per-step timeout budgets for the remote git/gh steps below.
@@ -531,6 +542,16 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
   } catch (err: any) {
     console.error(`[git] Worktree creation failed for task ${task.id}:`, err.message);
     addMessage(task.id, 'system', `Warning: could not create git worktree: ${err.message}. Task will run in the main workspace directory.`);
+    return;
+  }
+
+  // Best-effort: the checkpoint repo backs "Roll back to here" but is not
+  // required for the task to run, so a failure here must not be reported as a
+  // worktree-creation failure (the worktree itself succeeded above).
+  try {
+    await createCheckpointRepo(task);
+  } catch (err: any) {
+    console.error(`[git] Checkpoint repo creation failed for task ${task.id}:`, err.message);
   }
 }
 
@@ -542,6 +563,179 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
  */
 export async function handleTaskResumeGit(_task: Task): Promise<void> {
   // no-op: worktree persists between turns
+}
+
+// ─── Task Checkpoints ("Roll back to here") ──────────────────────────────────
+//
+// After every agent turn CPM commits a full snapshot of the worktree's file
+// contents into a SEPARATE bare git repo (its own index/HEAD, never the
+// worktree's own `.git`), keyed by task id. A rollback materializes an older
+// snapshot's tree into the worktree with that snapshot repo's own `reset
+// --hard`, then commits the result forward onto the task's REAL branch via the
+// worktree's own git — so a rollback is itself just another ordinary commit,
+// never a rewrite of the branch's history. Modeled on the same trick Forge
+// uses for its own per-turn checkpoints.
+
+function checkpointDirFor(taskId: string): string {
+  return `${CPM_CHECKPOINTS_BASE}/task-${taskId}.git`;
+}
+
+/** Create the (empty) snapshot repo for a task. Called once, when its worktree is created. */
+async function createCheckpointRepo(task: Task): Promise<void> {
+  if (!task.worktree_path) return;
+  const cp = checkpointDirFor(task.id);
+  await coderSsh(
+    task.workspace_name,
+    `mkdir -p ${shellEscape(CPM_CHECKPOINTS_BASE)} && git init -q --bare ${shellEscape(cp)}`,
+    GIT_T_INDEX,
+    task.user_id,
+  );
+}
+
+/** Delete a task's snapshot repo. Called once its worktree has been removed. */
+async function removeCheckpointRepo(task: Task): Promise<void> {
+  const cp = checkpointDirFor(task.id);
+  await coderSsh(task.workspace_name, `rm -rf ${shellEscape(cp)}`, GIT_T_INDEX, task.user_id).catch(() => {});
+}
+
+/**
+ * Take a snapshot of the current worktree into the task's checkpoint repo and
+ * commit it (only if the tree actually changed — except the very first
+ * snapshot ever taken for a task, which is committed `--allow-empty` so later
+ * restores always have a base to diff/reset against).
+ *
+ * `git add --all` aborts outright on the first unreadable path (root-owned
+ * files a containerized process wrote into the worktree are the common case),
+ * which would otherwise break every future checkpoint on this task once it
+ * happens once. So each call re-scans for unreadable files and excludes them
+ * via the checkpoint repo's `info/exclude` (rewritten every time — this file
+ * lives in the SNAPSHOT repo's git-dir, not the worktree, so it never pollutes
+ * the project's own git config). `.git` is permanently excluded there too:
+ * in a worktree it's a FILE pointing back into the main repo's metadata, and it
+ * must never be tracked by the snapshot (see rollbackTaskToCheckpoint for why
+ * that matters on restore). Everything the project's own .gitignore excludes
+ * (node_modules, build output, …) is already skipped for free — gitignore
+ * lookup walks the worktree's own files regardless of which --git-dir is in use.
+ *
+ * Returns the resulting commit hash. Callers must only invoke this when
+ * `task.worktree_path` is set.
+ */
+async function snapshotWorktree(task: Task, label: string): Promise<string> {
+  const wt = task.worktree_path!;
+  const cp = checkpointDirFor(task.id);
+  const script = [
+    'set -e',
+    `CP=${shellEscape(cp)}`,
+    `WT=${shellEscape(wt)}`,
+    'mkdir -p "$CP/info"',
+    '( echo ".git"; find "$WT" -mindepth 1 -type f ! -readable 2>/dev/null ) | sed "s#^$WT/##" > "$CP/info/exclude"',
+    'git --git-dir="$CP" --work-tree="$WT" add --all',
+    'if git --git-dir="$CP" rev-parse HEAD >/dev/null 2>&1; then',
+    '  if git --git-dir="$CP" --work-tree="$WT" diff --cached --quiet; then',
+    '    echo "NOCHANGE:$(git --git-dir=\"$CP\" rev-parse HEAD)"',
+    '  else',
+    `    git --git-dir="$CP" --work-tree="$WT" -c user.email=cpm@localhost -c user.name=CPM commit -q -m ${shellEscape(label)}`,
+    '    echo "COMMIT:$(git --git-dir=\"$CP\" rev-parse HEAD)"',
+    '  fi',
+    'else',
+    `  git --git-dir="$CP" --work-tree="$WT" -c user.email=cpm@localhost -c user.name=CPM commit -q --allow-empty -m ${shellEscape(label)}`,
+    '  echo "COMMIT:$(git --git-dir=\"$CP\" rev-parse HEAD)"',
+    'fi',
+  ].join('\n');
+
+  const out = await coderSsh(task.workspace_name, script, GIT_T_INDEX, task.user_id);
+  const lastLine = out.trim().split(/\r?\n/).pop() || '';
+  const m = /^(?:COMMIT|NOCHANGE):([0-9a-f]{7,40})$/.exec(lastLine.trim());
+  if (!m) throw new Error(`unexpected checkpoint output: ${truncate(out, 300)}`);
+  return m[1];
+}
+
+/**
+ * Record a checkpoint for the turn that just ended. Called (fire-and-forget)
+ * every time a task settles into `awaiting_feedback`. Best-effort by design —
+ * a failure here must never block the task's own turn from completing, so
+ * every caller wraps this in its own `.catch()`.
+ */
+export async function recordTurnCheckpoint(task: Task): Promise<void> {
+  if (!task.worktree_path) return;
+  const commitHash = await snapshotWorktree(task, `Checkpoint after turn (task ${task.id})`);
+
+  // Anchor to the last message from THIS task's own agent — the turn may have
+  // appended trailing system messages (e.g. an auto-review escalation notice)
+  // after it, and an advisory participant (a different workspace entirely,
+  // invited into the conversation) may have posted its own assistant-role
+  // message around the same time. Neither should own this checkpoint.
+  const lastAssistant = [...getMessages(task.id)].reverse().find(m => m.role === 'assistant' && !m.participant_id);
+  createTaskCheckpoint(task.id, lastAssistant?.id ?? null, commitHash);
+}
+
+/**
+ * Roll back a task's worktree to an earlier checkpoint.
+ *
+ * 1. Materialize the snapshot: `reset --hard <commit>` against the CHECKPOINT
+ *    repo's own git-dir/work-tree pair. Since the snapshot repo never tracked
+ *    `.git` (permanently excluded, see snapshotWorktree) or anything the
+ *    project's own .gitignore excludes, this only ever touches files the
+ *    snapshot actually tracks — it cannot detach the worktree by clobbering
+ *    `.git`, and it leaves node_modules/build output alone. Because every
+ *    snapshot re-`add`s the ENTIRE worktree, this also deletes files created
+ *    after the checkpoint and restores files deleted since — a real,
+ *    full-fidelity restore, not just a partial `checkout -- <paths>`.
+ * 2. Land the result as a NEW commit on the task's own real branch, via the
+ *    worktree's OWN git (never the snapshot repo) — a rollback is just another
+ *    forward commit, never a rewrite of branch history, so it can itself be
+ *    rolled back later and composes cleanly with the eventual `--merge` into
+ *    the default branch.
+ *
+ * Returns a human-readable summary for the caller to post as a system message.
+ */
+export async function rollbackTaskToCheckpoint(task: Task, checkpoint: TaskCheckpoint): Promise<string> {
+  if (!task.worktree_path) throw new Error('This task has no worktree to roll back.');
+  const wt = task.worktree_path;
+  const cp = checkpointDirFor(task.id);
+  const hash = checkpoint.commit_hash;
+  const commitMsg = `Roll back to state after turn ${checkpoint.turn_number}`;
+
+  const script = [
+    'set -e',
+    `CP=${shellEscape(cp)}`,
+    `WT=${shellEscape(wt)}`,
+    `git --git-dir="$CP" cat-file -e ${shellEscape(hash)}^{commit}`,
+    `git --git-dir="$CP" --work-tree="$WT" reset -q --hard ${shellEscape(hash)}`,
+    'cd "$WT"',
+    'git add -A',
+    'if git diff --cached --quiet; then',
+    `  git -c user.email=cpm@localhost -c user.name=CPM commit -q --allow-empty -m ${shellEscape(commitMsg)}`,
+    'else',
+    `  git -c user.email=cpm@localhost -c user.name=CPM commit -q -m ${shellEscape(commitMsg)}`,
+    'fi',
+    'git rev-parse HEAD',
+  ].join('\n');
+
+  const out = await coderSsh(task.workspace_name, script, GIT_T_INDEX, task.user_id);
+  const newTip = out.trim().split(/\r?\n/).pop()?.trim() || '';
+
+  // Anchor staleness to the checkpoint's own message, if we have one — messages
+  // strictly after it no longer reflect the worktree's (now-restored) state.
+  // Fall back to the checkpoint's own created_at for legacy rows with no
+  // anchor message.
+  const db = getDb();
+  let anchorCreatedAt = checkpoint.created_at;
+  if (checkpoint.message_id) {
+    const row = db.prepare('SELECT created_at FROM messages WHERE id = ?').get(checkpoint.message_id) as { created_at: string } | undefined;
+    if (row) anchorCreatedAt = row.created_at;
+  }
+  const now = new Date().toISOString();
+  const staleCount = markMessagesStaleAfter(task.id, anchorCreatedAt, now);
+
+  setPendingRollbackNote(task.id,
+    `[SYSTEM: The user rolled the worktree back to the state right after your turn ${checkpoint.turn_number} reply. ` +
+    `Everything you and the reviewer did in later turns has been undone on disk (though it still shows in the conversation history below, for the record) — ` +
+    `re-inspect the current file state before continuing rather than assuming it matches what you last wrote.]`
+  );
+
+  return `Rolled back to the state after turn ${checkpoint.turn_number} (new commit \`${newTip.slice(0, 8) || hash.slice(0, 8)}\`). ` +
+    `${staleCount} later message${staleCount === 1 ? ' is' : 's are'} now marked stale.`;
 }
 
 // ─── Worktree removal ────────────────────────────────────────────────────────
@@ -614,6 +808,10 @@ export async function removeTaskWorktree(task: Task): Promise<boolean> {
   getDb().prepare('UPDATE tasks SET worktree_path = NULL WHERE id = ?').run(task.id);
   task.worktree_path = null;
   console.log(`[git] Removed worktree for task ${task.id}`);
+
+  // Best-effort: tied to the worktree's own lifecycle, never blocks removal.
+  await removeCheckpointRepo(task).catch(() => {});
+
   return true;
 }
 

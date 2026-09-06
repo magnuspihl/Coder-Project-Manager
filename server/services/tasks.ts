@@ -51,6 +51,8 @@ export interface Task {
   wake_note: string | null;
   wake_file: string | null;
   wake_count: number;
+  /** Set by a rollback; injected into the prompt on the task's next resume. */
+  pending_rollback_note: string | null;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
@@ -108,6 +110,18 @@ export interface Message {
   turn_id: string | null;
   source?: string | null;
   client_label?: string | null;
+  /** Set once a rollback restores the worktree to a point before this message. */
+  stale_at?: string | null;
+  created_at: string;
+}
+
+export interface TaskCheckpoint {
+  id: string;
+  task_id: string;
+  message_id: string | null;
+  /** Commit in the task's separate snapshot repo — not the worktree's own branch. */
+  commit_hash: string;
+  turn_number: number;
   created_at: string;
 }
 
@@ -1044,6 +1058,74 @@ export function updateMessageCost(messageId: string, cost: number): void {
   const db = getDb();
   db.prepare('UPDATE messages SET cost = ? WHERE id = ?').run(cost, messageId);
   invalidateTokenTotalsCache();
+}
+
+// ─── Task checkpoints ("Roll back to here") ─────────────────────────────────
+
+/**
+ * Record a worktree checkpoint taken after a turn. `messageId` anchors it to
+ * the end-of-turn assistant message the chat UI attaches the rollback button
+ * to (null if the turn produced no assistant message to anchor to).
+ * `turn_number` is a simple 1-based sequence local to this table — independent
+ * of task_turns' own numbering, which tracks implementer/reviewer turns
+ * separately and would be a confusing label to show next to "Roll back".
+ */
+export function createTaskCheckpoint(taskId: string, messageId: string | null, commitHash: string): TaskCheckpoint {
+  const db = getDb();
+  const id = uuid();
+  const turnNumber = countTaskCheckpoints(taskId) + 1;
+  db.prepare(
+    'INSERT INTO task_checkpoints (id, task_id, message_id, commit_hash, turn_number) VALUES (?, ?, ?, ?, ?)'
+  ).run(id, taskId, messageId, commitHash, turnNumber);
+  return db.prepare('SELECT * FROM task_checkpoints WHERE id = ?').get(id) as TaskCheckpoint;
+}
+
+export function countTaskCheckpoints(taskId: string): number {
+  const db = getDb();
+  const row = db.prepare('SELECT COUNT(*) as count FROM task_checkpoints WHERE task_id = ?').get(taskId) as { count: number };
+  return row.count;
+}
+
+export function getTaskCheckpoints(taskId: string): TaskCheckpoint[] {
+  const db = getDb();
+  return db.prepare('SELECT * FROM task_checkpoints WHERE task_id = ? ORDER BY created_at ASC').all(taskId) as TaskCheckpoint[];
+}
+
+export function getTaskCheckpoint(id: string): TaskCheckpoint | undefined {
+  const db = getDb();
+  return db.prepare('SELECT * FROM task_checkpoints WHERE id = ?').get(id) as TaskCheckpoint | undefined;
+}
+
+/**
+ * Mark every message after `afterCreatedAt` as stale (a rollback restored the
+ * worktree to an earlier point, so these no longer reflect its current file
+ * state). Only touches rows not already marked, so an earlier rollback's
+ * staleness timestamp — "when did this become stale" — is preserved rather
+ * than overwritten by a later one; forward-only rollbacks only ever extend the
+ * stale range; see the design note in git.ts's rollbackTaskToCheckpoint.
+ */
+export function markMessagesStaleAfter(taskId: string, afterCreatedAt: string, staleAt: string): number {
+  const db = getDb();
+  const res = db.prepare(
+    "UPDATE messages SET stale_at = ? WHERE task_id = ? AND created_at > ? AND stale_at IS NULL"
+  ).run(staleAt, taskId, afterCreatedAt);
+  return res.changes;
+}
+
+export function setPendingRollbackNote(taskId: string, note: string | null): void {
+  getDb().prepare('UPDATE tasks SET pending_rollback_note = ?, updated_at = ? WHERE id = ?').run(
+    note, new Date().toISOString(), taskId
+  );
+}
+
+/** Read and clear the pending rollback note in one step — it is meant to be injected exactly once, on the next resume. */
+export function consumePendingRollbackNote(taskId: string): string | null {
+  const db = getDb();
+  const row = db.prepare('SELECT pending_rollback_note FROM tasks WHERE id = ?').get(taskId) as { pending_rollback_note: string | null } | undefined;
+  if (row?.pending_rollback_note) {
+    db.prepare('UPDATE tasks SET pending_rollback_note = NULL WHERE id = ?').run(taskId);
+  }
+  return row?.pending_rollback_note ?? null;
 }
 
 // ─── Task Participants ──────────────────────────────────────────────────
