@@ -1,6 +1,7 @@
 import { getDb } from '../db/index.js';
 import { v4 as uuid } from 'uuid';
 import { validateToken, type CoderUser } from './coder.js';
+import { encryptSecret, decryptSecret } from './secrets.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || '';
@@ -16,16 +17,65 @@ export interface Session {
   expires_at: string;
 }
 
+/** Row shape as stored in the DB — tokens are ciphertext (or, for rows written
+ * before encryption was added, legacy plaintext). Never expose this outside
+ * this module; always hydrate into a `Session` first. */
+type SessionRow = Session;
+
+function isEncryptedToken(value: string): boolean {
+  const parts = value.split(':');
+  return parts.length === 4 && parts[0] === 'v1';
+}
+
+/** Decrypt a stored token, transparently passing through legacy plaintext
+ * rows written before this column was encrypted. */
+function decryptToken(stored: string): string {
+  return isEncryptedToken(stored) ? decryptSecret(stored) : stored;
+}
+
+function decryptTokenNullable(stored: string | null): string | null {
+  return stored == null ? null : decryptToken(stored);
+}
+
+/**
+ * Convert a raw DB row into a Session with plaintext tokens, so the rest of
+ * the app can keep treating `Session.coder_access_token` as a usable token.
+ * Throws if the ciphertext can't be decrypted (e.g. the encryption key
+ * changed) — callers should treat that as an invalid session.
+ */
+function hydrateSession(row: SessionRow): Session {
+  return {
+    ...row,
+    coder_access_token: decryptToken(row.coder_access_token),
+    coder_refresh_token: decryptTokenNullable(row.coder_refresh_token),
+  };
+}
+
+/** Decrypt a row, deleting it and returning undefined if the ciphertext is
+ * unreadable rather than throwing — used on read paths where an unreadable
+ * token should just force re-authentication instead of crashing. */
+function hydrateSessionOrInvalidate(db: ReturnType<typeof getDb>, row: SessionRow): Session | undefined {
+  try {
+    return hydrateSession(row);
+  } catch (err) {
+    console.error('[session] Failed to decrypt stored token, invalidating session:', err);
+    db.prepare('DELETE FROM sessions WHERE id = ?').run(row.id);
+    return undefined;
+  }
+}
+
 export async function createSession(coderToken: string): Promise<{ session: Session; user: CoderUser }> {
   const user = await validateToken(coderToken);
   const db = getDb();
 
   upsertUser(db, user);
 
+  const encToken = encryptSecret(coderToken);
+
   // Update all existing sessions for this user with the fresh token
   db.prepare(
     `UPDATE sessions SET coder_access_token = ? WHERE user_id = ?`
-  ).run(coderToken, user.id);
+  ).run(encToken, user.id);
 
   // Create session (expires in 7 days)
   const sessionId = uuid();
@@ -34,10 +84,10 @@ export async function createSession(coderToken: string): Promise<{ session: Sess
   db.prepare(
     `INSERT INTO sessions (id, user_id, coder_access_token, expires_at)
      VALUES (?, ?, ?, ?)`
-  ).run(sessionId, user.id, coderToken, expiresAt);
+  ).run(sessionId, user.id, encToken, expiresAt);
 
-  const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sessionId) as Session;
-  return { session, user };
+  const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sessionId) as SessionRow;
+  return { session: hydrateSession(row), user };
 }
 
 export async function createSessionFromOAuth(
@@ -50,12 +100,15 @@ export async function createSessionFromOAuth(
 
   upsertUser(db, user);
 
+  const encAccessToken = encryptSecret(accessToken);
+  const encRefreshToken = refreshToken == null ? null : encryptSecret(refreshToken);
+
   // Update all existing sessions for this user with the fresh tokens,
   // so other devices don't get stale tokens when Coder invalidates old ones
   db.prepare(
     `UPDATE sessions SET coder_access_token = ?, coder_refresh_token = ?, token_expires_at = ?
      WHERE user_id = ?`
-  ).run(accessToken, refreshToken, tokenExpiresAt, user.id);
+  ).run(encAccessToken, encRefreshToken, tokenExpiresAt, user.id);
 
   const sessionId = uuid();
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -63,10 +116,10 @@ export async function createSessionFromOAuth(
   db.prepare(
     `INSERT INTO sessions (id, user_id, coder_access_token, coder_refresh_token, token_expires_at, expires_at)
      VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(sessionId, user.id, accessToken, refreshToken, tokenExpiresAt, expiresAt);
+  ).run(sessionId, user.id, encAccessToken, encRefreshToken, tokenExpiresAt, expiresAt);
 
-  const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sessionId) as Session;
-  return { session, user };
+  const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sessionId) as SessionRow;
+  return { session: hydrateSession(row), user };
 }
 
 function upsertUser(db: ReturnType<typeof getDb>, user: CoderUser): void {
@@ -79,12 +132,13 @@ function upsertUser(db: ReturnType<typeof getDb>, user: CoderUser): void {
 
 export function getSession(sessionId: string): Session | undefined {
   const db = getDb();
-  const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sessionId) as Session | undefined;
-  if (session && new Date(session.expires_at) < new Date()) {
+  const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sessionId) as SessionRow | undefined;
+  if (!row) return undefined;
+  if (new Date(row.expires_at) < new Date()) {
     db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionId);
     return undefined;
   }
-  return session;
+  return hydrateSessionOrInvalidate(db, row);
 }
 
 export function deleteSession(sessionId: string): void {
@@ -137,14 +191,16 @@ export async function refreshAccessToken(session: Session): Promise<string | nul
       ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
       : null;
 
+    const newRefreshToken = tokens.refresh_token || session.coder_refresh_token;
+
     // Update all sessions for this user with new tokens (keeps other devices in sync)
     const db = getDb();
     db.prepare(
       `UPDATE sessions SET coder_access_token = ?, coder_refresh_token = ?, token_expires_at = ?
        WHERE user_id = ?`
     ).run(
-      tokens.access_token,
-      tokens.refresh_token || session.coder_refresh_token,
+      encryptSecret(tokens.access_token),
+      newRefreshToken == null ? null : encryptSecret(newRefreshToken),
       tokenExpiresAt,
       session.user_id,
     );
@@ -170,10 +226,12 @@ const refreshInFlight = new Map<string, Promise<string | null>>();
 
 function latestSessionForUser(userId: string): Session | undefined {
   const db = getDb();
-  return db.prepare(
+  const row = db.prepare(
     `SELECT * FROM sessions WHERE user_id = ? AND coder_access_token IS NOT NULL
      ORDER BY created_at DESC LIMIT 1`,
-  ).get(userId) as Session | undefined;
+  ).get(userId) as SessionRow | undefined;
+  if (!row) return undefined;
+  return hydrateSessionOrInvalidate(db, row);
 }
 
 function dedupedRefresh(userId: string, session: Session): Promise<string | null> {
