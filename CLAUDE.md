@@ -98,7 +98,7 @@ queued → working → awaiting_feedback → working → ... → completed
 - All timestamps in UTC ISO 8601
 
 ### Security
-- NEVER store Coder API tokens in the database — keep them in encrypted HTTP-only session cookies
+- The session cookie holds only an opaque session ID, never a token. Coder OAuth access/refresh tokens live in the `sessions` table but MUST be encrypted at rest with AES-256-GCM via `server/services/secrets.ts` (same as `claude_accounts.token_enc`) — never store them as plaintext columns
 - All API routes require authentication
 - Authorization is Coder's RBAC via the user's token **for anything Coder owns** (workspaces, users). For data CPM owns, CPM must scope it itself — Coder has no opinion on it:
   - Tasks are per-user (`requireTaskAccess`; `listTasks` filters by `user_id`)
@@ -118,4 +118,4 @@ queued → working → awaiting_feedback → working → ... → completed
 - Don't use an ORM — raw SQL with better-sqlite3 is intentional.
 - Don't add heavy UI frameworks or component libraries.
 - Don't implement your own auth system — Coder is the auth provider.
-- Don't store secrets in the database or in environment variables committed to the repo. The one deliberate exception is `claude_accounts.token_enc` (Claude subscription tokens), which is encrypted with AES-256-GCM via `server/services/secrets.ts` — a user-supplied credential CPM has to replay later, so there is nowhere else for it to live. Encrypt anything similar the same way; don't add plaintext secret columns.
+- Don't store secrets in the database or in environment variables committed to the repo. The deliberate exceptions are `claude_accounts.token_enc` (Claude subscription tokens) and `sessions.coder_access_token`/`coder_refresh_token` (Coder OAuth tokens) — both are long-lived bearer credentials CPM has to replay later, so there is nowhere else for them to live, and both are encrypted with AES-256-GCM via `server/services/secrets.ts`. Encrypt anything similar the same way; don't add plaintext secret columns.

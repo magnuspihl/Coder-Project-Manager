@@ -6,9 +6,12 @@ import { DB_PATH } from '../db/index.js';
 /**
  * Symmetric encryption for secrets that must live in the database.
  *
- * Coder session tokens are short-lived and refreshable, so they are stored as-is.
- * Claude subscription tokens are not: they are long-lived bearer credentials for
- * a paid account, so they are encrypted at rest with AES-256-GCM.
+ * Both Coder OAuth tokens (`sessions.coder_access_token`/`coder_refresh_token`)
+ * and Claude subscription tokens (`claude_accounts.token_enc`) are long-lived
+ * bearer credentials, so both are encrypted at rest with AES-256-GCM. Rows
+ * written before encryption was added are read transparently as legacy
+ * plaintext (see `sessions.ts`'s `decryptToken`) and re-encrypted on their
+ * next write.
  *
  * The key comes from CPM_SECRET_KEY (64 hex chars) when set; otherwise a random
  * key is generated once and persisted as `secret.key` in the same directory as the
