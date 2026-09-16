@@ -1,7 +1,8 @@
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import { createSession, createSessionFromOAuth, deleteSession } from '../services/sessions.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, isAdminUser } from '../middleware/auth.js';
+import { cookieSecurity, rateLimit } from '../middleware/security.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const APP_URL = process.env.APP_URL || '';
@@ -12,6 +13,12 @@ const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || '';
 const PORT_RANGE_SIZE = parseInt(process.env.CPM_PORT_RANGE_SIZE || '10');
 
 const router = Router();
+
+const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Name of the cookie that binds an in-flight OAuth login to the browser that
+ * started it (see `/login`). */
+const STATE_COOKIE = 'cpm_oauth_state';
 
 // In-memory PKCE store (code_verifier keyed by state)
 const pkceStore = new Map<string, { verifier: string; createdAt: number }>();
@@ -40,6 +47,18 @@ router.get('/login', (req: Request, res: Response) => {
   const challenge = base64url(crypto.createHash('sha256').update(verifier).digest());
 
   pkceStore.set(state, { verifier, createdAt: Date.now() });
+
+  // Bind the flow to this browser. The pkceStore alone is keyed only by
+  // `state`, which travels in the URL — an attacker could start a login, then
+  // feed their own callback URL to a victim and land their authorization code
+  // in the victim's browser (login CSRF / session fixation). The callback now
+  // also requires a matching cookie, which only the browser that hit /login
+  // has.
+  res.cookie(STATE_COOKIE, state, {
+    ...cookieSecurity(),
+    maxAge: 10 * 60 * 1000, // matches the pkceStore sweep window
+    path: '/auth',
+  });
 
   const callbackUrl = `${APP_URL}/auth/callback`;
 
@@ -70,6 +89,15 @@ router.get('/callback', async (req: Request, res: Response) => {
     return;
   }
   pkceStore.delete(state);
+
+  // The state must also match the cookie set when this browser started the
+  // flow, so a callback URL crafted elsewhere cannot complete a login here.
+  const cookieState = req.cookies?.[STATE_COOKIE];
+  res.clearCookie(STATE_COOKIE, { path: '/auth' });
+  if (!cookieState || cookieState !== state) {
+    res.status(400).send('Login session not recognized by this browser — please start again');
+    return;
+  }
 
   const callbackUrl = `${APP_URL}/auth/callback`;
 
@@ -112,12 +140,7 @@ router.get('/callback', async (req: Request, res: Response) => {
       expiresAt,
     );
 
-    res.cookie('session_id', session.id, {
-      httpOnly: true,
-      secure: APP_URL.startsWith('https'),
-      sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000,
-    });
+    res.cookie('session_id', session.id, { ...cookieSecurity(), maxAge: SESSION_MAX_AGE_MS });
 
     // Redirect to the app
     res.redirect('/');
@@ -138,8 +161,15 @@ router.get('/config', (_req: Request, res: Response) => {
   });
 });
 
-// API token login (fallback)
-router.post('/token-login', async (req: Request, res: Response) => {
+// API token login (fallback). Rate limited because it is the one endpoint that
+// takes a guessable credential straight from an unauthenticated caller.
+const tokenLoginLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 20,
+  message: 'Too many login attempts. Try again shortly.',
+});
+
+router.post('/token-login', tokenLoginLimiter, async (req: Request, res: Response) => {
   const { token } = req.body;
   if (!token || typeof token !== 'string') {
     res.status(400).json({ error: 'Token is required' });
@@ -148,12 +178,7 @@ router.post('/token-login', async (req: Request, res: Response) => {
 
   try {
     const { session, user } = await createSession(token.trim());
-    res.cookie('session_id', session.id, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000,
-    });
+    res.cookie('session_id', session.id, { ...cookieSecurity(), maxAge: SESSION_MAX_AGE_MS });
     res.json({ user });
   } catch (err) {
     res.status(401).json({ error: 'Invalid token. Please check your Coder API token.' });
@@ -169,7 +194,9 @@ router.post('/logout', requireAuth, (req: Request, res: Response) => {
 });
 
 router.get('/me', requireAuth, (req: Request, res: Response) => {
-  res.json({ user: req.user });
+  // is_admin only drives which controls the UI offers — every privileged route
+  // re-checks it server-side via requireAdmin.
+  res.json({ user: req.user, is_admin: isAdminUser(req.user) });
 });
 
 export default router;

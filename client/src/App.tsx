@@ -7,11 +7,12 @@ import { ImageLightboxProvider } from './components/ImageLightbox';
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     getMe()
-      .then(({ user }) => setUser(user))
+      .then(({ user, is_admin }) => { setUser(user); setIsAdmin(is_admin); })
       .catch(() => setUser(null))
       .finally(() => setLoading(false));
   }, []);
@@ -32,12 +33,21 @@ export default function App() {
   }
 
   if (!user) {
-    return <LoginPage onLogin={setUser} />;
+    // Token login returns only the user, so re-read /auth/me to pick up
+    // is_admin rather than leaving admin controls hidden until a reload.
+    return (
+      <LoginPage
+        onLogin={(loggedIn) => {
+          setUser(loggedIn);
+          getMe().then(({ is_admin }) => setIsAdmin(is_admin)).catch(() => setIsAdmin(false));
+        }}
+      />
+    );
   }
 
   return (
     <ImageLightboxProvider>
-      <Layout>
+      <Layout isAdmin={isAdmin}>
         <WorkspacesPage />
       </Layout>
     </ImageLightboxProvider>
