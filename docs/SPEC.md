@@ -566,6 +566,33 @@ The app is configured via environment variables:
 | `CPM_MIDJOURNEY_MCP_URLS` | No | Explicit per-user Midjourney bridge endpoint map (overrides the template). See below. |
 | `CPM_MESHY_API_KEY` | No | Shared Meshy API key applied to every user with no per-user override. See below. |
 | `CPM_MESHY_API_KEYS` | No | Explicit per-user Meshy API key map (overrides the shared key). See below. |
+| `CPM_ADMIN_USERS` | No | Comma-separated Coder usernames allowed to perform deployment-wide operations (currently `POST /api/workspaces/restart`). Defaults to `CODER_WORKSPACE_OWNER_NAME` — the owner of the workspace CPM runs in. With neither set, those routes fail closed. |
+| `CPM_ALLOWED_ORIGINS` | No | Extra comma-separated origins allowed to make credentialed cross-origin calls, in addition to `APP_URL`. The browser app is same-origin (Vite proxies `/api` and `/auth`), so this is normally left unset. |
+| `CPM_CSP` | No | Content-Security-Policy header value. Unset means no CSP is sent — see below. |
+| `CPM_TRUST_PROXY` | No | Proxy hops to trust when resolving the client IP for rate limiting (default: 1, Coder's workspace-app proxy). |
+
+### Security headers and CORS
+
+Every response carries `X-Content-Type-Options: nosniff`,
+`X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: strict-origin-when-cross-origin`,
+`X-Permitted-Cross-Domain-Policies: none`, and — when `APP_URL` is HTTPS —
+`Strict-Transport-Security` (no `includeSubDomains`, since CPM shares a wildcard
+domain with every other Coder workspace app).
+
+No Content-Security-Policy is sent by default. The client loads ONNX/WASM
+runtimes into `blob:` workers for Kokoro TTS and Whisper STT, renders user
+Markdown, and iframes arbitrary workspace-preview origins; a policy tight
+enough to be worth having must allow each of those explicitly, and a wrong one
+fails silently in the browser rather than loudly on the server. Set `CPM_CSP`
+once a deployment has tested its own policy.
+
+CORS is an allowlist (`APP_URL` plus `CPM_ALLOWED_ORIGINS`), not a reflector.
+Requests with no `Origin` header — `curl`, the MCP transport, server-to-server —
+are unaffected, since CORS is a browser-side mechanism.
+
+The `secure` flag on every cookie CPM sets is derived from whether `APP_URL` is
+HTTPS, not from `NODE_ENV` (routinely unset in production here) or `req.secure`
+(depends on the proxy-hop count being right).
 
 ### Per-user memory store
 

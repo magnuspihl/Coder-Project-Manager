@@ -141,3 +141,54 @@ export function requireTaskAccess(req: Request, res: Response, next: NextFunctio
   req.task = task;
   next();
 }
+
+/**
+ * Usernames allowed to perform deployment-wide operations.
+ *
+ * CPM_ADMIN_USERS (comma-separated Coder usernames) when set; otherwise the
+ * owner of the workspace CPM itself runs in, who is by construction the
+ * operator. Coder's RBAC cannot answer this one — "may restart CPM" is not a
+ * permission Coder knows about, so CPM has to scope it itself.
+ */
+function adminUsernames(): Set<string> {
+  const configured = (process.env.CPM_ADMIN_USERS || '')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (configured.length > 0) return new Set(configured);
+
+  const owner = (process.env.CODER_WORKSPACE_OWNER_NAME || '').trim().toLowerCase();
+  return owner ? new Set([owner]) : new Set();
+}
+
+/**
+ * Gate for operations that affect the whole deployment rather than one user's
+ * data — currently only rebuilding and restarting the server, which any
+ * authenticated Coder user could previously trigger (a rebuild plus
+ * `process.exit(0)`, i.e. a one-request outage for everyone).
+ *
+ * Fails closed: with no allowlist and no workspace owner there is no way to
+ * tell an operator from any other authenticated user, and guessing wrong in
+ * that direction hands out the restart button. Must run after `requireAuth`.
+ */
+export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  const admins = adminUsernames();
+  if (admins.size === 0) {
+    res.status(403).json({
+      error: 'No CPM administrators are configured. Set CPM_ADMIN_USERS to a comma-separated list of Coder usernames.',
+    });
+    return;
+  }
+  if (!req.user || !admins.has(req.user.username.toLowerCase())) {
+    res.status(403).json({ error: 'Administrator access required' });
+    return;
+  }
+  next();
+}
+
+/** Whether a user may perform deployment-wide operations. Exported so
+ * `/auth/me` can tell the client to hide controls it would be refused. */
+export function isAdminUser(user: CoderUser | undefined): boolean {
+  const admins = adminUsernames();
+  return !!user && admins.size > 0 && admins.has(user.username.toLowerCase());
+}

@@ -212,7 +212,7 @@ export const logout = () =>
   request<{ ok: boolean }>('/auth/logout', { method: 'POST' });
 
 export const getMe = () =>
-  request<{ user: User }>('/auth/me');
+  request<{ user: User; is_admin: boolean }>('/auth/me');
 
 // Workspaces
 export interface TaskCounts {

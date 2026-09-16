@@ -2,7 +2,8 @@ import { Router, Request, Response } from 'express';
 import { execFile, exec } from 'child_process';
 import net from 'net';
 import dnsPromises from 'dns/promises';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireAdmin } from '../middleware/auth.js';
+import { rateLimit } from '../middleware/security.js';
 import { listWorkspaces, getWorkspace, stopWorkspace, startWorkspace, CoderAuthError } from '../services/coder.js';
 import { getTaskCountsByWorkspace, getTokenTotalsByWorkspace, getGithubRepoUrlsByWorkspace, getWindowedTokenUsage } from '../services/tasks.js';
 import { getSubscriptionUsage, getObservedSubscriptionKeys, subscriptionKeyFor, type RateLimitUsage } from '../services/claude.js';
@@ -300,8 +301,17 @@ router.get('/proxy-icon', requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-// Restart CPM: rebuild server and exit (the wrapper loop restarts the server)
-router.post('/restart', requireAuth, (req: Request, res: Response) => {
+// Restart CPM: rebuild server and exit (the wrapper loop restarts the server).
+// Admin-only and rate limited — it takes the whole deployment down for every
+// user, so it is not something any authenticated Coder user should be able to
+// trigger, let alone in a loop.
+const restartLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 5,
+  message: 'Too many restart requests. Try again shortly.',
+});
+
+router.post('/restart', requireAuth, requireAdmin, restartLimiter, (req: Request, res: Response) => {
   const projectRoot = process.cwd();
   console.log('[restart] Build + restart requested, running npm run build:server...');
 

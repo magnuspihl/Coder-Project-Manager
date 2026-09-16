@@ -12,6 +12,7 @@ import ttsRoutes from './routes/tts.js';
 import sttRoutes from './routes/stt.js';
 import claudeAccountRoutes from './routes/claude-accounts.js';
 import { requireAuth } from './middleware/auth.js';
+import { securityHeaders, allowedOrigins, corsOriginCheck } from './middleware/security.js';
 import { handleMcpRequest, handleMcpMethodNotAllowed } from './mcp/index.js';
 
 // Initialize database on import
@@ -29,8 +30,20 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 
 const app = express();
 
+// CPM is reached through Coder's workspace-app proxy, which appends the real
+// client IP to X-Forwarded-For. Trusting exactly that many hops (1 by default)
+// makes `req.ip` the actual client rather than the proxy — which the rate
+// limiters key on — without trusting a client-supplied leftmost XFF entry.
+app.set('trust proxy', Number(process.env.CPM_TRUST_PROXY ?? 1));
+
+const CORS_ALLOWED = allowedOrigins();
+if (CORS_ALLOWED.size === 0) {
+  console.warn('[server] No APP_URL or CPM_ALLOWED_ORIGINS set — all cross-origin browser calls will be blocked.');
+}
+
 app.use(compression());
-app.use(cors({ origin: true, credentials: true }));
+app.use(securityHeaders);
+app.use(cors({ origin: corsOriginCheck(CORS_ALLOWED), credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
 
