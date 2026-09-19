@@ -119,6 +119,8 @@ export interface Task {
   git_branch: string | null;
   github_repo_url: string | null;
   git_provider: string | null;
+  /** Draft PR URL opened by a fork-PR-mode completion. */
+  pr_url: string | null;
   worktree_path: string | null;
   port_range_start: number | null;
   model: string | null;
@@ -581,12 +583,12 @@ export interface TaskRequestItem {
 }
 
 export const getGitSettings = (workspaceId: string) =>
-  request<{ gitPushEnabled: boolean }>(`/api/workspaces/${workspaceId}/git-settings`);
+  request<{ gitPushEnabled: boolean; forkPrMode: boolean }>(`/api/workspaces/${workspaceId}/git-settings`);
 
-export const updateGitSettings = (workspaceId: string, gitPushEnabled: boolean) =>
-  request<{ ok: boolean; gitPushEnabled: boolean }>(`/api/workspaces/${workspaceId}/git-settings`, {
+export const updateGitSettings = (workspaceId: string, settings: { gitPushEnabled?: boolean; forkPrMode?: boolean }) =>
+  request<{ ok: boolean; gitPushEnabled: boolean; forkPrMode: boolean }>(`/api/workspaces/${workspaceId}/git-settings`, {
     method: 'PATCH',
-    body: JSON.stringify({ gitPushEnabled }),
+    body: JSON.stringify(settings),
   });
 
 export const getWorkspaceVoiceSettings = (workspaceId: string) =>

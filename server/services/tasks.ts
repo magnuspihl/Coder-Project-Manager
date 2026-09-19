@@ -23,6 +23,8 @@ export interface Task {
   git_branch: string | null;
   github_repo_url: string | null;
   git_provider: string | null;
+  /** Draft PR URL opened by a fork-PR-mode completion (see workspace_settings.fork_pr_mode). */
+  pr_url: string | null;
   worktree_path: string | null;
   port_range_start: number | null;
   caveman: string | null;

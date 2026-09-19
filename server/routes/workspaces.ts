@@ -491,24 +491,40 @@ function assignDefaultVoices(workspaceIds: string[]): void {
 }
 
 router.get('/:workspaceId/git-settings', requireAuth, (req: Request, res: Response) => {
-  const row = getDb().prepare('SELECT git_push_enabled FROM workspace_settings WHERE workspace_id = ?')
-    .get(req.params.workspaceId) as { git_push_enabled: number } | undefined;
-  res.json({ gitPushEnabled: row?.git_push_enabled !== 0 });
+  const row = getDb().prepare('SELECT git_push_enabled, fork_pr_mode FROM workspace_settings WHERE workspace_id = ?')
+    .get(req.params.workspaceId) as { git_push_enabled: number; fork_pr_mode: number } | undefined;
+  res.json({
+    gitPushEnabled: row?.git_push_enabled !== 0,
+    forkPrMode: row?.fork_pr_mode === 1,
+  });
 });
 
 router.patch('/:workspaceId/git-settings', requireAuth, (req: Request, res: Response) => {
-  const { gitPushEnabled } = req.body;
-  if (typeof gitPushEnabled !== 'boolean') {
+  const { gitPushEnabled, forkPrMode } = req.body;
+  if (gitPushEnabled === undefined && forkPrMode === undefined) {
+    res.status(400).json({ error: 'gitPushEnabled and/or forkPrMode must be provided' });
+    return;
+  }
+  if (gitPushEnabled !== undefined && typeof gitPushEnabled !== 'boolean') {
     res.status(400).json({ error: 'gitPushEnabled must be a boolean' });
     return;
   }
+  if (forkPrMode !== undefined && typeof forkPrMode !== 'boolean') {
+    res.status(400).json({ error: 'forkPrMode must be a boolean' });
+    return;
+  }
   const db = getDb();
+  const now = new Date().toISOString();
+  const existing = db.prepare('SELECT git_push_enabled, fork_pr_mode FROM workspace_settings WHERE workspace_id = ?')
+    .get(req.params.workspaceId) as { git_push_enabled: number; fork_pr_mode: number } | undefined;
+  const nextGitPushEnabled = gitPushEnabled !== undefined ? (gitPushEnabled ? 1 : 0) : (existing?.git_push_enabled ?? 1);
+  const nextForkPrMode = forkPrMode !== undefined ? (forkPrMode ? 1 : 0) : (existing?.fork_pr_mode ?? 0);
   db.prepare(
-    `INSERT INTO workspace_settings (workspace_id, git_push_enabled, updated_at)
-     VALUES (?, ?, ?)
-     ON CONFLICT(workspace_id) DO UPDATE SET git_push_enabled = ?, updated_at = ?`
-  ).run(req.params.workspaceId, gitPushEnabled ? 1 : 0, new Date().toISOString(), gitPushEnabled ? 1 : 0, new Date().toISOString());
-  res.json({ ok: true, gitPushEnabled });
+    `INSERT INTO workspace_settings (workspace_id, git_push_enabled, fork_pr_mode, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(workspace_id) DO UPDATE SET git_push_enabled = ?, fork_pr_mode = ?, updated_at = ?`
+  ).run(req.params.workspaceId, nextGitPushEnabled, nextForkPrMode, now, nextGitPushEnabled, nextForkPrMode, now);
+  res.json({ ok: true, gitPushEnabled: nextGitPushEnabled === 1, forkPrMode: nextForkPrMode === 1 });
 });
 
 // Voice settings

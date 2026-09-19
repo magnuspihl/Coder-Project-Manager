@@ -288,14 +288,29 @@ async function resolveProjectDir(task: Task): Promise<string | null> {
 }
 
 /**
- * Get the default branch name (main or master) as tracked on the remote.
+ * Get the default branch name (main or master) as tracked on `remote`.
+ * Defaults to `origin`; fork-PR-mode completion passes `upstream` so the
+ * branch name (and everything based on it) reflects the real target repo
+ * rather than a possibly differently-named fork default.
  */
-async function getDefaultBranch(workspaceName: string, projectDir: string, userId?: string | null): Promise<string> {
+async function getDefaultBranch(workspaceName: string, projectDir: string, userId?: string | null, remote = 'origin'): Promise<string> {
   try {
-    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify origin/main`, GIT_T_READ, userId);
+    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git rev-parse --verify ${remote}/main`, GIT_T_READ, userId);
     return 'main';
   } catch {
     return 'master';
+  }
+}
+
+/**
+ * Does `projectDir` have a git remote named `name` configured?
+ */
+async function hasRemote(workspaceName: string, projectDir: string, name: string, userId?: string | null): Promise<boolean> {
+  try {
+    await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git remote get-url ${shellEscape(name)}`, GIT_T_READ, userId);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -475,6 +490,28 @@ export function isRemoteAllowed(workspaceId: string): boolean {
   return row?.git_push_enabled !== 0;
 }
 
+/**
+ * Is this workspace set up to contribute to a repo the user doesn't own?
+ * `origin` is expected to be the user's fork; completion pushes there and
+ * opens a draft PR against `upstream` instead of merging.
+ */
+export function isForkPrMode(workspaceId: string): boolean {
+  const row = getDb().prepare('SELECT fork_pr_mode FROM workspace_settings WHERE workspace_id = ?')
+    .get(workspaceId) as { fork_pr_mode: number } | undefined;
+  return row?.fork_pr_mode === 1;
+}
+
+/**
+ * The remote to read the "real" default branch from. In fork-PR mode this is
+ * `upstream` when configured (so worktrees branch from, and completion merges
+ * against, the actual target repo rather than a possibly-stale fork `main`) —
+ * otherwise `origin`, same as every non-fork task.
+ */
+async function resolveBaseRemote(ws: string, dir: string, forkPrMode: boolean, userId?: string | null): Promise<string> {
+  if (forkPrMode && await hasRemote(ws, dir, 'upstream', userId)) return 'upstream';
+  return 'origin';
+}
+
 // ─── Task Launch: create worktree ────────────────────────────────────────────
 
 /**
@@ -509,17 +546,21 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
     // and from the main checkout. The only difference for remote-disabled
     // workspaces is the branch base and that completion never pushes/merges.
     const remoteAllowed = isRemoteAllowed(task.workspace_id);
+    const forkPrMode = remoteAllowed && isForkPrMode(task.workspace_id);
     const branchName = generateBranchName(task);
     const worktreePath = `${CPM_WORKTREE_BASE}/task-${task.id}`;
 
     if (remoteAllowed) {
-      // Branch from the canonical origin tip so the worktree starts clean
-      // regardless of local state in the main checkout or other worktrees.
-      const defaultBranch = await getDefaultBranch(ws, dir, userId);
+      // Branch from the canonical tip of the real target repo so the worktree
+      // starts clean regardless of local state in the main checkout or other
+      // worktrees. In fork-PR mode that's `upstream` (when configured) rather
+      // than the fork's possibly-stale `origin` default — see resolveBaseRemote.
+      const baseRemote = await resolveBaseRemote(ws, dir, forkPrMode, userId);
+      const defaultBranch = await getDefaultBranch(ws, dir, userId, baseRemote);
       await sshExec(ws,
         `mkdir -p ${shellEscape(CPM_WORKTREE_BASE)} && cd ${shellEscape(dir)} && ` +
-        `git fetch origin ${defaultBranch} 2>/dev/null || true && ` +
-        `git worktree add ${shellEscape(worktreePath)} -b ${shellEscape(branchName)} origin/${defaultBranch}`,
+        `git fetch ${baseRemote} ${defaultBranch} 2>/dev/null || true && ` +
+        `git worktree add ${shellEscape(worktreePath)} -b ${shellEscape(branchName)} ${baseRemote}/${defaultBranch}`,
         GIT_T_WORKTREE,
       );
     } else {
@@ -894,11 +935,12 @@ async function isLandedOnDefault(
   dir: string,
   defaultBranch: string,
   userId: string | null,
+  remote = 'origin',
 ): Promise<boolean> {
   try {
     await coderSsh(ws,
-      `cd ${shellEscape(dir)} && git fetch origin ${shellEscape(defaultBranch)} && ` +
-      `git merge-base --is-ancestor HEAD origin/${shellEscape(defaultBranch)}`,
+      `cd ${shellEscape(dir)} && git fetch ${remote} ${shellEscape(defaultBranch)} && ` +
+      `git merge-base --is-ancestor HEAD ${remote}/${shellEscape(defaultBranch)}`,
       GIT_T_NETWORK,
       userId,
     );
@@ -943,6 +985,7 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
     if (!await hasCommits(ws, dir, userId)) return true;
 
     const remoteAllowed = isRemoteAllowed(task.workspace_id);
+    const forkPrMode = remoteAllowed && isForkPrMode(task.workspace_id);
     const status = await sshExec(ws, `cd ${shellEscape(dir)} && git status --porcelain`, GIT_T_READ);
     const hasChanges = !!status.trim();
 
@@ -963,6 +1006,12 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
       return true;
     }
 
+    // In fork-PR mode, everything below that reads "the real default branch"
+    // (idempotency checks, the pre-push merge, the PR base) reads it from
+    // `upstream` when configured, not the fork's own `origin` — see
+    // resolveBaseRemote. The push itself always still targets `origin` (the fork).
+    const baseRemote = await resolveBaseRemote(ws, dir, forkPrMode, userId);
+
     // Determine branch name
     let branchName = task.git_branch;
     if (!branchName) {
@@ -975,16 +1024,16 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
     if (task.worktree_path) {
       const currentBranch = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse --abbrev-ref HEAD`, GIT_T_READ)).trim();
       if (currentBranch !== branchName) {
-        // Before failing, check whether all commits are already on origin/main —
-        // if so, the work is done regardless of branch name.
-        const defaultBranchCheck = await getDefaultBranch(ws, dir, userId);
-        const alreadyLanded = await isLandedOnDefault(ws, dir, defaultBranchCheck, userId);
+        // Before failing, check whether all commits are already on the default
+        // branch — if so, the work is done regardless of branch name.
+        const defaultBranchCheck = await getDefaultBranch(ws, dir, userId, baseRemote);
+        const alreadyLanded = await isLandedOnDefault(ws, dir, defaultBranchCheck, userId, baseRemote);
 
         if (alreadyLanded && !hasChanges) {
-          // Committed work is already on origin/main AND the working tree is clean —
-          // there is genuinely nothing left to commit, push, or merge.
+          // Committed work is already on the default branch AND the working tree
+          // is clean — there is genuinely nothing left to commit, push, or merge.
           addMessage(task.id, 'system',
-            `Worktree is on branch \`${currentBranch}\` (expected \`${branchName}\`), but all commits are already present on \`origin/${defaultBranchCheck}\`. Marking complete.`
+            `Worktree is on branch \`${currentBranch}\` (expected \`${branchName}\`), but all commits are already present on \`${baseRemote}/${defaultBranchCheck}\`. Marking complete.`
           );
           return true;
         }
@@ -1000,7 +1049,7 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
       }
     } else {
       // Legacy non-worktree path: check we're on default branch and create task branch
-      const defaultBranch = await getDefaultBranch(ws, dir, userId);
+      const defaultBranch = await getDefaultBranch(ws, dir, userId, baseRemote);
       const currentBranch = (await sshExec(ws, `cd ${shellEscape(dir)} && git rev-parse --abbrev-ref HEAD`, GIT_T_READ)).trim();
       if (currentBranch !== defaultBranch) {
         addMessage(task.id, 'system',
@@ -1012,9 +1061,9 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
       // A clean tree here does not mean there is nothing to do: the agent is
       // allowed to commit locally, which on this path leaves those commits
       // sitting on the default branch, unpushed. Only stop if HEAD is already
-      // contained in origin/<default>; otherwise fall through so the commits get
+      // contained in <default>; otherwise fall through so the commits get
       // their own branch, a push and a PR like any other work.
-      if (!hasChanges && await isLandedOnDefault(ws, dir, defaultBranch, userId)) return true;
+      if (!hasChanges && await isLandedOnDefault(ws, dir, defaultBranch, userId, baseRemote)) return true;
       try {
         await sshExec(ws, `cd ${shellEscape(dir)} && git checkout -b ${shellEscape(branchName)}`, GIT_T_INDEX);
       } catch (err: any) {
@@ -1035,8 +1084,8 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
       // query always failed, so the function silently returned `true` and marked the
       // task completed even when an Azure PR was still open and unmerged. The git
       // ancestry check below works identically for every provider.
-      const defaultBranch = await getDefaultBranch(ws, dir, userId);
-      const landed = await isLandedOnDefault(ws, dir, defaultBranch, userId);
+      const defaultBranch = await getDefaultBranch(ws, dir, userId, baseRemote);
+      const landed = await isLandedOnDefault(ws, dir, defaultBranch, userId, baseRemote);
 
       if (landed) {
         // The committed work is already integrated into the default branch — there
@@ -1069,20 +1118,23 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
       return 'git_error';
     }
 
-    // Merge origin/main into the task branch before pushing so the branch is
-    // up-to-date and the resulting PR has no conflicts with the default branch.
+    // Merge the default branch into the task branch before pushing so the
+    // branch is up-to-date and the resulting PR has no conflicts. In fork-PR
+    // mode this merges from `upstream` (the real target repo) rather than the
+    // fork's own `origin`, so conflicts are caught against the actual base the
+    // PR will land on.
     if (task.worktree_path) {
-      const defaultForMerge = await getDefaultBranch(ws, dir, userId);
+      const defaultForMerge = await getDefaultBranch(ws, dir, userId, baseRemote);
       try {
         await sshExec(ws,
           `cd ${shellEscape(dir)} && ` +
-          `git fetch origin ${shellEscape(defaultForMerge)} && ` +
-          `git merge origin/${shellEscape(defaultForMerge)} --no-edit`,
+          `git fetch ${baseRemote} ${shellEscape(defaultForMerge)} && ` +
+          `git merge ${baseRemote}/${shellEscape(defaultForMerge)} --no-edit`,
           GIT_T_NETWORK,
         );
       } catch (mergeErr: any) {
         addMessage(task.id, 'system',
-          `Cannot complete: failed to merge \`origin/${defaultForMerge}\` into task branch before pushing: ${mergeErr.message}. ` +
+          `Cannot complete: failed to merge \`${baseRemote}/${defaultForMerge}\` into task branch before pushing: ${mergeErr.message}. ` +
           `Resolve any conflicts in the worktree (\`${dir}\`) and retry.`
         );
         return 'git_error';
@@ -1138,36 +1190,37 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
       }
     }
 
-    const defaultBranch = await getDefaultBranch(ws, dir, userId);
+    const defaultBranch = await getDefaultBranch(ws, dir, userId, baseRemote);
 
     // NOTE: we deliberately do NOT sync the local `main` checkout here. In worktree
     // mode the merge into the default branch happens entirely on the remote via the
     // PR, and every local git step runs in the task's worktree against the freshly
-    // fetched `origin/<default>` ref — the main checkout (task.project_dir) plays no
-    // part in the merge, and new worktrees branch from `origin/<default>` regardless
+    // fetched `<baseRemote>/<default>` ref — the main checkout (task.project_dir)
+    // plays no part in the merge, and new worktrees branch from that ref regardless
     // of its state. A pre-merge `git merge --ff-only` on the main checkout used to
     // live here and hard-blocked completion whenever the checkout had diverged from
     // origin (e.g. a stray local commit), even though completion would otherwise
-    // succeed. The post-merge pull below refreshes the checkout as a best effort.
+    // succeed. The post-merge pull below refreshes the checkout as a best effort
+    // (skipped entirely in fork-PR mode, since nothing merges there).
 
     // Nothing-to-merge guard. A reopened task that was previously completed already
-    // has its commit on origin/<default>. If the committed tip is already an
-    // ancestor of the remote default branch there is nothing left to merge, so
-    // complete instead of re-merging the stale (already-MERGED) PR — which would
-    // print "PR merged" yet leave the new commit stranded and fail verification.
+    // has its commit on the default branch. If the committed tip is already an
+    // ancestor of it there is nothing left to merge, so complete instead of
+    // re-merging the stale (already-MERGED) PR — which would print "PR merged"
+    // yet leave the new commit stranded and fail verification.
     if (branchTip) {
       let alreadyLanded = false;
       try {
         await sshExec(ws,
-          `cd ${shellEscape(dir)} && git fetch origin ${shellEscape(defaultBranch)} && ` +
-          `git merge-base --is-ancestor ${shellEscape(branchTip)} origin/${shellEscape(defaultBranch)}`,
+          `cd ${shellEscape(dir)} && git fetch ${baseRemote} ${shellEscape(defaultBranch)} && ` +
+          `git merge-base --is-ancestor ${shellEscape(branchTip)} ${baseRemote}/${shellEscape(defaultBranch)}`,
           GIT_T_NETWORK,
         );
         alreadyLanded = true;
-      } catch { /* tip not on origin/<default> yet → real work to merge */ }
+      } catch { /* tip not on the default branch yet → real work to merge */ }
       if (alreadyLanded) {
         addMessage(task.id, 'system',
-          `Changes on branch \`${branchName}\` are already present on \`origin/${defaultBranch}\` — nothing to merge. Marking complete.`
+          `Changes on branch \`${branchName}\` are already present on \`${baseRemote}/${defaultBranch}\` — nothing to merge. Marking complete.`
         );
         return true;
       }
@@ -1182,6 +1235,11 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
     const prTitle = freshTask.title || `Task: ${freshTask.prompt.slice(0, 60)}`;
     const prBody = `Automated PR for completed task.\n\n**Task:** ${freshTask.title}\n**Task ID:** ${freshTask.id}`;
 
+    // Fork-PR mode never merges — CPM has no merge rights on someone else's
+    // repo — so the PR is opened as a draft and left for the upstream
+    // maintainer (or the user themselves) to review and merge.
+    const prOpts = forkPrMode ? { draft: true, skipMerge: true } : undefined;
+
     let outcome: PrOutcome;
     if (provider === 'azure') {
       if (!remote?.azure) {
@@ -1191,37 +1249,42 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
         );
         return 'git_error';
       }
-      outcome = await completePrAzure(ws, task.id, branchName, defaultBranch, prTitle, prBody, branchTip, remote.azure, userId);
+      outcome = await completePrAzure(ws, task.id, branchName, defaultBranch, prTitle, prBody, branchTip, remote.azure, userId, prOpts);
     } else {
       // GitHub and anything else (e.g. GitHub Enterprise) go through the `gh` CLI,
       // matching the prior behaviour where `gh` was used unconditionally.
-      outcome = await completePrGitHub(ws, dir, task.id, branchName, defaultBranch, prTitle, prBody, userId);
+      outcome = await completePrGitHub(ws, dir, task.id, branchName, defaultBranch, prTitle, prBody, userId, prOpts);
     }
 
     if (outcome.kind === 'blocked') return 'git_error';
     if (outcome.kind === 'nothing-to-merge') return true;
     const verifyMergeWithGit = outcome.verifyByGit;
 
-    // Verify the merge actually landed on origin/<default>. `gh pr merge` exiting 0
-    // is normally sufficient, but this guards against partial/misreported merges so
-    // a task is never marked completed while its branch is still unmerged. With the
-    // `--merge` strategy the branch tip becomes a parent of the merge commit, so it
-    // must be an ancestor of the updated default branch.
+    if (forkPrMode && outcome.prUrl) {
+      getDb().prepare('UPDATE tasks SET pr_url = ? WHERE id = ?').run(outcome.prUrl, task.id);
+    }
+
+    // Verify the merge actually landed on <default>. `gh pr merge` exiting 0 is
+    // normally sufficient, but this guards against partial/misreported merges so
+    // a task is never marked completed while its branch is still unmerged. With
+    // the `--merge` strategy the branch tip becomes a parent of the merge commit,
+    // so it must be an ancestor of the updated default branch.
     //
-    // Skip when the provider authoritatively reports the PR as merged/completed: a
-    // squash/rebase merge (GitHub) or a non-merge completion strategy (Azure DevOps)
-    // produces new commits, so the branch tip would legitimately not be an ancestor —
-    // checking it would be a false-negative block.
+    // Skipped whenever `verifyByGit` is false: a squash/rebase merge (GitHub) or a
+    // non-merge completion strategy (Azure DevOps) produces new commits, so the
+    // branch tip would legitimately not be an ancestor — checking it would be a
+    // false-negative block. Also false, deliberately, for fork-PR mode (nothing
+    // was merged at all — see `prOpts.skipMerge` above).
     if (branchTip && verifyMergeWithGit) {
       try {
         await sshExec(ws,
-          `cd ${shellEscape(dir)} && git fetch origin ${shellEscape(defaultBranch)} && ` +
-          `git merge-base --is-ancestor ${shellEscape(branchTip)} origin/${shellEscape(defaultBranch)}`,
+          `cd ${shellEscape(dir)} && git fetch ${baseRemote} ${shellEscape(defaultBranch)} && ` +
+          `git merge-base --is-ancestor ${shellEscape(branchTip)} ${baseRemote}/${shellEscape(defaultBranch)}`,
           GIT_T_NETWORK,
         );
       } catch {
         addMessage(task.id, 'system',
-          `Cannot complete: the merge could not be verified on \`origin/${defaultBranch}\` — commit \`${branchTip.slice(0, 8)}\` is not part of the remote default branch yet. ` +
+          `Cannot complete: the merge could not be verified on \`${baseRemote}/${defaultBranch}\` — commit \`${branchTip.slice(0, 8)}\` is not part of the remote default branch yet. ` +
           `The worktree has been kept. Check the PR state and retry completion.`
         );
         return 'git_error';
@@ -1233,8 +1296,10 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
     // worktree. The caller (complete route / deferred-completion handler) frees the
     // port range after marking the task completed.
 
-    // Pull main checkout to reflect the merge
-    if (task.project_dir) {
+    // Pull main checkout to reflect the merge. Skipped in fork-PR mode: nothing
+    // merged into anything CPM can pull — the draft PR sits on the target repo
+    // awaiting review, and the fork's own default branch hasn't moved.
+    if (!forkPrMode && task.project_dir) {
       try {
         await sshExec(ws,
           `cd ${shellEscape(task.project_dir)} && git pull --ff-only origin ${shellEscape(defaultBranch)}`,
@@ -1265,9 +1330,19 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
  *   added to the task and completion should be refused.
  */
 type PrOutcome =
-  | { kind: 'completed'; verifyByGit: boolean }
+  | { kind: 'completed'; verifyByGit: boolean; prUrl?: string }
   | { kind: 'nothing-to-merge' }
   | { kind: 'blocked' };
+
+/**
+ * Options for fork-PR-mode completion: open the PR as a draft and stop right
+ * after creating/reusing it — never merge, since CPM has no merge rights on a
+ * repo the user doesn't own.
+ */
+interface PrCreateOpts {
+  draft?: boolean;
+  skipMerge?: boolean;
+}
 
 /**
  * Does a `gh` failure look like an authentication problem rather than a merge
@@ -1296,6 +1371,7 @@ function isGhAuthFailure(failure: string): boolean {
 async function completePrGitHub(
   ws: string, dir: string, taskId: string, branchName: string,
   defaultBranch: string, prTitle: string, prBody: string, userId?: string | null,
+  opts?: PrCreateOpts,
 ): Promise<PrOutcome> {
   // Resolve the GitHub token ONCE for the whole flow rather than per gh call, so
   // every step is authenticated identically and `coder external-auth` is shelled
@@ -1318,15 +1394,17 @@ async function completePrGitHub(
   // Shadow sshGh to inject the task owner's token (see coderSsh note above).
   const sshGh = (w: string, cmd: string, timeout?: number) => coderSshGh(w, cmd, timeout, userId, ghToken);
   let mergeTarget: string;
-  let existingPr: { url?: string; state?: string; number?: number } | null = null;
+  let prUrl: string | undefined;
+  let existingPr: { url?: string; state?: string; number?: number; isDraft?: boolean } | null = null;
   try {
-    const raw = await sshGh(ws, `cd ${shellEscape(dir)} && gh pr view ${shellEscape(branchName)} --json url,state,number 2>/dev/null`);
+    const raw = await sshGh(ws, `cd ${shellEscape(dir)} && gh pr view ${shellEscape(branchName)} --json url,state,number,isDraft 2>/dev/null`);
     if (raw.trim()) existingPr = JSON.parse(raw);
   } catch { /* no PR associated with this branch yet */ }
 
   if (existingPr && existingPr.state === 'OPEN' && existingPr.url) {
     mergeTarget = existingPr.number != null ? String(existingPr.number) : existingPr.url;
-    addMessage(taskId, 'system', `Existing open pull request found: ${existingPr.url}`);
+    prUrl = existingPr.url;
+    addMessage(taskId, 'system', `Existing ${existingPr.isDraft ? 'draft ' : ''}pull request found: ${existingPr.url}`);
   } else {
     if (existingPr && existingPr.url && (existingPr.state === 'MERGED' || existingPr.state === 'CLOSED')) {
       addMessage(taskId, 'system',
@@ -1340,14 +1418,15 @@ async function completePrGitHub(
       // PR by branch via `--json` gives a clean, structured identifier that can
       // never carry stray decoration into the subsequent `gh pr merge`.
       await sshGh(ws,
-        `cd ${shellEscape(dir)} && gh pr create --base ${shellEscape(defaultBranch)} --head ${shellEscape(branchName)} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}`
+        `cd ${shellEscape(dir)} && gh pr create --base ${shellEscape(defaultBranch)} --head ${shellEscape(branchName)} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}${opts?.draft ? ' --draft' : ''}`
       );
       const created = JSON.parse(
         (await sshGh(ws, `cd ${shellEscape(dir)} && gh pr view ${shellEscape(branchName)} --json url,number 2>/dev/null`)).trim()
       ) as { url?: string; number?: number };
       mergeTarget = created.number != null ? String(created.number) : (created.url ?? '');
+      prUrl = created.url;
       if (!mergeTarget) throw new Error('PR was created but its number/URL could not be read back.');
-      addMessage(taskId, 'system', `Pull request created: ${created.url ?? `#${mergeTarget}`}`);
+      addMessage(taskId, 'system', `${opts?.draft ? 'Draft pull' : 'Pull'} request created: ${created.url ?? `#${mergeTarget}`}`);
     } catch (prErr: any) {
       const msg = String(prErr?.message || prErr);
       // GitHub refuses a PR when the branch adds no commits over the base — the
@@ -1363,6 +1442,12 @@ async function completePrGitHub(
       );
       return { kind: 'blocked' };
     }
+  }
+
+  if (opts?.skipMerge) {
+    // Fork-PR mode: CPM has no merge rights on the target repo — stop here and
+    // leave the (draft) PR for the upstream maintainer or the user to merge.
+    return { kind: 'completed', verifyByGit: false, prUrl };
   }
 
   try {
@@ -1428,6 +1513,7 @@ async function completePrAzure(
   defaultBranch: string, prTitle: string, prBody: string,
   branchTip: string, azure: { orgUrl: string; project: string; repo: string },
   userId?: string | null,
+  opts?: PrCreateOpts,
 ): Promise<PrOutcome> {
   // Shadow adoApi to inject the task owner's token (see coderSsh note above).
   const adoApi = (w: string, method: string, url: string, body?: unknown) => coderAdoApi(w, method, url, body, userId);
@@ -1475,12 +1561,13 @@ async function completePrAzure(
       targetRefName: targetRef,
       title: prTitle,
       description: prBody,
+      isDraft: !!opts?.draft,
     });
     if (res.curlMissing) { addMessage(taskId, 'system', curlMissingMsg); return { kind: 'blocked' }; }
     if (isAdoAuthError(res)) { addMessage(taskId, 'system', authErrMsg); return { kind: 'blocked' }; }
     if (res.status >= 200 && res.status < 300) {
       try { prId = JSON.parse(res.body).pullRequestId; } catch { /* handled below */ }
-      if (prId != null) addMessage(taskId, 'system', `Pull request created: ${prWebUrl(prId)}`);
+      if (prId != null) addMessage(taskId, 'system', `${opts?.draft ? 'Draft pull' : 'Pull'} request created: ${prWebUrl(prId)}`);
     } else if (/TF401179|active pull request.*already exists/i.test(res.body)) {
       // A PR for this branch pair already exists — recover by looking it up.
       prId = await findActivePr();
@@ -1492,6 +1579,12 @@ async function completePrAzure(
       );
       return { kind: 'blocked' };
     }
+  }
+
+  if (opts?.skipMerge) {
+    // Fork-PR mode: CPM has no merge/completion rights on the target repo —
+    // stop here and leave the (draft) PR for review.
+    return { kind: 'completed', verifyByGit: false, prUrl: prWebUrl(prId) };
   }
 
   // Complete the PR: merge it and delete the source branch. `lastMergeSourceCommit`

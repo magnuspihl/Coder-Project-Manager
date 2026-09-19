@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- into the prompt on the task's next resume, then cleared — see
   -- consumePendingRollbackNote / launchTask.
   pending_rollback_note TEXT,
+  -- Draft PR URL opened by a fork-PR-mode completion (see workspace_settings.fork_pr_mode).
+  pr_url TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT,
@@ -250,6 +252,11 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
   discussion_full_access INTEGER NOT NULL DEFAULT 0,
   preview_url TEXT,
   max_concurrent INTEGER NOT NULL DEFAULT 3,
+  -- When set, this repo isn't the user's own: the workspace's `origin` remote
+  -- is expected to be the user's fork (with `upstream` pointing at the real
+  -- repo). Completion pushes to the fork and opens a DRAFT pull request
+  -- against upstream instead of merging — see services/git.ts.
+  fork_pr_mode INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
