@@ -323,6 +323,7 @@ export default function WorkspacesPage() {
   const [memoryEditingFile, setMemoryEditingFile] = useState<{ wsId: string; filename: string; draft: string } | null>(null);
   const [memorySavingFile, setMemorySavingFile] = useState<string | null>(null);
   const [gitPushSettings, setGitPushSettings] = useState<Record<string, boolean>>({});
+  const [forkPrSettings, setForkPrSettings] = useState<Record<string, boolean>>({});
   const [previewUrlSettings, setPreviewUrlSettings] = useState<Record<string, string>>({});
   const [previewUrlDrafts, setPreviewUrlDrafts] = useState<Record<string, string>>({});
   const [previewUrlSaving, setPreviewUrlSaving] = useState<Record<string, boolean>>({});
@@ -769,12 +770,13 @@ export default function WorkspacesPage() {
       return;
     }
     setSettingsOpenWsId(workspaceId);
-    // Fetch current git push setting
+    // Fetch current git push / fork-PR settings
     if (!(workspaceId in gitPushSettings)) {
       try {
-        const { gitPushEnabled } = await getGitSettings(workspaceId);
+        const { gitPushEnabled, forkPrMode } = await getGitSettings(workspaceId);
         setGitPushSettings(prev => ({ ...prev, [workspaceId]: gitPushEnabled }));
-      } catch { /* default shown as true */ }
+        setForkPrSettings(prev => ({ ...prev, [workspaceId]: forkPrMode }));
+      } catch { /* default shown as true/false */ }
     }
     // Fetch saved preview URL
     if (!(workspaceId in previewUrlSettings)) {
@@ -912,10 +914,22 @@ export default function WorkspacesPage() {
     const next = !current;
     setGitPushSettings(prev => ({ ...prev, [workspaceId]: next }));
     try {
-      await updateGitSettings(workspaceId, next);
+      await updateGitSettings(workspaceId, { gitPushEnabled: next });
     } catch {
       // Revert on failure
       setGitPushSettings(prev => ({ ...prev, [workspaceId]: current }));
+    }
+  };
+
+  const handleToggleForkPr = async (workspaceId: string) => {
+    const current = forkPrSettings[workspaceId] ?? false;
+    const next = !current;
+    setForkPrSettings(prev => ({ ...prev, [workspaceId]: next }));
+    try {
+      await updateGitSettings(workspaceId, { forkPrMode: next });
+    } catch {
+      // Revert on failure
+      setForkPrSettings(prev => ({ ...prev, [workspaceId]: current }));
     }
   };
 
@@ -1050,12 +1064,24 @@ export default function WorkspacesPage() {
               </svg>
             </a>
           )}
+          {task.pr_url && (
+            <a
+              href={task.pr_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => e.stopPropagation()}
+              className="p-1.5 bg-amber-600 text-white rounded hover:bg-amber-700 transition-colors"
+              title="View draft pull request"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="currentColor" viewBox="0 0 16 16"><path fillRule="evenodd" d="M11.75 2.5a.75.75 0 0 1 .75.75v7.5a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.75Zm-8.5 0a.75.75 0 0 1 .75.75v3.402c.458-.204.96-.319 1.489-.319A4.265 4.265 0 0 1 9.49 9.39V3.25a.75.75 0 0 1 1.5 0v7.5a.75.75 0 0 1-1.5 0v-.156a2.765 2.765 0 0 0-3.999-2.473A2.766 2.766 0 0 0 4 10.75v.001a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.751Z" clipRule="evenodd" /></svg>
+            </a>
+          )}
           {task.status === 'awaiting_feedback' && (
             <button
               onClick={(e) => handleComplete(e, task.id)}
               disabled={!!task.pending_complete || completingTaskIds.has(task.id)}
-              className="p-1.5 bg-green-600 text-white rounded hover:bg-green-700 transition-colors disabled:opacity-50"
-              title={task.pending_complete ? 'Completion queued — will finalize once the working task finishes' : completingTaskIds.has(task.id) ? 'Completing — merging the task branch…' : 'Mark Complete'}
+              className={`p-1.5 text-white rounded transition-colors disabled:opacity-50 ${forkPrSettings[task.workspace_id] ? 'bg-amber-600 hover:bg-amber-700' : 'bg-green-600 hover:bg-green-700'}`}
+              title={task.pending_complete ? 'Completion queued — will finalize once the working task finishes' : completingTaskIds.has(task.id) ? (forkPrSettings[task.workspace_id] ? 'Opening draft PR…' : 'Completing — merging the task branch…') : (forkPrSettings[task.workspace_id] ? 'Open draft PR' : 'Mark Complete')}
             >
               {completingTaskIds.has(task.id) ? (
                 <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
@@ -1302,6 +1328,16 @@ export default function WorkspacesPage() {
                   className="rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500 h-3.5 w-3.5"
                 />
                 <span className="text-gray-600 dark:text-gray-300">Allow git remote operations</span>
+              </label>
+              <label className="flex items-center gap-1.5 cursor-pointer select-none" title="For repos you don't own: origin is expected to be your fork (with an `upstream` remote pointing at the real repo). Completion pushes to the fork and opens a draft PR against upstream instead of merging.">
+                <input
+                  type="checkbox"
+                  checked={forkPrSettings[ws.id] ?? false}
+                  onChange={() => handleToggleForkPr(ws.id)}
+                  disabled={!(gitPushSettings[ws.id] ?? true)}
+                  className="rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500 h-3.5 w-3.5 disabled:opacity-50"
+                />
+                <span className="text-gray-600 dark:text-gray-300">Not my repo — open draft PRs instead of merging</span>
               </label>
               <div className="flex items-center gap-1.5 flex-wrap">
                 <span className="text-gray-500 dark:text-gray-400 shrink-0">Preview URL:</span>

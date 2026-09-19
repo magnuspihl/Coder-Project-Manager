@@ -34,6 +34,7 @@ import {
   dismissTaskRequestForTask,
   updateTaskRequestTargetForTask,
   rollbackTaskToCheckpoint,
+  getGitSettings,
   type Task,
   type ClaudeAccount,
   type ModelInfo,
@@ -375,6 +376,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [sending, setSending] = useState(false);
   const [optimisticMessage, setOptimisticMessage] = useState<Message | null>(null);
   const [idCopied, setIdCopied] = useState(false);
+  const [forkPrMode, setForkPrMode] = useState(false);
   const [claudeAccounts, setClaudeAccounts] = useState<ClaudeAccount[]>([]);
   // Distinguishes "no accounts" from "haven't loaded / load failed", so a pinned
   // account is never mislabelled as removed just because the fetch failed.
@@ -1290,8 +1292,16 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const handleComplete = async () => {
     setCompleting(true);
     try {
-      await completeTask(taskId);
-      closeAndNotify();
+      const { task: updated } = await completeTask(taskId);
+      if (forkPrMode && updated?.pr_url) {
+        // A draft PR was opened rather than merged — keep the task open so the
+        // user sees the link now rather than having to dig it out of the
+        // workspace list later.
+        setTask(updated);
+        onTaskChanged?.();
+      } else {
+        closeAndNotify();
+      }
     } catch (err: unknown) {
       if (err instanceof Error && err.message.includes('uncommitted')) {
         alert(err.message);
@@ -1693,6 +1703,15 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task?.workspace_id, participants.length]);
+
+  // Fork-PR mode changes "Complete" into "Draft PR" and what happens after —
+  // see handleComplete.
+  useEffect(() => {
+    if (!task?.workspace_id) return;
+    getGitSettings(task.workspace_id)
+      .then(({ forkPrMode: mode }) => setForkPrMode(mode))
+      .catch(() => setForkPrMode(false));
+  }, [task?.workspace_id]);
 
   // Warm the self-hosted Qwen model when voice features turn on, so the first
   // spoken reply isn't delayed by an on-demand model load on the GPU box.
@@ -3095,10 +3114,12 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                     <button
                       onClick={handleComplete}
                       disabled={completing || !!task.pending_complete}
-                      className="bg-green-600 text-white text-sm px-4 py-2 rounded-md hover:bg-green-700 disabled:opacity-50"
-                      title={task.pending_complete ? 'Completion queued — will finalize once the working task finishes' : undefined}
+                      className={`text-white text-sm px-4 py-2 rounded-md disabled:opacity-50 ${forkPrMode ? 'bg-amber-600 hover:bg-amber-700' : 'bg-green-600 hover:bg-green-700'}`}
+                      title={task.pending_complete ? 'Completion queued — will finalize once the working task finishes' : forkPrMode ? "Push to your fork and open a draft PR — this isn't merged automatically" : undefined}
                     >
-                      {task.pending_complete ? 'Completion queued…' : completing ? 'Completing...' : (
+                      {task.pending_complete ? 'Completion queued…' : completing ? (forkPrMode ? 'Opening draft PR...' : 'Completing...') : forkPrMode ? (
+                        <>Draft PR<span className="hidden sm:inline"> (Alt+C)</span></>
+                      ) : (
                         <>Complete<span className="hidden sm:inline"> (Alt+C)</span></>
                       )}
                     </button>
@@ -3300,6 +3321,21 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                       </div>
                     </>
                   )}
+                </div>
+              )}
+
+              {task.status === 'completed' && task.pr_url && (
+                <div className="flex items-center gap-2 text-sm bg-amber-50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700 text-amber-800 dark:text-amber-300 px-3 py-2 rounded-md mb-2">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 shrink-0" fill="currentColor" viewBox="0 0 16 16"><path fillRule="evenodd" d="M11.75 2.5a.75.75 0 0 1 .75.75v7.5a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.75Zm-8.5 0a.75.75 0 0 1 .75.75v3.402c.458-.204.96-.319 1.489-.319A4.265 4.265 0 0 1 9.49 9.39V3.25a.75.75 0 0 1 1.5 0v7.5a.75.75 0 0 1-1.5 0v-.156a2.765 2.765 0 0 0-3.999-2.473A2.766 2.766 0 0 0 4 10.75v.001a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.751Z" clipRule="evenodd" /></svg>
+                  <span>Draft pull request opened — review and mark it ready in the git provider when you're happy.</span>
+                  <a
+                    href={task.pr_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="ml-auto shrink-0 inline-flex items-center gap-1 px-2.5 py-1 bg-amber-600 text-white rounded hover:bg-amber-700 transition-colors"
+                  >
+                    View PR
+                  </a>
                 </div>
               )}
 

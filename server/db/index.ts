@@ -582,6 +582,17 @@ export function getDb(): Database.Database {
   db.exec("CREATE INDEX IF NOT EXISTS idx_task_checkpoints_task ON task_checkpoints(task_id, created_at)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_task_checkpoints_message ON task_checkpoints(message_id)");
 
+  // Fork PR mode: for repos the user doesn't own, completion opens a draft PR
+  // against upstream instead of pushing/merging directly. See services/git.ts.
+  const wsCols3 = db.prepare("PRAGMA table_info(workspace_settings)").all() as Array<{ name: string }>;
+  if (!wsCols3.some(c => c.name === 'fork_pr_mode')) {
+    db.exec("ALTER TABLE workspace_settings ADD COLUMN fork_pr_mode INTEGER NOT NULL DEFAULT 0");
+  }
+  const tasksCols7 = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+  if (!tasksCols7.some(c => c.name === 'pr_url')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN pr_url TEXT");
+  }
+
   return db;
 }
 
