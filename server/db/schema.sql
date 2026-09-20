@@ -41,6 +41,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   pending_rollback_note TEXT,
   -- Draft PR URL opened by a fork-PR-mode completion (see workspace_settings.fork_pr_mode).
   pr_url TEXT,
+  -- The GitHub issue this task was created from (see services/github-issues.ts).
+  -- github_issue_repo is `owner/repo` and is NOT necessarily the repo in
+  -- github_repo_url: in fork-PR mode `origin` is the fork, but the issues live
+  -- on `upstream`. Completing the task closes this issue; reopening reopens it.
+  github_issue_repo TEXT,
+  github_issue_number INTEGER,
+  github_issue_title TEXT,
+  github_issue_url TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT,

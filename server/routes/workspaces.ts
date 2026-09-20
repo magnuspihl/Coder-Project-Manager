@@ -13,6 +13,7 @@ import { getModelsForWorkspace } from '../services/models.js';
 import { getPortOwnerTaskId } from '../services/port-janitor.js';
 import { setWorkspacesForUser } from '../services/workspace-cache.js';
 import { readWorkspaceMemory, writeWorkspaceMemoryFile } from '../services/workspace-memory.js';
+import { resolveWorkspaceRepo, listOpenIssues, getIssueDetail, GitHubError } from '../services/github-issues.js';
 
 const router = Router();
 
@@ -407,6 +408,51 @@ router.get('/:workspaceId/token-usage', requireAuth, (req: Request, res: Respons
 
   const usage = getWindowedTokenUsage(since, req.params.workspaceId);
   res.json(usage);
+});
+
+// GitHub issues — backing for the "+ Issue" task composer. Only workspaces whose
+// repo is on GitHub get a repo back; everything else returns `repo: null` and the
+// UI hides the entry point rather than showing a broken browser.
+
+router.get('/:workspaceId/github/issues', requireAuth, async (req: Request, res: Response) => {
+  const workspace = await withTokenRefresh(req, res, (token) => getWorkspace(token, req.params.workspaceId), 'Failed to fetch workspace');
+  if (!workspace) return;
+
+  const repo = await resolveWorkspaceRepo(req.params.workspaceId, workspace.name, req.user!.id);
+  if (!repo) {
+    res.json({ repo: null, issues: [] });
+    return;
+  }
+  try {
+    const issues = await listOpenIssues(repo, req.user!.id);
+    res.json({ repo, issues });
+  } catch (err) {
+    const status = err instanceof GitHubError ? err.status : 502;
+    res.status(status).json({ repo, error: (err as Error).message || 'Failed to list issues' });
+  }
+});
+
+router.get('/:workspaceId/github/issues/:number', requireAuth, async (req: Request, res: Response) => {
+  const issueNumber = Number(req.params.number);
+  if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+    res.status(400).json({ error: 'Invalid issue number' });
+    return;
+  }
+  const workspace = await withTokenRefresh(req, res, (token) => getWorkspace(token, req.params.workspaceId), 'Failed to fetch workspace');
+  if (!workspace) return;
+
+  const repo = await resolveWorkspaceRepo(req.params.workspaceId, workspace.name, req.user!.id);
+  if (!repo) {
+    res.status(404).json({ error: 'This workspace is not checked out on a GitHub repository.' });
+    return;
+  }
+  try {
+    const issue = await getIssueDetail(repo, issueNumber, req.user!.id);
+    res.json({ repo, issue });
+  } catch (err) {
+    const status = err instanceof GitHubError ? err.status : 502;
+    res.status(status).json({ error: (err as Error).message || 'Failed to fetch issue' });
+  }
 });
 
 router.get('/:workspaceId/models', requireAuth, async (req: Request, res: Response) => {

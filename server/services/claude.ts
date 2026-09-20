@@ -5,6 +5,7 @@ import { updateTaskStatus, addMessage, addTokenUsage, recordContextTokens, getMe
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, fetchGitHubToken, isRemoteAllowed, recordTurnCheckpoint } from './git.js';
+import { closeIssueForCompletedTask } from './github-issues.js';
 import { getOllamaBaseUrl } from './models.js';
 import { getAttachmentsByTask, getAttachmentsByMessage, createAgentOutputAttachment, hasAgentOutputAttachment, sha256Hex, MAX_FILE_SIZE, type Attachment } from '../routes/uploads.js';
 import { writeCpmGuidelines } from './workspace-memory.js';
@@ -2174,6 +2175,9 @@ export async function processQueue(workspaceId: string): Promise<void> {
         } else if (allowed) {
           setPendingComplete(pending.id, false);
           updateTaskStatus(pending.id, 'completed');
+          // Close the GitHub issue this task was created from, if any — the same
+          // step the manual /complete route runs. No-op for every other task.
+          await closeIssueForCompletedTask(pending.id).catch(() => {});
           // Free the port range (shuts down the task's preview server). The worktree
           // is kept until the task is deleted.
           await cleanupPortRange(pending).catch(() => {});

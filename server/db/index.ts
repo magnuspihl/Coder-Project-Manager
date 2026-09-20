@@ -593,6 +593,23 @@ export function getDb(): Database.Database {
     db.exec("ALTER TABLE tasks ADD COLUMN pr_url TEXT");
   }
 
+  // Issue-backed tasks: a task created from a GitHub issue records which one, so
+  // completing the task can close that issue (and reopening it can reopen the
+  // issue). See services/github-issues.ts.
+  const tasksCols8 = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+  if (!tasksCols8.some(c => c.name === 'github_issue_repo')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN github_issue_repo TEXT");
+  }
+  if (!tasksCols8.some(c => c.name === 'github_issue_number')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN github_issue_number INTEGER");
+  }
+  if (!tasksCols8.some(c => c.name === 'github_issue_title')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN github_issue_title TEXT");
+  }
+  if (!tasksCols8.some(c => c.name === 'github_issue_url')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN github_issue_url TEXT");
+  }
+
   return db;
 }
 
