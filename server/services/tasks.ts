@@ -23,6 +23,17 @@ export interface Task {
   git_branch: string | null;
   github_repo_url: string | null;
   git_provider: string | null;
+  /**
+   * The GitHub issue this task was created from, if any (see
+   * services/github-issues.ts). `github_issue_repo` is `owner/repo` — the issue
+   * doesn't necessarily live on the same repo `github_repo_url` points at (in
+   * fork-PR mode `origin` is the fork but issues are on `upstream`). Completing
+   * the task closes this issue; reopening it reopens the issue.
+   */
+  github_issue_repo: string | null;
+  github_issue_number: number | null;
+  github_issue_title: string | null;
+  github_issue_url: string | null;
   /** Draft PR URL opened by a fork-PR-mode completion (see workspace_settings.fork_pr_mode). */
   pr_url: string | null;
   worktree_path: string | null;
@@ -423,6 +434,11 @@ export function createTask(params: {
   clientLabel?: string | null;
   autoReview?: boolean;
   attachmentIds?: string[];
+  /**
+   * The GitHub issue this task was created from, already validated against the
+   * API by the caller. Completing the task closes it; reopening reopens it.
+   */
+  issue?: { repo: string; number: number; title: string | null; url: string | null } | null;
 }): Task {
   const db = getDb();
   const id = uuid();
@@ -438,17 +454,22 @@ export function createTask(params: {
     .get(params.workspaceId) as { max_pos: number };
   const position = maxPos.max_pos + 10;
 
-  // Immediate heuristic title; LLM will refine it async
-  const title = generateTitleFallback(params.prompt);
+  // Immediate heuristic title; LLM will refine it async. An issue-backed task
+  // gets the issue's own title instead — it is already a human-written summary,
+  // and the composed prompt starts with a wall of quoted issue text that neither
+  // the heuristic nor the LLM would summarise usefully.
+  const title = params.issue
+    ? `#${params.issue.number}: ${params.issue.title ?? 'issue'}`.slice(0, 120)
+    : generateTitleFallback(params.prompt);
 
   // Off unless the caller explicitly asks for it — a red-team pass costs an extra
   // agent round-trip per turn, so callers that say nothing get the cheap path.
   const autoReview = params.autoReview === true ? 1 : 0;
 
   db.prepare(
-    `INSERT INTO tasks (id, workspace_id, workspace_name, user_id, title, prompt, status, position, project_dir, claude_session_id, model, claude_account_id, caveman, source, client_label, auto_review)
-     VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(id, params.workspaceId, params.workspaceName, params.userId, title, params.prompt, position, params.projectDir || null, claudeSessionId, params.model || null, claudeAccountId, params.caveman || null, params.source || null, params.clientLabel || null, autoReview);
+    `INSERT INTO tasks (id, workspace_id, workspace_name, user_id, title, prompt, status, position, project_dir, claude_session_id, model, claude_account_id, caveman, source, client_label, auto_review, github_issue_repo, github_issue_number, github_issue_title, github_issue_url)
+     VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(id, params.workspaceId, params.workspaceName, params.userId, title, params.prompt, position, params.projectDir || null, claudeSessionId, params.model || null, claudeAccountId, params.caveman || null, params.source || null, params.clientLabel || null, autoReview, params.issue?.repo ?? null, params.issue?.number ?? null, params.issue?.title ?? null, params.issue?.url ?? null);
 
   // Store the initial prompt as a user message (inherits provenance from the task creation call)
   const initialMessage = addMessage(id, 'user', params.prompt, undefined, params.username, undefined, params.source || null, params.clientLabel || null);
@@ -459,8 +480,9 @@ export function createTask(params: {
     linkAttachmentsToTask(params.attachmentIds, id, initialMessage.id);
   }
 
-  // Fire off async LLM title generation (updates DB when ready)
-  generateTitleAsync(id, params.prompt);
+  // Fire off async LLM title generation (updates DB when ready). Skipped for
+  // issue-backed tasks, whose title is the issue's.
+  if (!params.issue) generateTitleAsync(id, params.prompt);
 
   return getTask(id)!;
 }

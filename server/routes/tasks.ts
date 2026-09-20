@@ -54,6 +54,10 @@ import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitI
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, removeTaskWorktree, rollbackTaskToCheckpoint } from '../services/git.js';
+import {
+  resolveWorkspaceRepo, getIssueDetail, buildIssuePrompt, GitHubError,
+  closeIssueForCompletedTask, reopenIssueForTask, type TaskIssueLink,
+} from '../services/github-issues.js';
 import { linkAttachmentsToTask, getAttachmentsByTask } from './uploads.js';
 import { getDb } from '../db/index.js';
 
@@ -92,9 +96,16 @@ router.get('/workspaces/:workspaceId/tasks', requireAuth, (req: Request, res: Re
 
 // Create a new task
 router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, res: Response) => {
-  const { prompt, model, claudeAccountId, caveman, attachmentIds, autoReview } = req.body;
+  const { prompt, model, claudeAccountId, caveman, attachmentIds, autoReview, issueNumber, includeIssueComments } = req.body;
   if (!prompt) {
     res.status(400).json({ error: 'Prompt is required' });
+    return;
+  }
+
+  // An issue-backed task must name a valid issue before anything else happens.
+  const wantsIssue = issueNumber !== undefined && issueNumber !== null;
+  if (wantsIssue && (!Number.isInteger(Number(issueNumber)) || Number(issueNumber) <= 0)) {
+    res.status(400).json({ error: 'issueNumber must be a positive integer' });
     return;
   }
 
@@ -145,13 +156,43 @@ router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, 
     }
   }
 
+  // Issue-backed task: `prompt` is the user's description of what they want
+  // done, and the issue thread is fetched here and prepended to it. Fetching
+  // server-side (rather than trusting a client-supplied body) means the quoted
+  // text is what GitHub actually holds, and the issue linkage stored on the task
+  // — the thing that later closes the issue — is verified to exist first.
+  let issueLink: TaskIssueLink | null = null;
+  let finalPrompt: string = prompt;
+  if (wantsIssue) {
+    const repo = await resolveWorkspaceRepo(req.params.workspaceId, workspace.name, req.user!.id);
+    if (!repo) {
+      res.status(400).json({ error: 'This workspace is not checked out on a GitHub repository.' });
+      return;
+    }
+    try {
+      const issue = await getIssueDetail(repo, Number(issueNumber), req.user!.id);
+      finalPrompt = buildIssuePrompt(issue, repo, String(prompt), includeIssueComments !== false);
+      issueLink = {
+        repo: `${repo.owner}/${repo.repo}`,
+        number: issue.number,
+        title: issue.title,
+        url: issue.html_url,
+      };
+    } catch (err) {
+      const status = err instanceof GitHubError ? err.status : 502;
+      res.status(status).json({ error: (err as Error).message || 'Failed to fetch issue' });
+      return;
+    }
+  }
+
   try {
     const task = createTask({
       workspaceId: req.params.workspaceId,
       workspaceName: workspace.name,
       userId: req.user!.id,
       username: req.user!.username,
-      prompt,
+      prompt: finalPrompt,
+      issue: issueLink,
       model: typeof model === 'string' ? model.trim() : undefined,
       claudeAccountId: requestedAccountId,
       caveman: typeof caveman === 'string' && ['lite', 'full', 'ultra'].includes(caveman) ? caveman : undefined,
@@ -595,6 +636,9 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
     // the task is already marked completed, so the response needn't wait for
     // these SSH round-trips.
     runInBackground(`complete-cleanup ${task.id}`, async () => {
+      // Close the GitHub issue this task was created from, if any. No-op for
+      // every other task, and never fatal — see closeIssueForCompletedTask.
+      await closeIssueForCompletedTask(task.id);
       await cleanupPortRange(task).catch(() => {});
       await processQueue(task.workspace_id);
     });
@@ -632,6 +676,11 @@ router.post('/tasks/:taskId/reopen', requireAuth, async (req: Request, res: Resp
 
   // Reopen is now a no-op for git — stash handling happens on next resume
   handleTaskReopenGit(task).catch(() => {});
+
+  // Put the linked GitHub issue back in step: completing the task closed it, so
+  // reopening the task reopens it. Backgrounded — the response doesn't wait on
+  // GitHub, and failures are reported into the task's message log.
+  runInBackground(`reopen-issue ${task.id}`, () => reopenIssueForTask(task.id));
 
   res.json({ task: getTask(task.id) });
 });

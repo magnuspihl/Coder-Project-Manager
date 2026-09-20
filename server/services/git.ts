@@ -392,10 +392,17 @@ export function parseAzureRemote(remoteUrl: string): { orgUrl: string; project: 
  * Detect the git hosting provider and a browsable web URL from a workspace's
  * git remote. Supports GitHub and Azure DevOps; returns provider 'unknown' with
  * a null webUrl for anything else, and null if detection fails entirely.
+ *
+ * `remote` defaults to `origin`. The issue browser passes `upstream` first for
+ * fork-PR-mode workspaces, where `origin` is the user's fork and the issues
+ * being worked from live on the real repo.
  */
-async function detectGitRemote(workspaceName: string, projectDir: string, userId?: string | null): Promise<GitRemoteInfo | null> {
+export async function detectGitRemote(workspaceName: string, projectDir: string, userId?: string | null, remote = 'origin'): Promise<GitRemoteInfo | null> {
   try {
-    const remoteUrl = await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git config --get remote.origin.url`, GIT_T_READ, userId);
+    // Remote names reach git unquoted inside the config key, so only accept a
+    // plain identifier — never interpolate caller-supplied text into the shell.
+    if (!/^[A-Za-z0-9._-]+$/.test(remote)) return null;
+    const remoteUrl = await sshExec(workspaceName, `cd ${shellEscape(projectDir)} && git config --get remote.${remote}.url`, GIT_T_READ, userId);
     if (!remoteUrl) return null;
     const url = remoteUrl.trim();
 

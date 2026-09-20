@@ -38,6 +38,7 @@ import { KOKORO_VOICES } from '../utils/kokoroTTS';
 import { playChime } from '../utils/chime';
 import { useDraft, useSessionState } from '../hooks/useDraft';
 import TaskDetailModal from '../components/TaskDetailModal';
+import IssueTaskModal from '../components/IssueTaskModal';
 import MarkdownComposer from '../components/MarkdownComposer';
 import PendingFiles from '../components/PendingFiles';
 
@@ -299,6 +300,10 @@ export default function WorkspacesPage() {
   // busy feedback; the other task actions return near-instantly.
   const [completingTaskIds, setCompletingTaskIds] = useState<Set<string>>(new Set());
   const [newTaskWorkspaceId, setNewTaskWorkspaceId] = useSessionState<string | null>('newTaskWorkspaceId', null);
+  // Workspace whose GitHub issue browser is open ("+ Issue"). Shares the model
+  // and subscription pickers with the inline composer below, so only one of the
+  // two is ever open at a time.
+  const [issueTaskWorkspaceId, setIssueTaskWorkspaceId] = useState<string | null>(null);
   const [newTaskPrompt, setNewTaskPrompt, clearNewTaskPrompt] = useDraft('newTaskPrompt');
   const [newTaskModel, setNewTaskModel] = useState('');
   const [newTaskCaveman, setNewTaskCaveman] = useState('');
@@ -628,9 +633,12 @@ export default function WorkspacesPage() {
     return () => window.removeEventListener('keydown', handleAltN);
   }, []);
 
-  // Fetch available models and restore saved defaults when task creation form opens
+  // Fetch available models and restore saved defaults when either task creation
+  // form opens — the inline "+ Task" composer or the "+ Issue" modal, which
+  // shows the same model/subscription pickers.
+  const taskFormWorkspaceId = newTaskWorkspaceId ?? issueTaskWorkspaceId;
   useEffect(() => {
-    if (!newTaskWorkspaceId) {
+    if (!taskFormWorkspaceId) {
       setAvailableModels([]);
       setNewTaskModel('');
       setNewTaskCaveman('');
@@ -652,7 +660,7 @@ export default function WorkspacesPage() {
         // the block below because a stored id may point at a deleted account.
         let stored: string | undefined;
         try {
-          stored = JSON.parse(localStorage.getItem('taskDefaults') || '{}')[newTaskWorkspaceId]?.claudeAccountId;
+          stored = JSON.parse(localStorage.getItem('taskDefaults') || '{}')[taskFormWorkspaceId]?.claudeAccountId;
         } catch { /* ignore */ }
         if (stored && (stored === WORKSPACE_CLAUDE_ACCOUNT || accounts.some(a => a.id === stored))) {
           setNewTaskClaudeAccount(stored);
@@ -669,19 +677,19 @@ export default function WorkspacesPage() {
     // Restore per-workspace defaults
     try {
       const defaults = JSON.parse(localStorage.getItem('taskDefaults') || '{}');
-      const ws = defaults[newTaskWorkspaceId];
+      const ws = defaults[taskFormWorkspaceId];
       if (ws) {
         setNewTaskModel(ws.model || '');
         setNewTaskCaveman(ws.caveman || '');
       }
     } catch { /* ignore */ }
     setLoadingModels(true);
-    getModels(newTaskWorkspaceId)
+    getModels(taskFormWorkspaceId)
       .then(({ models }) => { if (!cancelled) setAvailableModels(models); })
       .catch(() => { if (!cancelled) setAvailableModels([]); })
       .finally(() => { if (!cancelled) setLoadingModels(false); });
     return () => { cancelled = true; };
-  }, [newTaskWorkspaceId]);
+  }, [taskFormWorkspaceId]);
 
   const handleStop = async (e: React.MouseEvent, id: string, name: string) => {
     e.preventDefault();
@@ -954,6 +962,29 @@ export default function WorkspacesPage() {
     setNewTaskAttachmentIds(prev => prev.filter((_, i) => i !== index));
   };
 
+  /**
+   * Persist this workspace's task defaults so the next composer opens on them.
+   *
+   * The subscription is only overwritten when we actually know the user's
+   * choice. On the accounts-fetch-failure path the picker was never shown, so
+   * rewriting the entry without it would silently erase a preference the user
+   * set earlier — keep whatever was already stored instead.
+   */
+  const rememberTaskDefaults = (workspaceId: string, model: string, caveman: string, claudeAccount: string) => {
+    try {
+      const defaults = JSON.parse(localStorage.getItem('taskDefaults') || '{}');
+      const storedAccountId = accountsLoaded && claudeAccount
+        ? claudeAccount
+        : defaults[workspaceId]?.claudeAccountId;
+      defaults[workspaceId] = {
+        model,
+        caveman,
+        ...(storedAccountId ? { claudeAccountId: storedAccountId } : {}),
+      };
+      localStorage.setItem('taskDefaults', JSON.stringify(defaults));
+    } catch { /* ignore */ }
+  };
+
   const handleCreateTask = async (workspaceId: string) => {
     if (!newTaskPrompt.trim()) return;
     setCreatingTask(true);
@@ -967,22 +998,7 @@ export default function WorkspacesPage() {
         // to the user's default rather than this form forcing the workspace login.
         claudeAccountId: accountsLoaded ? newTaskClaudeAccount || undefined : undefined,
       });
-      try {
-        const defaults = JSON.parse(localStorage.getItem('taskDefaults') || '{}');
-        // Only overwrite the stored subscription when we actually know the user's
-        // choice. On the accounts-fetch-failure path the picker was never shown, so
-        // rewriting the entry without it would silently erase a preference the user
-        // set earlier — keep whatever was already stored instead.
-        const storedAccountId = accountsLoaded && newTaskClaudeAccount
-          ? newTaskClaudeAccount
-          : defaults[workspaceId]?.claudeAccountId;
-        defaults[workspaceId] = {
-          model: newTaskModel,
-          caveman: newTaskCaveman,
-          ...(storedAccountId ? { claudeAccountId: storedAccountId } : {}),
-        };
-        localStorage.setItem('taskDefaults', JSON.stringify(defaults));
-      } catch { /* ignore */ }
+      rememberTaskDefaults(workspaceId, newTaskModel, newTaskCaveman, newTaskClaudeAccount);
       lastTaskWorkspaceIdRef.current = workspaceId;
       clearNewTaskPrompt();
       setNewTaskModel('');
@@ -1010,6 +1026,18 @@ export default function WorkspacesPage() {
       <div className="flex items-start justify-between gap-2">
         <h4 className="text-sm font-medium text-gray-900 dark:text-gray-100 line-clamp-2 flex-1">{task.title}</h4>
         <div className="flex items-center gap-1 shrink-0">
+          {task.github_issue_number && (
+            <a
+              href={task.github_issue_url || undefined}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => e.stopPropagation()}
+              title={`GitHub issue ${task.github_issue_repo} #${task.github_issue_number}${task.github_issue_title ? ` — ${task.github_issue_title}` : ''}. Completing this task closes it.`}
+              className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 border border-purple-200 dark:border-purple-800 whitespace-nowrap hover:bg-purple-200 dark:hover:bg-purple-900/60"
+            >
+              #{task.github_issue_number}
+            </a>
+          )}
           {task.source === 'api' && (
             <span
               title={`Created via API${task.client_label ? ` (${task.client_label})` : ''}`}
@@ -1081,7 +1109,7 @@ export default function WorkspacesPage() {
               onClick={(e) => handleComplete(e, task.id)}
               disabled={!!task.pending_complete || completingTaskIds.has(task.id)}
               className={`p-1.5 text-white rounded transition-colors disabled:opacity-50 ${forkPrSettings[task.workspace_id] ? 'bg-amber-600 hover:bg-amber-700' : 'bg-green-600 hover:bg-green-700'}`}
-              title={task.pending_complete ? 'Completion queued — will finalize once the working task finishes' : completingTaskIds.has(task.id) ? (forkPrSettings[task.workspace_id] ? 'Opening draft PR…' : 'Completing — merging the task branch…') : (forkPrSettings[task.workspace_id] ? 'Open draft PR' : 'Mark Complete')}
+              title={task.pending_complete ? 'Completion queued — will finalize once the working task finishes' : completingTaskIds.has(task.id) ? (forkPrSettings[task.workspace_id] ? 'Opening draft PR…' : 'Completing — merging the task branch…') : `${forkPrSettings[task.workspace_id] ? 'Open draft PR' : 'Mark Complete'}${task.github_issue_number ? ` (also closes issue #${task.github_issue_number})` : ''}`}
             >
               {completingTaskIds.has(task.id) ? (
                 <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
@@ -1172,6 +1200,10 @@ export default function WorkspacesPage() {
     );
     const apps = getApps(ws);
     const githubRepoUrl = githubRepoUrls[ws.id] || tasks.find(t => t.github_repo_url)?.github_repo_url || null;
+    // Whether to offer "+ Issue". The recorded repo URL is the only cheap signal
+    // available here, and it only exists once a task has run — so an unknown repo
+    // counts as "maybe" and the modal resolves it properly.
+    const couldHaveGithubIssues = !githubRepoUrl || githubRepoUrl.includes('github.com');
 
     return (
       <div
@@ -1521,6 +1553,21 @@ export default function WorkspacesPage() {
             </div>
             {isRunning && (
               <div className="flex gap-1.5 shrink-0 mt-0.5">
+                {/* Only hidden when the repo is known NOT to be on GitHub — a
+                    workspace with no tasks yet has no recorded repo, and the
+                    modal itself says so if it turns out not to be GitHub. */}
+                {couldHaveGithubIssues && (
+                  <button
+                    onClick={() => {
+                      setNewTaskWorkspaceId(null);
+                      setIssueTaskWorkspaceId(ws.id);
+                    }}
+                    className="text-xs px-2 py-0.5 border border-blue-600 text-blue-600 dark:text-blue-400 dark:border-blue-500 rounded-full hover:bg-blue-50 dark:hover:bg-blue-900/30 transition-colors"
+                    title="New task from a GitHub issue"
+                  >
+                    + Issue
+                  </button>
+                )}
                 <button
                   onClick={() => {
                     if (newTaskWorkspaceId === ws.id) return;
@@ -1748,6 +1795,27 @@ export default function WorkspacesPage() {
             </svg>
           </button>
         </div>
+      )}
+
+      {issueTaskWorkspaceId && (
+        <IssueTaskModal
+          workspaceId={issueTaskWorkspaceId}
+          workspaceName={workspaces.find(w => w.id === issueTaskWorkspaceId)?.name || ''}
+          models={availableModels}
+          loadingModels={loadingModels}
+          claudeAccounts={claudeAccounts}
+          accountsLoaded={accountsLoaded}
+          model={newTaskModel}
+          onModelChange={setNewTaskModel}
+          claudeAccount={newTaskClaudeAccount}
+          onClaudeAccountChange={setNewTaskClaudeAccount}
+          onClose={() => setIssueTaskWorkspaceId(null)}
+          onCreated={() => {
+            rememberTaskDefaults(issueTaskWorkspaceId, newTaskModel, newTaskCaveman, newTaskClaudeAccount);
+            lastTaskWorkspaceIdRef.current = issueTaskWorkspaceId;
+            loadData();
+          }}
+        />
       )}
 
       {selectedTaskId && (

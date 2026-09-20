@@ -2373,6 +2373,18 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                       ${task.total_cost_usd.toFixed(2)}
                     </span>
                   )}
+                  {task.github_issue_number && task.github_issue_url && (
+                    <a
+                      href={task.github_issue_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title={`Issue ${task.github_issue_repo} #${task.github_issue_number} — closed automatically when this task is marked complete, reopened if the task is reopened`}
+                      className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 hover:bg-purple-200 dark:hover:bg-purple-900/50 transition-colors font-mono"
+                    >
+                      <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16"><path d="M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z" /><path fillRule="evenodd" d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0ZM1.5 8a6.5 6.5 0 1 1 13 0 6.5 6.5 0 0 1-13 0Z" clipRule="evenodd" /></svg>
+                      #{task.github_issue_number}
+                    </a>
+                  )}
                   {task.git_branch && (
                     task.github_repo_url ? (
                       <a
@@ -3115,7 +3127,12 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                       onClick={handleComplete}
                       disabled={completing || !!task.pending_complete}
                       className={`text-white text-sm px-4 py-2 rounded-md disabled:opacity-50 ${forkPrMode ? 'bg-amber-600 hover:bg-amber-700' : 'bg-green-600 hover:bg-green-700'}`}
-                      title={task.pending_complete ? 'Completion queued — will finalize once the working task finishes' : forkPrMode ? "Push to your fork and open a draft PR — this isn't merged automatically" : undefined}
+                      title={[
+                        task.pending_complete
+                          ? 'Completion queued — will finalize once the working task finishes'
+                          : forkPrMode ? "Push to your fork and open a draft PR — this isn't merged automatically" : '',
+                        task.github_issue_number ? `Also closes GitHub issue #${task.github_issue_number}.` : '',
+                      ].filter(Boolean).join(' ') || undefined}
                     >
                       {task.pending_complete ? 'Completion queued…' : completing ? (forkPrMode ? 'Opening draft PR...' : 'Completing...') : forkPrMode ? (
                         <>Draft PR<span className="hidden sm:inline"> (Alt+C)</span></>

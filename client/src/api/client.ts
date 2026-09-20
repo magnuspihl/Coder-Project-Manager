@@ -119,6 +119,14 @@ export interface Task {
   git_branch: string | null;
   github_repo_url: string | null;
   git_provider: string | null;
+  /**
+   * The GitHub issue this task was created from, if any. Completing the task
+   * closes it; reopening the task reopens it. `github_issue_repo` is `owner/repo`.
+   */
+  github_issue_repo?: string | null;
+  github_issue_number?: number | null;
+  github_issue_title?: string | null;
+  github_issue_url?: string | null;
   /** Draft PR URL opened by a fork-PR-mode completion. */
   pr_url: string | null;
   worktree_path: string | null;
@@ -382,6 +390,14 @@ export interface CreateTaskOptions {
   autoReview?: boolean;
   /** Account id, or WORKSPACE_CLAUDE_ACCOUNT to use the workspace's own login. */
   claudeAccountId?: string;
+  /**
+   * Base the task on this GitHub issue. `prompt` then carries only the user's
+   * description — the server fetches the issue and prepends its thread, and
+   * links the task to it so completing the task closes the issue.
+   */
+  issueNumber?: number;
+  /** Quote the issue's comment thread too. Defaults to true server-side. */
+  includeIssueComments?: boolean;
 }
 
 export const createTask = (workspaceId: string, prompt: string, opts: CreateTaskOptions = {}) =>
@@ -399,8 +415,54 @@ export const createTask = (workspaceId: string, prompt: string, opts: CreateTask
       // Defaulting to the sentinel here would silently override the user's default
       // account whenever the account list hadn't loaded.
       ...(opts.claudeAccountId ? { claudeAccountId: opts.claudeAccountId } : {}),
+      ...(opts.issueNumber ? { issueNumber: opts.issueNumber } : {}),
+      ...(opts.includeIssueComments === false ? { includeIssueComments: false } : {}),
     }),
   });
+
+// GitHub issues (for the "+ Issue" composer)
+
+export interface GitHubRepoRef {
+  owner: string;
+  repo: string;
+  webUrl: string;
+}
+
+export interface GitHubIssueSummary {
+  number: number;
+  title: string;
+  state: string;
+  html_url: string;
+  user: string | null;
+  labels: string[];
+  comments: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GitHubIssueComment {
+  id: number;
+  user: string | null;
+  body: string;
+  created_at: string;
+  html_url: string;
+}
+
+export interface GitHubIssueDetail extends GitHubIssueSummary {
+  body: string;
+  comment_list: GitHubIssueComment[];
+}
+
+/** Open issues on the repo this workspace is checked out on. `repo` is null when it isn't a GitHub repo. */
+export const getWorkspaceIssues = (workspaceId: string) =>
+  request<{ repo: GitHubRepoRef | null; issues: GitHubIssueSummary[] }>(
+    `/api/workspaces/${workspaceId}/github/issues`,
+  );
+
+export const getWorkspaceIssue = (workspaceId: string, issueNumber: number) =>
+  request<{ repo: GitHubRepoRef; issue: GitHubIssueDetail }>(
+    `/api/workspaces/${workspaceId}/github/issues/${issueNumber}`,
+  );
 
 export interface AttachmentInfo {
   id: string;
