@@ -97,15 +97,25 @@ router.get('/workspaces/:workspaceId/tasks', requireAuth, (req: Request, res: Re
 // Create a new task
 router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, res: Response) => {
   const { prompt, model, claudeAccountId, caveman, attachmentIds, autoReview, issueNumber, includeIssueComments } = req.body;
-  if (!prompt) {
-    res.status(400).json({ error: 'Prompt is required' });
-    return;
-  }
 
   // An issue-backed task must name a valid issue before anything else happens.
   const wantsIssue = issueNumber !== undefined && issueNumber !== null;
   if (wantsIssue && (!Number.isInteger(Number(issueNumber)) || Number(issueNumber) <= 0)) {
     res.status(400).json({ error: 'issueNumber must be a positive integer' });
+    return;
+  }
+
+  // The prompt is optional ONLY for an issue-backed task: there, a blank one
+  // means "the issue is the brief", and buildIssuePrompt still produces a
+  // complete prompt from the issue thread. Every other task still needs one —
+  // without an issue there would be nothing at all to act on.
+  if (typeof prompt !== 'string' && prompt !== undefined && prompt !== null) {
+    res.status(400).json({ error: 'Prompt must be a string' });
+    return;
+  }
+  const promptText = typeof prompt === 'string' ? prompt : '';
+  if (!wantsIssue && !promptText.trim()) {
+    res.status(400).json({ error: 'Prompt is required' });
     return;
   }
 
@@ -157,12 +167,13 @@ router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, 
   }
 
   // Issue-backed task: `prompt` is the user's description of what they want
-  // done, and the issue thread is fetched here and prepended to it. Fetching
-  // server-side (rather than trusting a client-supplied body) means the quoted
-  // text is what GitHub actually holds, and the issue linkage stored on the task
-  // — the thing that later closes the issue — is verified to exist first.
+  // done — optional, since a blank one means "the issue is the brief" — and the
+  // issue thread is fetched here and prepended to it. Fetching server-side
+  // (rather than trusting a client-supplied body) means the quoted text is what
+  // GitHub actually holds, and the issue linkage stored on the task — the thing
+  // that later closes the issue — is verified to exist first.
   let issueLink: TaskIssueLink | null = null;
-  let finalPrompt: string = prompt;
+  let finalPrompt: string = promptText;
   if (wantsIssue) {
     const repo = await resolveWorkspaceRepo(req.params.workspaceId, workspace.name, req.user!.id);
     if (!repo) {
@@ -171,7 +182,7 @@ router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, 
     }
     try {
       const issue = await getIssueDetail(repo, Number(issueNumber), req.user!.id);
-      finalPrompt = buildIssuePrompt(issue, repo, String(prompt), includeIssueComments !== false);
+      finalPrompt = buildIssuePrompt(issue, repo, promptText, includeIssueComments !== false);
       issueLink = {
         repo: `${repo.owner}/${repo.repo}`,
         number: issue.number,

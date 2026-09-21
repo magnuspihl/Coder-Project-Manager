@@ -137,8 +137,10 @@ export default function IssueTaskModal({
     );
   }, [issues, filter]);
 
+  // The description is optional: with it blank the issue itself is the brief,
+  // so an issue being selected is the only requirement.
   const handleCreate = async () => {
-    if (selected === null || !description.trim() || creating) return;
+    if (selected === null || creating) return;
     setCreating(true);
     setError('');
     try {
@@ -310,7 +312,10 @@ export default function IssueTaskModal({
           <div className="lg:w-80 xl:w-96 shrink-0 border-t lg:border-t-0 lg:border-l border-gray-200 dark:border-gray-800 flex flex-col min-h-0">
             <div className="p-3 overflow-y-auto space-y-2 min-h-0">
               <label className="block text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
-                What should Claude do?
+                What should Claude do?{' '}
+                <span className="font-normal normal-case tracking-normal text-gray-400 dark:text-gray-500">
+                  — optional
+                </span>
               </label>
               <MarkdownComposer
                 size="compact"
@@ -322,11 +327,16 @@ export default function IssueTaskModal({
                     handleCreate();
                   }
                 }}
-                placeholder={selected === null ? 'Select an issue first…' : 'e.g. Fix this and add a regression test.'}
+                placeholder={
+                  selected === null
+                    ? 'Select an issue first…'
+                    : 'Leave blank to just do what the issue asks.'
+                }
                 disabled={creating || selected === null}
               />
               <p className="text-xs text-gray-500 dark:text-gray-400">
-                The issue's title, link and body are prepended to this automatically.
+                The issue's title, link and body are prepended automatically. Leave this blank and the issue
+                itself is the brief.
               </p>
 
               <label className="flex items-center gap-2 cursor-pointer select-none">
@@ -411,7 +421,7 @@ export default function IssueTaskModal({
             <div className="mt-auto p-3 border-t border-gray-200 dark:border-gray-800 flex gap-2 shrink-0">
               <button
                 onClick={handleCreate}
-                disabled={creating || selected === null || !description.trim()}
+                disabled={creating || selected === null}
                 className="text-sm px-3 py-1.5 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
               >
                 {creating ? 'Creating…' : 'Create task'}
