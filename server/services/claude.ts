@@ -1931,6 +1931,45 @@ function isCoderAuthFailure(stderr: string): boolean {
 }
 
 /**
+ * Byte caps for a single poll of a remote stream-json file.
+ *
+ * These exist because an unbounded read is fatal, not merely slow. `execFile`
+ * defaults to a 1MB `maxBuffer`, and on overflow Node kills the child — the
+ * poll throws, `linesRead` is NOT advanced (only `processLine` advances it), so
+ * the next poll re-issues the same `tail` offset against a file that has only
+ * grown. The failure is therefore permanent: 20 consecutive throws later the
+ * caller gives up with "Lost connection to workspace" while Claude is still
+ * running perfectly well in the workspace. Two things reach 1MB in practice —
+ * a burst of large tool_results between two 5s polls, and the restart-reconnect
+ * path, which starts from `linesRead = 0` and re-reads the whole turn.
+ *
+ * So the read is bounded remotely with `head -c` instead, where truncation is
+ * recoverable: a chunk cut mid-line is already handled — the trailing partial
+ * line is buffered WITHOUT advancing `linesRead`, so the next `tail` re-reads it
+ * whole and the backlog drains over several polls. Callers must honour the
+ * returned `truncated` flag (see below) and must skip the line when a capped
+ * chunk contains no newline at all, which is the one case that cannot drain:
+ * the event itself is bigger than the cap.
+ *
+ * Note the cap is deliberately NOT applied per line with `cut`/`awk`: both
+ * terminate an unterminated final line, which would make the poller mistake a
+ * half-written JSON line for a complete one and skip it permanently. Whether the
+ * chunk ends in a newline is load-bearing information here.
+ *
+ * `maxBuffer` is then set well above the chunk cap purely as a backstop — the
+ * PTY turns every LF into CRLF on the way back, inflating the transfer.
+ */
+const POLL_MAX_CHUNK_BYTES = 4_000_000;
+const POLL_EXEC_MAX_BUFFER = 16 * 1024 * 1024;
+/**
+ * Caps for the one-shot whole-file read on the restart-recovery path. That read
+ * is not incremental, so there is no partial-line semantics to protect and the
+ * per-line cap can be applied remotely with `cut`.
+ */
+const RECOVERY_MAX_LINE_BYTES = 1_000_000;
+const RECOVERY_EXEC_MAX_BUFFER = 64 * 1024 * 1024;
+
+/**
  * Read new lines from a remote output file and the remote exit-code file in a
  * single SSH round trip, separated by a nonce marker so Claude's output can
  * never be mistaken for the marker.
@@ -1947,24 +1986,52 @@ async function pollOutputAndExit(
   linesRead: number,
   timeout = 20000,
   userId?: string | null,
-): Promise<{ jsonPart: string; exitPart: string }> {
+): Promise<{ jsonPart: string; exitPart: string; truncated: boolean }> {
   const marker = `---CPM-EXIT-${randomUUID()}---`;
   const command =
-    `tail -n +${linesRead + 1} ${shellEscape(outputFile)} 2>/dev/null; ` +
+    `{ tail -n +${linesRead + 1} ${shellEscape(outputFile)} 2>/dev/null ` +
+    `| head -c ${POLL_MAX_CHUNK_BYTES}; }; ` +
     `echo ${shellEscape(marker)}; ` +
     `cat ${shellEscape(exitFile)} 2>/dev/null || echo 'RUNNING'`;
-  const output = await sshExec(workspaceName, command, timeout, userId);
+  const output = await sshExec(workspaceName, command, timeout, userId, POLL_EXEC_MAX_BUFFER);
   // Use lastIndexOf as a belt-and-suspenders guard: even in the pathological
   // case where Claude's output echoed the exact nonce, the real marker is
   // always appended after the tail, so the last occurrence wins.
   const markerIdx = output.lastIndexOf(marker);
+  const jsonPart = markerIdx < 0 ? output : output.slice(0, markerIdx);
+  // "Did `head -c` cut us off, i.e. is there still backlog behind this chunk?"
+  // Callers must not finalize a run on a chunk that answers yes — the exit file
+  // can already exist while megabytes of output remain unread, and finalizing
+  // there would drop the rest. Measured locally with a slack margin because the
+  // PTY's LF→CRLF rewrite and `sshExec`'s leading trim make the returned size
+  // drift off the remote byte count — always upward for CRLF, and by at most a
+  // few leading whitespace bytes for the trim. So this can over-report (costing
+  // one extra 5s poll that returns nothing and then finalizes) but not
+  // under-report, which is the direction that would lose data.
+  const truncated = Buffer.byteLength(jsonPart, 'utf8') >= POLL_MAX_CHUNK_BYTES - 1024;
   if (markerIdx < 0) {
-    return { jsonPart: output, exitPart: 'RUNNING' };
+    return { jsonPart, exitPart: 'RUNNING', truncated };
   }
   return {
-    jsonPart: output.slice(0, markerIdx),
+    jsonPart,
     exitPart: output.slice(markerIdx + marker.length).trim(),
+    truncated,
   };
+}
+
+/**
+ * Is this chunk a single event too large to ever be read in one poll?
+ *
+ * A capped chunk with no newline in it means we read `POLL_MAX_CHUNK_BYTES`
+ * without reaching the end of the current line, so that line is at least that
+ * big. Nothing can be parsed from it and re-reading returns the same bytes
+ * forever, so the only way forward is to step `linesRead` over it and lose the
+ * one event. The test is exact rather than heuristic: a chunk that hit the cap
+ * yet contains a newline always yields at least one complete line and drains
+ * normally.
+ */
+function isUnreadableOversizedLine(jsonPart: string, truncated: boolean): boolean {
+  return truncated && !jsonPart.includes('\n');
 }
 
 /**
@@ -3141,6 +3208,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
   let polling = false;   // Guard against overlapping polls
   let finalized = false; // Set once we've transitioned status (via result event or exit code)
   let resultSeen = false; // Set when we observe Claude's terminal `result` event
+  let oversizedNoticeSent = false; // One skipped-event notice per turn, not per line
 
   // Per-line processor — extracted so the first poll can run it inside the
   // wipe+reparse transaction without duplicating logic.
@@ -3245,11 +3313,26 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
       const outputFile = remoteOutputPath(task.id);
       const exitFile = remoteExitCodePath(task.id);
 
-      const { jsonPart, exitPart } = await pollOutputAndExit(
+      const { jsonPart, exitPart, truncated } = await pollOutputAndExit(
         task.workspace_name, outputFile, exitFile, linesRead, undefined, task.user_id,
       );
 
       consecutiveErrors = 0;
+
+      if (isUnreadableOversizedLine(jsonPart, truncated)) {
+        console.warn(`[claude-poller] Task ${task.id}: stream event larger than ${POLL_MAX_CHUNK_BYTES} bytes — skipping it to keep the stream moving`);
+        if (!oversizedNoticeSent) {
+          oversizedNoticeSent = true;
+          addMessage(task.id, 'system', 'A single stream event was too large to read back and has been skipped. The run is unaffected, but one event (usually a very large tool result) is missing from this transcript.');
+        }
+        linesRead++;       // step over the unreadable line
+        partialLine = '';
+        return;
+      }
+
+      if (truncated) {
+        console.log(`[claude-poller] Task ${task.id} backlog exceeds the ${POLL_MAX_CHUNK_BYTES}-byte chunk cap — draining over multiple polls`);
+      }
 
       if (jsonPart.trim()) {
         // Do NOT prepend the previous poll's partialLine. `pollOutputAndExit`
@@ -3314,7 +3397,12 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
       // the result event (the same class of "lost final message" bug the reviewer
       // poller's flush fixed). Guard on `wiped` so we never bypass the staging
       // wipe, and re-run the shared `processLine` so result handling is identical.
-      const streamDone = exitPart !== 'RUNNING' && exitPart !== '';
+      //
+      // `truncated` blocks the flush as well: a capped chunk ends mid-line by
+      // construction, and that partial line is not the file's last one — the
+      // rest of the backlog follows it. Flushing it here would feed half a JSON
+      // event to `processLine` and finalize on top of unread output.
+      const streamDone = exitPart !== 'RUNNING' && exitPart !== '' && !truncated;
       if (streamDone && wiped && !finalized && partialLine.trim()) {
         processLine(partialLine);
         partialLine = '';
@@ -3323,11 +3411,11 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
       // Finalize on `result` event arrival — Claude has logically finished even
       // if the OS process hasn't exited yet (e.g. lingering subprocess holds the
       // stdout pipe open, blocking exit). Don't wait for the exit code.
-      if (resultSeen && !finalized) {
+      if (resultSeen && !finalized && !truncated) {
         finalized = true;
         console.log(`[claude-poller] Task ${task.id} finalized via result event`);
         finalizeTask(task, resultError);
-      } else if (exitPart !== 'RUNNING' && exitPart !== '' && !finalized) {
+      } else if (streamDone && !finalized) {
         const exitCode = parseInt(exitPart, 10);
         if (isNaN(exitCode)) {
           // Non-numeric exit content means something went wrong reading the
@@ -3832,7 +3920,14 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
     try {
       const outputFile = remoteReviewerOutputPath(task.id);
       const exitFile = remoteReviewerExitCodePath(task.id);
-      const { jsonPart, exitPart } = await pollOutputAndExit(task.workspace_name, outputFile, exitFile, linesRead, undefined, task.user_id);
+      const { jsonPart, exitPart, truncated } = await pollOutputAndExit(task.workspace_name, outputFile, exitFile, linesRead, undefined, task.user_id);
+
+      if (isUnreadableOversizedLine(jsonPart, truncated)) {
+        console.warn(`[auto-review] Task ${task.id}: reviewer stream event larger than ${POLL_MAX_CHUNK_BYTES} bytes — skipping it`);
+        linesRead++;
+        partialLine = '';
+        return;
+      }
 
       if (jsonPart.trim()) {
         // No prepend — see startFilePolling: `tail` re-reads the not-yet-
@@ -3893,7 +3988,10 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
         return;
       }
 
-      const done = exitPart !== 'RUNNING' && exitPart !== '';
+      // `!truncated`: the chunk cap means the exit file can be readable while
+      // output is still unread. Finalizing there would route a verdict decided
+      // on a partial transcript — and flush a half-line into JSON.parse.
+      const done = exitPart !== 'RUNNING' && exitPart !== '' && !truncated;
 
       // A credential-staging abort produces no output at all, which would
       // otherwise read as "the reviewer ran but emitted no verdict" — burning a
@@ -4362,9 +4460,15 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
   let resultError: string | null = null;
   try {
     const outputFile = remoteOutputPath(task.id);
+    // One-shot read of a whole turn, so it needs a far bigger budget than the
+    // 1MB `execFile` default — which used to make this throw on any turn over
+    // 1MB and, because the catch below only logs, silently discard the entire
+    // recovered turn. Lines are capped for the same reason as in the poller: an
+    // over-length event degrades to one skipped line instead of eating the
+    // buffer.
     const output = await sshExec(task.workspace_name,
-      `cat ${shellEscape(outputFile)} 2>/dev/null`,
-      30000, task.user_id,
+      `cut -b 1-${RECOVERY_MAX_LINE_BYTES} ${shellEscape(outputFile)} 2>/dev/null`,
+      30000, task.user_id, RECOVERY_EXEC_MAX_BUFFER,
     );
 
     if (!output) return { resultSeen, resultError };
@@ -5475,10 +5579,17 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant, b
     try {
       const outputFile = remoteTaskParticipantOutputPath(participant.id);
       const exitFile = remoteTaskParticipantExitCodePath(participant.id);
-      const { jsonPart, exitPart } = await pollOutputAndExit(
+      const { jsonPart, exitPart, truncated } = await pollOutputAndExit(
         participant.workspace_name, outputFile, exitFile, linesRead, undefined, task.user_id,
       );
       consecutiveErrors = 0;
+
+      if (isUnreadableOversizedLine(jsonPart, truncated)) {
+        console.warn(`[task-participant-poller] Participant ${participant.id}: stream event larger than ${POLL_MAX_CHUNK_BYTES} bytes — skipping it`);
+        linesRead++;
+        partialLine = '';
+        return;
+      }
 
       if (jsonPart.trim()) {
         // No prepend — see startFilePolling: `tail` already re-reads the
@@ -5504,7 +5615,9 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant, b
       // would fall through to the exit-code branch. Reuse the shared processor so
       // every event shape is handled identically. Same fix as the implementer and
       // reviewer pollers.
-      const streamDone = exitPart !== 'RUNNING' && exitPart !== '';
+      // `!truncated`: a capped chunk always ends mid-line with more behind it,
+      // so neither the flush nor either finalize branch may fire on it.
+      const streamDone = exitPart !== 'RUNNING' && exitPart !== '' && !truncated;
       if (streamDone && !finalized && partialLine.trim()) {
         processParticipantLine(partialLine);
         partialLine = '';
@@ -5513,7 +5626,7 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant, b
       // Finalize on `result` event arrival — Claude has logically finished even
       // if the OS process hasn't exited yet (e.g. lingering subprocess holds the
       // stdout pipe open, blocking exit). Don't wait for the exit code.
-      if (resultSeen && !finalized) {
+      if (resultSeen && !finalized && !truncated) {
         finalized = true;
         const proc = activeProcesses.get(pollKey);
         if (proc) proc.kill();
@@ -5521,7 +5634,7 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant, b
         if (resultError) {
           addMessage(task.id, 'system', `${participant.workspace_name} session ended with error: ${resultError}`);
         }
-      } else if (exitPart !== 'RUNNING' && exitPart !== '' && !finalized) {
+      } else if (streamDone && !finalized) {
         const exitCode = parseInt(exitPart, 10);
         if (isNaN(exitCode)) {
           console.warn(`[task-participant-poller] Participant ${participant.id} got non-numeric exit content (${exitPart.slice(0, 60)}) — continuing to poll`);
