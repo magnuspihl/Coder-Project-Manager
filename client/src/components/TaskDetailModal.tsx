@@ -16,6 +16,9 @@ import {
   setTaskModel,
   setTaskReviewerModel,
   getModels,
+  getCliInfo,
+  isModelUnsupported,
+  type CliInfo,
   WORKSPACE_CLAUDE_ACCOUNT,
   interruptTask,
   wakeTaskNow,
@@ -388,6 +391,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [accountsState, setAccountsState] = useState<'loading' | 'loaded' | 'failed'>('loading');
   const [switchingAccount, setSwitchingAccount] = useState(false);
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
+  const [cliInfo, setCliInfo] = useState<CliInfo | null>(null);
   const [switchingModel, setSwitchingModel] = useState(false);
   const [switchingReviewerModel, setSwitchingReviewerModel] = useState(false);
   const [switchingAutoReview, setSwitchingAutoReview] = useState(false);
@@ -659,6 +663,12 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     getModels(modelsWorkspaceId)
       .then(({ models }) => { if (!cancelled) setAvailableModels(models); })
       .catch(() => { if (!cancelled) setAvailableModels([]); });
+    // Same reasoning as the model list — cleared first so a stale workspace's CLI
+    // version never labels this workspace's model unsupported.
+    setCliInfo(null);
+    getCliInfo(modelsWorkspaceId)
+      .then(({ cli }) => { if (!cancelled) setCliInfo(cli); })
+      .catch(() => { if (!cancelled) setCliInfo(null); });
     return () => { cancelled = true; };
   }, [modelsWorkspaceId]);
 
@@ -2218,6 +2228,18 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         : task.model.replace(/^claude-/, '')}
                     </span>
                   ) : null}
+                  {/* This workspace's CLI is older than the selected model. The
+                      dropdown is built from a global list, so the mismatch is only
+                      detectable here — flag it rather than let the next turn fail
+                      with an opaque API error. */}
+                  {task.model && isModelUnsupported(cliInfo, task.model) && (
+                    <span
+                      className="hidden sm:inline-block text-xs px-1.5 py-0.5 rounded font-medium bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-400 cursor-help"
+                      title={`This workspace's Claude Code CLI (${cliInfo?.version ?? 'unknown'}) predates ${task.model} and may not be able to run it.${cliInfo?.latest_stable ? ` Latest is ${cliInfo.latest_stable}.` : ''}`}
+                    >
+                      CLI too old
+                    </span>
+                  )}
                   {/* Which Claude subscription this task burns. Editable mid-task:
                       the change lands on the next turn, so a rate-limited task can
                       be finished on the other subscription. Hidden for Ollama

@@ -8,6 +8,8 @@ import {
   type GitHubRepoRef,
   type ClaudeAccount,
   type ModelInfo,
+  type CliInfo,
+  isModelUnsupported,
 } from '../api/client';
 import Markdown from './Markdown';
 import MarkdownComposer from './MarkdownComposer';
@@ -29,6 +31,7 @@ export default function IssueTaskModal({
   workspaceName,
   models,
   loadingModels,
+  cliInfo,
   claudeAccounts,
   accountsLoaded,
   model,
@@ -42,6 +45,8 @@ export default function IssueTaskModal({
   workspaceName: string;
   models: ModelInfo[];
   loadingModels: boolean;
+  /** Null while the (slower) CLI probe is still in flight; warnings stay hidden. */
+  cliInfo: CliInfo | null;
   claudeAccounts: ClaudeAccount[];
   accountsLoaded: boolean;
   /**
@@ -381,6 +386,13 @@ export default function IssueTaskModal({
                   </optgroup>
                 )}
               </select>
+              {/* Same per-workspace CLI mismatch the inline composer warns about. */}
+              {isModelUnsupported(cliInfo, model) && (
+                <p className="text-xs text-amber-700 dark:text-amber-400">
+                  This workspace's Claude Code CLI ({cliInfo?.version ?? 'unknown'}) predates{' '}
+                  {models.find(m => m.id === model)?.display_name ?? model} and may not be able to run it.
+                </p>
+              )}
 
               {accountsLoaded && claudeAccounts.length > 0 && (
                 <select

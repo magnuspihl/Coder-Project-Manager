@@ -13,6 +13,10 @@ import {
   restoreTask,
   createTask,
   getModels,
+  getCliInfo,
+  updateWorkspaceCli,
+  isModelUnsupported,
+  type CliInfo,
   getClaudeAccounts,
   WORKSPACE_CLAUDE_ACCOUNT,
   type ClaudeAccount,
@@ -313,6 +317,11 @@ export default function WorkspacesPage() {
   const [newTaskClaudeAccount, setNewTaskClaudeAccount] = useState('');
   const [accountsLoaded, setAccountsLoaded] = useState(false);
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
+  // CLI version for the workspace the task form is pointed at. Fetched
+  // separately from the model list because the probe is much slower and must
+  // not hold up the dropdown.
+  const [cliInfo, setCliInfo] = useState<CliInfo | null>(null);
+  const [updatingCli, setUpdatingCli] = useState(false);
   const [claudeAccounts, setClaudeAccounts] = useState<ClaudeAccount[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
   const [creatingTask, setCreatingTask] = useState(false);
@@ -688,8 +697,30 @@ export default function WorkspacesPage() {
       .then(({ models }) => { if (!cancelled) setAvailableModels(models); })
       .catch(() => { if (!cancelled) setAvailableModels([]); })
       .finally(() => { if (!cancelled) setLoadingModels(false); });
+    setCliInfo(null);
+    getCliInfo(taskFormWorkspaceId)
+      .then(({ cli }) => { if (!cancelled) setCliInfo(cli); })
+      .catch(() => { if (!cancelled) setCliInfo(null); });
     return () => { cancelled = true; };
   }, [taskFormWorkspaceId]);
+
+  const handleUpdateCli = async () => {
+    if (!taskFormWorkspaceId || updatingCli) return;
+    setUpdatingCli(true);
+    try {
+      const result = await updateWorkspaceCli(taskFormWorkspaceId);
+      if (result.ok && result.version) {
+        const { cli } = await getCliInfo(taskFormWorkspaceId);
+        setCliInfo(cli);
+      } else {
+        alert(`CLI update failed:\n\n${result.output || 'No output'}`);
+      }
+    } catch (err) {
+      alert(`CLI update failed: ${(err as Error).message}`);
+    } finally {
+      setUpdatingCli(false);
+    }
+  };
 
   const handleStop = async (e: React.MouseEvent, id: string, name: string) => {
     e.preventDefault();
@@ -1636,6 +1667,42 @@ export default function WorkspacesPage() {
                   </optgroup>
                 )}
               </select>
+              {/* The model list is global but CLI support for a model is
+                  per-workspace, so a workspace running an old CLI can be offered
+                  a model it cannot actually run. Warn before the task launches
+                  rather than letting it fail mid-turn. */}
+              {cliInfo && isModelUnsupported(cliInfo, newTaskModel) && (
+                <p className="text-xs text-amber-700 dark:text-amber-400 mt-1">
+                  This workspace's Claude Code CLI ({cliInfo.version ?? 'unknown'}) predates{' '}
+                  {availableModels.find(m => m.id === newTaskModel)?.display_name ?? newTaskModel} and may not be able to run it.
+                  {cliInfo.update_available && (
+                    <>
+                      {' '}
+                      <button
+                        type="button"
+                        onClick={handleUpdateCli}
+                        disabled={updatingCli}
+                        className="underline hover:no-underline disabled:opacity-50"
+                      >
+                        {updatingCli ? 'Updating…' : `Update to ${cliInfo.latest_stable}`}
+                      </button>
+                    </>
+                  )}
+                </p>
+              )}
+              {cliInfo?.update_available && !isModelUnsupported(cliInfo, newTaskModel) && (
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                  CLI {cliInfo.version} · {cliInfo.latest_stable} available{' '}
+                  <button
+                    type="button"
+                    onClick={handleUpdateCli}
+                    disabled={updatingCli}
+                    className="underline hover:no-underline disabled:opacity-50"
+                  >
+                    {updatingCli ? 'Updating…' : 'Update'}
+                  </button>
+                </p>
+              )}
               {accountsLoaded && claudeAccounts.length > 0 && (
                 <select
                   value={newTaskClaudeAccount}
@@ -1803,6 +1870,7 @@ export default function WorkspacesPage() {
           workspaceName={workspaces.find(w => w.id === issueTaskWorkspaceId)?.name || ''}
           models={availableModels}
           loadingModels={loadingModels}
+          cliInfo={cliInfo}
           claudeAccounts={claudeAccounts}
           accountsLoaded={accountsLoaded}
           model={newTaskModel}
