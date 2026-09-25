@@ -10,6 +10,7 @@ import { getSubscriptionUsage, getObservedSubscriptionKeys, subscriptionKeyFor, 
 import { listAccounts } from '../services/claude-accounts.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { getModelsForWorkspace } from '../services/models.js';
+import { getCliInfo, updateCli } from '../services/cli-version.js';
 import { getPortOwnerTaskId } from '../services/port-janitor.js';
 import { setWorkspacesForUser } from '../services/workspace-cache.js';
 import { readWorkspaceMemory, writeWorkspaceMemoryFile } from '../services/workspace-memory.js';
@@ -464,6 +465,38 @@ router.get('/:workspaceId/models', requireAuth, async (req: Request, res: Respon
     res.json({ models });
   } catch {
     res.status(500).json({ error: 'Failed to fetch models' });
+  }
+});
+
+/**
+ * Claude Code CLI version for a workspace.
+ *
+ * Deliberately separate from /models rather than folded into it: the probe greps
+ * the whole CLI binary and can take tens of seconds on a cold cache, and the
+ * model dropdown must not wait on it. The client fetches both in parallel and
+ * layers the staleness warning on once this resolves.
+ */
+router.get('/:workspaceId/cli', requireAuth, async (req: Request, res: Response) => {
+  const workspace = await withTokenRefresh(req, res, (token) => getWorkspace(token, req.params.workspaceId), 'Failed to fetch workspace');
+  if (!workspace) return;
+
+  try {
+    const cli = await getCliInfo(workspace.name, req.user!.id);
+    res.json({ cli });
+  } catch {
+    res.status(500).json({ error: 'Failed to probe CLI version' });
+  }
+});
+
+router.post('/:workspaceId/cli/update', requireAuth, async (req: Request, res: Response) => {
+  const workspace = await withTokenRefresh(req, res, (token) => getWorkspace(token, req.params.workspaceId), 'Failed to fetch workspace');
+  if (!workspace) return;
+
+  try {
+    const result = await updateCli(workspace.name, req.user!.id);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ ok: false, version: null, output: (err as Error).message?.slice(0, 500) || 'Update failed' });
   }
 });
 

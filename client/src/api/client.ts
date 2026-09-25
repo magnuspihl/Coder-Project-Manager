@@ -364,6 +364,39 @@ export const setTaskAutoReview = (taskId: string, autoReview: boolean) =>
 export const getModels = (workspaceId: string) =>
   request<{ models: ModelInfo[] }>(`/api/workspaces/${workspaceId}/models`);
 
+/**
+ * The Claude Code CLI installed in a workspace. Each workspace carries its own
+ * copy and nothing updates it automatically, so versions drift independently and
+ * an old one may not know a model the (global) dropdown offers.
+ */
+export interface CliInfo {
+  version: string | null;
+  latest_stable: string | null;
+  latest: string | null;
+  update_available: boolean;
+  /** Empty means "could not determine" — never treat it as "supports nothing". */
+  known_model_ids: string[];
+}
+
+export const getCliInfo = (workspaceId: string) =>
+  request<{ cli: CliInfo }>(`/api/workspaces/${workspaceId}/cli`);
+
+export const updateWorkspaceCli = (workspaceId: string) =>
+  request<{ ok: boolean; version: string | null; output: string }>(
+    `/api/workspaces/${workspaceId}/cli/update`,
+    { method: 'POST' },
+  );
+
+/**
+ * Whether this workspace's CLI is known to predate a model. Mirrors the server's
+ * `isModelUnsupported` and fails open the same way.
+ */
+export function isModelUnsupported(cli: CliInfo | null, modelId: string): boolean {
+  if (!cli || !modelId || modelId.startsWith('ollama/')) return false;
+  if (cli.known_model_ids.length === 0) return false;
+  return !cli.known_model_ids.includes(modelId);
+}
+
 export interface MemoryFile {
   name: string;
   content: string;
