@@ -297,6 +297,9 @@ export default function WorkspacesPage() {
   // forwarded ports to the task that owns them so they render on the task card
   // instead of the workspace-wide shortcut row.
   const [portRangeSize, setPortRangeSize] = useState(10);
+  // Base URL of the Coder deployment (from server config), used to build the
+  // web-terminal shortcut for each workspace.
+  const [coderUrl, setCoderUrl] = useState('');
   const [showStopped, setShowStopped] = useState(false);
   const [deletedTaskId, setDeletedTaskId] = useState<string | null>(null);
   // Tasks with a completion request in flight. Completing runs the git merge
@@ -363,10 +366,14 @@ export default function WorkspacesPage() {
     }
   }
 
-  // Load the per-task port range size once so ports can be attributed to tasks.
+  // Load the per-task port range size once so ports can be attributed to tasks,
+  // plus the Coder base URL for the terminal shortcut.
   useEffect(() => {
     getAuthConfig()
-      .then((cfg) => { if (cfg.port_range_size > 0) setPortRangeSize(cfg.port_range_size); })
+      .then((cfg) => {
+        if (cfg.port_range_size > 0) setPortRangeSize(cfg.port_range_size);
+        if (cfg.coder_url) setCoderUrl(cfg.coder_url.replace(/\/+$/, ''));
+      })
       .catch(() => { /* keep default */ });
   }, []);
 
@@ -1235,6 +1242,12 @@ export default function WorkspacesPage() {
     // available here, and it only exists once a task has run — so an unknown repo
     // counts as "maybe" and the modal resolves it properly.
     const couldHaveGithubIssues = !githubRepoUrl || githubRepoUrl.includes('github.com');
+    // Coder's built-in web terminal, e.g. https://coder.example/@magnus/Palisade.main/terminal.
+    // Only useful while the workspace is up, so it follows the running state.
+    const terminalUrl =
+      isRunning && coderUrl && agent.name
+        ? `${coderUrl}/@${encodeURIComponent(ws.owner_name)}/${encodeURIComponent(ws.name)}.${encodeURIComponent(agent.name)}/terminal`
+        : null;
 
     return (
       <div
@@ -1501,8 +1514,26 @@ export default function WorkspacesPage() {
               </div>
             </div>
           )}
-          {(apps.length > 0 || openPorts.length > 0 || githubRepoUrl) && (
+          {(apps.length > 0 || openPorts.length > 0 || githubRepoUrl || terminalUrl) && (
             <div className="flex items-center gap-1.5 flex-wrap mb-1">
+              {terminalUrl && (
+                <a
+                  href={terminalUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="shrink-0 hover:opacity-80 transition-opacity"
+                  title="Open workspace terminal"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    className="h-4 w-4 text-gray-400 dark:text-gray-500 hover:text-gray-900 dark:hover:text-gray-100"
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                  >
+                    <path fillRule="evenodd" d="M2 5a2 2 0 012-2h12a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V5zm3.293 1.793a1 1 0 011.414 0l2.5 2.5a1 1 0 010 1.414l-2.5 2.5a1 1 0 01-1.414-1.414L7.086 10 5.293 8.207a1 1 0 010-1.414zM11 12a1 1 0 100 2h3a1 1 0 100-2h-3z" clipRule="evenodd" />
+                  </svg>
+                </a>
+              )}
               {githubRepoUrl && (
                 <a
                   href={githubRepoUrl}
