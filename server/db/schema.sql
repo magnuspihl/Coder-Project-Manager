@@ -266,6 +266,13 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
   -- repo). Completion pushes to the fork and opens a DRAFT pull request
   -- against upstream instead of merging — see services/git.ts.
   fork_pr_mode INTEGER NOT NULL DEFAULT 0,
+  -- GitHub label watcher (services/github-issue-watcher.ts): open issues on
+  -- issue_watch_repo (`owner/repo`) that issue_watch_user_id labels with
+  -- issue_watch_label become tasks automatically. NULL label = off.
+  issue_watch_label TEXT,
+  issue_watch_repo TEXT,
+  issue_watch_user_id TEXT,
+  issue_watch_workspace_name TEXT,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

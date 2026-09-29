@@ -22,6 +22,9 @@ import {
   type ClaudeAccount,
   getGitSettings,
   updateGitSettings,
+  getIssueWatchSettings,
+  updateIssueWatchSettings,
+  type IssueWatchSettings,
   getPreviewSettings,
   updatePreviewSettings,
   getWorkspaceVoiceSettings,
@@ -345,6 +348,11 @@ export default function WorkspacesPage() {
   const [previewUrlDrafts, setPreviewUrlDrafts] = useState<Record<string, string>>({});
   const [previewUrlSaving, setPreviewUrlSaving] = useState<Record<string, boolean>>({});
   const [previewUrlError, setPreviewUrlError] = useState<Record<string, string | null>>({});
+  // GitHub label watcher ("auto-pick up issues labeled …"), per workspace.
+  const [issueWatch, setIssueWatch] = useState<Record<string, IssueWatchSettings>>({});
+  const [issueWatchLabelDrafts, setIssueWatchLabelDrafts] = useState<Record<string, string>>({});
+  const [issueWatchSaving, setIssueWatchSaving] = useState<Record<string, boolean>>({});
+  const [issueWatchNotice, setIssueWatchNotice] = useState<Record<string, string | null>>({});
   const [wsVoiceSettings, setWsVoiceSettings] = useState<Record<string, string[]>>({});
   const [wsDefaultVoices, setWsDefaultVoices] = useState<Record<string, string | null>>({});
   const [availableVoices, setAvailableVoices] = useState<Array<{ id: string; name: string }>>([]);
@@ -824,6 +832,15 @@ export default function WorkspacesPage() {
         setForkPrSettings(prev => ({ ...prev, [workspaceId]: forkPrMode }));
       } catch { /* default shown as true/false */ }
     }
+    // Fetch the GitHub label watcher setting
+    if (!(workspaceId in issueWatch)) {
+      getIssueWatchSettings(workspaceId)
+        .then(w => {
+          setIssueWatch(prev => ({ ...prev, [workspaceId]: w }));
+          setIssueWatchLabelDrafts(prev => ({ ...prev, [workspaceId]: w.label }));
+        })
+        .catch(() => { /* row stays hidden until it loads */ });
+    }
     // Fetch saved preview URL
     if (!(workspaceId in previewUrlSettings)) {
       try {
@@ -979,6 +996,22 @@ export default function WorkspacesPage() {
     }
   };
 
+  const handleSaveIssueWatch = async (workspaceId: string, enabled: boolean) => {
+    setIssueWatchSaving(prev => ({ ...prev, [workspaceId]: true }));
+    setIssueWatchNotice(prev => ({ ...prev, [workspaceId]: null }));
+    try {
+      const label = (issueWatchLabelDrafts[workspaceId] ?? '').trim();
+      const w = await updateIssueWatchSettings(workspaceId, enabled ? { enabled, label: label || undefined } : { enabled });
+      setIssueWatch(prev => ({ ...prev, [workspaceId]: w }));
+      setIssueWatchLabelDrafts(prev => ({ ...prev, [workspaceId]: w.label }));
+      setIssueWatchNotice(prev => ({ ...prev, [workspaceId]: w.warning ?? null }));
+    } catch (err) {
+      setIssueWatchNotice(prev => ({ ...prev, [workspaceId]: err instanceof Error ? err.message : 'Failed to save' }));
+    } finally {
+      setIssueWatchSaving(prev => ({ ...prev, [workspaceId]: false }));
+    }
+  };
+
   const handleNewTaskFileSelect = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     const newFiles = Array.from(files);
@@ -1075,6 +1108,14 @@ export default function WorkspacesPage() {
             >
               #{task.github_issue_number}
             </a>
+          )}
+          {task.source === 'github' && (
+            <span
+              title={`Picked up automatically — the "${task.client_label ?? 'watch'}" label was added to the issue on GitHub`}
+              className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 border border-purple-200 dark:border-purple-800 whitespace-nowrap"
+            >
+              auto
+            </span>
           )}
           {task.source === 'api' && (
             <span
@@ -1415,6 +1456,56 @@ export default function WorkspacesPage() {
                 />
                 <span className="text-gray-600 dark:text-gray-300">Not my repo — open draft PRs instead of merging</span>
               </label>
+              {couldHaveGithubIssues && issueWatch[ws.id] && (() => {
+                const w = issueWatch[ws.id];
+                const draft = issueWatchLabelDrafts[ws.id] ?? w.label;
+                const saving = !!issueWatchSaving[ws.id];
+                return (
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <label
+                        className="flex items-center gap-1.5 cursor-pointer select-none"
+                        title="Every couple of minutes CPM checks this workspace's GitHub repo for open issues carrying the label and turns each into a task, with the issue as the brief. Only labels you add yourself count; the label is removed once the issue is picked up."
+                      >
+                        <input
+                          type="checkbox"
+                          checked={w.enabled}
+                          onChange={() => handleSaveIssueWatch(ws.id, !w.enabled)}
+                          disabled={saving}
+                          className="rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500 h-3.5 w-3.5 disabled:opacity-50"
+                        />
+                        <span className="text-gray-600 dark:text-gray-300">Auto-create tasks from GitHub issues labeled</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={draft}
+                        maxLength={50}
+                        onChange={(e) => setIssueWatchLabelDrafts(prev => ({ ...prev, [ws.id]: e.target.value }))}
+                        onKeyDown={(e) => { if (e.key === 'Enter' && w.enabled) handleSaveIssueWatch(ws.id, true); }}
+                        className="w-28 text-[11px] font-mono px-1.5 py-0.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200 focus:outline-none focus:border-blue-400"
+                      />
+                      {w.enabled && draft.trim() !== w.label && (
+                        <button
+                          onClick={() => handleSaveIssueWatch(ws.id, true)}
+                          disabled={saving || !draft.trim()}
+                          className="text-[10px] px-2 py-0.5 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                        >
+                          {saving ? 'Saving…' : 'Save'}
+                        </button>
+                      )}
+                    </div>
+                    {w.enabled && (
+                      <span className="text-[10px] text-gray-500 dark:text-gray-400 pl-5">
+                        Watching {w.repo ?? 'the repo'}
+                        {w.ownedByYou ? ' — tasks are created as you' : ` — tasks are created as ${w.owner ?? 'another user'}, from labels they add`}
+                      </span>
+                    )}
+                    {issueWatchNotice[ws.id] && (
+                      <span className="text-[10px] text-amber-600 dark:text-amber-400 pl-5">{issueWatchNotice[ws.id]}</span>
+                    )}
+                  </div>
+                );
+              })()}
               <div className="flex items-center gap-1.5 flex-wrap">
                 <span className="text-gray-500 dark:text-gray-400 shrink-0">Preview URL:</span>
                 <input

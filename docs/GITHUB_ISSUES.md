@@ -93,3 +93,44 @@ The state change is sent **before** the explanatory comment. In the reverse orde
 `PATCH` (the normal outcome on a repo you can comment on but not close — i.e. every fork-PR-mode
 workspace) would leave a comment announcing a closure that never happened on someone else's
 tracker. A silent no-op plus a message in the task log is better than a false public statement.
+
+---
+
+## 5. Label watcher — pick up issues tagged on GitHub
+
+The push-based counterpart to "+ Issue": tag an issue on GitHub and CPM creates the task itself.
+Implementation: `server/services/github-issue-watcher.ts`.
+
+- **Opt-in per workspace**, in the workspace's settings panel: *Auto-create tasks from GitHub issues
+  labeled `cpm:ready`* (label editable). Enabling resolves the repo once (`resolveWorkspaceRepo`,
+  so fork-PR mode watches `upstream`), creates the label on the repo if it's missing (a warning is
+  shown if that isn't permitted), and runs a check immediately.
+- **Polling, not webhooks.** Every 2 minutes (`CPM_ISSUE_WATCH_INTERVAL_MS`) one
+  `issues?labels=<label>&state=open` call per watched workspace. CPM isn't necessarily reachable
+  from GitHub, and webhooks would need per-repo admin setup and a shared secret.
+- **The task is exactly "+ Issue" with a blank description** — the issue (with comments) is the
+  brief — marked `source = 'github'` (an "auto" badge in the task list). It is owned by, and runs on
+  the Claude account and GitHub/Coder tokens of, **the user who enabled the watcher**.
+
+| Column (`workspace_settings`) | Notes |
+| --- | --- |
+| `issue_watch_label` | Trigger label. `NULL` = watcher off. |
+| `issue_watch_repo` | `owner/repo`, resolved when enabled. |
+| `issue_watch_user_id` | Whose label counts, and who owns the tasks. |
+| `issue_watch_workspace_name` | So the poller needs no Coder/SSH round-trip. |
+
+### Rules
+
+1. **Only your own label counts.** The most recent `labeled` event for the label must be by the
+   GitHub account the enabling user's token belongs to (`GET /user`). The label is the approval to
+   run an agent on third-party issue text with your workspace and subscription, so a collaborator
+   with triage rights can't trigger it on your behalf. Labels by anyone else are logged and ignored.
+2. **One label, one task.** Skipped while any non-deleted, non-completed task for the issue exists
+   in the workspace. Otherwise it fires only if the label was applied *after* the newest task
+   (deleted ones included) created for that issue — so a label that couldn't be removed never
+   re-fires, and removing + re-adding it is how you ask for a fresh task.
+3. **After pickup** the label is removed and a "Picked up by Coder Project Manager" comment is
+   posted. Best-effort: a failure is written to the task's message log; rule 2 keeps it from
+   looping either way.
+
+Stopped workspaces aren't special-cased: like any queued task, the launch's `coder ssh` starts it.

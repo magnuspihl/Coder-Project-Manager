@@ -610,6 +610,15 @@ export function getDb(): Database.Database {
     db.exec("ALTER TABLE tasks ADD COLUMN github_issue_url TEXT");
   }
 
+  // GitHub label watcher: label an issue on GitHub and CPM creates a task from
+  // it. See services/github-issue-watcher.ts.
+  const wsCols4 = db.prepare("PRAGMA table_info(workspace_settings)").all() as Array<{ name: string }>;
+  for (const col of ['issue_watch_label', 'issue_watch_repo', 'issue_watch_user_id', 'issue_watch_workspace_name']) {
+    if (!wsCols4.some(c => c.name === col)) {
+      db.exec(`ALTER TABLE workspace_settings ADD COLUMN ${col} TEXT`);
+    }
+  }
+
   return db;
 }
 

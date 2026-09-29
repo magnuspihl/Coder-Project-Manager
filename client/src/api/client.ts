@@ -686,6 +686,26 @@ export const updateGitSettings = (workspaceId: string, settings: { gitPushEnable
     body: JSON.stringify(settings),
   });
 
+export interface IssueWatchSettings {
+  enabled: boolean;
+  label: string;
+  repo: string | null;
+  /** Username of whoever turned the watcher on — the picked-up tasks are theirs. */
+  owner: string | null;
+  ownedByYou: boolean;
+  /** Set when the label couldn't be created on the repo. */
+  warning?: string | null;
+}
+
+export const getIssueWatchSettings = (workspaceId: string) =>
+  request<IssueWatchSettings>(`/api/workspaces/${workspaceId}/github/issue-watch`);
+
+export const updateIssueWatchSettings = (workspaceId: string, settings: { enabled: boolean; label?: string }) =>
+  request<IssueWatchSettings>(`/api/workspaces/${workspaceId}/github/issue-watch`, {
+    method: 'PUT',
+    body: JSON.stringify(settings),
+  });
+
 export const getWorkspaceVoiceSettings = (workspaceId: string) =>
   request<{ voiceIds: string[]; defaultVoiceId: string | null }>(`/api/workspaces/${workspaceId}/voice-settings`);
 

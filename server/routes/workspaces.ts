@@ -15,6 +15,10 @@ import { getPortOwnerTaskId } from '../services/port-janitor.js';
 import { setWorkspacesForUser } from '../services/workspace-cache.js';
 import { readWorkspaceMemory, writeWorkspaceMemoryFile } from '../services/workspace-memory.js';
 import { resolveWorkspaceRepo, listOpenIssues, getIssueDetail, GitHubError } from '../services/github-issues.js';
+import {
+  DEFAULT_WATCH_LABEL, normalizeWatchLabel, getIssueWatchSettings, setIssueWatchSettings,
+  ensureWatchLabel, pollIssueWatches,
+} from '../services/github-issue-watcher.js';
 
 const router = Router();
 
@@ -454,6 +458,70 @@ router.get('/:workspaceId/github/issues/:number', requireAuth, async (req: Reque
     const status = err instanceof GitHubError ? err.status : 502;
     res.status(status).json({ error: (err as Error).message || 'Failed to fetch issue' });
   }
+});
+
+// GitHub label watcher: when on, open issues on the workspace's repo that the
+// enabling user labels with `label` are turned into tasks automatically (see
+// services/github-issue-watcher.ts). The tasks belong to — and run on the
+// tokens of — whoever turned the watcher on, so the response says who that is.
+
+function issueWatchResponse(workspaceId: string, userId: string) {
+  const s = getIssueWatchSettings(workspaceId);
+  const owner = s.userId
+    ? (getDb().prepare('SELECT username FROM users WHERE id = ?').get(s.userId) as { username: string } | undefined)?.username ?? null
+    : null;
+  return {
+    enabled: !!s.label,
+    label: s.label ?? DEFAULT_WATCH_LABEL,
+    repo: s.repo,
+    owner,
+    ownedByYou: !!s.userId && s.userId === userId,
+  };
+}
+
+router.get('/:workspaceId/github/issue-watch', requireAuth, (req: Request, res: Response) => {
+  res.json(issueWatchResponse(req.params.workspaceId, req.user!.id));
+});
+
+router.put('/:workspaceId/github/issue-watch', requireAuth, async (req: Request, res: Response) => {
+  const { enabled, label } = req.body as { enabled: unknown; label: unknown };
+  if (typeof enabled !== 'boolean') {
+    res.status(400).json({ error: 'enabled must be a boolean' });
+    return;
+  }
+  // Workspace access is Coder's call — this also yields the name the tasks need.
+  const workspace = await withTokenRefresh(req, res, (token) => getWorkspace(token, req.params.workspaceId), 'Failed to fetch workspace');
+  if (!workspace) return;
+
+  if (!enabled) {
+    setIssueWatchSettings(req.params.workspaceId, { label: null, repo: null, userId: null, workspaceName: null });
+    res.json(issueWatchResponse(req.params.workspaceId, req.user!.id));
+    return;
+  }
+
+  const watchLabel = label === undefined ? DEFAULT_WATCH_LABEL : normalizeWatchLabel(label);
+  if (!watchLabel) {
+    res.status(400).json({ error: 'label must be 1–50 characters with no commas' });
+    return;
+  }
+  const repo = await resolveWorkspaceRepo(req.params.workspaceId, workspace.name, req.user!.id);
+  if (!repo) {
+    res.status(400).json({ error: 'This workspace is not checked out on a GitHub repository.' });
+    return;
+  }
+  const warning = await ensureWatchLabel(repo, watchLabel, req.user!.id);
+  setIssueWatchSettings(req.params.workspaceId, {
+    label: watchLabel,
+    repo: `${repo.owner}/${repo.repo}`,
+    userId: req.user!.id,
+    workspaceName: workspace.name,
+  });
+  // Check right away rather than on the next tick, so issues already labeled
+  // show up without waiting out the poll interval.
+  pollIssueWatches().catch(err =>
+    console.error(`[issue-watch] immediate poll failed: ${(err as Error)?.message?.slice(0, 200)}`),
+  );
+  res.json({ ...issueWatchResponse(req.params.workspaceId, req.user!.id), warning });
 });
 
 router.get('/:workspaceId/models', requireAuth, async (req: Request, res: Response) => {
