@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT,
+  deleted_at TEXT,
   FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
