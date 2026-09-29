@@ -20,6 +20,7 @@ import './db/index.js';
 import { reconnectWorkingTasks, startRateLimitRetryPoller, startWakePoller } from './services/claude.js';
 import { startWorktreeReconciler } from './services/git.js';
 import { startPortJanitor } from './services/port-janitor.js';
+import { startIssueWatchPoller } from './services/github-issue-watcher.js';
 
 // Prevent unhandled promise rejections from crashing the server
 process.on('unhandledRejection', (reason) => {
@@ -80,4 +81,6 @@ app.listen(PORT, '0.0.0.0', () => {
   // Periodically reap orphaned dev servers and attribute drifted ports to their
   // owning task (see services/port-janitor.ts).
   startPortJanitor();
+  // Turn GitHub issues labeled for pickup (per-workspace opt-in) into tasks.
+  startIssueWatchPoller();
 });

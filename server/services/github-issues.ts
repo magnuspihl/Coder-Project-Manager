@@ -137,7 +137,7 @@ export async function resolveWorkspaceRepo(
 
 // ─── GitHub REST ─────────────────────────────────────────────────────────────
 
-async function ghApi<T>(
+export async function ghApi<T>(
   path: string,
   token: string,
   init: { method?: string; body?: unknown } = {},
@@ -176,7 +176,7 @@ async function ghApi<T>(
  * Callers surface this verbatim — "no token" is otherwise indistinguishable
  * from "repo has no issues".
  */
-async function requireToken(userId: string): Promise<string> {
+export async function requireToken(userId: string): Promise<string> {
   const token = await fetchGitHubToken(userId);
   if (!token) {
     throw new GitHubError(
@@ -362,12 +362,12 @@ export function getTaskIssueLink(task: Task): TaskIssueLink | null {
  * GitHub's own `message` usually ends in a period, which would otherwise read
  * as "…admin rights to Repository.. Close it manually".
  */
-function failureReason(err: unknown): string {
+export function failureReason(err: unknown): string {
   const msg = err instanceof GitHubError ? err.message : (err as Error)?.message || String(err);
   return msg.trim().replace(/\.+$/, '');
 }
 
-function refFromRepoSlug(slug: string): GitHubRepoRef | null {
+export function refFromRepoSlug(slug: string): GitHubRepoRef | null {
   const m = slug.match(/^([^/\s]+)\/([^/\s]+)$/);
   if (!m) return null;
   return { owner: m[1], repo: m[2], webUrl: `https://github.com/${m[1]}/${m[2]}` };
