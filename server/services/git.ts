@@ -5,6 +5,7 @@ import {
   markMessagesStaleAfter, setPendingRollbackNote, type Task, type TaskCheckpoint,
 } from './tasks.js';
 import { getDb } from '../db/index.js';
+import { resolveGhPrTarget, type GhPrTarget } from './github-pr-target.js';
 import { execFile } from 'child_process';
 import { AsyncLocalStorage } from 'async_hooks';
 
@@ -1259,8 +1260,23 @@ async function runTaskCompletionGit(task: Task): Promise<boolean | 'git_error'> 
       outcome = await completePrAzure(ws, task.id, branchName, defaultBranch, prTitle, prBody, branchTip, remote.azure, userId, prOpts);
     } else {
       // GitHub and anything else (e.g. GitHub Enterprise) go through the `gh` CLI,
-      // matching the prior behaviour where `gh` was used unconditionally.
-      outcome = await completePrGitHub(ws, dir, task.id, branchName, defaultBranch, prTitle, prBody, userId, prOpts);
+      // matching the prior behaviour where `gh` was used unconditionally. The PR
+      // goes against the base remote's repo (`upstream` in fork-PR mode), from the
+      // branch just pushed to `origin` — see resolveGhPrTarget for why both must
+      // be explicit.
+      let baseUrl: string | null = null;
+      if (baseRemote !== 'origin') {
+        baseUrl = (await detectGitRemote(ws, dir, userId, baseRemote))?.webUrl ?? null;
+        if (!baseUrl) {
+          addMessage(task.id, 'system',
+            `Cannot complete: changes were pushed to branch \`${branchName}\`, but the \`${baseRemote}\` remote's repository could not be read, so the PR target is unknown. ` +
+            `Check \`git remote -v\` in the workspace and retry completion.`
+          );
+          return 'git_error';
+        }
+      }
+      const target = resolveGhPrTarget(branchName, remote?.webUrl, baseUrl);
+      outcome = await completePrGitHub(ws, dir, task.id, branchName, target, defaultBranch, prTitle, prBody, userId, prOpts);
     }
 
     if (outcome.kind === 'blocked') return 'git_error';
@@ -1376,10 +1392,11 @@ function isGhAuthFailure(failure: string): boolean {
  * the same branch can't be re-targeted).
  */
 async function completePrGitHub(
-  ws: string, dir: string, taskId: string, branchName: string,
+  ws: string, dir: string, taskId: string, branchName: string, target: GhPrTarget,
   defaultBranch: string, prTitle: string, prBody: string, userId?: string | null,
   opts?: PrCreateOpts,
 ): Promise<PrOutcome> {
+  const repoFlag = target.repo ? ` --repo ${shellEscape(target.repo)}` : '';
   // Resolve the GitHub token ONCE for the whole flow rather than per gh call, so
   // every step is authenticated identically and `coder external-auth` is shelled
   // out to once. When it can't be resolved, `gh` falls back to whatever auth the
@@ -1404,7 +1421,7 @@ async function completePrGitHub(
   let prUrl: string | undefined;
   let existingPr: { url?: string; state?: string; number?: number; isDraft?: boolean } | null = null;
   try {
-    const raw = await sshGh(ws, `cd ${shellEscape(dir)} && gh pr view ${shellEscape(branchName)} --json url,state,number,isDraft 2>/dev/null`);
+    const raw = await sshGh(ws, `cd ${shellEscape(dir)} && gh pr view ${shellEscape(target.head)}${repoFlag} --json url,state,number,isDraft 2>/dev/null`);
     if (raw.trim()) existingPr = JSON.parse(raw);
   } catch { /* no PR associated with this branch yet */ }
 
@@ -1425,10 +1442,10 @@ async function completePrGitHub(
       // PR by branch via `--json` gives a clean, structured identifier that can
       // never carry stray decoration into the subsequent `gh pr merge`.
       await sshGh(ws,
-        `cd ${shellEscape(dir)} && gh pr create --base ${shellEscape(defaultBranch)} --head ${shellEscape(branchName)} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}${opts?.draft ? ' --draft' : ''}`
+        `cd ${shellEscape(dir)} && gh pr create${repoFlag} --base ${shellEscape(defaultBranch)} --head ${shellEscape(target.head)} --title ${shellEscape(prTitle)} --body ${shellEscape(prBody)}${opts?.draft ? ' --draft' : ''}`
       );
       const created = JSON.parse(
-        (await sshGh(ws, `cd ${shellEscape(dir)} && gh pr view ${shellEscape(branchName)} --json url,number 2>/dev/null`)).trim()
+        (await sshGh(ws, `cd ${shellEscape(dir)} && gh pr view ${shellEscape(target.head)}${repoFlag} --json url,number 2>/dev/null`)).trim()
       ) as { url?: string; number?: number };
       mergeTarget = created.number != null ? String(created.number) : (created.url ?? '');
       prUrl = created.url;
@@ -1467,7 +1484,7 @@ async function completePrGitHub(
     // intentionally kept (the worktree owns it for the task's lifetime and is
     // removed only when the task is deleted); the remote branch is cleaned up
     // best-effort below and never blocks completion.
-    await sshGh(ws, `cd ${shellEscape(dir)} && gh pr merge ${shellEscape(mergeTarget)} --merge`);
+    await sshGh(ws, `cd ${shellEscape(dir)} && gh pr merge ${shellEscape(mergeTarget)}${repoFlag} --merge`);
     await sshGh(ws, `cd ${shellEscape(dir)} && git push origin --delete ${shellEscape(branchName)}`)
       .catch(() => { /* remote branch may be auto-deleted on merge, or kept by policy — either is fine */ });
     addMessage(taskId, 'system', `PR merged into \`${defaultBranch}\`.`);
@@ -1479,7 +1496,7 @@ async function completePrGitHub(
     let state = '', mergeable = '', mergeStateStatus = '';
     try {
       const info = JSON.parse((await sshGh(ws,
-        `cd ${shellEscape(dir)} && gh pr view ${shellEscape(mergeTarget)} --json state,mergeable,mergeStateStatus`
+        `cd ${shellEscape(dir)} && gh pr view ${shellEscape(mergeTarget)}${repoFlag} --json state,mergeable,mergeStateStatus`
       )).trim()) as { state?: string; mergeable?: string; mergeStateStatus?: string };
       state = info.state ?? ''; mergeable = info.mergeable ?? ''; mergeStateStatus = info.mergeStateStatus ?? '';
     } catch { /* ignore state-check errors */ }

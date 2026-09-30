@@ -15,6 +15,7 @@ import { buildMeshyMcpServerEntry, MESHY_MCP_ALLOWED_TOOL, buildMeshyUsagePrompt
 import { getValidCoderTokenForUser, forceRefreshCoderTokenForUser } from './sessions.js';
 import { resolveAccountToken, markAccountUsed } from './claude-accounts.js';
 import { writeRemoteStdin } from './ssh-stdin.js';
+import { combineExecOutput, redactSecrets } from './exec-output.js';
 import { parseReviewDecision, extractProofFiles, type ReviewDecision, type ReviewIssue } from './review-verdict.js';
 import {
   assignRepairFiles, formatFindingForImplementer, opinionIssues, repairable, rerunProof, routeReview, tally, toStored, verifyProofs,
@@ -1599,34 +1600,6 @@ export interface RemoteExecError extends Error {
 const EXEC_OUTPUT_LIMIT = 2000;
 
 /**
- * Lines emitted by the `coder` CLI itself rather than by the command we ran.
- * They carry no diagnostic value and are actively misleading: a plain git
- * conflict surfaces as `Encountered an error running "coder ssh"`, which is what
- * made failing git steps look like Coder outages.
- */
-const CODER_NOISE = [
-  /^Encountered an error running "coder ssh"/,
-  /^error: run command: Process exited with status \d+/,
-  /^==> ⧗ /,
-  /^⧗ /,
-];
-
-/** Strip PTY decoration (ANSI escapes, CR) and coder-CLI noise from command output. */
-function scrubExecOutput(s: string): string {
-  return s
-    // OSC (ESC ] … BEL/ST) first, then CSI/other ESC-introduced sequences, then lone ESC.
-    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?/g, '')
-    .replace(/\u001b[@-_][0-?]*[ -\/]*[@-~]?/g, '')
-    .replace(/\u001b/g, '')
-    .replace(/\r/g, '\n')
-    .split('\n')
-    .map((l) => l.trimEnd())
-    .filter((l) => l.trim() && !CODER_NOISE.some((re) => re.test(l)))
-    .join('\n')
-    .trim();
-}
-
-/**
  * Turn a raw `execFile` failure into an error that says what actually went wrong.
  *
  * Two things make the raw error useless on its own:
@@ -1651,12 +1624,7 @@ function buildExecError(
   stderr: string,
   timeout: number,
 ): RemoteExecError {
-  const combined = [scrubExecOutput(stdout || ''), scrubExecOutput(stderr || '')]
-    .filter(Boolean)
-    .join('\n');
-  const output = combined.length > EXEC_OUTPUT_LIMIT
-    ? `…${combined.slice(-EXEC_OUTPUT_LIMIT)}`
-    : combined;
+  const output = redactSecrets(combineExecOutput(stdout || '', stderr || '', EXEC_OUTPUT_LIMIT));
 
   // Node kills the child with SIGTERM for a maxBuffer overflow too, so `killed`
   // and `signal` alone cannot distinguish "ran too long" from "produced too much
@@ -1689,8 +1657,9 @@ function buildExecError(
   // Never emit a reason with nothing behind it. When the command produced no
   // output we fall back to Node's own message (which at least names the command)
   // rather than shipping a bare "exited with status unknown" — the opaque
-  // failure this whole function exists to eliminate.
-  const raw = (err.message || '').trim();
+  // failure this whole function exists to eliminate. Node's message quotes the
+  // command line verbatim, tokens included, hence the redaction.
+  const raw = redactSecrets((err.message || '').trim());
   const detail = output || (raw ? truncateForMessage(raw) : '');
 
   const e = new Error(detail ? `${reason}: ${detail}` : reason) as RemoteExecError;
