@@ -68,6 +68,8 @@ export interface Task {
   wake_count: number;
   /** Set by a rollback; injected into the prompt on the task's next resume. */
   pending_rollback_note: string | null;
+  /** JSON VerificationSummary — the harness's account of the task's tests (services/verification.ts). */
+  verification: string | null;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
@@ -83,6 +85,10 @@ export interface TaskTurn {
   review_outcome: 'pass' | 'fail' | null;
   review_summary: string | null;
   review_issues: string | null;
+  /** 'proof' when findings had to be backed by failing tests, 'opinion' when no test setup was found. */
+  review_mode: 'proof' | 'opinion' | null;
+  /** JSON StoredReview (see review-proof.ts): every proof attempted this turn, refuted ones included. */
+  review_proofs: string | null;
   files_changed: number | null;
   started_at: string;
   completed_at: string | null;
@@ -108,6 +114,28 @@ export interface ReviewFinding {
   created_at: string;
   /** Bumped when the reviewer re-raises a finding it judged inadequately fixed. */
   revision: number;
+  /**
+   * blocking — sends the implementer back to work.
+   * advisory — the reviewer could not demonstrate it with a test; shown, never loops.
+   */
+  severity: 'blocking' | 'advisory';
+  /** How the harness classified the reviewer's test; null for opinion-mode findings. */
+  proof_status: 'confirmed' | 'unproven' | null;
+  /** The requirement this finding claims to violate (quoted/cited by the reviewer). */
+  requirement: string | null;
+  /** Repo-relative path of the reviewer's test. Kept in the worktree when confirmed. */
+  proof_path: string | null;
+  proof_output: string | null;
+}
+
+/** A finding as the review pipeline hands it over for storage. */
+export interface NewFinding {
+  body: string;
+  severity?: 'blocking' | 'advisory';
+  proofStatus?: 'confirmed' | 'unproven' | null;
+  requirement?: string | null;
+  proofPath?: string | null;
+  proofOutput?: string | null;
 }
 
 export type FindingState = 'open' | 'fixing' | 'fixed' | 'verified' | 'dismissed' | 'resolved';
@@ -634,20 +662,54 @@ export function completeTaskTurn(turnId: string, outcome?: 'pass' | 'fail', summ
  * duplicating them. Findings from *other* turns are untouched, so the waiver
  * history accumulated across passes survives.
  */
-export function createReviewFindings(taskId: string, turnId: string, issues: string[]): ReviewFinding[] {
+export function createReviewFindings(taskId: string, turnId: string, issues: Array<string | NewFinding>): ReviewFinding[] {
   const db = getDb();
   const now = new Date().toISOString();
   const insert = db.prepare(
-    'INSERT INTO review_findings (id, task_id, turn_id, position, body, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    `INSERT INTO review_findings
+       (id, task_id, turn_id, position, body, state, created_at, severity, proof_status, requirement, proof_path, proof_output)
+     VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)`
   );
   db.transaction(() => {
     db.prepare('DELETE FROM review_findings WHERE turn_id = ?').run(turnId);
-    issues.forEach((body, i) => {
-      if (!body || !body.trim()) return;
-      insert.run(uuid(), taskId, turnId, i, body.trim(), 'open', now);
+    issues.forEach((raw, i) => {
+      const f: NewFinding = typeof raw === 'string' ? { body: raw } : raw;
+      if (!f.body || !f.body.trim()) return;
+      insert.run(
+        uuid(), taskId, turnId, i, f.body.trim(), now,
+        f.severity ?? 'blocking', f.proofStatus ?? null, f.requirement ?? null, f.proofPath ?? null, f.proofOutput ?? null,
+      );
     });
   })();
   return getReviewFindings(taskId).filter(f => f.turn_id === turnId);
+}
+
+export function setTaskVerification(taskId: string, summaryJson: string | null): void {
+  getDb().prepare('UPDATE tasks SET verification = ?, updated_at = ? WHERE id = ?').run(summaryJson, new Date().toISOString(), taskId);
+}
+
+/** Record the harness's verdict on a turn: which mode it ran in and every proof attempted. */
+export function setTurnReview(turnId: string, mode: 'proof' | 'opinion', proofsJson: string | null): void {
+  getDb().prepare('UPDATE task_turns SET review_mode = ?, review_proofs = ? WHERE id = ?').run(mode, proofsJson, turnId);
+}
+
+/** Attach a (newly confirmed) proof to an existing finding, e.g. when a claimed fix is re-raised. */
+export function setFindingProof(
+  findingId: string,
+  proof: { proofStatus: 'confirmed' | 'unproven'; requirement?: string | null; proofPath?: string | null; proofOutput?: string | null },
+): void {
+  getDb().prepare(
+    `UPDATE review_findings SET severity = 'blocking', proof_status = ?, requirement = COALESCE(?, requirement),
+       proof_path = COALESCE(?, proof_path), proof_output = ? WHERE id = ?`
+  ).run(proof.proofStatus, proof.requirement ?? null, proof.proofPath ?? null, proof.proofOutput ?? null, findingId);
+}
+
+/** Findings that still need the user AND count as blocking. Advisory ones never hold a task back. */
+export function hasOpenBlockingFindings(taskId: string): boolean {
+  const row = getDb().prepare(
+    "SELECT 1 AS x FROM review_findings WHERE task_id = ? AND state = 'open' AND severity != 'advisory' LIMIT 1"
+  ).get(taskId);
+  return !!row;
 }
 
 export function getReviewFindings(taskId: string): ReviewFinding[] {
@@ -746,14 +808,16 @@ export function verifyClaimedFixes(taskId: string, exceptIds: string[] = []): nu
  * on all of them.
  *
  * User decisions (`dismissed` / `resolved`) are deliberately excluded: those are
- * the user's calls, and the reviewer does not get to overwrite them.
+ * the user's calls, and the reviewer does not get to overwrite them. So are
+ * advisory findings: they were never asserted as defects, so a pass says nothing
+ * about them either way.
  */
 export function closeOutstandingOnPass(taskId: string): number {
   const db = getDb();
   const now = new Date().toISOString();
   const res = db.prepare(
     `UPDATE review_findings SET state = 'verified', decided_at = ?
-     WHERE task_id = ? AND state IN ('open', 'fixing', 'fixed')`
+     WHERE task_id = ? AND state IN ('open', 'fixing', 'fixed') AND severity != 'advisory'`
   ).run(now, taskId);
   return res.changes;
 }
