@@ -706,6 +706,22 @@ export const updateIssueWatchSettings = (workspaceId: string, settings: { enable
     body: JSON.stringify(settings),
   });
 
+export interface IssueProgressLabelSettings {
+  enabled: boolean;
+  label: string;
+  /** Set when the label couldn't be created on the repo. */
+  warning?: string | null;
+}
+
+export const getIssueProgressLabelSettings = (workspaceId: string) =>
+  request<IssueProgressLabelSettings>(`/api/workspaces/${workspaceId}/github/progress-label`);
+
+export const updateIssueProgressLabelSettings = (workspaceId: string, settings: { enabled: boolean; label?: string }) =>
+  request<IssueProgressLabelSettings>(`/api/workspaces/${workspaceId}/github/progress-label`, {
+    method: 'PUT',
+    body: JSON.stringify(settings),
+  });
+
 export const getWorkspaceVoiceSettings = (workspaceId: string) =>
   request<{ voiceIds: string[]; defaultVoiceId: string | null }>(`/api/workspaces/${workspaceId}/voice-settings`);
 

@@ -32,7 +32,7 @@ import { createTask, addMessage } from './tasks.js';
 import { processQueue } from './claude.js';
 import {
   ghApi, requireToken, refFromRepoSlug, getIssueDetail, buildIssuePrompt, failureReason,
-  GitHubError, type GitHubRepoRef,
+  applyIssueProgressLabel, GitHubError, type GitHubRepoRef,
 } from './github-issues.js';
 
 export const DEFAULT_WATCH_LABEL = 'cpm:ready';
@@ -99,12 +99,19 @@ function repoPath(ref: GitHubRepoRef): string {
 }
 
 /**
- * Make sure the trigger label exists on the repo, creating it if not, so it is
- * there to pick from in GitHub's label menu. Returns a warning to show the user
+ * Make sure a CPM label (the watcher's trigger label, or the in-progress label)
+ * exists on the repo, creating it if not, so it is there in GitHub's label
+ * menu with a sensible colour and description. Returns a warning to show the user
  * when that isn't possible (typically: no permission to create labels) — the
  * watcher still works if someone creates the label by hand.
  */
-export async function ensureWatchLabel(ref: GitHubRepoRef, label: string, userId: string): Promise<string | null> {
+export async function ensureWatchLabel(
+  ref: GitHubRepoRef,
+  label: string,
+  userId: string,
+  description = 'Ready for Coder Project Manager to pick up',
+  color = '8250df',
+): Promise<string | null> {
   try {
     const token = await requireToken(userId);
     try {
@@ -115,7 +122,7 @@ export async function ensureWatchLabel(ref: GitHubRepoRef, label: string, userId
     }
     await ghApi(`${repoPath(ref)}/labels`, token, {
       method: 'POST',
-      body: { name: label, color: '8250df', description: 'Ready for Coder Project Manager to pick up' },
+      body: { name: label, color, description },
     });
     return null;
   } catch (err) {
@@ -221,6 +228,7 @@ async function pickUpIssue(
   } catch (err) {
     addMessage(task.id, 'system', `Could not update GitHub issue #${issue.number} after pickup (${failureReason(err)}). The \`${label}\` label may still be on it — it won't trigger another task, but you may want to remove it by hand.`);
   }
+  await applyIssueProgressLabel(task.id);
 }
 
 async function pollWorkspace(workspaceId: string, s: IssueWatchSettings): Promise<void> {

@@ -619,6 +619,16 @@ export function getDb(): Database.Database {
     }
   }
 
+  // "CPM is working on this" issue label: the per-workspace setting, and the
+  // label actually applied to each task's issue. See services/github-issues.ts.
+  if (!wsCols4.some(c => c.name === 'issue_progress_label')) {
+    db.exec("ALTER TABLE workspace_settings ADD COLUMN issue_progress_label TEXT");
+  }
+  const tasksCols9 = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+  if (!tasksCols9.some(c => c.name === 'github_issue_progress_label')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN github_issue_progress_label TEXT");
+  }
+
   return db;
 }
 

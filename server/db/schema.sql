@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   github_issue_number INTEGER,
   github_issue_title TEXT,
   github_issue_url TEXT,
+  -- The "CPM is working on this" label actually put on that issue, if any, so
+  -- the same label is removed later even if the workspace setting changed since.
+  github_issue_progress_label TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT,
@@ -273,6 +276,10 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
   issue_watch_repo TEXT,
   issue_watch_user_id TEXT,
   issue_watch_workspace_name TEXT,
+  -- Optional label put on an issue while a CPM task is working from it (added
+  -- when the issue-backed task is created, removed when it completes or is
+  -- deleted). NULL = off.
+  issue_progress_label TEXT,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

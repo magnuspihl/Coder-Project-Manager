@@ -34,6 +34,8 @@ export interface Task {
   github_issue_number: number | null;
   github_issue_title: string | null;
   github_issue_url: string | null;
+  /** The in-progress label CPM put on that issue, if any (removed on completion/deletion). */
+  github_issue_progress_label: string | null;
   /** Draft PR URL opened by a fork-PR-mode completion (see workspace_settings.fork_pr_mode). */
   pr_url: string | null;
   worktree_path: string | null;

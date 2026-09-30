@@ -14,7 +14,10 @@ import { getCliInfo, updateCli } from '../services/cli-version.js';
 import { getPortOwnerTaskId } from '../services/port-janitor.js';
 import { setWorkspacesForUser } from '../services/workspace-cache.js';
 import { readWorkspaceMemory, writeWorkspaceMemoryFile } from '../services/workspace-memory.js';
-import { resolveWorkspaceRepo, listOpenIssues, getIssueDetail, GitHubError } from '../services/github-issues.js';
+import {
+  resolveWorkspaceRepo, listOpenIssues, getIssueDetail, GitHubError,
+  DEFAULT_PROGRESS_LABEL, getIssueProgressLabel, setIssueProgressLabel,
+} from '../services/github-issues.js';
 import {
   DEFAULT_WATCH_LABEL, normalizeWatchLabel, getIssueWatchSettings, setIssueWatchSettings,
   ensureWatchLabel, pollIssueWatches,
@@ -504,6 +507,12 @@ router.put('/:workspaceId/github/issue-watch', requireAuth, async (req: Request,
     res.status(400).json({ error: 'label must be 1–50 characters with no commas' });
     return;
   }
+  // Same label for both would loop: CPM's own in-progress label, applied as
+  // you, would read as a fresh pickup request.
+  if (watchLabel.toLowerCase() === (getIssueProgressLabel(req.params.workspaceId) ?? '').toLowerCase()) {
+    res.status(400).json({ error: 'The pickup label must differ from the in-progress label.' });
+    return;
+  }
   const repo = await resolveWorkspaceRepo(req.params.workspaceId, workspace.name, req.user!.id);
   if (!repo) {
     res.status(400).json({ error: 'This workspace is not checked out on a GitHub repository.' });
@@ -522,6 +531,48 @@ router.put('/:workspaceId/github/issue-watch', requireAuth, async (req: Request,
     console.error(`[issue-watch] immediate poll failed: ${(err as Error)?.message?.slice(0, 200)}`),
   );
   res.json({ ...issueWatchResponse(req.params.workspaceId, req.user!.id), warning });
+});
+
+// "CPM is working on this" label: when set, issue-backed tasks label their issue
+// while they're open (see services/github-issues.ts). Applies to tasks created
+// from here on, both from "+ Issue" and from the label watcher.
+
+router.get('/:workspaceId/github/progress-label', requireAuth, (req: Request, res: Response) => {
+  const label = getIssueProgressLabel(req.params.workspaceId);
+  res.json({ enabled: !!label, label: label ?? DEFAULT_PROGRESS_LABEL });
+});
+
+router.put('/:workspaceId/github/progress-label', requireAuth, async (req: Request, res: Response) => {
+  const { enabled, label } = req.body as { enabled: unknown; label: unknown };
+  if (typeof enabled !== 'boolean') {
+    res.status(400).json({ error: 'enabled must be a boolean' });
+    return;
+  }
+  const workspace = await withTokenRefresh(req, res, (token) => getWorkspace(token, req.params.workspaceId), 'Failed to fetch workspace');
+  if (!workspace) return;
+
+  if (!enabled) {
+    setIssueProgressLabel(req.params.workspaceId, null);
+    res.json({ enabled: false, label: DEFAULT_PROGRESS_LABEL });
+    return;
+  }
+  const progressLabel = label === undefined ? DEFAULT_PROGRESS_LABEL : normalizeWatchLabel(label);
+  if (!progressLabel) {
+    res.status(400).json({ error: 'label must be 1–50 characters with no commas' });
+    return;
+  }
+  if (progressLabel.toLowerCase() === (getIssueWatchSettings(req.params.workspaceId).label ?? '').toLowerCase()) {
+    res.status(400).json({ error: 'The in-progress label must differ from the pickup label.' });
+    return;
+  }
+  const repo = await resolveWorkspaceRepo(req.params.workspaceId, workspace.name, req.user!.id);
+  if (!repo) {
+    res.status(400).json({ error: 'This workspace is not checked out on a GitHub repository.' });
+    return;
+  }
+  const warning = await ensureWatchLabel(repo, progressLabel, req.user!.id, 'Coder Project Manager is working on this', 'fbca04');
+  setIssueProgressLabel(req.params.workspaceId, progressLabel);
+  res.json({ enabled: true, label: progressLabel, warning });
 });
 
 router.get('/:workspaceId/models', requireAuth, async (req: Request, res: Response) => {

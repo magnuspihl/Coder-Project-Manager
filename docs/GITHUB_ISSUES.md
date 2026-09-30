@@ -134,3 +134,27 @@ Implementation: `server/services/github-issue-watcher.ts`.
    looping either way.
 
 Stopped workspaces aren't special-cased: like any queued task, the launch's `coder ssh` starts it.
+
+---
+
+## 6. In-progress label
+
+Optional, per workspace: *Label issues CPM is working on* (default `cpm:in-progress`, editable) in
+the workspace settings panel. Enabling it creates the label on the repo if missing (yellow, "Coder
+Project Manager is working on this"). Stored in `workspace_settings.issue_progress_label`; `NULL` = off.
+
+| Event | Label |
+| --- | --- |
+| Issue-backed task created — "+ Issue" or the label watcher | added |
+| Task completed (either completion path — runs inside `closeIssueForCompletedTask`, *before* the close, so it comes off even when closing is refused) | removed |
+| Task deleted | removed |
+| Task reopened / restored (restore only if it wasn't completed) | re-added |
+
+The label actually applied is recorded on the task (`tasks.github_issue_progress_label`), and that
+is what gets removed — so changing or disabling the setting never strands an old label on an issue.
+A label already removed by hand (404) counts as removed. Everything is best-effort: failures are
+written to the task's message log, like the close/reopen sync. Failed and cancelled tasks keep the
+label, since they're still retryable.
+
+It must differ from the watcher's pickup label — both routes reject a clash — because CPM applies
+it with your token, and the watcher would read your own in-progress label as a fresh pickup request.
