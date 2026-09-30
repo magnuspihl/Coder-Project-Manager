@@ -7,6 +7,7 @@ import {
   reopenTask,
   retryTask,
   reviewTask,
+  verifyTask,
   resetTaskSession,
   compactTaskSession,
   updateTaskTitle,
@@ -49,6 +50,7 @@ import {
   type AttachmentInfo,
   type TaskRequestItem,
   type ReviewFinding,
+  type VerificationSummary,
   type TaskCheckpoint,
   setFindingState,
   fixFindings,
@@ -67,6 +69,8 @@ import MarkdownComposer, { type ComposerHandle, type ComposerKeyEvent } from './
 import { useTTSVoice } from '../hooks/useTTSVoice';
 import { useVoiceRecorder } from '../hooks/useVoiceRecorder';
 import { useVoiceMode } from '../hooks/useVoiceMode';
+import { FindingEvidence, OpinionNote, RefutedClaims, parseStoredReview, proofTally } from './ReviewEvidence';
+import VerificationCard from './VerificationCard';
 
 function timeAgo(iso: string): string {
   const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -394,6 +398,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [cliInfo, setCliInfo] = useState<CliInfo | null>(null);
   const [switchingModel, setSwitchingModel] = useState(false);
   const [switchingReviewerModel, setSwitchingReviewerModel] = useState(false);
+  const [verifyingSince, setVerifyingSince] = useState<{ before: string | null; at: number } | null>(null);
   const [switchingAutoReview, setSwitchingAutoReview] = useState(false);
   const [completing, setCompleting] = useState(false);
   const [reviewing, setReviewing] = useState(false);
@@ -1097,6 +1102,21 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reply, uploadedAttachmentIds, sending, taskId]);
 
+  // The harness's account of the task's tests (server: verification.ts). Parsed
+  // once per task update rather than on every render.
+  const verification = useMemo(() => {
+    if (!task?.verification) return null;
+    try { return JSON.parse(task.verification) as VerificationSummary; } catch { return null; }
+  }, [task?.verification]);
+
+  useEffect(() => {
+    if (!verifyingSince) return;
+    if ((task?.verification ?? null) !== verifyingSince.before) { setVerifyingSince(null); return; }
+    const remaining = 10 * 60_000 - (Date.now() - verifyingSince.at);
+    const t = setTimeout(() => setVerifyingSince(null), Math.max(remaining, 0));
+    return () => clearTimeout(t);
+  }, [verifyingSince, task?.verification]);
+
   const parseIssues = (turn: TaskTurn): string[] => {
     if (!turn.review_issues) return [];
     try {
@@ -1140,6 +1160,17 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const findingsForTurn = (turnId: string): ReviewFinding[] =>
     findings.filter(f => f.turn_id === turnId).sort((a, b) => a.position - b.position);
 
+  // The stored proof (test source, requirement, failure output) behind a finding,
+  // looked up on the reviewer turn that raised it. Matched by the defect text the
+  // finding body was created from; a re-raised finding takes the revised text, so
+  // the path is the fallback.
+  const proofForFinding = (f: ReviewFinding) => {
+    const turn = turns.find(t => t.id === f.turn_id);
+    const stored = turn ? parseStoredReview(turn) : null;
+    return stored?.proofs.find(p => p.defect.trim() === f.body.trim())
+      ?? (f.proof_path ? stored?.proofs.find(p => p.path === f.proof_path) : undefined);
+  };
+
   const turnNumberOf = (turnId: string): number =>
     turns.find(t => t.id === turnId)?.turn_number ?? 0;
 
@@ -1153,6 +1184,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
    */
   const supersededByLaterReview = (f: ReviewFinding): boolean => {
     if (f.state !== 'open') return false;
+    if (f.severity === 'advisory') return false;
     // A re-raised finding was explicitly looked at and objected to by a later
     // review, so "a later review didn't raise this again" is flatly false for
     // it. This heuristic only still applies to findings that never went through
@@ -1338,6 +1370,21 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       alert(err instanceof Error ? err.message : 'Failed to start review');
     } finally {
       setReviewing(false);
+    }
+  };
+
+  // Full verification on demand. The request returns at once; the modal's own
+  // polling delivers the result, so "running" is simply "the stored result has
+  // not changed yet" — with a ceiling, so a run that never reports back can't
+  // leave the button spinning forever.
+  const handleRunFullVerification = async () => {
+    const before = task?.verification ?? null;
+    setVerifyingSince({ before, at: Date.now() });
+    try {
+      await verifyTask(taskId);
+    } catch (err: unknown) {
+      setVerifyingSince(null);
+      alert(err instanceof Error ? err.message : 'Failed to start verification');
     }
   };
 
@@ -1834,6 +1881,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
               </button>
             )}
 
+            <FindingEvidence finding={f} proof={proofForFinding(f)} />
+
             {dismissed && (
               <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400 italic">
                 Ignored — won't be changed{f.note ? ` (${f.note})` : ''}
@@ -2029,14 +2078,29 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
       );
     }
 
+    const stored = parseStoredReview(turn);
+    const proofMode = turn.review_mode === 'proof';
+    const opinionMode = turn.review_mode === 'opinion';
+    const tally = proofTally(stored);
+    const refuted = stored?.proofs.filter(p => p.status === 'refuted') ?? [];
+
     if (turn.review_outcome === 'pass') {
+      // Advisory notes are findings the reviewer could not demonstrate with a
+      // test: they never loop, but the user should still see them.
+      const advisory = findingsForTurn(turn.id).filter(f => f.severity === 'advisory');
       return (
         <div className="space-y-2">
           <div className="flex items-center gap-2 py-1">
             <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
-            <span className="flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full border text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800">
+            <span
+              className="flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full border text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800"
+              title={proofMode
+                ? 'The reviewer could not produce a test that fails on this code. That is weaker than proof the code is correct.'
+                : undefined}
+            >
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
-              Review passed
+              {proofMode ? 'No confirmed defects' : opinionMode ? 'Review passed (opinion-based)' : 'Review passed'}
+              {tally && <span className="font-normal opacity-80">· {tally}</span>}
             </span>
             {fullReview && (
               <button
@@ -2048,6 +2112,20 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
             )}
             <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
           </div>
+          {opinionMode && <div className="mr-8"><OpinionNote /></div>}
+          {(advisory.length > 0 || refuted.length > 0) && (
+            <div className="mr-8 space-y-2">
+              {advisory.length > 0 && (
+                <div className="rounded-lg p-3 bg-amber-50/60 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-800 space-y-2">
+                  <p className="text-[11px] font-medium text-amber-800 dark:text-amber-200">
+                    Advisory notes — the reviewer could not prove {advisory.length === 1 ? 'this' : 'these'} with a test
+                  </p>
+                  {advisory.map((f, i) => renderFinding(f, i, task?.status === 'awaiting_feedback'))}
+                </div>
+              )}
+              <RefutedClaims proofs={refuted} />
+            </div>
+          )}
           {expanded && fullReview && (
             <div className="rounded-lg p-4 bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 mr-8">
               <Markdown content={fullReview} />
@@ -2069,22 +2147,36 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     // only once it has been decided, not because time passed.
     const canApply = task?.status === 'awaiting_feedback';
     const turnFindings = findingsForTurn(turn.id);
-    const openCount = turnFindings.filter(f => f.state === 'open').length;
-    const decidedCount = turnFindings.length - openCount;
+    const blockingFindings = turnFindings.filter(f => f.severity !== 'advisory');
+    const advisoryFindings = turnFindings.filter(f => f.severity === 'advisory');
+    // "Fix all" is about the blocking findings; advisory ones are fixed one at a
+    // time from their own row, if the user decides they matter.
+    const openCount = blockingFindings.filter(f => f.state === 'open').length;
+    const decidedCount = turnFindings.filter(f => f.state !== 'open').length;
     return (
       <div className="space-y-2">
         <div className="flex items-center gap-2 py-1">
           <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
           <span className="flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full border text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/30 border-amber-200 dark:border-amber-800">
             <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" /></svg>
-            Review found issues
+            {proofMode ? 'Review confirmed issues' : 'Review found issues'}
+            {tally && <span className="font-normal opacity-80">· {tally}</span>}
           </span>
           <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
         </div>
+        {opinionMode && <div className="mr-8"><OpinionNote /></div>}
         <div className="rounded-lg p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 mr-8">
           {turnFindings.length > 0 ? (
             <div className="space-y-2">
-              {turnFindings.map((f, i) => renderFinding(f, i, canApply))}
+              {blockingFindings.map((f, i) => renderFinding(f, i, canApply))}
+              {advisoryFindings.length > 0 && (
+                <>
+                  <p className="pt-1 text-[11px] font-medium text-amber-800 dark:text-amber-200">
+                    Advisory notes — not proven by a test, so they do not send anything back
+                  </p>
+                  {advisoryFindings.map((f, i) => renderFinding(f, i, canApply))}
+                </>
+              )}
             </div>
           ) : issues.length > 0 ? (
             // Legacy verdicts (recorded before per-finding triage) have no
@@ -2128,6 +2220,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
               </button>
             )}
           </div>
+          <RefutedClaims proofs={refuted} />
           {expanded && fullReview && (
             <div className="mt-3 pt-3 border-t border-amber-200 dark:border-amber-800">
               <Markdown content={fullReview} />
@@ -2697,6 +2790,16 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                     </p>
                   )}
                 </div>
+              )}
+
+              {/* What the harness verified: shown once the turn has settled, so it never
+                  sits between a streaming message and its own reviewer card. */}
+              {task.status !== 'working' && task.status !== 'queued' && verification && (
+                <VerificationCard
+                  summary={verification}
+                  running={verifyingSince !== null}
+                  onRunFull={task.status === 'awaiting_feedback' || task.status === 'completed' ? handleRunFullVerification : undefined}
+                />
               )}
 
               {/* Participant thinking indicator */}

@@ -85,9 +85,66 @@ export interface TaskTurn {
   review_outcome: 'pass' | 'fail' | null;
   review_summary: string | null;
   review_issues: string | null;
+  /** 'proof': findings had to be backed by failing tests. 'opinion': no test runner was found. */
+  review_mode: 'proof' | 'opinion' | null;
+  /** JSON StoredReview — every proof the reviewer attempted this turn, refuted ones included. */
+  review_proofs: string | null;
   files_changed: number | null;
   started_at: string;
   completed_at: string | null;
+}
+
+export type ProofStatus = 'confirmed' | 'refuted' | 'unproven';
+
+/** One proof the reviewer attempted, as stored on the turn (server: review-proof.ts StoredProof). */
+export interface StoredProof {
+  defect: string;
+  requirement?: string;
+  requirementSource?: string;
+  path?: string;
+  content?: string;
+  status: ProofStatus;
+  reason: string;
+  failedTests: string[];
+  output: string;
+}
+
+export interface StoredReview {
+  mode: 'proof' | 'opinion';
+  proofs: StoredProof[];
+}
+
+export type BaselineResult = 'fails' | 'passes' | 'not_runnable';
+
+/** The harness's account of a task's tests (server: verification.ts VerificationSummary). */
+export interface VerificationSummary {
+  computedAt: string;
+  /** 'tests': just the change's own tests (after an ordinary turn). 'full': also the comparison with the original code and the whole suite. */
+  level: 'tests' | 'full';
+  fingerprint?: string;
+  runner: string | null;
+  tests: Array<{
+    name: string;
+    file: string;
+    outcome: 'passed' | 'failed' | 'skipped';
+    origin: 'implementer' | 'reviewer';
+    baseline?: BaselineResult;
+    message?: string;
+  }>;
+  problems: Array<{ file: string; error: string }>;
+  filesOmitted: number;
+  suite?: { passed: number; failed: number; skipped: number; error?: string; failedNames: string[] };
+  noTestsReason?: string;
+  baselineChecked: boolean;
+  notes: string[];
+}
+
+export interface TestProfile {
+  runner: 'node-test' | 'vitest' | 'jest' | 'pytest' | 'go' | 'dotnet';
+  command?: string;
+  cwd?: string;
+  suite?: string;
+  source: 'detected' | 'implementer' | 'user';
 }
 
 export interface ReviewFinding {
@@ -101,6 +158,12 @@ export interface ReviewFinding {
   note: string | null;
   decided_at: string | null;
   created_at: string;
+  /** 'advisory' findings were not demonstrated by a test: shown, never sent back to the implementer. */
+  severity: 'blocking' | 'advisory';
+  proof_status: 'confirmed' | 'unproven' | null;
+  requirement: string | null;
+  proof_path: string | null;
+  proof_output: string | null;
 }
 
 export interface Task {
@@ -145,6 +208,8 @@ export interface Task {
   context_tokens?: number;
   /** Per-task auto-reviewer model; null inherits the deployment default, then the task's model. */
   reviewer_model?: string | null;
+  /** JSON VerificationSummary, or null before the first verification. */
+  verification?: string | null;
   total_cost_usd?: number;
   /**
    * Agent-scheduled self-resume. When set, the agent asked CPM to wake it — at
@@ -739,6 +804,24 @@ export const updatePreviewSettings = (workspaceId: string, previewUrl: string | 
     method: 'PATCH',
     body: JSON.stringify({ previewUrl }),
   });
+
+export type TestObligationSetting = 'auto' | 'on' | 'off';
+
+export const getTestProfile = (workspaceId: string) =>
+  request<{ profile: TestProfile | null; obligation: TestObligationSetting }>(`/api/workspaces/${workspaceId}/test-profile`);
+
+export const updateTestProfile = (
+  workspaceId: string,
+  patch: { profile?: Omit<TestProfile, 'source'> | null; obligation?: TestObligationSetting },
+) =>
+  request<{ ok: boolean; profile: TestProfile | null; obligation: TestObligationSetting }>(`/api/workspaces/${workspaceId}/test-profile`, {
+    method: 'PUT',
+    body: JSON.stringify(patch),
+  });
+
+/** Start a full verification (change's tests + comparison with the original code + whole suite). Poll the task for the result. */
+export const verifyTask = (taskId: string) =>
+  request<{ started: boolean }>(`/api/tasks/${taskId}/verify`, { method: 'POST' });
 
 export const restartCpm = () =>
   request<{ ok: boolean; message: string }>('/api/workspaces/restart', { method: 'POST' });
