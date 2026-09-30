@@ -1,0 +1,40 @@
+TAP version 13
+# node:internal/modules/run_main:123
+#     triggerUncaughtException(
+#     ^
+# Error: Transform failed with 1 error:
+# /work/node/syntax.test.ts:2:26: ERROR: Expected identifier but found "="
+#     at failureErrorWithLog (/work/node_modules/esbuild/lib/main.js:1748:15)
+#     at /work/node_modules/esbuild/lib/main.js:1017:50
+#     at responseCallbacks.<computed> (/work/node_modules/esbuild/lib/main.js:884:9)
+#     at handleIncomingPacket (/work/node_modules/esbuild/lib/main.js:939:12)
+#     at Socket.readFromStdout (/work/node_modules/esbuild/lib/main.js:862:7)
+#     at Socket.emit (node:events:519:28)
+#     at addChunk (node:internal/streams/readable:561:12)
+#     at readableAddChunkPushByteMode (node:internal/streams/readable:512:3)
+#     at Readable.push (node:internal/streams/readable:392:5)
+#     at Pipe.onStreamRead (node:internal/stream_base_commons:189:23) {
+#   name: 'TransformError'
+# }
+# Node.js v22.22.2
+# Subtest: syntax.test.ts
+not ok 1 - syntax.test.ts
+  ---
+  duration_ms: 341.726872
+  type: 'test'
+  location: '/work/node/syntax.test.ts:1:1'
+  failureType: 'testCodeFailure'
+  exitCode: 1
+  signal: ~
+  error: 'test failed'
+  code: 'ERR_TEST_FAILURE'
+  ...
+1..1
+# tests 1
+# suites 0
+# pass 0
+# fail 1
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 351.269711

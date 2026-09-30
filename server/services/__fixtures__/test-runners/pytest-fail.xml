@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="2" time="0.032" timestamp="2026-09-30T15:44:43.070077+00:00" hostname="h"><testcase classname="test_fail" name="test_rejects_at" time="0.001"><failure message="AssertionError: assert '@' not in 'a@b'&#10;  &#10;  '@' is contained here:&#10;    a@b&#10;  ?  +">&gt;   def test_rejects_at(): assert '@' not in 'a@b'
+                           ^^^^^^^^^^^^^^^^^^^^^^^
+E   AssertionError: assert '@' not in 'a@b'
+E     
+E     '@' is contained here:
+E       a@b
+E     ?  +
+
+test_fail.py:1: AssertionError</failure></testcase><testcase classname="test_fail" name="test_ok" time="0.000" /></testsuite></testsuites>

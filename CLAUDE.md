@@ -55,6 +55,9 @@ npm install
 # Development (runs both server and client with hot reload)
 npm run dev
 
+# Run the tests (node:test via tsx; server/**/*.test.ts)
+npm test
+
 # Build for production
 npm run build
 
