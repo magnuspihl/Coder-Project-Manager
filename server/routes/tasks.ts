@@ -50,7 +50,8 @@ import {
   getTaskCheckpoint,
 } from '../services/tasks.js';
 import { findUserWorkspaceById } from '../services/workspace-cache.js';
-import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview, wakeTaskNow, FINDING_REPORT_FORMAT } from '../services/claude.js';
+import { formatFindingForImplementer, PROOF_INSTRUCTIONS } from '../services/review-proof.js';
+import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview, wakeTaskNow, startFullVerification, FINDING_REPORT_FORMAT } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, removeTaskWorktree, rollbackTaskToCheckpoint } from '../services/git.js';
@@ -86,7 +87,9 @@ router.use('/tasks/:taskId', requireAuth, requireTaskAccess);
 // List tasks for a workspace
 router.get('/workspaces/:workspaceId/tasks', requireAuth, (req: Request, res: Response) => {
   const costs = getTaskCostsByWorkspace(req.params.workspaceId);
-  const tasks = listTasks(req.params.workspaceId, req.user!.id).map(t => ({
+  // `verification` (the harness's per-test results) is detail-view data; shipping
+  // it for every task on every poll of the list would only add weight.
+  const tasks = listTasks(req.params.workspaceId, req.user!.id).map(({ verification: _verification, ...t }) => ({
     ...t,
     activity: t.status === 'working' ? getTaskActivity(t.id) || null : null,
     total_cost_usd: costs[t.id] || 0,
@@ -527,16 +530,15 @@ router.post('/tasks/:taskId/findings/fix', requireAuth, (req: Request, res: Resp
   // so every finding sent from the inbox came back 'open' with no note — and on
   // an auto-review-off task no later reviewer pass exists to close them, leaving
   // them un-clearable however many times the user clicked Fix.
-  const issueList = selected
-    .map(f => `[${findingRef(f)}] ${f.body}${f.revision > 0 ? '  (RE-RAISED: your previous fix was judged inadequate)' : ''}`)
-    .join('\n\n');
+  const issueList = selected.map(f => formatFindingForImplementer(f)).join('\n\n');
+  const proofNote = selected.some(f => f.proof_status === 'confirmed' && f.proof_path) ? `\n\n${PROOF_INSTRUCTIONS}` : '';
   const dismissed = getDismissedFindings(task.id);
   // Tell the implementer what NOT to touch as well, so it doesn't "helpfully"
   // fix a waived finding it can still see in the earlier conversation.
   const waiverNote = dismissed.length > 0
     ? `\n\nThe user has explicitly DISMISSED the following reviewer findings. Do not act on them, and do not undo or "improve" the code they refer to:\n${dismissed.map((f, i) => `${i + 1}. ${f.body}${f.note ? ` (user's reason: ${f.note})` : ''}`).join('\n')}`
     : '';
-  const body = `${REVIEW_FIX_REPLY_PREFIX}. Each is tagged with a ref you must report against.\n\n${issueList}${waiverNote}\n\n${FINDING_REPORT_FORMAT}`;
+  const body = `${REVIEW_FIX_REPLY_PREFIX}. Each is tagged with a ref you must report against.\n\n${issueList}${proofNote}${waiverNote}\n\n${FINDING_REPORT_FORMAT}`;
 
   addMessage(task.id, 'user', body, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
   selected.forEach(f => setReviewFindingState(f.id, 'fixing'));
@@ -699,6 +701,32 @@ router.post('/tasks/:taskId/reopen', requireAuth, async (req: Request, res: Resp
   res.json({ task: getTask(task.id) });
 });
 
+// Run the full verification on demand: the change's tests, the comparison with the
+// original code, and the whole suite. Ordinary implementer turns only run the
+// change's own tests (a full run after every small tweak is too slow); a review
+// runs the full check itself. Backgrounded — the client polls the task.
+router.post('/tasks/:taskId/verify', requireAuth, (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  if (task.status !== 'awaiting_feedback' && task.status !== 'completed') {
+    res.status(400).json({ error: `Verification can run once the task has settled (current status: ${task.status}).` });
+    return;
+  }
+  const started = startFullVerification(task);
+  if (started === 'unavailable') {
+    res.status(400).json({ error: 'This task has no worktree, so there is nothing to verify.' });
+    return;
+  }
+  if (started === 'busy') {
+    res.status(409).json({ error: 'A verification is already running for this task.' });
+    return;
+  }
+  res.status(202).json({ started: true });
+});
+
 // Manually trigger the red-team reviewer on a task awaiting feedback.
 router.post('/tasks/:taskId/review', requireAuth, async (req: Request, res: Response) => {
   const task = getTask(req.params.taskId);
@@ -727,7 +755,7 @@ router.post('/tasks/:taskId/review', requireAuth, async (req: Request, res: Resp
   try {
     const launched = await triggerManualReview(task);
     if (!launched) {
-      res.status(400).json({ error: 'No changes to review — the task\'s working tree is clean.' });
+      res.status(400).json({ error: 'No changes to review — the task\'s branch has no changes relative to the default branch.' });
       return;
     }
     res.json({ task: getTask(task.id) });

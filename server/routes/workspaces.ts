@@ -8,6 +8,9 @@ import { listWorkspaces, getWorkspace, stopWorkspace, startWorkspace, CoderAuthE
 import { getTaskCountsByWorkspace, getTokenTotalsByWorkspace, getGithubRepoUrlsByWorkspace, getWindowedTokenUsage } from '../services/tasks.js';
 import { getSubscriptionUsage, getObservedSubscriptionKeys, subscriptionKeyFor, type RateLimitUsage } from '../services/claude.js';
 import { listAccounts } from '../services/claude-accounts.js';
+import { getStoredTestProfile, setStoredTestProfile, getTestObligationSetting, setTestObligationSetting } from '../services/test-profile.js';
+import { parseTestProfile } from '../services/test-runners.js';
+import { findUserWorkspaceById } from '../services/workspace-cache.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { getModelsForWorkspace } from '../services/models.js';
 import { getCliInfo, updateCli } from '../services/cli-version.js';
@@ -788,6 +791,56 @@ router.patch('/:workspaceId/preview-settings', requireAuth, (req: Request, res: 
      ON CONFLICT(workspace_id) DO UPDATE SET preview_url = excluded.preview_url, updated_at = excluded.updated_at`
   ).run(req.params.workspaceId, normalized, now);
   res.json({ ok: true, previewUrl: normalized });
+});
+
+// Test settings for evidence-based review and the implementer's test obligation:
+//  - profile:    how this workspace runs its tests (null = auto-detect)
+//  - obligation: 'auto' (on only where a runner is detected/configured), 'on'
+//                (also lets the implementer set a framework up), 'off'
+// GET shows the stored values only; detection itself happens at review time.
+router.get('/:workspaceId/test-profile', requireAuth, (req: Request, res: Response) => {
+  if (!findUserWorkspaceById(req.user!.id, req.params.workspaceId)) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  res.json({ profile: getStoredTestProfile(req.params.workspaceId), obligation: getTestObligationSetting(req.params.workspaceId) });
+});
+
+router.put('/:workspaceId/test-profile', requireAuth, (req: Request, res: Response) => {
+  // The command is run in this workspace's shell on later reviews, so only users
+  // who can see the workspace may change it.
+  if (!findUserWorkspaceById(req.user!.id, req.params.workspaceId)) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  const body = req.body as { profile?: unknown; obligation?: unknown };
+  if (body.profile === undefined && body.obligation === undefined) {
+    res.status(400).json({ error: 'profile and/or obligation must be provided' });
+    return;
+  }
+  // Validate everything before writing anything, so a bad half never leaves a good half applied.
+  let profileUpdate: { value: ReturnType<typeof parseTestProfile> } | null = null;
+  if (body.profile !== undefined) {
+    if (body.profile === null) {
+      profileUpdate = { value: null };
+    } else {
+      // Same rules as the implementer's TEST_PROFILE marker: the command ends up
+      // in a shell, so anything beyond a plain command is refused.
+      const profile = parseTestProfile(body.profile, 'user');
+      if (!profile) {
+        res.status(400).json({ error: 'Invalid test profile: runner must be one of node-test, vitest, jest, pytest, go, dotnet; command must be a plain command (no shell operators); cwd must be a relative path.' });
+        return;
+      }
+      profileUpdate = { value: profile };
+    }
+  }
+  if (body.obligation !== undefined && body.obligation !== 'auto' && body.obligation !== 'on' && body.obligation !== 'off') {
+    res.status(400).json({ error: "obligation must be 'auto', 'on' or 'off'" });
+    return;
+  }
+  if (profileUpdate) setStoredTestProfile(req.params.workspaceId, profileUpdate.value);
+  if (body.obligation !== undefined) setTestObligationSetting(req.params.workspaceId, body.obligation as 'auto' | 'on' | 'off');
+  res.json({ ok: true, profile: getStoredTestProfile(req.params.workspaceId), obligation: getTestObligationSetting(req.params.workspaceId) });
 });
 
 export default router;

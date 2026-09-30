@@ -1,7 +1,7 @@
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { createReadStream, createWriteStream, promises as fsPromises } from 'fs';
 import { randomUUID } from 'crypto';
-import { updateTaskStatus, addMessage, addTokenUsage, recordContextTokens, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, getLatestTaskTurn, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, createReviewFindings, getReviewFindings, getFindingsInFlight, closeOutstandingOnPass, getDismissedFindings, getPriorFindings, getUserReplies, findingRef, findFindingByRef, verifyClaimedFixes, reraiseReviewFinding, reopenUnreportedFindings, setReviewFindingState, setTaskWake, clearTaskWake, incrementTaskWakeCount, getTasksWithPendingWake, consumePendingRollbackNote, type Task, type TaskParticipant } from './tasks.js';
+import { updateTaskStatus, addMessage, addTokenUsage, recordContextTokens, getMessages, getNextQueuedTask, getWorkingTask, getWorkingTaskCount, getMaxConcurrent, getTask, deleteCurrentSessionAssistantMessages, updateMessageCost, buildTaskParticipantContext, buildTaskMentionInstruction, updateTaskParticipantProjectDir, getTaskParticipants, getTaskParticipant, getPendingCompletionTask, setPendingComplete, markSessionInitialized, createTaskTurn, getTaskTurns, getLatestTaskTurn, completeTaskTurn, setActiveTaskTurnRole, incrementReviewLoopCount, resetReviewLoopCount, createTaskRequestFromTask, createReviewFindings, setTaskVerification, getReviewFinding, type ReviewFinding, type NewFinding, setTurnReview, setFindingProof, hasOpenBlockingFindings, getReviewFindings, getFindingsInFlight, closeOutstandingOnPass, getDismissedFindings, getPriorFindings, getUserReplies, findingRef, findFindingByRef, verifyClaimedFixes, reraiseReviewFinding, reopenUnreportedFindings, setReviewFindingState, setTaskWake, clearTaskWake, incrementTaskWakeCount, getTasksWithPendingWake, consumePendingRollbackNote, type Task, type TaskParticipant } from './tasks.js';
 import { findUserWorkspaceByName, findUserWorkspaceById, getWorkspacesForUser } from './workspace-cache.js';
 import { getDb } from '../db/index.js';
 import { handleTaskLaunchGit, handleTaskResumeGit, handleTaskCompletionGit, fetchGitHubToken, isRemoteAllowed, recordTurnCheckpoint } from './git.js';
@@ -15,6 +15,16 @@ import { buildMeshyMcpServerEntry, MESHY_MCP_ALLOWED_TOOL, buildMeshyUsagePrompt
 import { getValidCoderTokenForUser, forceRefreshCoderTokenForUser } from './sessions.js';
 import { resolveAccountToken, markAccountUsed } from './claude-accounts.js';
 import { writeRemoteStdin } from './ssh-stdin.js';
+import { parseReviewDecision, extractProofFiles, type ReviewDecision, type ReviewIssue } from './review-verdict.js';
+import {
+  assignRepairFiles, formatFindingForImplementer, opinionIssues, repairable, rerunProof, routeReview, tally, toStored, verifyProofs,
+  PROOF_INSTRUCTIONS, type ReviewMode, type StoredReview, type VerifiedIssue,
+} from './review-proof.js';
+import { getReviewDiff, hasBranchChanges, makeProofIO, makeVerificationIO, type Exec } from './review-io.js';
+import { describeRunCommand, describeRunner, parseTestProfile, type TestProfile } from './test-runners.js';
+import { resolveTestProfile, resolveTestObligation, getStoredTestProfile, setStoredTestProfile } from './test-profile.js';
+import { buildTestingPrompt, extractNoTests, extractTestProfile } from './implementer-markers.js';
+import { buildVerification, summariseVerification, withBudget, type VerificationIO, type VerificationLevel, type VerificationSummary } from './verification.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
@@ -38,6 +48,11 @@ const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || '';
 // emitted REVIEW_DECISION, surfacing the confusing "did not emit a structured
 // verdict" message. Give it generous headroom (still bounded to cap cost).
 const REVIEWER_MAX_TURNS = process.env.CLAUDE_REVIEWER_MAX_TURNS || '100';
+// Proof-mode reviews are scoped: read the diff, write up to five tests, stop. A
+// far smaller cap than opinion mode keeps a reviewer from exploring the repo
+// open-endedly; the wrap-up and repair resumes each get their own tiny budget.
+const REVIEWER_PROOF_MAX_TURNS = process.env.CLAUDE_REVIEWER_PROOF_MAX_TURNS || '40';
+const REPAIR_MAX_TURNS = '8';
 
 /**
  * Model for the auto-reviewer. Empty = inherit the task's model (the previous,
@@ -1044,6 +1059,43 @@ function stripNoReviewMarker(taskId: string, text: string): string {
   return text.replace(re, '').replace(/\n{3,}/g, '\n\n').trim();
 }
 
+// Test obligation (buildTestingPrompt, per-workspace via resolveTestObligation).
+// Tests are part of the deliverable, not an auto-review extra. The harness runs
+// them itself after the turn (verification.ts), so the implementer also reports
+// how they are run when it sets a runner up.
+// Markers parsed from the in-flight implementer turn, consumed when it completes.
+const testProfileReports = new Map<string, unknown>();
+const noTestsReasons = new Map<string, string>();
+
+/** Strip every marker line the implementer may emit, recording what they said for turn end. */
+function stripImplementerMarkers(taskId: string, text: string): string {
+  let out = stripNoReviewMarker(taskId, text);
+  const tp = extractTestProfile(out);
+  if (tp.profile) testProfileReports.set(taskId, tp.profile);
+  out = tp.stripped;
+  const nt = extractNoTests(out);
+  if (nt.reason) noTestsReasons.set(taskId, nt.reason);
+  return nt.stripped;
+}
+
+/**
+ * Persist a runner the implementer reported. Validated exactly like a user-set
+ * profile (the command reaches a shell), and never overrides one the user chose.
+ */
+function applyTestProfileReport(task: Task): void {
+  const raw = testProfileReports.get(task.id);
+  testProfileReports.delete(task.id);
+  if (!raw) return;
+  const profile = parseTestProfile(raw, 'implementer');
+  if (!profile) {
+    console.warn(`[verification] Task ${task.id}: ignoring an invalid TEST_PROFILE from the implementer`);
+    return;
+  }
+  if (getStoredTestProfile(task.workspace_id)?.source === 'user') return;
+  setStoredTestProfile(task.workspace_id, profile);
+  appendStreamLog(task.id, 'verification', `[Harness] test profile from the implementer: ${describeRunner(profile)}`);
+}
+
 export interface FindingReportEntry {
   ref: string;
   status: 'fixed' | 'not_fixed' | 'disagree';
@@ -1207,28 +1259,29 @@ function applyFindingReport(task: Task): void {
   }
 }
 
+/**
+ * Does the task have any work to review — committed on its branch, uncommitted,
+ * or untracked? Measured against the merge-base with the default branch, NOT
+ * `git status`: an implementer that commits everything leaves a clean porcelain,
+ * and the old check then skipped the review of a fully-implemented task.
+ *
+ * Fails toward reviewing. If the workspace can't be asked, "no changes" would
+ * silently skip the review (the very failure this exists to prevent), whereas
+ * "changes" just lets the reviewer launch and report its own error.
+ */
 async function worktreeHasChanges(worktreePath: string, workspaceName: string, userId?: string | null): Promise<boolean> {
   try {
-    const out = await sshExec(workspaceName, `git -C ${shellEscape(worktreePath)} status --porcelain 2>/dev/null`, 10000, userId);
-    return out.trim().length > 0;
-  } catch {
-    return false;
+    return await hasBranchChanges((cmd, timeoutMs = 20000, maxBuffer) => sshExec(workspaceName, cmd, timeoutMs, userId, maxBuffer), worktreePath);
+  } catch (err) {
+    console.warn(`[auto-review] Could not check ${worktreePath} for changes (${(err as Error).message?.slice(0, 120)}) — assuming there are some`);
+    return true;
   }
 }
 
+/** The diff the reviewer sees: everything the task changed vs the default branch, committed or not. */
 async function getGitDiff(worktreePath: string, workspaceName: string, userId?: string | null): Promise<string> {
   try {
-    const diff = await sshExec(workspaceName, `git -C ${shellEscape(worktreePath)} diff HEAD 2>/dev/null`, 15000, userId);
-    const untracked = await sshExec(workspaceName, `git -C ${shellEscape(worktreePath)} ls-files --others --exclude-standard 2>/dev/null`, 10000, userId);
-    const parts: string[] = [];
-    if (diff.trim()) parts.push(diff.trim());
-    if (untracked.trim()) parts.push(`Untracked files:\n${untracked.trim()}`);
-    const combined = parts.join('\n\n');
-    // Truncate if very large (~8000 tokens ≈ 32000 chars)
-    if (combined.length > 32000) {
-      return combined.slice(0, 32000) + '\n\n[diff truncated — use Read tool to inspect remaining files]';
-    }
-    return combined || '(no diff output)';
+    return await getReviewDiff((cmd, timeoutMs = 20000, maxBuffer) => sshExec(workspaceName, cmd, timeoutMs, userId, maxBuffer), worktreePath);
   } catch {
     return '(could not retrieve diff)';
   }
@@ -1236,9 +1289,8 @@ async function getGitDiff(worktreePath: string, workspaceName: string, userId?: 
 
 /**
  * Full diff of a task's branch + working tree against the repo's default
- * branch (main/master). Unlike getGitDiff (which only shows uncommitted work
- * for the reviewer prompt), this resolves the merge-base with the default
- * branch so it captures BOTH committed-on-branch and uncommitted changes —
+ * branch (main/master). Like getGitDiff it resolves the merge-base with the
+ * default branch, so it captures BOTH committed-on-branch and uncommitted changes —
  * i.e. everything the branch would contribute if merged. Used by the MCP
  * get_task_diff tool. Requires the workspace to be running (uses SSH).
  */
@@ -1330,8 +1382,35 @@ Entries in "issues" may be a plain string, or an object {"text":"...","reraises"
 
 ONE PROBLEM PER ENTRY IN "issues". Each entry is triaged individually by the user — they fix, dismiss, or mark it done one by one — so every entry you add is a separate decision they have to make. Do NOT split one problem across several entries: two call sites needing the same guard is ONE issue naming both, and the remedy for an issue belongs inside that issue's text, never as its own entry. Merge anything that would be fixed by a single edit.`;
 
-function buildReviewerSystemPrompt(): string {
-  return `MANDATORY REVIEW RULES — RED TEAM MODE:
+// Proof-mode counterpart of REVIEW_DECISION_FORMAT. Restated in the -p prompt for
+// the same reason: the appended system prompt is not reliably re-attached to a
+// resumed session (verdict recovery, repair round), so the contract that matters
+// has to live in the conversation.
+function buildProofVerdictFormat(profile: TestProfile): string {
+  return `Output exactly one of these two lines as the very last line of your response, with nothing after it:
+
+REVIEW_DECISION: {"outcome":"pass","summary":"<one sentence>"}
+REVIEW_DECISION: {"outcome":"fail","summary":"<one sentence>","findings":[{"defect":"<defect>","requirement":"<quote>","proof":"<path>"}]}
+
+Output only the raw JSON after the marker — no markdown, no code fences, no commentary after it. "outcome" is your claim; the pipeline runs your tests and decides the real outcome from what they demonstrate.
+
+A finding blocks ONLY if a test you supply FAILS on the current code. Each entry in "findings" needs:
+- "defect": what is wrong (one problem per entry — each is triaged individually; merge anything one edit would fix)
+- "requirement": a short quote from the original task or the user's later direction, or the existing behaviour/test it contradicts. No requirement, no finding.
+- "proof": the path of the test file, which must contain "cpm-proof" in its name and not already exist.
+When re-raising a finding you were told about, add "reraises":"<ref>" — and it still needs a "requirement" and a failing "proof", otherwise the implementer's fix is accepted.
+
+Put every test file BEFORE the REVIEW_DECISION line, as:
+
+PROOF_FILE: <path>
+\`\`\`<language>
+<the entire test file>
+\`\`\`
+
+Tests run with ${describeRunner(profile)}. Write them in the style of the project's existing tests, importing the real code. A finding without a test is advisory only and sends nobody back to work.`;
+}
+
+const REVIEWER_PREAMBLE = `MANDATORY REVIEW RULES — RED TEAM MODE:
 
 You are a code reviewer who did not write this code. Your job is to find problems the implementer missed, not to confirm that things work.
 
@@ -1358,7 +1437,13 @@ Do NOT:
 - Run commands that modify state (no git commits, no writes, no installs)
 - Offer to fix issues, ask the user what they want to do, or request any input
 
-You MAY run read-only commands: git diff, git log, git status, cat, grep, find, npm test / go test / pytest (read test results — do not write new test files).
+`;
+
+/** Read-only-command allowance. In proof mode the "don't write test files" clause changes meaning. */
+const OPINION_MAY_RUN = `You MAY run read-only commands: git diff, git log, git status, cat, grep, find, npm test / go test / pytest (read test results — do not write new test files).`;
+
+function buildOpinionReviewerPrompt(): string {
+  return `${REVIEWER_PREAMBLE}${OPINION_MAY_RUN}
 
 ══════════════════════════════════════════════════════════════════
 OUTPUT CONTRACT — THIS IS THE ENTIRE POINT OF YOUR RUN
@@ -1388,124 +1473,61 @@ DO NOT, under any circumstances:
 Before you finish, check: is the literal text "REVIEW_DECISION:" present as your final line? If not, add it now. This is non-negotiable.`;
 }
 
-/** One issue from a verdict. `reraises` links it to a finding the implementer claimed fixed. */
-interface ReviewIssue {
-  text: string;
-  reraises?: string;
+// Proof mode: a blocking finding must be demonstrated by a failing test. The
+// reviewer is still read-only — it cannot run what it writes — so it emits the
+// tests in its reply and the harness (review-proof.ts) saves, runs and classifies
+// them. Kept as one block so the same wording is restated in the -p prompt, where
+// it survives --resume (see REVIEW_DECISION_FORMAT).
+function buildProofRules(profile: TestProfile): string {
+  return `EVIDENCE RULES — A FINDING ONLY BLOCKS IF YOU CAN PROVE IT WITH A TEST:
+You cannot create files or run code that changes state. You CAN write a test in your reply. The pipeline saves it, runs it, and classifies the result:
+- your test FAILS on the current code  → the finding is CONFIRMED and sent to the implementer
+- your test PASSES                     → the finding is REFUTED and discarded (you were wrong)
+- your test cannot run                 → the finding is UNPROVEN: shown to the user as advisory, nobody is sent to fix it
+A finding with no test is advisory only. Raise fewer, provable defects rather than many opinions. Things a test cannot show (design taste, UX, performance feel) are advisory at best — list them without a "proof" only if they are genuinely important.
+
+For every finding give:
+1. "defect" — one or two sentences on what is wrong.
+2. "requirement" — the requirement it violates: a short QUOTE from the original task or the user's later direction, or the existing behaviour, test or doc it contradicts (say which). "It would be nicer if…" is not a requirement. If you cannot cite one, do not raise the finding.
+3. "proof" — the path of a test file that FAILS on the code as it is now and would PASS once the defect is fixed.
+
+TEST FILE RULES:
+- Runner: ${describeRunner(profile)}. Read one existing test first and copy its imports, helpers and style; check the exact names the code under test exports — a test that cannot compile proves nothing.
+- The file name MUST contain "cpm-proof" (e.g. src/parse.cpm-proof.test.ts, test_cpm_proof_parse.py, parse_cpm_proof_test.go, CpmProofParseTests.cs). The path must not already exist; never edit an existing file.
+- One file per finding. Import and exercise the REAL code; never re-implement the logic inside the test. No network, clock, randomness, sleeps, or files outside the repository.
+- Assert the requirement, not the implementation's current output. Name each test after the behaviour it checks (e.g. "rejects usernames containing @").
+- Keep it small — the fewest lines that fail for the right reason.
+- Emit every test file BEFORE your REVIEW_DECISION line, exactly like this:
+
+PROOF_FILE: <path>
+\`\`\`<language>
+<the entire test file>
+\`\`\`
+
+BUDGET: at most 5 findings with proofs, most important first. Read the diff, the files it touches and one existing test for conventions — do not survey the whole repository, and stop investigating once you have your proofs.`;
 }
 
-interface ReviewDecision {
-  outcome: 'pass' | 'fail';
-  summary: string;
-  issues?: ReviewIssue[];
+function buildProofReviewerPrompt(profile: TestProfile): string {
+  return `${REVIEWER_PREAMBLE}You MAY run read-only commands: git diff, git log, git status, cat, grep, find, and the project's existing test suite (to understand current behaviour). You cannot write files — put tests in your reply as described below.
+
+${buildProofRules(profile)}
+
+══════════════════════════════════════════════════════════════════
+OUTPUT CONTRACT — THIS IS THE ENTIRE POINT OF YOUR RUN
+══════════════════════════════════════════════════════════════════
+An automated parser reads the PROOF_FILE blocks and one line that begins with REVIEW_DECISION:, and discards everything else. Your response MUST end with exactly one of these, as the very last line, with NOTHING after it:
+
+REVIEW_DECISION: {"outcome":"pass","summary":"<one sentence>"}
+   or
+REVIEW_DECISION: {"outcome":"fail","summary":"<one sentence>","findings":[{"defect":"<defect>","requirement":"<quote>","proof":"<path>"}]}
+
+"outcome" is only your claim: the pipeline decides the real outcome from what your tests demonstrate. "pass" = you found nothing you could prove.
+
+DO NOT end with a question, a prose "Verdict:", or anything after the REVIEW_DECISION line. There is no human to answer. Before you finish, check that the literal text "REVIEW_DECISION:" is your final line. This is non-negotiable.`;
 }
 
-// The literal placeholder tokens from the verdict template / worked example in
-// the reviewer system prompt and REVIEW_DECISION_FORMAT. A weak (or rushed)
-// model can echo the example line verbatim — e.g.
-// `REVIEW_DECISION: {"outcome":"pass","summary":"<one sentence>"}` — which must
-// NOT be accepted as a real verdict: doing so would silently route the task on a
-// fabricated pass/fail the reviewer never actually reached. We reject a decision
-// whose summary is a placeholder, and strip placeholder entries from `issues`.
-const PLACEHOLDER_SUMMARIES = new Set(['<one sentence>', '<summary>']);
-const PLACEHOLDER_ISSUES = new Set(['<specific issue>', '<issue>', '...']);
-
-function isPlaceholderSummary(summary: string): boolean {
-  return PLACEHOLDER_SUMMARIES.has(summary.trim());
-}
-
-/**
- * Extract and validate the balanced JSON object that begins at the first `{`
- * at or after `from`. Returns the decision or null if no valid object is found.
- * The brace walk respects JSON string literals so a `}` inside a summary/issue
- * value doesn't terminate the object early.
- */
-function extractDecisionAt(text: string, from: number): ReviewDecision | null {
-  const braceStart = text.indexOf('{', from);
-  if (braceStart === -1) return null;
-
-  let depth = 0;
-  let end = -1;
-  let inStr = false;
-  let escaped = false;
-  for (let i = braceStart; i < text.length; i++) {
-    const ch = text[i];
-    if (inStr) {
-      if (escaped) escaped = false;
-      else if (ch === '\\') escaped = true;
-      else if (ch === '"') inStr = false;
-    } else if (ch === '"') {
-      inStr = true;
-    } else if (ch === '{') {
-      depth++;
-    } else if (ch === '}') {
-      depth--;
-      if (depth === 0) { end = i; break; }
-    }
-  }
-  if (end === -1) return null;
-
-  try {
-    const parsed = JSON.parse(text.slice(braceStart, end + 1));
-    if (parsed.outcome !== 'pass' && parsed.outcome !== 'fail') return null;
-    const summary = typeof parsed.summary === 'string' ? parsed.summary : '';
-    // Reject an echoed template (e.g. summary still "<one sentence>") — see
-    // PLACEHOLDER_SUMMARIES. Returning null lets parseReviewDecision fall back to
-    // an earlier (real) marker, or trigger verdict recovery if there is none.
-    if (isPlaceholderSummary(summary)) return null;
-    // Drop placeholder issue entries the model copied from the example without
-    // filling in (e.g. "<specific issue>", "..."), keeping only real issues. An
-    // empty list collapses to undefined so downstream routing falls back to the
-    // summary rather than surfacing an empty "issues found" list.
-    // Entries may be plain strings (the long-standing shape) or objects
-    // carrying a `reraises` ref. Both are normalised to ReviewIssue.
-    const realIssues: ReviewIssue[] = Array.isArray(parsed.issues)
-      ? parsed.issues.flatMap((x: unknown): ReviewIssue[] => {
-          if (typeof x === 'string') {
-            return PLACEHOLDER_ISSUES.has(x.trim()) ? [] : [{ text: x }];
-          }
-          if (x && typeof x === 'object' && typeof (x as any).text === 'string') {
-            const text = (x as any).text;
-            if (PLACEHOLDER_ISSUES.has(text.trim())) return [];
-            const ref = (x as any).reraises;
-            return [{ text, reraises: typeof ref === 'string' && ref.trim() ? ref.trim().toLowerCase() : undefined }];
-          }
-          return [];
-        })
-      : [];
-    return { outcome: parsed.outcome, summary, issues: realIssues.length ? realIssues : undefined };
-  } catch {
-    return null;
-  }
-}
-
-function parseReviewDecision(text: string): ReviewDecision | null {
-  // Tolerant parsing: the model often wraps the marker in markdown (**bold**,
-  // `code`, fenced blocks), indents it, or pretty-prints the JSON across
-  // multiple lines. The old anchored single-line regex (`^…$/m`) missed all of
-  // those and treated a perfectly good verdict as "no decision".
-  //
-  // We collect every `REVIEW_DECISION` marker and try them from LAST to first,
-  // returning the first that yields a valid verdict object. Trying the last
-  // marker first preserves the "the model may discuss the token before emitting
-  // the real verdict" behaviour. Falling back to earlier markers fixes a real
-  // misparse in THIS codebase: when the reviewer reviews its own pipeline, a
-  // genuine verdict can contain the literal token inside an issue string, e.g.
-  // `…"issues":["the reviewer never emits REVIEW_DECISION: when cut off"]`. The
-  // last marker then lands *inside* the JSON; anchoring to it alone would find
-  // no `{` (or a stray later brace) and drop an otherwise-valid verdict.
-  const markerRe = /REVIEW_DECISION\b\s*:?[ \t]*/gi;
-  const markerEnds: number[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = markerRe.exec(text)) !== null) {
-    markerEnds.push(m.index + m[0].length);
-  }
-
-  for (let i = markerEnds.length - 1; i >= 0; i--) {
-    const decision = extractDecisionAt(text, markerEnds[i]);
-    if (decision) return decision;
-  }
-  return null;
+function buildReviewerSystemPrompt(mode: ReviewMode, profile: TestProfile | null): string {
+  return mode === 'proof' && profile ? buildProofReviewerPrompt(profile) : buildOpinionReviewerPrompt();
 }
 
 // Stream log per task — persisted to database
@@ -2578,6 +2600,13 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
   if (!isSlashCommand && task.auto_review) {
     systemPromptFragments.push(NO_REVIEW_PROMPT);
   }
+  if (!isSlashCommand) {
+    // Per-workspace: a Godot or Unity project must not be talked into installing
+    // a test framework it cannot use. Auto = on only where a runner exists.
+    const { obligation } = await resolveTestObligation(task.workspace_id, task.worktree_path || task.project_dir,
+      cmd => sshExec(task.workspace_name, cmd, 15000, task.user_id));
+    if (obligation !== 'off') systemPromptFragments.push(buildTestingPrompt(obligation));
+  }
 
   if (memoryMcpConfig) {
     systemPromptFragments.push(buildMemoryUsagePrompt(task.user_id, task.workspace_name));
@@ -2704,6 +2733,8 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
     // Clear any opt-out flag from a prior turn before this one starts streaming.
     noReviewDeclared.delete(task.id);
     findingReports.delete(task.id);
+    testProfileReports.delete(task.id);
+    noTestsReasons.delete(task.id);
     // Record this implementer run as a turn so its messages carry a turn_id.
     // Reviewer turns were always recorded, but implementer turns were not — so
     // implementer messages had a NULL turn_id and the UI couldn't attribute
@@ -2937,6 +2968,7 @@ function interruptReviewer(taskId: string, workspaceName: string, userId?: strin
         .catch(err => console.error(`[kill] Remote reviewer pkill failed for task ${taskId}:`, (err as Error).message?.slice(0, 120)));
     }
     completeTaskTurn(openTurn!.id);
+    reviewContexts.delete(openTurn!.id);
   }
 
   addMessage(taskId, 'system',
@@ -3251,7 +3283,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
       // Save each assistant turn's text as a message immediately,
       // so it appears in the chat UI while the task is still working.
       if (event.type === 'assistant' && (event.message as { content?: unknown })?.content) {
-        const rawTurnText = stripFindingReport(task.id, stripNoReviewMarker(task.id, extractAssistantTurnText((event.message as { content: Array<{ type: string; text?: string; name?: string; input?: unknown }> }).content)));
+        const rawTurnText = stripFindingReport(task.id, stripImplementerMarkers(task.id, extractAssistantTurnText((event.message as { content: Array<{ type: string; text?: string; name?: string; input?: unknown }> }).content)));
         const turnText = compactRun ? rewriteCompactionFailure(rawTurnText) : rawTurnText;
         if (turnText) {
           const msg = addMessage(task.id, 'assistant', turnText, undefined, undefined, undefined, undefined, undefined, turnId);
@@ -3271,7 +3303,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
         // dead-end env-var advice this rewrite exists to suppress.
         const rawFatal = extractFatalError(event);
         const fatal = rawFatal !== null && compactRun ? rewriteCompactionFailure(rawFatal) : rawFatal;
-        const rawResultText = stripFindingReport(task.id, stripNoReviewMarker(task.id, extractResultText(event)));
+        const rawResultText = stripFindingReport(task.id, stripImplementerMarkers(task.id, extractResultText(event)));
         // Rewritten on the same terms as turnText above, so the dedupe check
         // below compares like with like. Skipping it here would let the raw
         // "set CLAUDE_CODE_MAX_OUTPUT_TOKENS" text through as a second message
@@ -3503,9 +3535,16 @@ async function onImplementerTurnComplete(task: Task): Promise<void> {
   // long-standing case of clicking Fix in the inbox on an auto-review-off task,
   // which hands findings to the implementer regardless of the flag.
   applyFindingReport(current);
+  applyTestProfileReport(current);
 
   // No auto-review: check the flag, and also skip if no worktree (pre-worktrees task)
   if (!current.auto_review || !current.worktree_path) {
+    // Tests are part of the deliverable whether or not a reviewer follows, so the
+    // harness still reports what they show. Only where a worktree gives it
+    // something to inspect, and only after a turn that actually changed files.
+    if (current.worktree_path && await worktreeHasChanges(current.worktree_path, current.workspace_name, current.user_id)) {
+      await verifyTurnTests(current, 'tests');
+    }
     // settleWithUnresolvedFindings clears review_loop_count, which matters here:
     // a manual review on an auto-review-off task increments it and its exempted
     // fix turn ends on exactly this path, so without the reset the next failing
@@ -3544,8 +3583,202 @@ async function onImplementerTurnComplete(task: Task): Promise<void> {
     return;
   }
 
+  // The reviewer's confirmed tests are the fix target. Re-run them ourselves:
+  // that is a deterministic check of "did you fix it", and it makes a claim of
+  // "fixed" something we verified rather than something we were told. If a fix
+  // demonstrably didn't work there is nothing for a reviewer to add yet — go
+  // straight back to the implementer with the evidence.
+  const recheck = await reverifyConfirmedProofs(current).catch(err => {
+    console.error(`[auto-review] Proof re-check failed for task ${task.id}:`, (err as Error).message?.slice(0, 200));
+    return null;
+  });
+  if (recheck && recheck.stillFailing.length > 0) {
+    addMessage(task.id, 'system',
+      `The implementer reported ${recheck.stillFailing.length === 1 ? 'a finding' : 'findings'} fixed, but the reviewer's failing ` +
+      `${recheck.stillFailing.length === 1 ? 'test still fails' : 'tests still fail'} — sending back without another review pass:\n` +
+      recheck.stillFailing.map(f => `- ${f.proof_path}`).join('\n'));
+    handBackForFixes(current, recheck.stillFailing.map(f => f.body), recheck.profile);
+    return;
+  }
+
   // Changes detected — launch reviewer
   await launchReviewerOnTask(current);
+}
+
+// Hard wall-clock budgets for verification. Each individual run is already
+// time-limited (120 s per file / 180 s per suite inside the workspace, and the
+// ssh call itself is killed after 150 s / 210 s), but a turn runs many of them —
+// so the WHOLE step is capped too, and the task moves on when the cap is hit
+// rather than waiting on a hung test process. Seconds.
+const VERIFY_TESTS_BUDGET_SEC = parseInt(process.env.CPM_VERIFY_TURN_BUDGET_SEC || '150', 10);
+const VERIFY_FULL_BUDGET_SEC = parseInt(process.env.CPM_VERIFY_FULL_BUDGET_SEC || '480', 10);
+/** How long after the budget the outer race abandons work still inside a single run. */
+const VERIFY_GRACE_MS = 15_000;
+/** Budget for verifying the reviewer's proof tests (and re-running confirmed ones). */
+const PROOF_BUDGET_MS = parseInt(process.env.CPM_PROOF_BUDGET_SEC || '480', 10) * 1000;
+
+const verifyingTasks = new Set<string>();
+
+/** True while a verification for this task is in flight (the on-demand route refuses to stack a second). */
+export function isVerifying(taskId: string): boolean {
+  return verifyingTasks.has(taskId);
+}
+
+/**
+ * Compute and store the harness's account of this task's tests.
+ *
+ *  - `tests`: just the change's own test files. What an ordinary implementer
+ *    turn gets — many turns are small tweaks and must stay quick.
+ *  - `full`: additionally the comparison with the original code and the whole
+ *    suite. Run when a review runs, and on demand. Skipped when the tree is
+ *    exactly what the last full run described.
+ *
+ * Never throws, and never lets a hung test process hold the task: the work races
+ * a hard budget, and when it loses a "did not finish" result is stored so the
+ * card says so instead of showing stale numbers.
+ */
+async function verifyTurnTests(task: Task, level: VerificationLevel): Promise<void> {
+  if (verifyingTasks.has(task.id)) return;
+  verifyingTasks.add(task.id);
+  const budgetMs = (level === 'full' ? VERIFY_FULL_BUDGET_SEC : VERIFY_TESTS_BUDGET_SEC) * 1000;
+  const deadline = Date.now() + budgetMs;
+  let abandoned = false;
+  try {
+    const { obligation, profile } = await resolveTestObligation(task.workspace_id, task.worktree_path,
+      cmd => sshExec(task.workspace_name, cmd, 15000, task.user_id));
+    // Workspaces where tests are not expected (Godot, Unity…) get no report at all —
+    // not even a "no test runner" card on every turn.
+    if (obligation === 'off') return;
+
+    const io = profile ? makeVerificationIO(workspaceExec(task), task.worktree_path!, profile) : null;
+    if (level === 'full' && io) {
+      const previous = parseVerification(getTask(task.id)?.verification);
+      const fp = await io.fingerprint().catch(() => null);
+      if (previous?.level === 'full' && fp && previous.fingerprint === fp && !previous.notes.some(n => /time budget|did not finish/.test(n))) {
+        appendStreamLog(task.id, 'verification', '[Harness] tree unchanged since the last full verification — keeping its results');
+        // Re-stamp rather than leave the row untouched: a user who asked for this
+        // on demand is waiting for the stored result to change, and it IS current.
+        setTaskVerification(task.id, JSON.stringify({ ...previous, computedAt: new Date().toISOString() }));
+        return;
+      }
+    }
+
+    appendStreamLog(task.id, 'verification', profile
+      ? `[Harness] ${level === 'full' ? 'full verification' : 'running the change\'s tests'} (${describeRunner(profile)})`
+      : '[Harness] no test runner found — nothing to run');
+    const noIO: VerificationIO = {
+      fingerprint: async () => '', changedPaths: async () => [], run: async () => '', runSuite: async () => '',
+      prepareBaseline: async () => null, runIn: async () => '', cleanupBaseline: async () => {},
+    };
+    const work = buildVerification({
+      profile,
+      io: io ?? noIO,
+      level,
+      noTestsReason: noTestsReasons.get(task.id),
+      shouldStop: () => abandoned || Date.now() > deadline,
+    }).then(summary => {
+      if (abandoned) return;
+      noTestsReasons.delete(task.id);
+      setTaskVerification(task.id, JSON.stringify(summary));
+      const c = summariseVerification(summary);
+      appendStreamLog(task.id, 'verification',
+        `[Harness] ${c.passing} passing / ${c.failing} failing test(s) in the change` +
+        (level === 'full' ? `, ${c.failsWithoutChange} fail without it` : '') +
+        (summary.suite ? `; suite ${summary.suite.passed} passed, ${summary.suite.failed} failed${summary.suite.error ? ` (${summary.suite.error.slice(0, 60)})` : ''}` : ''));
+    });
+    if ((await withBudget(work, budgetMs + VERIFY_GRACE_MS)).timedOut) {
+      abandoned = true;
+      console.warn(`[verification] Task ${task.id}: ${level} verification exceeded ${budgetMs / 1000}s — abandoning it so the task can move on`);
+      setTaskVerification(task.id, JSON.stringify({
+        computedAt: new Date().toISOString(), level, runner: profile?.runner ?? null, tests: [], problems: [], filesOmitted: 0,
+        baselineChecked: false,
+        notes: [`Verification did not finish within ${Math.round(budgetMs / 6000) / 10} minutes and was abandoned — no results are available for this state.`],
+      } satisfies VerificationSummary));
+      appendStreamLog(task.id, 'verification', '[Harness] verification timed out and was abandoned');
+    }
+  } catch (err) {
+    console.error(`[verification] Task ${task.id}:`, (err as Error).message?.slice(0, 200));
+  } finally {
+    verifyingTasks.delete(task.id);
+  }
+}
+
+function parseVerification(json: string | null | undefined): VerificationSummary | null {
+  if (!json) return null;
+  try { return JSON.parse(json) as VerificationSummary; } catch { return null; }
+}
+
+/**
+ * On-demand full verification ("Run full verification"). Runs in the background
+ * of the request; the caller polls the task. Refused while the task is working
+ * or a verification is already running.
+ */
+export function startFullVerification(task: Task): 'started' | 'busy' | 'unavailable' {
+  if (!task.worktree_path) return 'unavailable';
+  if (task.status === 'working' || task.status === 'queued' || verifyingTasks.has(task.id)) return 'busy';
+  verifyTurnTests(task, 'full').catch(() => {});
+  return 'started';
+}
+
+/** The harness's test results as a block for the reviewer prompt — facts it should audit, not re-derive. */
+function buildVerificationBlock(task: Task): string {
+  const v = parseVerification(getTask(task.id)?.verification);
+  if (!v) return '';
+  const tag = (t: VerificationSummary['tests'][number]) =>
+    t.baseline === 'fails' ? ' [fails without the change]'
+    : t.baseline === 'passes' ? ' [ALSO PASSES without the change]'
+    : t.baseline === 'not_runnable' ? ' [could not run without the change]' : '';
+  const lines = v.tests.slice(0, 30).map(t => `- ${t.outcome === 'passed' ? 'PASS' : t.outcome === 'failed' ? 'FAIL' : 'SKIP'} "${t.name}" (${t.file})${tag(t)}`);
+  const problems = v.problems.map(p => `- COULD NOT RUN ${p.file}: ${p.error.slice(0, 160)}`);
+  if (lines.length === 0 && problems.length === 0 && !v.suite) return '';
+  const suite = v.suite
+    ? `\nWhole suite: ${v.suite.error ? `did not complete (${v.suite.error.slice(0, 120)})` : `${v.suite.passed} passed, ${v.suite.failed} failed, ${v.suite.skipped} skipped`}.`
+    : '';
+  return `
+Tests found in this change, as RUN BY THE HARNESS (not reported by the implementer):
+${[...lines, ...problems].join('\n') || '(the change adds or modifies no test files)'}${suite}${v.noTestsReason ? `\nThe implementer states no tests apply: ${v.noTestsReason}` : ''}
+
+Also audit these tests. Does each assertion really check what its name claims? Is any requirement in the task above untested, or only trivially tested? Report a weak, vacuous or missing test as a finding WITHOUT a "proof" (it is advisory) — unless you can write a failing test that shows a real defect these tests miss.
+`;
+}
+
+/**
+ * Re-run the proof tests behind findings the implementer just claimed to have
+ * fixed. A passing test promotes the finding to `verified` — by execution, not
+ * by anyone's say-so. A test that still fails reopens the finding.
+ *
+ * Skipped silently (leaving the normal reviewer verification to cover it) when
+ * the profile can't be resolved or the test file is gone — the implementer may
+ * have renamed it, and "I can't find the test" is not "the test fails".
+ */
+async function reverifyConfirmedProofs(task: Task): Promise<{ stillFailing: ReviewFinding[]; profile: TestProfile } | null> {
+  const candidates = getReviewFindings(task.id).filter(f =>
+    f.proof_status === 'confirmed' && f.proof_path && (f.state === 'fixed' || f.state === 'open'));
+  if (candidates.length === 0) return null;
+
+  const profile = await resolveTestProfile(task.workspace_id, task.worktree_path!,
+    cmd => sshExec(task.workspace_name, cmd, 15000, task.user_id));
+  if (!profile) return null;
+  const io = makeProofIO(workspaceExec(task), task.worktree_path!, profile);
+
+  const stillFailing: ReviewFinding[] = [];
+  const deadline = Date.now() + PROOF_BUDGET_MS;
+  for (const f of candidates) {
+    // Out of time: leave the rest to the reviewer rather than hold the task here.
+    if (Date.now() > deadline) break;
+    if (!(await io.exists(f.proof_path!).catch(() => false))) continue;
+    const result = await rerunProof(f.proof_path!, profile, io.run);
+    if (result.fixed) {
+      setReviewFindingState(f.id, 'verified', 'The reviewer\'s failing test now passes');
+      appendStreamLog(task.id, 'reviewer_pass', `[Harness] proof test ${f.proof_path} now passes — finding verified`);
+    } else if (f.state === 'fixed') {
+      // Only a claimed fix that didn't hold loops. A finding the implementer
+      // handed back ('open', with its own reason) is the user's to weigh.
+      setReviewFindingState(f.id, 'open', `The implementer claimed this fixed, but the proof test still fails: ${result.detail.slice(0, 300)}`);
+      stillFailing.push(getReviewFinding(f.id) ?? f);
+    }
+  }
+  return { stillFailing, profile };
 }
 
 /**
@@ -3595,7 +3828,7 @@ ${list}
  * memory of them and re-raises the same issue every pass, which is what drove
  * tasks into double-digit review rounds.
  */
-export function buildWaiverBlock(taskId: string, currentTurnId = ''): string {
+export function buildWaiverBlock(taskId: string, currentTurnId = '', mode: ReviewMode = 'opinion'): string {
   const prior = getPriorFindings(taskId, currentTurnId);
   if (prior.length === 0) return '';
 
@@ -3641,7 +3874,12 @@ it you will restate points the user has already dealt with. Rules:
 Do not contradict an earlier finding on the same code without saying so
 explicitly: if a previous pass asked for X and you now believe X was wrong, name
 that in your summary rather than issuing an opposing finding as if it were new.
-${list}
+${mode === 'proof' ? `
+EVIDENCE: a re-raise needs proof like any other finding — give a "requirement"
+and a "proof" test that fails on the code as it is now. Findings that already
+carry a confirmed failing test are re-run by the pipeline itself after the
+implementer's turn, so you will only be asked to verify the rest.
+` : ''}${list}
 `;
 }
 
@@ -3719,25 +3957,72 @@ async function launchReviewerOnTask(task: Task, opts: { manual?: boolean } = {})
   setActiveTaskTurnRole(task.id, 'reviewer');
   appendStreamLog(task.id, 'reviewer_start', `Reviewer turn ${turn.turn_number} starting`);
 
-  const gitDiff = await getGitDiff(task.worktree_path!, task.workspace_name, task.user_id);
+  // Evidence-based review needs a way to run tests. With none, degrade to the
+  // opinion-based review — and record that on the turn so the UI can say so
+  // instead of implying the findings were checked.
+  const profile = await resolveTestProfile(task.workspace_id, task.worktree_path!,
+    cmd => sshExec(task.workspace_name, cmd, 15000, task.user_id));
+  const mode: ReviewMode = profile ? 'proof' : 'opinion';
+  setTurnReview(turn.id, mode, null);
+  reviewContexts.set(turn.id, { mode, profile });
+  appendStreamLog(task.id, 'reviewer_mode', profile
+    ? `[Reviewer] proof mode — ${describeRunner(profile)} (${profile.source})`
+    : '[Reviewer] opinion mode — no test runner found, findings will not be backed by tests');
 
-  const reviewerPrompt = `Original task:\n${task.prompt}\n${buildUserDirectionBlock(task.id)}${buildWaiverBlock(task.id, turn.id)}\nChanges made by the implementer:\n${gitDiff}\n\n---\nReview the change adversarially, then emit your verdict. ${REVIEW_DECISION_FORMAT}`;
+  // A review is where the full check earns its cost: the comparison with the
+  // original code and the whole suite, computed by the harness and handed to the
+  // reviewer as facts to audit (skipped when nothing changed since the last one).
+  // Bounded by its own budget, so a hung test process cannot hold the reviewer
+  // turn — and with it the task — in `working`.
+  await verifyTurnTests(task, 'full');
+
+  const gitDiff = await getGitDiff(task.worktree_path!, task.workspace_name, task.user_id);
+  const format = mode === 'proof' && profile ? buildProofVerdictFormat(profile) : REVIEW_DECISION_FORMAT;
+
+  const reviewerPrompt = `Original task:\n${task.prompt}\n${buildUserDirectionBlock(task.id)}${buildWaiverBlock(task.id, turn.id, mode)}${buildRefutedBlock(task.id, turn.id)}${buildVerificationBlock(task)}\nChanges made by the implementer:\n${gitDiff}\n\n---\nReview the change adversarially, then emit your verdict. ${format}`;
 
   await executeReviewer(task, turn.id, reviewerSessionId, {
     prompt: reviewerPrompt,
-    maxTurns: REVIEWER_MAX_TURNS,
+    maxTurns: mode === 'proof' ? REVIEWER_PROOF_MAX_TURNS : REVIEWER_MAX_TURNS,
     resume: canResumeReviewer,
-    isWrapUp: false,
+    phase: 'review',
+    mode,
+    profile,
   });
 }
+
+/** What a reviewer turn is doing: the review itself, the one-shot "emit your verdict" recovery, or the proof-repair round. */
+type ReviewerPhase = 'review' | 'wrap_up' | 'repair';
+
+/**
+ * Per-turn review state that outlives a single reviewer process: the mode it
+ * runs in, and — while a repair round is out — what was verified so far. In
+ * memory, like the interrupt guards: a server restart mid-review already
+ * abandons the reviewer (reconnectWorkingTasks only reconnects implementers).
+ */
+const reviewContexts = new Map<string, {
+  mode: ReviewMode;
+  profile: TestProfile | null;
+  /** Output of the run(s) before a wrap-up resume, which holds the PROOF_FILE blocks. */
+  priorText?: string;
+  pending?: { decision: ReviewDecision; verified: VerifiedIssue[] };
+}>();
 
 interface ExecuteReviewerOpts {
   prompt: string;
   maxTurns: string;
   /** Resume the existing reviewer session (`--resume`) instead of starting a fresh one (`--session-id`). */
   resume: boolean;
-  /** True when this is the one-shot "emit your verdict" recovery run; prevents the recovery from recursing. */
-  isWrapUp: boolean;
+  /** Which stage this process is; wrap_up and repair are one-shot and never recurse. */
+  phase: ReviewerPhase;
+  mode: ReviewMode;
+  profile: TestProfile | null;
+  /**
+   * Called instead of failing the whole review when this process cannot be
+   * launched. The repair round is best-effort: if it can't start, the review
+   * proceeds with the proofs it already has.
+   */
+  onLaunchFailure?: () => void;
 }
 
 /**
@@ -3802,7 +4087,7 @@ async function executeReviewer(
   if (actualModel) {
     claudeParts.push('--model', shellEscape(actualModel));
   }
-  pushAppendSystemPrompt(claudeParts, [buildReviewerSystemPrompt(), HARNESS_REMINDER_NOTE]);
+  pushAppendSystemPrompt(claudeParts, [buildReviewerSystemPrompt(opts.mode, opts.profile), HARNESS_REMINDER_NOTE]);
 
   const claudeCmd = claudeParts.join(' ');
   const outputFile = remoteReviewerOutputPath(task.id);
@@ -3884,22 +4169,24 @@ async function executeReviewer(
       console.error('[auto-review] Spawn error:', (err as Error).message);
       accountAuth.cleanup?.(); // launch command never ran; its in-band `rm` won't either
       stopPolling(`review:${task.id}`);
+      if (opts.onLaunchFailure) { opts.onLaunchFailure(); return; }
       completeTaskTurn(turnId, 'fail', `Reviewer launch failed: ${(err as Error).message}`);
       settleWithUnresolvedFindings(task);
     });
 
     sshProcess.unref();
-    startReviewerPolling(task, turnId, reviewerSessionId, opts.isWrapUp);
+    startReviewerPolling(task, turnId, reviewerSessionId, opts.phase);
   } catch (err) {
     const errorMsg = (err as Error).message || 'Failed to launch reviewer';
     console.error('[auto-review] Launch failed:', errorMsg);
     accountAuth.cleanup?.();
+    if (opts.onLaunchFailure) { opts.onLaunchFailure(); return; }
     completeTaskTurn(turnId, 'fail', `Reviewer launch failed: ${errorMsg}`);
     settleWithUnresolvedFindings(task);
   }
 }
 
-function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: string, isWrapUp = false): void {
+function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: string, phase: ReviewerPhase = 'review'): void {
   const pollKey = `review:${task.id}`;
   stopPolling(pollKey);
 
@@ -4041,7 +4328,7 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
             }
           } catch { /* not a complete JSON event — nothing to recover */ }
         }
-        finalizeReviewer(task, turnId, reviewerSessionId, allAssistantText, resultSubtype, isWrapUp);
+        finalizeReviewer(task, turnId, reviewerSessionId, allAssistantText, resultSubtype, phase);
       }
     } catch (err) {
       console.error(`[auto-review] Poll error for task ${task.id}:`, (err as Error).message?.slice(0, 100));
@@ -4061,7 +4348,7 @@ function finalizeReviewer(
   reviewerSessionId: string,
   allText: string,
   resultSubtype?: string | null,
-  isWrapUp = false,
+  phase: ReviewerPhase = 'review',
 ): void {
   const current = getTask(task.id);
   if (!current) return;
@@ -4070,29 +4357,46 @@ function finalizeReviewer(
   // interruptReviewer has already settled the task — don't route the verdict.
   if (interruptedReviews.has(task.id)) return;
 
-  const decision = parseReviewDecision(allText);
+  // The repair round only re-emits test files; there is no verdict in it to parse.
+  if (phase === 'repair') {
+    finishRepair(task, turnId, allText).catch(err => failReview(task, turnId, err));
+    return;
+  }
+
+  // Server restarted mid-review: the in-memory context is gone. Opinion mode is
+  // the only thing that needs nothing but the text in hand.
+  const ctx = reviewContexts.get(turnId) ?? { mode: 'opinion' as ReviewMode, profile: null };
+  // A wrap-up run is a fresh process, so `allText` is only ITS output. The
+  // PROOF_FILE blocks were emitted by the run before it — carry them over.
+  const fullText = ctx.priorText ? `${ctx.priorText}\n${allText}` : allText;
+  const decision = parseReviewDecision(fullText);
 
   if (!decision) {
     // Distinguish a genuine no-verdict from a turn-limit cutoff. The latter is
     // the common cause of a "cut off" reviewer: the CLI aborted the session
     // (subtype `error_max_turns`) before the reviewer reached its verdict.
     const cutOff = typeof resultSubtype === 'string' && resultSubtype.includes('max_turns');
+    const maxTurns = ctx.mode === 'proof' ? REVIEWER_PROOF_MAX_TURNS : REVIEWER_MAX_TURNS;
 
     // Recovery: the reviewer produced no parseable verdict. In practice this is
     // the common case — the model writes a thorough prose review and simply
     // never appends the REVIEW_DECISION block (or it ran out of turns before
     // doing so). Resume the SAME session once (so it keeps all the context it
     // gathered) and demand ONLY the block — no further investigation, no prose.
-    // `isWrapUp` guards against recursion if the recovery itself produces none.
-    if (!isWrapUp) {
+    // The phase guards against recursion if the recovery itself produces none.
+    if (phase === 'review') {
       console.warn(`[auto-review] Reviewer for task ${task.id} emitted no verdict${cutOff ? ' (hit turn limit)' : ''} — resuming once for the decision`);
       appendStreamLog(task.id, 'reviewer_output', '[Reviewer] no verdict emitted — asking for final decision');
-      const wrapUpPrompt = `You finished your review but did not output the required REVIEW_DECISION line — without it the automated pipeline cannot proceed. Do NOT investigate further, run any tools, ask any questions, or add commentary. Based only on what you have already reviewed, output your verdict now as your entire response and nothing else.\n\n${REVIEW_DECISION_FORMAT}`;
+      const format = ctx.mode === 'proof' && ctx.profile ? buildProofVerdictFormat(ctx.profile) : REVIEW_DECISION_FORMAT;
+      const wrapUpPrompt = `You finished your review but did not output the required REVIEW_DECISION line — without it the automated pipeline cannot proceed. Do NOT investigate further, run any tools, ask any questions, or add commentary. Based only on what you have already reviewed, output your verdict now as your entire response and nothing else${ctx.mode === 'proof' ? ' (plus PROOF_FILE blocks for any test you have not yet written out in full)' : ''}.\n\n${format}`;
+      reviewContexts.set(turnId, { ...ctx, priorText: fullText });
       executeReviewer(task, turnId, reviewerSessionId, {
         prompt: wrapUpPrompt,
         maxTurns: '5',
         resume: true,
-        isWrapUp: true,
+        phase: 'wrap_up',
+        mode: ctx.mode,
+        profile: ctx.profile,
       }).catch(err => {
         console.error(`[auto-review] Reviewer verdict-recovery failed for task ${task.id}:`, (err as Error).message?.slice(0, 200));
         completeTaskTurn(turnId, 'fail', 'Reviewer did not produce a structured decision');
@@ -4108,64 +4412,245 @@ function finalizeReviewer(
       ? 'Reviewer hit its turn limit before emitting a decision'
       : 'Reviewer did not produce a structured decision');
     addMessage(task.id, 'system', cutOff
-      ? `The reviewer ran out of turns (limit ${REVIEWER_MAX_TURNS}) before finishing its check, so it could not emit a verdict. You can raise CLAUDE_REVIEWER_MAX_TURNS, reply to send it back, or mark the task complete.`
+      ? `The reviewer ran out of turns (limit ${maxTurns}) before finishing its check, so it could not emit a verdict. You can raise ${ctx.mode === 'proof' ? 'CLAUDE_REVIEWER_PROOF_MAX_TURNS' : 'CLAUDE_REVIEWER_MAX_TURNS'}, reply to send it back, or mark the task complete.`
       : "The reviewer completed its check but did not emit a structured verdict. See the reviewer's response above — proceed when ready or reply to ask for clarification.");
     settleWithUnresolvedFindings(task);
     return;
   }
 
-  const issueTexts = (decision.issues ?? []).map(i => i.text);
-  completeTaskTurn(turnId, decision.outcome, decision.summary, issueTexts.length ? issueTexts : undefined);
-  appendStreamLog(task.id, decision.outcome === 'pass' ? 'reviewer_pass' : 'reviewer_fail',
-    `[Reviewer] ${decision.outcome.toUpperCase()}: ${decision.summary}`);
+  completeReview(task, turnId, reviewerSessionId, decision, fullText, ctx).catch(err => failReview(task, turnId, err));
+}
+
+function failReview(task: Task, turnId: string, err: unknown): void {
+  reviewContexts.delete(turnId);
+  const msg = (err as Error)?.message?.slice(0, 200) || 'unknown error';
+  console.error(`[auto-review] Review failed for task ${task.id}:`, msg);
+  completeTaskTurn(turnId, 'fail', `Review verification failed: ${msg}`);
+  addMessage(task.id, 'system', `The review could not be completed (${msg}). The reviewer's output is above — proceed when ready or reply to ask for clarification.`);
+  settleWithUnresolvedFindings(task);
+}
+
+/** Run a command in the task's workspace (ssh, or a local shell for the local workspace). */
+function workspaceExec(task: Task): Exec {
+  return (cmd, timeoutMs = 20000, maxBuffer) => sshExec(task.workspace_name, cmd, timeoutMs, task.user_id, maxBuffer);
+}
+
+/**
+ * Verify the reviewer's proofs (proof mode), give it one chance to repair tests
+ * that were merely broken, then route. Opinion mode skips straight to routing.
+ */
+async function completeReview(
+  task: Task,
+  turnId: string,
+  reviewerSessionId: string,
+  decision: ReviewDecision,
+  fullText: string,
+  ctx: { mode: ReviewMode; profile: TestProfile | null },
+): Promise<void> {
+  if (!(ctx.mode === 'proof' && ctx.profile)) {
+    routeVerifiedReview(task, turnId, decision, 'opinion', opinionIssues(decision), null);
+    return;
+  }
+  const { profile } = ctx;
+
+  const verified = await verifyProofs({
+    issues: decision.issues ?? [],
+    files: extractProofFiles(fullText),
+    profile,
+    io: makeProofIO(workspaceExec(task), task.worktree_path!, profile),
+    deadline: Date.now() + PROOF_BUDGET_MS,
+  });
+  // Verification runs tests over ssh — long enough for the user to have interrupted.
+  if (interruptedReviews.has(task.id)) return;
+
+  const broken = repairable(verified);
+  if (broken.length > 0) {
+    // One bounded repair round: the reviewer is read-only and could not run its
+    // own tests, so many will be broken for trivial reasons (a wrong import).
+    // Resuming its session with the runner's error is far cheaper than throwing
+    // the finding away, and the round cannot recurse.
+    reviewContexts.set(turnId, { ...ctx, pending: { decision, verified } });
+    appendStreamLog(task.id, 'reviewer_output', `[Reviewer] ${broken.length} test(s) could not run — one repair round`);
+    const proceedWithoutRepair = () => routeVerifiedReview(task, turnId, decision, 'proof', verified, profile);
+    await executeReviewer(task, turnId, reviewerSessionId, {
+      prompt: buildRepairPrompt(broken, profile),
+      maxTurns: REPAIR_MAX_TURNS,
+      resume: true,
+      phase: 'repair',
+      mode: 'proof',
+      profile,
+      onLaunchFailure: proceedWithoutRepair,
+    });
+    return;
+  }
+  routeVerifiedReview(task, turnId, decision, 'proof', verified, profile);
+}
+
+function buildRepairPrompt(broken: VerifiedIssue[], profile: TestProfile): string {
+  const list = broken.map((v, i) =>
+    `${i + 1}. Finding: ${v.issue.text}\n   Test path: ${v.proofPath ?? '(none)'}\n   Problem: ${v.proof.reason}${v.proof.output ? `\n   Runner output:\n${v.proof.output.slice(0, 700).split('\n').map(l => '     ' + l).join('\n')}` : ''}`).join('\n\n');
+  return `Some of your tests could not be used. The pipeline ran them and they did not run as valid tests, so the findings they back would only be advisory. You have ONE chance to fix them.
+
+${list}
+
+Rules:
+- Do NOT investigate further, add new findings, or output a REVIEW_DECISION line. Reply with ONLY corrected PROOF_FILE blocks.
+- Re-emit each corrected test as a complete file:
+
+PROOF_FILE: <path>
+\`\`\`<language>
+<the entire test file>
+\`\`\`
+
+- Reuse the same path unless the problem was the path itself, in which case pick a new one. The file name must contain "cpm-proof" and must not already exist.
+- Fix imports and names so they match what the code actually exports. The test must still FAIL on the current code because of the defect — do not turn it into a test that passes.
+- Runner: ${describeRunner(profile)}.`;
+}
+
+/** Complete a review after the repair round: re-verify only what was repaired, then route. */
+async function finishRepair(task: Task, turnId: string, text: string): Promise<void> {
+  const ctx = reviewContexts.get(turnId);
+  const pending = ctx?.pending;
+  if (!ctx || !pending || !ctx.profile) {
+    throw new Error('the pending review state was lost (server restart?)');
+  }
+  const { profile } = ctx;
+
+  const idxs = pending.verified.map((v, i) => (repairable([v]).length ? i : -1)).filter(i => i >= 0);
+  const files = extractProofFiles(text);
+  const { issues } = assignRepairFiles(idxs.map(i => pending.verified[i].issue), files);
+  const reverified = await verifyProofs({ issues, files, profile, io: makeProofIO(workspaceExec(task), task.worktree_path!, profile), deadline: Date.now() + PROOF_BUDGET_MS });
+  if (interruptedReviews.has(task.id)) return;
+
+  const merged = pending.verified.slice();
+  idxs.forEach((i, n) => { merged[i] = reverified[n]; });
+  routeVerifiedReview(task, turnId, pending.decision, 'proof', merged, profile);
+}
+
+/**
+ * Apply a fully-verified review: record it, create findings, and either settle
+ * the task or send the implementer back. In proof mode the outcome is decided by
+ * evidence (routeReview), not by the reviewer's own `outcome`.
+ */
+function routeVerifiedReview(
+  task: Task,
+  turnId: string,
+  decision: ReviewDecision,
+  mode: ReviewMode,
+  verified: VerifiedIssue[],
+  profile: TestProfile | null,
+): void {
+  reviewContexts.delete(turnId);
+  const routed = routeReview(mode, decision, verified);
+  const blockingTexts = routed.blocking.map(v => v.issue.text);
+  const summary = reviewSummary(decision, routed);
+
+  completeTaskTurn(turnId, routed.outcome, summary, blockingTexts.length ? blockingTexts : undefined);
+  setTurnReview(turnId, mode, JSON.stringify(toStored(routed, verified)));
+  appendStreamLog(task.id, routed.outcome === 'pass' ? 'reviewer_pass' : 'reviewer_fail',
+    `[Reviewer] ${routed.outcome.toUpperCase()}: ${summary}${mode === 'proof' ? ` (${tally(routed)})` : ''}`);
+  for (const v of routed.refuted) {
+    // Kept for reviewer-quality signal: a refuted claim is a reviewer hallucination caught.
+    console.log(`[auto-review] Task ${task.id}: refuted finding — "${v.issue.text.slice(0, 120)}" (${v.proofPath})`);
+  }
 
   // Apply the verdict to the findings the implementer claimed to have fixed.
   // Re-raised ones reopen in place with the reviewer's revised reasoning;
   // everything else it did not object to is now verified rather than merely
-  // "not mentioned again".
+  // "not mentioned again". In proof mode only a CONFIRMED re-raise reopens: an
+  // unproven "your fix is inadequate" is an opinion, and the claim stands.
   const reraisedIds: string[] = [];
-  if (decision.outcome === 'fail') {
-    const fresh: string[] = [];
-    for (const issue of decision.issues ?? [{ text: decision.summary }]) {
-      const target = issue.reraises ? findFindingByRef(task.id, issue.reraises) : undefined;
-      if (target) {
-        reraiseReviewFinding(target.id, issue.text);
-        reraisedIds.push(target.id);
-      } else {
-        fresh.push(issue.text);
+  const created: NewFinding[] = [];
+  if (routed.outcome === 'fail') {
+    if (mode === 'opinion') {
+      for (const issue of decision.issues ?? [{ text: decision.summary }]) {
+        const target = (issue as ReviewIssue).reraises ? findFindingByRef(task.id, (issue as ReviewIssue).reraises!) : undefined;
+        if (target) {
+          reraiseReviewFinding(target.id, issue.text);
+          reraisedIds.push(target.id);
+        } else {
+          created.push({ body: issue.text });
+        }
+      }
+    } else {
+      for (const v of routed.blocking) {
+        const target = v.issue.reraises ? findFindingByRef(task.id, v.issue.reraises) : undefined;
+        const proof = {
+          proofStatus: 'confirmed' as const,
+          requirement: v.issue.requirement ?? null,
+          proofPath: v.proofPath ?? null,
+          proofOutput: v.proof.output || null,
+        };
+        if (target) {
+          reraiseReviewFinding(target.id, v.issue.text);
+          setFindingProof(target.id, proof);
+          reraisedIds.push(target.id);
+        } else {
+          created.push({ body: v.issue.text, severity: 'blocking', ...proof });
+        }
       }
     }
-    if (fresh.length > 0) createReviewFindings(task.id, turnId, fresh);
   }
+  if (mode === 'proof') {
+    for (const v of routed.advisory) {
+      created.push({
+        body: v.issue.text,
+        severity: 'advisory',
+        proofStatus: 'unproven',
+        requirement: v.issue.requirement ?? null,
+        proofOutput: [v.proof.reason, v.proof.output].filter(Boolean).join('\n') || null,
+      });
+    }
+  }
+  if (created.length > 0) createReviewFindings(task.id, turnId, created);
+
   const verifiedCount = verifyClaimedFixes(task.id, reraisedIds);
   if (verifiedCount > 0) {
     console.log(`[auto-review] Task ${task.id}: ${verifiedCount} claimed fix(es) verified by reviewer`);
   }
 
-  if (decision.outcome === 'pass') {
+  if (routed.outcome === 'pass') {
     // A pass closes the whole outstanding set, not just claimed fixes. The
     // reviewer is handed every prior finding with its state and told to
-    // re-raise anything still present, so passing IS its verdict on them.
+    // re-raise anything still present, so passing IS its verdict on all of them.
     // Previously only 'fixed' findings were promoted, so a finding that came
     // back 'open' (e.g. its report failed to parse) survived every later pass
     // and sat in the inbox forever while the UI said "Review passed".
-    // User decisions (dismissed / resolved) are never overwritten.
+    // User decisions (dismissed / resolved) and advisory findings are never
+    // overwritten.
     const closed = closeOutstandingOnPass(task.id);
     if (closed > 0) console.log(`[auto-review] Task ${task.id}: ${closed} outstanding finding(s) closed by passing review`);
     console.log(`[auto-review] Task ${task.id} reviewer passed`);
-    // closeOutstandingOnPass above left nothing open, so the disarm inside the
-    // helper is a no-op here and a deferred completion still flushes — which is
-    // the whole point of "review passed, complete it".
+    // closeOutstandingOnPass above left nothing blocking open, so the disarm
+    // inside the helper is a no-op here and a deferred completion still flushes
+    // — which is the whole point of "review passed, complete it".
     settleWithUnresolvedFindings(task);
     return;
   }
 
-  // Reviewer failed — but first, did the user switch auto-review off while this
-  // pass was running? Then the loop stops here: the findings above are already
-  // recorded and stay in the inbox, but no further implementer turn is spent on
-  // them. Read fresh, before the loop counter moves, so a disable that already
-  // reset the count doesn't leave it at 1. A manually requested review is exempt
-  // — the user asked for that pass, so its verdict still routes back once.
+  handBackForFixes(task, blockingTexts.length ? blockingTexts : (decision.issues ?? []).map(i => i.text), profile);
+}
+
+/** One-line summary of a review, honest about the reviewer's claim vs. what was demonstrated. */
+function reviewSummary(decision: ReviewDecision, routed: ReturnType<typeof routeReview>): string {
+  if (routed.mode === 'opinion') return decision.summary;
+  if (routed.outcome === 'pass' && decision.outcome === 'fail') {
+    return `${decision.summary} — but no finding was confirmed by a failing test (${tally(routed)}), so it does not block.`;
+  }
+  return decision.summary;
+}
+
+/**
+ * The reviewer (or the harness re-running a proof) found blocking problems:
+ * spend a fix round on them, or escalate to the user when the budget is spent.
+ */
+function handBackForFixes(task: Task, issueTexts: string[], profile: TestProfile | null): void {
+  // Did the user switch auto-review off while this pass was running? Then the
+  // loop stops here: the findings are already recorded and stay in the inbox,
+  // but no further implementer turn is spent on them. Read fresh, before the
+  // loop counter moves, so a disable that already reset the count doesn't leave
+  // it at 1. A manually requested review is exempt — the user asked for that
+  // pass, so its verdict still routes back once.
   const settled = getTask(task.id);
   if (settled && !settled.auto_review && !manualReviews.has(task.id)) {
     addMessage(task.id, 'system',
@@ -4180,23 +4665,27 @@ function finalizeReviewer(
   if (!refreshed) return;
 
   if (refreshed.review_loop_count >= MAX_REVIEW_LOOPS) {
-    escalateToUser(refreshed, (decision.issues ?? []).map(i => i.text));
+    escalateToUser(refreshed, issueTexts);
     return;
   }
 
-  // Hand every still-open finding to the implementer, tagged with the refs it
-  // must report back against. Marking them 'fixing' means an unreported one is
-  // detectable when the turn ends rather than silently lost.
-  const toFix = getReviewFindings(task.id).filter(f => f.state === 'open');
+  // Hand every still-open blocking finding to the implementer, tagged with the
+  // refs it must report back against. Marking them 'fixing' means an unreported
+  // one is detectable when the turn ends rather than silently lost. Advisory
+  // findings are deliberately left out: nobody proved them.
+  const toFix = getReviewFindings(task.id).filter(f => f.state === 'open' && f.severity !== 'advisory');
   toFix.forEach(f => setReviewFindingState(f.id, 'fixing'));
 
+  const runCommand = (f: { proof_path: string | null }) =>
+    profile && f.proof_path ? describeRunCommand(profile, [f.proof_path]) : undefined;
   const issueList = toFix.length > 0
-    ? toFix.map(f => `[${findingRef(f)}] ${f.body}${f.revision > 0 ? '  (RE-RAISED: your previous fix was judged inadequate)' : ''}`).join('\n\n')
-    : (decision.issues ?? []).map((i, n) => `${n + 1}. ${i.text}`).join('\n');
+    ? toFix.map(f => formatFindingForImplementer(f, { runCommand: runCommand(f) })).join('\n\n')
+    : issueTexts.map((t, n) => `${n + 1}. ${t}`).join('\n');
+  const hasProof = toFix.some(f => f.proof_status === 'confirmed' && f.proof_path);
 
   const retryPrompt = toFix.length > 0
-    ? `The reviewer found the following issues with your previous implementation. Each is tagged with a ref you must report against.\n\n${issueList}\n\nAddress what you can, then report on every one of them. Original task:\n${task.prompt}\n\n${FINDING_REPORT_FORMAT}`
-    : `The reviewer found the following issues with your previous implementation:\n\n${issueList}\n\nPlease address these issues. Original task:\n${task.prompt}`;
+    ? `The reviewer found the following issues with your previous implementation. Each is tagged with a ref you must report against.\n\n${issueList}\n\n${hasProof ? PROOF_INSTRUCTIONS + '\n\n' : ''}Address what you can, then report on every one of them. Original task:\n${refreshed.prompt}\n\n${FINDING_REPORT_FORMAT}`
+    : `The reviewer found the following issues with your previous implementation:\n\n${issueList}\n\nPlease address these issues. Original task:\n${refreshed.prompt}`;
 
   addMessage(task.id, 'system', `Auto-review found issues — resuming implementer:\n${issueList}`);
   setActiveTaskTurnRole(task.id, 'implementer');
@@ -4204,6 +4693,29 @@ function finalizeReviewer(
     console.error(`[auto-review] Failed to re-launch implementer for task ${task.id}:`, (err as Error).message?.slice(0, 200));
     settleWithUnresolvedFindings(refreshed);
   });
+}
+
+/**
+ * Buildup for the reviewer of its own past mistakes: claims whose tests PASSED.
+ * Without this a fresh (or cold-resumed) reviewer re-raises the same refuted
+ * claim every pass, which the harness then has to refute all over again.
+ */
+function buildRefutedBlock(taskId: string, currentTurnId: string): string {
+  const lines: string[] = [];
+  for (const t of getTaskTurns(taskId)) {
+    if (t.role !== 'reviewer' || t.id === currentTurnId || !t.review_proofs) continue;
+    try {
+      const stored = JSON.parse(t.review_proofs) as StoredReview;
+      for (const p of stored.proofs ?? []) {
+        if (p.status === 'refuted') lines.push(`- ${p.defect}${p.path ? ` (test ${p.path} PASSED)` : ''}`);
+      }
+    } catch { /* unreadable history is not worth failing a review over */ }
+  }
+  if (lines.length === 0) return '';
+  return `
+Claims YOU made in earlier passes that were REFUTED — the test you wrote to prove each one PASSED on the code, so the code was right and you were wrong. Do not raise these again, or a reworded variant, unless the code has since changed in a way that reintroduces them:
+${lines.join('\n').slice(0, REVIEW_CONTEXT_CHAR_BUDGET)}
+`;
 }
 
 /**
@@ -4226,7 +4738,7 @@ function finalizeReviewer(
  */
 function settleWithUnresolvedFindings(task: Task): void {
   const current = getTask(task.id) ?? task;
-  if (current.pending_complete && getReviewFindings(task.id).some(f => f.state === 'open')) {
+  if (current.pending_complete && hasOpenBlockingFindings(task.id)) {
     setPendingComplete(task.id, false);
     addMessage(task.id, 'system',
       'Pending completion cancelled — there are review findings that need your decision. Triage them, then complete the task.');
@@ -4493,7 +5005,7 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
         stagedStreamEvents.push(event);
 
         if (event.type === 'assistant' && event.message?.content) {
-          const turnText = stripNoReviewMarker(task.id, extractAssistantTurnText(event.message.content));
+          const turnText = stripImplementerMarkers(task.id, extractAssistantTurnText(event.message.content));
           if (turnText) {
             stagedMessages.push({ text: turnText });
             lastStagedText = turnText;
@@ -4501,7 +5013,7 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
         }
         if (event.type === 'result') {
           const fatal = extractFatalError(event);
-          const resultText = stripNoReviewMarker(task.id, extractResultText(event));
+          const resultText = stripImplementerMarkers(task.id, extractResultText(event));
           const cost = typeof event.total_cost_usd === 'number' ? event.total_cost_usd as number : undefined;
           // Skip staging the result text as an assistant message when it's a
           // fatal error — finalizeTask will surface it as a system error instead.
