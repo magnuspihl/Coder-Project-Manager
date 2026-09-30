@@ -11,13 +11,16 @@ human call is needed. This document should be read alongside `SPEC.md` and `WORK
 - Task execution gains a post-turn review phase, triggered automatically when files are modified
 - A new `task_turns` table tracks each Implementer and Reviewer turn within a task
 - The Reviewer runs as a fresh, read-only Claude session — no shared context with the Implementer
-- Up to 2 Reviewer passes per Implementer turn; if still failing, the task escalates to the user
-- Tasks can opt out at creation time; review is skipped automatically when the worktree is clean
+- **A blocking finding must be backed by a failing test** (Section 17). The Reviewer emits tests; the
+  *harness* runs them and decides the outcome. Findings it cannot demonstrate are advisory and never loop
+- The harness also runs the change's own tests and reports what they show (Section 18)
+- Up to `CPM_REVIEW_MAX_LOOPS` (default 2) automated fix rounds per task; if still failing, the task escalates to the user
+- Tasks can opt out at creation time; review is skipped automatically when the branch has no work relative to the default branch (Section 3)
 - The Reviewer can also be triggered manually on an `awaiting_feedback` task — via the **Review**
   button next to **Complete** in the task detail UI, the `POST /api/tasks/:taskId/review` route, or
   the `review` MCP tool. A manual review resets the loop counter, then routes its verdict through the
   same `finalizeReviewer` path as auto-review (pass → `awaiting_feedback`; fail → back to the
-  Implementer, capped by the loop limit). It is rejected if the worktree is clean or another task is
+  Implementer, capped by the loop limit). It is rejected if the branch has no work or another task is
   running on the workspace.
 
 **What stays the same:**
@@ -33,7 +36,7 @@ human call is needed. This document should be read alongside `SPEC.md` and `WORK
 ```
 Implementer turn completes
           ↓
-git status --porcelain in worktree
+any work vs the merge-base? (committed, uncommitted or untracked — Section 3)
           ↓
     ┌─────┴──────┐
     │ no changes │  changes
@@ -63,20 +66,35 @@ adversarial separation is architectural.
 
 ## 3. Skip Condition
 
-Review is skipped when the worktree is clean after an Implementer turn. The server runs:
+Review is skipped when the task has **no work relative to the default branch**. "Work" is measured against
+the merge-base of `HEAD` with `origin/main` / `main` / `origin/master` / `master` (`hasBranchChanges`,
+`review-io.ts`) and counts anything committed on the branch, staged, modified, or untracked:
 
 ```bash
-git -C {task.worktree_path} status --porcelain
+git -C {worktree} status --porcelain        # uncommitted / untracked
+git -C {worktree} diff --quiet $base HEAD   # committed on the branch
 ```
 
-If the output is empty (no modified, staged, or untracked files), the task transitions directly
-to `awaiting_feedback` without starting a Reviewer turn. This covers:
+**This must never be `git status --porcelain` alone.** An implementer that commits everything before its
+turn ends leaves a clean porcelain, and a porcelain-only check then reads a fully implemented task as
+"nothing to review" — auto_review=1 tasks bcabb2f9 and 554b3aad got no reviewer turn for exactly this
+reason. The reviewer's diff (`getReviewDiff`) and the verification step's changed-file list use the same
+`$base`, so committed work is also *shown* to the reviewer and its tests are found. A regression test
+builds a repo whose work is fully committed (clean porcelain) and asserts detection, the diff and the test
+discovery all still see it.
+
+If the workspace cannot be asked, the check **fails toward reviewing** (assumes changes, logs a warning):
+"no changes" would silently skip the review, whereas a reviewer that can't launch reports its own error.
+
+If the branch has no work at all, the task transitions directly to `awaiting_feedback` without a Reviewer
+turn. This covers:
 
 - **Speccing / discussion turns** — Claude responded without writing any files
 - **No-op turns** — user asked a question, Claude answered
-- **Stuck loop** — if an Implementer turn after a failed review also produces no changes, this is
-  caught here and the task escalates to the user immediately (rather than running another review
-  on identical code)
+
+(An earlier version also promised to catch a "stuck loop" — a fix turn that changed nothing — via the
+clean-tree check. That only ever worked when the implementer happened to have committed; it is not
+detected now, and such a turn is simply reviewed again, bounded by `CPM_REVIEW_MAX_LOOPS`.)
 
 If `worktree_path` is NULL (pre-worktrees task), skip review and fall through to the existing
 `awaiting_feedback` behaviour unchanged.
@@ -85,8 +103,10 @@ If `worktree_path` is NULL (pre-worktrees task), skip review and fall through to
 
 ## 4. Reviewer Context
 
-The Reviewer starts a **fresh Claude session** (`--session-id` with a new UUID, not `--resume`).
-It receives no conversation history from the Implementer. Its context is constructed by the server:
+The Reviewer has **no conversation history from the Implementer**. Its first pass starts a fresh Claude
+session (`--session-id` with a new UUID); later passes on the same task **resume that reviewer session**
+(`--resume`) when it still exists on the workspace — an actual resumed session remembers what *it* already
+raised, which the replayed blocks below only approximate. Either way, the server constructs its context:
 
 ```
 Original task:
@@ -98,9 +118,12 @@ Changes made by the implementer:
 Untracked files added:
 {git ls-files --others --exclude-standard}
 
+Tests found in this change, as run by the harness:      (Section 18, when there are results)
+{verification block}
+
 ---
 Review the change adversarially, then emit your verdict.
-{REVIEW_DECISION_FORMAT — the literal verdict contract, see "self-contained" note below}
+{verdict contract — REVIEW_DECISION_FORMAT (opinion) or the proof-mode format (Section 17)}
 ```
 
 If the diff exceeds ~8 000 tokens (estimated by character count), it is truncated to the first
@@ -241,7 +264,10 @@ despite the contract — so a missing verdict no longer dead-ends on the user.
 
 ## 5. Reviewer System Prompt
 
-Appended via `--append-system-prompt`, same mechanism as caveman mode:
+Appended via `--append-system-prompt`, same mechanism as caveman mode. The text below is the
+**opinion-mode** prompt (used when the workspace has no runnable test setup, Section 17.2). Proof mode
+shares its preamble (role, read-only rules, "no human is reading") and replaces the tail with the
+**evidence rules** and proof-mode output contract described in Section 17.
 
 ```
 MANDATORY REVIEW RULES — RED TEAM MODE:
@@ -289,7 +315,7 @@ message after the `result` event arrives in the stream. It looks for a line matc
 REVIEW_DECISION: {valid JSON}
 ```
 
-Parsing (`parseReviewDecision`) is deliberately tolerant. It collects **every** `REVIEW_DECISION`
+Parsing (`parseReviewDecision`, now in `server/services/review-verdict.ts`) is deliberately tolerant. It collects **every** `REVIEW_DECISION`
 marker and tries them from **last to first**, returning the first that yields a valid verdict object.
 For each marker it extracts the first balanced JSON object after it — walking brace depth while
 respecting string literals, so the JSON may span multiple lines and contain `}` inside string values
@@ -324,7 +350,13 @@ parsing, finalize also flushes any trailing buffered line that lacked a newline 
 final assistant message (where `REVIEW_DECISION` lives) can arrive that way, and dropping it would
 misread a valid verdict as "no decision."
 
-The parsed object is stored in `task_turns.review_outcome` and `task_turns.review_summary`.
+The verdict accepts two payload shapes, merged if both appear: the long-standing `issues` (plain strings,
+or `{text, reraises}`) and the evidence-based `findings` (`{defect, requirement, proof, reraises?}`, where
+`requirement` may be a string or `{quote, source}` and `proof` a path string or `{path}`). Placeholder
+tokens copied from the prompt's template (`<defect>`, `<quote>`…) are stripped like the old ones.
+
+The parsed object is stored in `task_turns.review_outcome` and `task_turns.review_summary`. In proof mode
+`review_outcome` is the **harness's** outcome, not the reviewer's claim (Section 17.5).
 
 ---
 
@@ -352,8 +384,11 @@ Please address these issues. Original task:
 
 The Implementer's `--resume` flag is used (same session, full context of prior work is available).
 
-`review_loop_count` resets to 0 when the user manually replies to a task in `awaiting_feedback`,
-since that constitutes a new human-directed turn.
+`review_loop_count` is **cumulative over the task's life**, not per stretch of conversation (see the
+comment on `MAX_REVIEW_LOOPS`): once spent, reviews still run and still report, they just stop being routed
+back automatically. It is refilled only by explicit user intent — a manual review, **Fix** on a finding,
+interrupting a reviewer, or toggling auto-review off and on. (An earlier version reset it on every reply,
+which let any task with an active user accumulate unbounded rounds.)
 
 ---
 
@@ -375,13 +410,10 @@ switchers — it applies from the next decision point, not retroactively:
   `fail` verdict the implementer is not resumed; the task settles into `awaiting_feedback` with the
   findings in the inbox.
 - Later implementer turns skip the review entirely (`onImplementerTurnComplete` re-reads the task).
-- Disabling resets `review_loop_count`, and so does `settleWithUnresolvedFindings` — the single
-  helper every review-related hand-back routes through (skip, escalation, pass, no-verdict, and the
-  reviewer/implementer launch failures). Keeping the reset in that one place rather than at each
-  call site is what makes the invariant "a task waiting on the user has a zero counter" hold by
-  construction, so re-enabling always starts a fresh loop budget. Without it a spent budget survives
-  the hand-back — a manual review's exempted fix turn, or a clean-worktree escalation, would leave
-  the count at 1 and the next failing review would escalate immediately with no fix attempt.
+- Disabling resets `review_loop_count`. `settleWithUnresolvedFindings` — the single helper every
+  review-related hand-back routes through — deliberately does **not** (the budget is cumulative, see
+  Section 7); it does disarm a pending "complete after this turn" when a *blocking* finding is still
+  open. Advisory findings never hold a completion back.
 - The change is written to the conversation as a system message — unlike model/subscription
   switches — because it changes what happens when the current turn ends.
 - A **manually** requested review (the "Review" button / `POST /api/tasks/:id/review`) is exempt
@@ -485,11 +517,15 @@ New function `launchReviewer(task: Task, issues: string[] | null)`:
 4. Generate a new `claude_session_id` for this reviewer turn (fresh session)
 5. Invoke Claude with:
    - `--session-id {new_uuid}` (not `--resume`)
-   - `--allowedTools "Read,Glob,Grep,Bash"`
+   - `--allowedTools` — `Read,Glob,Grep` plus the read-only `Bash(<cmd>:*)` whitelist (Section 4); bare
+     `Bash` was removed. Proof mode changes nothing here: the reviewer stays read-only, and the harness
+     writes and runs its tests
    - `--append-system-prompt {reviewer_system_prompt}` (plus the verdict contract embedded in the
      `-p` prompt itself — see Section 4's "self-contained" note)
-   - `--model {actualModel}` if set — Reviewer uses the **same model as the Implementer**, including
-     Ollama models: the `ollama/` prefix is stripped for `--model` and `ANTHROPIC_BASE_URL` /
+   - `--model {actualModel}` — precedence: the task's `reviewer_model` (set in the task header) >
+     `CLAUDE_REVIEWER_MODEL` > the implementer's model. Running the reviewer on a *different* model than
+     the implementer is the recommended setup: independent checks are worth more than correlated ones.
+     Ollama models are supported: the `ollama/` prefix is stripped for `--model` and `ANTHROPIC_BASE_URL` /
      `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are exported in the remote command exactly as the
      implementer does. (Previously the reviewer skipped `--model` for Ollama and never set the
      endpoint, so it ran against the default Anthropic API — wrong model, or an auth error producing
@@ -502,8 +538,10 @@ New function `launchReviewer(task: Task, issues: string[] | null)`:
    prior pass and finalize immediately against the previous turn's leftover output (routing on a
    stale verdict, or on empty text once the in-band `rm` lands). Awaiting the archive closes the race.
 7. Stream output to client via WebSocket, tagged with `role: "reviewer"` in the event payload
-8. On `result` event, parse `REVIEW_DECISION` from final assistant text
-9. Act on outcome (transition task or start new Implementer turn)
+8. On `result` event, parse `REVIEW_DECISION` from the accumulated assistant text (`finalizeReviewer`)
+9. Proof mode: materialise, run and classify the proofs, with at most one repair round (Section 17)
+10. Route on the *harness-decided* outcome (`routeVerifiedReview`): transition the task or start a new
+    Implementer turn
 
 New function `buildReviewerPrompt()`: returns the static reviewer system prompt from Section 5.
 
@@ -525,7 +563,8 @@ async function onImplementerComplete(task: Task) {
 ```
 
 New helper `worktreeHasChanges(worktreePath, workspaceName): Promise<boolean>`:
-Runs `git -C {worktree_path} status --porcelain` via SSH. Returns `true` if output is non-empty.
+Answers "does the task have any work relative to the default branch" — see Section 3. It is **not** a
+`git status` check.
 
 #### Implementer opt-out (`NO_REVIEW_NEEDED`)
 
@@ -615,11 +654,21 @@ output; they just won't show the turn labels.
 
 ## 14. Configuration
 
-One new optional environment variable:
+Optional environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `CPM_REVIEW_MAX_LOOPS` | `2` | Max Reviewer passes before escalating to user |
+| `CPM_REVIEW_MAX_LOOPS` | `2` | Max automated fix rounds per task before escalating to user |
+| `CLAUDE_REVIEWER_MAX_TURNS` | `100` | Turn cap for an **opinion-mode** review |
+| `CLAUDE_REVIEWER_PROOF_MAX_TURNS` | `40` | Turn cap for a **proof-mode** review (scoped: read the diff, write ≤5 tests, stop) |
+| `CLAUDE_REVIEWER_MODEL` | *(implementer's model)* | Deployment default reviewer model; the per-task `reviewer_model` overrides it |
+| `CPM_VERIFY_TURN_BUDGET_SEC` | `150` | Hard cap on the per-turn *quick* check (the change's own tests) |
+| `CPM_VERIFY_FULL_BUDGET_SEC` | `480` | Hard cap on a *full* verification (comparison with the original code + whole suite) |
+| `CPM_PROOF_BUDGET_SEC` | `480` | Hard cap on running the reviewer's proof tests (and re-running confirmed ones) |
+
+Per-workspace, not environment (both on the workspace card, `PUT /api/workspaces/:id/test-profile`):
+the **test profile** (`workspace_settings.test_profile`, *Test runner*) — Section 17.2 — and the
+**implementer test obligation** (`workspace_settings.test_obligation`, *Implementer tests*) — Section 18.
 
 The per-task `auto_review` column is the primary control. There is no workspace-level default setting.
 
@@ -787,13 +836,248 @@ signal (`N review findings still undecided`); all detail is opt-in. Any change h
 re-measured at 800px viewport height, where the composer's action row is the first thing to be
 pushed out of view.
 
-### A pass does not resolve open findings
+### What a pass does to open findings
 
-When a later reviewer pass runs without re-raising a finding, that is evidence it was fixed — the
-implementer resumes with full context and routinely fixes neighbouring issues it can still see in
-the conversation, even ones the fix action didn't send. It is **not** proof: a fresh reviewer
-session can simply miss it. So a pass never changes a finding's state. Instead the finding is
-labelled *"A later review didn't raise this again — likely fixed, but not confirmed"*, and the panel
-header notes that a later review passed without raising them. Auto-resolving here would reproduce
-exactly the failure the per-finding design exists to prevent: the system quietly deciding an issue
-the user never ruled on.
+A pass settles the **blocking** findings still outstanding (`closeOutstandingOnPass`): the reviewer is
+handed every prior finding and told to re-raise any that persists, so passing is its verdict on them. In
+proof mode "re-raise" needs a failing test like any other finding, and confirmed proof tests are re-run by
+the harness after each implementer turn (Section 17.6) — so a finding closed by a pass has usually been
+*verified by execution*, not merely not-mentioned.
+
+Two things a pass never touches: the user's own decisions (`dismissed`, `resolved`) and **advisory**
+findings, which were never asserted as defects so a pass says nothing about them. An open finding no later
+review mentions is labelled *"A later review didn't raise this again — likely fixed, but not confirmed"*
+(a fresh session can simply miss it); that label is never applied to advisory findings.
+
+---
+
+## 17. Evidence-Based Review ("proof, not opinion")
+
+An opinion-based reviewer has the same model's blind spots and its findings are unfalsifiable: the
+implementer cannot tell a real bug from a hallucination, and neither can the user. The contract is
+therefore: **a blocking finding must be backed by a failing test, and the harness — not the reviewer —
+verifies it.** A finding the reviewer cannot demonstrate is advisory and never triggers a fix loop.
+
+### 17.1 What the reviewer must produce
+
+For each blocking finding: the **defect**, the **requirement** it violates (a quote from the task or the
+user's later direction, or the existing behaviour/test/doc it contradicts — this guards against invented
+requirements; "it would be nicer" is not one), and a **test** that fails on the current code and passes once
+the defect is fixed. The reviewer stays read-only (Section 4); it cannot run what it writes, so it emits
+the tests in its reply:
+
+~~~text
+PROOF_FILE: src/parse.cpm-proof.test.ts
+```ts
+import test from 'node:test'; …           (the whole test file, in a fenced block)
+```
+
+REVIEW_DECISION: {"outcome":"fail","summary":"…","findings":[
+  {"defect":"parseRow() crashes on an empty line","requirement":"Task: \"blank lines must be skipped\"","proof":"src/parse.cpm-proof.test.ts"}]}
+~~~
+
+Test source travels in **fenced blocks, not inside the JSON**: multi-line code in a one-line JSON string
+loses the entire verdict to a single bad escape; a malformed fence now costs one proof (`extractProofFiles`
+ignores unterminated blocks; a longer fence lets a test contain ``` itself; the last block for a path wins).
+
+Rules the prompt imposes: one file per finding; file name contains `cpm-proof`; path must not exist; import
+the real code (never re-implement it); no network/clock/randomness; assert the requirement, not the current
+output; at most 5 findings with proofs; read one existing test for conventions first. `outcome` is only a
+*claim* — the harness decides.
+
+### 17.2 Mode selection and the test profile
+
+Before the reviewer launches, `resolveTestProfile` works out how this workspace runs tests. **No runnable
+setup → opinion mode**: today's read-and-judge review, recorded on the turn (`review_mode = 'opinion'`) and
+labelled in the UI ("Opinion-based review — findings were not checked by running anything").
+
+Profile precedence: **user setting > what the repo says right now > what the implementer last reported.**
+Detection beats the implementer's report because it reflects the tree as it is (`package.json` deps and
+`test` script, then `pyproject.toml`/`pytest.ini`…, `go.mod`, `*.sln`/`*.csproj`). Supported runners:
+`node-test`, `vitest`, `jest`, `pytest`, `go`, `dotnet`. A profile is `{runner, command?, cwd?, suite?}`;
+`command` and `suite` are validated (no shell operators) because they reach a shell. `suite` carries a
+`node --test` project's glob, which node does not discover for `.ts` files on its own.
+
+### 17.3 Materialising and running the proofs (`review-proof.ts`, `review-io.ts`)
+
+**In the worktree, not a scratch copy.** A scratch copy loses `node_modules`, build output and untracked
+files, and `git worktree add` loses the uncommitted work under review. Instead the trust boundary is the
+*path*: relative, no `..`, safe characters, inside the tree, not `.git`/`node_modules`, shaped like a test
+for the runner, name containing `cpm-proof`, size-capped, and **never overwriting an existing file**. Files
+are written base64-encoded (arbitrary code; shell quoting of it is not to be trusted). Each proof runs alone
+(120 s timeout) so every result is attributable to one finding; findings sharing a file run it once.
+
+The exit code cannot tell "an assertion failed" from "it never ran", so each runner is invoked with a
+machine-readable reporter and parsed (`test-runners.ts`): TAP (`node:test`), jest-JSON (jest, vitest),
+JUnit (pytest), `go test -json`, TRX (`dotnet test`). Parsers are tested against **real captured output**
+(`__fixtures__/test-runners`) for node:test, jest, vitest and pytest; the go and dotnet parsers follow the
+documented formats and have not been exercised against a real runner. `coder ssh` runs commands under a PTY,
+so output is CRLF-normalised and ANSI-stripped first.
+
+### 17.4 Classification
+
+| Runner result | Status | Effect |
+|---|---|---|
+| a test **fails** (assertion, or the code under test throws) | **confirmed** | blocking |
+| the test **passes** | **refuted** | dropped; logged; shown collapsed in the UI; fed back to the reviewer so it stops re-raising it |
+| suite-level error (didn't load/compile), no tests ran, all skipped, timeout | **unproven** | advisory |
+| no test supplied / path rejected / file missing / over the 5-proof cap | **unproven** | advisory |
+
+A failing test whose message shows the **test itself** is broken (`SyntaxError`, `Cannot find module`,
+`x is not defined`, `x is not a function`, `module 'm' has no attribute`, `error CS####`, `[build failed]`…)
+is unproven, not confirmed. The bias is deliberate: wrongly demoting a real failure costs a repair round;
+wrongly confirming sends the implementer chasing a phantom. A runtime `TypeError` from inside the code under
+test is *not* in that list — "crashes on empty input" is exactly what a proof should confirm.
+
+**Known limit:** *confirmed* means the test fails, not that the reviewer is right. A hallucinated
+requirement can be encoded into a test that fails perfectly. The cited requirement is shown beside the test,
+and the implementer may report `disagree`, which goes to the user.
+
+**Repair round.** The reviewer could not run its own tests, so many will be broken for trivial reasons (a
+wrong import). Unproven findings whose test was broken get **one** bounded resume of the reviewer session
+(`--max-turns 8`, no new findings, only corrected `PROOF_FILE` blocks); the round cannot recurse, and if it
+cannot launch the review proceeds with what it has. Repair state is in memory (`reviewContexts`): a server
+restart mid-review already abandons the reviewer, since `reconnectWorkingTasks` only reconnects
+implementers.
+
+### 17.5 Routing
+
+`routeReview`: **`fail` iff ≥ 1 finding is confirmed** — regardless of the reviewer's own `outcome`.
+Refuted findings are dropped; unproven ones become **advisory** findings. A reviewer that says `fail` but
+proves nothing yields a pass whose summary says so. In opinion mode the reviewer's word stands, as before.
+`CPM_REVIEW_MAX_LOOPS` and escalation are unchanged. Re-raising a finding the implementer claimed fixed now
+needs a proof too: an unproven re-raise does not reopen it.
+
+Advisory findings are stored (`review_findings.severity = 'advisory'`), listed in the UI, actionable
+one-by-one (**Fix this** / **Ignore**), excluded from the automatic hand-back and from the reviewer card's "Fix all", and
+never hold up a deferred completion. (The pinned *unresolved findings* panel lists every undecided finding,
+advisory included, so its "Fix all" is the user's explicit choice to act on them.)
+
+### 17.6 Confirmed tests are the fix target
+
+The implementer's fix prompt lists each confirmed finding with its requirement, the failing test's path, the
+command to run it and the failure output, and instructs: make the test pass; do **not** edit, weaken, skip or
+delete it (if it is wrong, report `disagree`); leave it at its path. **The harness leaves confirmed tests in
+the worktree uncommitted** — Mark Complete's commit picks them up, so they become regression tests without
+CPM committing anything itself. Refuted and unproven files are removed.
+
+After the implementer's turn the harness **re-runs each confirmed proof** (`reverifyConfirmedProofs`): a pass
+promotes the finding to `verified` — by execution, not by anyone's say-so — and a claimed fix whose test
+*still fails* goes straight back to the implementer without spending a reviewer pass (it counts against the
+loop budget). A proof file that has been moved or deleted is skipped and left to the reviewer.
+
+### 17.7 Data model
+
+`review_findings`: `severity` (`blocking`|`advisory`), `proof_status` (`confirmed`|`unproven`|NULL for
+opinion mode), `requirement`, `proof_path`, `proof_output`. `task_turns`: `review_mode`, and `review_proofs`
+(JSON of **every** proof attempted, refuted ones included — the log of reviewer quality). Refuted claims are
+not finding rows, so they cannot pollute the waiver replay. `workspace_settings.test_profile`.
+
+### 17.8 UI
+
+The reviewer card shows a status pill (`No confirmed defects` for a proof-mode pass — deliberately not
+"Passed ✓", since it means the reviewer could not produce a failing test, which is weaker than proof of
+correctness — or `Review confirmed issues`) with a tally (`1 confirmed · 2 refuted · 1 unproven`). Each
+finding row carries its **confirmed / unproven** badge, the cited requirement, and a collapsed **Show the
+test** with the failure output. Advisory notes render in their own group; refuted claims sit behind a
+"tested and dropped" toggle. Opinion-mode reviews carry an explicit "not checked by running anything" note.
+
+### 17.9 Token cost
+
+Proof-mode reviews run with `CLAUDE_REVIEWER_PROOF_MAX_TURNS` (40 vs 100), at most 5 proofs, one repair round
+of at most 8 turns, and a 5-turn verdict-recovery resume. The reviewer is told to read the diff, the files it
+touches and one existing test, and to stop once it has its proofs.
+
+---
+
+## 18. Verification Summary and the Implementer's Test Obligation
+
+Trust in a deliverable comes less from *absence of found bugs* than from *evidence of correct behaviour*.
+So the process asks the implementer for that evidence and has the harness — no model — report what it shows.
+
+**Obligation (a per-workspace setting; every task in a workspace where it applies, not only auto-review).**
+`buildTestingPrompt` tells the implementer to add or update tests for the behaviour it changes, to name each
+test as a plain-English behaviour ("rejects usernames containing @, $, € or ¥"), and to run them. If nothing
+is testable it ends with `NO_TESTS_NEEDED: <reason>`; if it set up or changed the runner it ends with
+`TEST_PROFILE: {"runner":…,"command":…}` (validated like a user setting, and never overriding one). Both
+lines are stripped from the visible message (`implementer-markers.ts`).
+
+Whether the obligation applies is `workspace_settings.test_obligation` (`decideTestObligation`):
+
+| Setting | Runner detected/configured | No runner |
+|---|---|---|
+| **auto** (default) | obligation on — **use the existing framework; do not add one** | **off** — no prompt, no per-turn report, no "no test runner" card |
+| **always** | on, existing framework | on, and the implementer **sets a framework up** as part of the task |
+| **off** | off | off |
+
+`auto` follows the tooling on purpose: a Godot (GUT) or Unity (Unity Test Framework) workspace has no
+parser here, and the "obvious" framework would be the wrong thing to install into it, so it is left alone
+unless someone opts in. Only an explicit *always* may ask an implementer to add a test framework. `off`
+never touches the workspace. The setting governs the implementer's prompt and the harness's per-turn report;
+proof-mode *review* depends only on whether a runner can be resolved (Section 17.2).
+
+**What the harness computes** (`verification.ts`; stored in `tasks.verification`), at two levels:
+
+| Level | What runs | When |
+|---|---|---|
+| **tests** (quick) | only the test files the task added or changed, each run individually | after an ordinary implementer turn that changed files |
+| **full** | the above **plus** the fail-before comparison **plus** the whole suite | when a review runs (automatic or manual), and on demand via **Run full verification** (`POST /api/tasks/:id/verify`) |
+
+Why not full every turn: many turns are small tweaks in a conversation, and a suite run (≤180 s) after each
+would make iteration miserable for a benefit the user only needs at review time. A full result is **not
+recomputed when the tree is unchanged** since the last one (a hash of `HEAD`, the diff against the merge-base
+and untracked file contents), so an auto-review followed by a manual one costs one run. The card marks a
+quick result as such and offers the button.
+
+**Why not "at completion":** completion runs inside the workspace lock and does fetch/push/merge; a
+multi-minute test run there would stall every other task on the workspace, and after the merge the
+before-the-change comparison has nothing left to compare against. The user has just seen the last result,
+and can request a full one first.
+
+What it computes:
+
+1. the files the task changed **relative to the merge-base** (committed, uncommitted and untracked — never
+   `git status` alone, see Section 3) that look like tests — each run individually, per-test results;
+2. *(full)* **fail-before, pass-after**: the same test files run against the code as it was *before* the task (a
+   `git archive` of the merge-base, the test files laid over it, `node_modules` symlinked — no worktree
+   metadata is written to the repository). Labels: `fails without the change` (genuinely exercises the new
+   behaviour), `also passes without the change` (guards existing behaviour or proves nothing new),
+   `couldn't run without the change` (e.g. imports a module that didn't exist yet — never claimed to be more
+   than that);
+3. *(full)* the project's whole suite (pass/fail/skip counts; an incomplete run is *not* reported as a pass).
+
+**Hard limits — a hung test cannot hold a task in `working`.** Every layer is bounded: each run is wrapped in
+`timeout -k 5` *inside the workspace* (120 s per file, 180 s per suite; it signals the whole process group, so
+a test's child processes die too — verified by a test that spawns a never-exiting child); each ssh call is
+killed by node after 150 s / 210 s; and the whole step races a wall-clock budget (`CPM_VERIFY_*_BUDGET_SEC`),
+polled between runs (`shouldStop`) and enforced from outside (`withBudget`). When the budget wins the task
+moves on, the late result is discarded, and a "did not finish" summary is stored so the card says so instead
+of showing stale numbers. Proof runs get the same treatment (`CPM_PROOF_BUDGET_SEC`, a `deadline` on
+`verifyProofs`). Quick check: 150 s; full: 480 s. Not covered: a workspace with no `timeout` binary relies on
+the ssh kill (the PTY hang-up normally ends the remote process group); the reviewer/implementer `claude`
+processes themselves are bounded by `--max-turns`, not wall-clock, as before.
+
+The reviewer receives these results as facts (`buildVerificationBlock`) and is asked to **audit the tests**:
+does each assertion check what its name says, is any requirement untested? Weak or missing coverage is an
+advisory finding (a missing test cannot itself be demonstrated by a failing test).
+
+**UI.** A *What was verified* card at the end of the conversation (absent in workspaces where the obligation
+is off) lists each test as a tick/cross with its
+name and baseline label, the suite tally, files that could not be run, and — when there are no tests — the
+implementer's stated reason or a plain "nothing verified this change". It says on its face what is and isn't
+trustworthy: **names are the implementer's words; a tick means the harness ran the test and it passed.**
+
+**Limits.** Tests the implementer writes share the implementer's understanding of the requirement — the
+reviewer audit and the human reading the checklist are the check on that, which is why the list is in plain
+English. Repos with dependencies outside the tree (a venv, a compiled `dist/`) may show
+`couldn't run without the change`. Monorepos with several roots need `cwd` in the profile.
+
+### Running the tests
+
+`npm test` runs every `server/**/*.test.ts` with `node:test` via `tsx` (no extra dependency). They cover the
+verdict parser, the per-runner output parsers (against captured real output), proof classification and
+routing, the implementer markers, the verification summary, and — against real temporary git repositories
+with a real `node:test` runner and a local shell standing in for `coder ssh` — the whole
+write → run → classify → clean-up path and the fail-before baseline. `review-findings.test.ts` needs
+better-sqlite3's native module and skips itself if it is not built.
+
