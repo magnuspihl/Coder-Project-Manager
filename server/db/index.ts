@@ -485,6 +485,30 @@ export function getDb(): Database.Database {
     console.log(`[migration] review_findings states widened (${moved.changes} dismissal(s) reclassified as 'resolved')`);
   }
 
+  // Evidence-based review (docs/AUTO_REVIEW.md §17). These come AFTER the
+  // review_findings rebuild above, whose explicit column list would otherwise
+  // drop them on databases that still take that path.
+  //   severity      'blocking' findings send the implementer back; 'advisory'
+  //                 ones (unproven claims) are shown to the user and never loop.
+  //   proof_*       the reviewer's failing test and how the harness classified it
+  //                 (confirmed/unproven — refuted findings are not stored as rows).
+  const evidenceCols = db.prepare("PRAGMA table_info(review_findings)").all() as Array<{ name: string }>;
+  for (const [col, ddl] of [
+    ['severity', "severity TEXT NOT NULL DEFAULT 'blocking'"],
+    ['proof_status', 'proof_status TEXT'],
+    ['requirement', 'requirement TEXT'],
+    ['proof_path', 'proof_path TEXT'],
+    ['proof_output', 'proof_output TEXT'],
+  ] as const) {
+    if (!evidenceCols.some(c => c.name === col)) db.exec(`ALTER TABLE review_findings ADD COLUMN ${ddl}`);
+  }
+  // review_mode: 'proof' (findings need failing tests) or 'opinion' (no runnable
+  // test setup — the pre-existing read-and-judge review). review_proofs: JSON of
+  // every proof attempted this turn, including refuted ones.
+  const turnCols = db.prepare("PRAGMA table_info(task_turns)").all() as Array<{ name: string }>;
+  if (!turnCols.some(c => c.name === 'review_mode')) db.exec("ALTER TABLE task_turns ADD COLUMN review_mode TEXT");
+  if (!turnCols.some(c => c.name === 'review_proofs')) db.exec("ALTER TABLE task_turns ADD COLUMN review_proofs TEXT");
+
   // Per-delta token usage events, so consumers can attribute tokens to a
   // rolling time window (e.g. "tokens in the last 5 hours") instead of only the
   // cumulative per-task totals on the tasks row. One row is inserted per token
@@ -623,6 +647,26 @@ export function getDb(): Database.Database {
   // label actually applied to each task's issue. See services/github-issues.ts.
   if (!wsCols4.some(c => c.name === 'issue_progress_label')) {
     db.exec("ALTER TABLE workspace_settings ADD COLUMN issue_progress_label TEXT");
+  }
+  // Harness-computed account of the task's tests (JSON VerificationSummary, see
+  // services/verification.ts): which tests ran, whether they fail without the
+  // change, and the suite tally. Overwritten after each implementer turn.
+  const taskColsV = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+  if (!taskColsV.some(c => c.name === 'verification')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN verification TEXT");
+  }
+  // Whether implementers must write tests in this workspace. NULL = auto: on when a
+  // supported runner is detected/configured, off otherwise. 'on' also lets the
+  // implementer set a framework up; 'off' disables the obligation and the
+  // harness's per-turn test report. See services/test-profile.ts.
+  if (!wsCols4.some(c => c.name === 'test_obligation')) {
+    db.exec("ALTER TABLE workspace_settings ADD COLUMN test_obligation TEXT");
+  }
+  // How this workspace runs its tests (JSON TestProfile, see services/test-runners.ts).
+  // NULL = auto-detect from the repo. Set by the user, or reported by the implementer
+  // when it sets up or changes the test runner.
+  if (!wsCols4.some(c => c.name === 'test_profile')) {
+    db.exec("ALTER TABLE workspace_settings ADD COLUMN test_profile TEXT");
   }
   const tasksCols9 = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
   if (!tasksCols9.some(c => c.name === 'github_issue_progress_label')) {

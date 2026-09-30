@@ -51,6 +51,7 @@ import TaskDetailModal from '../components/TaskDetailModal';
 import IssueTaskModal from '../components/IssueTaskModal';
 import MarkdownComposer from '../components/MarkdownComposer';
 import PendingFiles from '../components/PendingFiles';
+import TestProfileSetting from '../components/TestProfileSetting';
 
 function timeAgo(iso: string): string {
   const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -1619,6 +1620,7 @@ export default function WorkspacesPage() {
                   <span className="text-[10px] text-red-500">{previewUrlError[ws.id]}</span>
                 )}
               </div>
+              <TestProfileSetting workspaceId={ws.id} />
               <div className="flex items-center gap-1.5 flex-wrap">
                 <span className="text-gray-500 dark:text-gray-400 shrink-0">Voice:</span>
                 {(wsVoiceSettings[ws.id] ?? []).map((vid, idx) => {

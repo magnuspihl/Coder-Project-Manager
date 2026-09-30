@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- into the prompt on the task's next resume, then cleared — see
   -- consumePendingRollbackNote / launchTask.
   pending_rollback_note TEXT,
+  -- JSON VerificationSummary: the harness's account of the task's tests (services/verification.ts).
+  verification TEXT,
   -- Draft PR URL opened by a fork-PR-mode completion (see workspace_settings.fork_pr_mode).
   pr_url TEXT,
   -- The GitHub issue this task was created from (see services/github-issues.ts).
@@ -72,6 +74,10 @@ CREATE TABLE IF NOT EXISTS task_turns (
   review_outcome TEXT CHECK (review_outcome IN ('pass', 'fail', NULL)),
   review_summary TEXT,
   review_issues TEXT,
+  -- 'proof' (findings must be backed by failing tests) or 'opinion' (no runnable
+  -- test setup found). review_proofs: JSON of every proof attempted, incl. refuted.
+  review_mode TEXT,
+  review_proofs TEXT,
   files_changed INTEGER,
   started_at TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT
@@ -93,7 +99,14 @@ CREATE TABLE IF NOT EXISTS review_findings (
   state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'fixing', 'dismissed', 'resolved')),
   note TEXT,
   decided_at TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  -- Evidence-based review: 'advisory' findings never loop; proof_* record the
+  -- reviewer's failing test and how the harness classified it.
+  severity TEXT NOT NULL DEFAULT 'blocking',
+  proof_status TEXT,
+  requirement TEXT,
+  proof_path TEXT,
+  proof_output TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_review_findings_task ON review_findings(task_id);
@@ -280,6 +293,11 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
   -- when the issue-backed task is created, removed when it completes or is
   -- deleted). NULL = off.
   issue_progress_label TEXT,
+  -- JSON TestProfile: how this workspace runs tests (see services/test-runners.ts).
+  -- NULL = auto-detect from the repo.
+  test_profile TEXT,
+  -- NULL = auto, 'on', 'off': whether implementers must write tests here (services/test-profile.ts).
+  test_obligation TEXT,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
