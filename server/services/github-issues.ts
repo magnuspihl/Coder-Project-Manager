@@ -395,6 +395,96 @@ async function setIssueState(
   await ghApi(`${base}/comments`, token, { method: 'POST', body: { body: comment } });
 }
 
+// ─── "CPM is working on this" label ──────────────────────────────────────────
+//
+// Optional, per workspace: while an issue-backed task exists, its issue carries
+// a label (default `cpm:in-progress`) so the tracker shows the issue is taken.
+// Added when the task is created — from "+ Issue" or the label watcher — and on
+// reopen/restore; removed when the task completes or is deleted. The label that
+// was actually applied is recorded on the task, so changing the setting later
+// never strands the old label on an issue.
+
+export const DEFAULT_PROGRESS_LABEL = 'cpm:in-progress';
+
+/** The workspace's in-progress label, or null when the feature is off. */
+export function getIssueProgressLabel(workspaceId: string): string | null {
+  const row = getDb().prepare('SELECT issue_progress_label FROM workspace_settings WHERE workspace_id = ?')
+    .get(workspaceId) as { issue_progress_label: string | null } | undefined;
+  return row?.issue_progress_label ?? null;
+}
+
+export function setIssueProgressLabel(workspaceId: string, label: string | null): void {
+  const now = new Date().toISOString();
+  getDb().prepare(
+    `INSERT INTO workspace_settings (workspace_id, issue_progress_label, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(workspace_id) DO UPDATE SET issue_progress_label = excluded.issue_progress_label, updated_at = excluded.updated_at`,
+  ).run(workspaceId, label, now);
+}
+
+function setTaskProgressLabel(taskId: string, label: string | null): void {
+  getDb().prepare('UPDATE tasks SET github_issue_progress_label = ? WHERE id = ?').run(label, taskId);
+}
+
+/**
+ * Put the workspace's in-progress label on the task's issue. No-op when the
+ * feature is off, the task has no issue, or a label is already recorded.
+ * Best-effort like the close/reopen sync: failures go to the task's log.
+ */
+export async function applyIssueProgressLabel(taskId: string): Promise<void> {
+  const task = getTask(taskId);
+  if (!task || task.github_issue_progress_label) return;
+  const link = getTaskIssueLink(task);
+  const label = getIssueProgressLabel(task.workspace_id);
+  if (!link || !label) return;
+  const ref = refFromRepoSlug(link.repo);
+  if (!ref) return;
+
+  try {
+    const token = await requireToken(task.user_id);
+    await ghApi(
+      `/repos/${encodeURIComponent(ref.owner)}/${encodeURIComponent(ref.repo)}/issues/${link.number}/labels`,
+      token,
+      { method: 'POST', body: { labels: [label] } },
+    );
+    setTaskProgressLabel(taskId, label);
+  } catch (err) {
+    addMessage(taskId, 'system', `Could not add the \`${label}\` label to GitHub issue #${link.number} (${link.repo}): ${failureReason(err)}.`);
+  }
+}
+
+/**
+ * Take the in-progress label back off the task's issue — the one recorded when
+ * it was applied. A label someone already removed by hand (404) counts as done.
+ */
+export async function clearIssueProgressLabel(taskId: string): Promise<void> {
+  const task = getTask(taskId);
+  const label = task?.github_issue_progress_label;
+  if (!task || !label) return;
+  const link = getTaskIssueLink(task);
+  const ref = link ? refFromRepoSlug(link.repo) : null;
+  if (!link || !ref) {
+    setTaskProgressLabel(taskId, null);
+    return;
+  }
+
+  try {
+    const token = await requireToken(task.user_id);
+    try {
+      await ghApi(
+        `/repos/${encodeURIComponent(ref.owner)}/${encodeURIComponent(ref.repo)}/issues/${link.number}/labels/${encodeURIComponent(label)}`,
+        token,
+        { method: 'DELETE' },
+      );
+    } catch (err) {
+      if (!(err instanceof GitHubError) || err.status !== 404) throw err;
+    }
+    setTaskProgressLabel(taskId, null);
+  } catch (err) {
+    addMessage(taskId, 'system', `Could not remove the \`${label}\` label from GitHub issue #${link.number} (${link.repo}): ${failureReason(err)}. Remove it manually if needed.`);
+  }
+}
+
 /**
  * Close the issue a task was created from, after the task completed.
  *
@@ -416,6 +506,10 @@ export async function closeIssueForCompletedTask(taskId: string): Promise<void> 
     ? ` (PR: ${task.pr_url})`
     : task.git_branch ? ` (branch \`${task.git_branch}\`)` : '';
   const comment = `Closed by Coder Project Manager — task "${task.title}" was marked complete.${trailer}`;
+
+  // The task is done, so the issue is no longer being worked on — even if
+  // closing it below fails (e.g. no permission on someone else's repo).
+  await clearIssueProgressLabel(taskId);
 
   try {
     await setIssueState(ref, link.number, task.user_id, 'closed', comment);
@@ -445,4 +539,5 @@ export async function reopenIssueForTask(taskId: string): Promise<void> {
   } catch (err) {
     addMessage(taskId, 'system', `Could not reopen GitHub issue #${link.number} (${link.repo}): ${failureReason(err)}. Reopen it manually if needed.`);
   }
+  await applyIssueProgressLabel(taskId);
 }

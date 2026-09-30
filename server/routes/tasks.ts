@@ -56,7 +56,8 @@ import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, removeTaskWorktree, rollbackTaskToCheckpoint } from '../services/git.js';
 import {
   resolveWorkspaceRepo, getIssueDetail, buildIssuePrompt, GitHubError,
-  closeIssueForCompletedTask, reopenIssueForTask, type TaskIssueLink,
+  closeIssueForCompletedTask, reopenIssueForTask, applyIssueProgressLabel, clearIssueProgressLabel,
+  type TaskIssueLink,
 } from '../services/github-issues.js';
 import { linkAttachmentsToTask, getAttachmentsByTask } from './uploads.js';
 import { getDb } from '../db/index.js';
@@ -220,6 +221,8 @@ router.post('/workspaces/:workspaceId/tasks', requireAuth, async (req: Request, 
     // via polling anyway; launch failures mark the task failed with a message.
     res.status(201).json({ task: getTask(task.id) });
     runInBackground(`launch ${task.id}`, () => processQueue(req.params.workspaceId));
+    // Mark the issue as being worked on, if the workspace opted in.
+    if (issueLink) runInBackground(`progress-label ${task.id}`, () => applyIssueProgressLabel(task.id));
   } catch (err) {
     res.status(500).json({ error: 'Failed to create task' });
   }
@@ -1021,6 +1024,8 @@ router.delete('/tasks/:taskId', requireAuth, async (req: Request, res: Response)
   res.json({ ok: true, taskId: task.id });
 
   runInBackground(`delete-cleanup ${task.id}`, async () => {
+    // A deleted task is no longer working on its issue.
+    await clearIssueProgressLabel(task.id).catch(() => {});
     // Shut down preview servers first, then remove the worktree — a running
     // server holding the worktree open would otherwise block its removal.
     await cleanupPortRange(task).catch(() => {});
@@ -1045,6 +1050,10 @@ router.post('/tasks/:taskId/restore', requireAuth, (req: Request, res: Response)
   }
   restoreTask(task.id);
   res.json({ ok: true, task: getTask(task.id) });
+  // Undo the delete's label removal — unless the task had already completed.
+  if (task.status !== 'completed') {
+    runInBackground(`progress-label ${task.id}`, () => applyIssueProgressLabel(task.id));
+  }
 });
 
 // --- Task Participants (advisory agents) ---

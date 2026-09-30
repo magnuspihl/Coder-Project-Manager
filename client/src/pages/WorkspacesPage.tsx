@@ -25,6 +25,9 @@ import {
   getIssueWatchSettings,
   updateIssueWatchSettings,
   type IssueWatchSettings,
+  getIssueProgressLabelSettings,
+  updateIssueProgressLabelSettings,
+  type IssueProgressLabelSettings,
   getPreviewSettings,
   updatePreviewSettings,
   getWorkspaceVoiceSettings,
@@ -353,6 +356,11 @@ export default function WorkspacesPage() {
   const [issueWatchLabelDrafts, setIssueWatchLabelDrafts] = useState<Record<string, string>>({});
   const [issueWatchSaving, setIssueWatchSaving] = useState<Record<string, boolean>>({});
   const [issueWatchNotice, setIssueWatchNotice] = useState<Record<string, string | null>>({});
+  // "CPM is working on this" issue label, per workspace.
+  const [progressLabel, setProgressLabel] = useState<Record<string, IssueProgressLabelSettings>>({});
+  const [progressLabelDrafts, setProgressLabelDrafts] = useState<Record<string, string>>({});
+  const [progressLabelSaving, setProgressLabelSaving] = useState<Record<string, boolean>>({});
+  const [progressLabelNotice, setProgressLabelNotice] = useState<Record<string, string | null>>({});
   const [wsVoiceSettings, setWsVoiceSettings] = useState<Record<string, string[]>>({});
   const [wsDefaultVoices, setWsDefaultVoices] = useState<Record<string, string | null>>({});
   const [availableVoices, setAvailableVoices] = useState<Array<{ id: string; name: string }>>([]);
@@ -841,6 +849,15 @@ export default function WorkspacesPage() {
         })
         .catch(() => { /* row stays hidden until it loads */ });
     }
+    // Fetch the in-progress issue label setting
+    if (!(workspaceId in progressLabel)) {
+      getIssueProgressLabelSettings(workspaceId)
+        .then(p => {
+          setProgressLabel(prev => ({ ...prev, [workspaceId]: p }));
+          setProgressLabelDrafts(prev => ({ ...prev, [workspaceId]: p.label }));
+        })
+        .catch(() => { /* row stays hidden until it loads */ });
+    }
     // Fetch saved preview URL
     if (!(workspaceId in previewUrlSettings)) {
       try {
@@ -1009,6 +1026,22 @@ export default function WorkspacesPage() {
       setIssueWatchNotice(prev => ({ ...prev, [workspaceId]: err instanceof Error ? err.message : 'Failed to save' }));
     } finally {
       setIssueWatchSaving(prev => ({ ...prev, [workspaceId]: false }));
+    }
+  };
+
+  const handleSaveProgressLabel = async (workspaceId: string, enabled: boolean) => {
+    setProgressLabelSaving(prev => ({ ...prev, [workspaceId]: true }));
+    setProgressLabelNotice(prev => ({ ...prev, [workspaceId]: null }));
+    try {
+      const label = (progressLabelDrafts[workspaceId] ?? '').trim();
+      const p = await updateIssueProgressLabelSettings(workspaceId, enabled ? { enabled, label: label || undefined } : { enabled });
+      setProgressLabel(prev => ({ ...prev, [workspaceId]: p }));
+      setProgressLabelDrafts(prev => ({ ...prev, [workspaceId]: p.label }));
+      setProgressLabelNotice(prev => ({ ...prev, [workspaceId]: p.warning ?? null }));
+    } catch (err) {
+      setProgressLabelNotice(prev => ({ ...prev, [workspaceId]: err instanceof Error ? err.message : 'Failed to save' }));
+    } finally {
+      setProgressLabelSaving(prev => ({ ...prev, [workspaceId]: false }));
     }
   };
 
@@ -1502,6 +1535,50 @@ export default function WorkspacesPage() {
                     )}
                     {issueWatchNotice[ws.id] && (
                       <span className="text-[10px] text-amber-600 dark:text-amber-400 pl-5">{issueWatchNotice[ws.id]}</span>
+                    )}
+                  </div>
+                );
+              })()}
+              {couldHaveGithubIssues && progressLabel[ws.id] && (() => {
+                const p = progressLabel[ws.id];
+                const draft = progressLabelDrafts[ws.id] ?? p.label;
+                const saving = !!progressLabelSaving[ws.id];
+                return (
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <label
+                        className="flex items-center gap-1.5 cursor-pointer select-none"
+                        title="Tasks created from a GitHub issue (via + Issue or the pickup label) add this label to the issue, and remove it when the task is completed or deleted."
+                      >
+                        <input
+                          type="checkbox"
+                          checked={p.enabled}
+                          onChange={() => handleSaveProgressLabel(ws.id, !p.enabled)}
+                          disabled={saving}
+                          className="rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500 h-3.5 w-3.5 disabled:opacity-50"
+                        />
+                        <span className="text-gray-600 dark:text-gray-300">Label issues CPM is working on</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={draft}
+                        maxLength={50}
+                        onChange={(e) => setProgressLabelDrafts(prev => ({ ...prev, [ws.id]: e.target.value }))}
+                        onKeyDown={(e) => { if (e.key === 'Enter' && p.enabled) handleSaveProgressLabel(ws.id, true); }}
+                        className="w-28 text-[11px] font-mono px-1.5 py-0.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200 focus:outline-none focus:border-blue-400"
+                      />
+                      {p.enabled && draft.trim() !== p.label && (
+                        <button
+                          onClick={() => handleSaveProgressLabel(ws.id, true)}
+                          disabled={saving || !draft.trim()}
+                          className="text-[10px] px-2 py-0.5 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                        >
+                          {saving ? 'Saving…' : 'Save'}
+                        </button>
+                      )}
+                    </div>
+                    {progressLabelNotice[ws.id] && (
+                      <span className="text-[10px] text-amber-600 dark:text-amber-400 pl-5">{progressLabelNotice[ws.id]}</span>
                     )}
                   </div>
                 );
