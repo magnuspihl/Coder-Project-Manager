@@ -12,10 +12,15 @@ const BASELINE: Record<BaselineResult, { label: string; cls: string; title: stri
     cls: 'text-gray-500 dark:text-gray-400',
     title: 'This test passes on the original code too, so it guards existing behaviour or proves nothing new about this change.',
   },
+  new_code: {
+    label: 'new code: fails without the change',
+    cls: 'text-green-700 dark:text-green-400',
+    title: 'On the original code this test file could not even load, because it imports a module this task adds. That proves the test depends on the new code, not that its assertions check the behaviour — weaker evidence than a test that loads and fails. Every test in the file gets this label, since a load failure takes the whole file down.',
+  },
   not_runnable: {
     label: "couldn't run without the change",
     cls: 'text-gray-500 dark:text-gray-400',
-    title: 'The test could not run against the original code (for example it needs code that did not exist yet), so it is unknown whether it fails there.',
+    title: 'The test could not run against the original code for a reason other than new code (a syntax error, a missing package, an environment problem, or an import whose exports changed), so it is unknown whether it fails there.',
   },
 };
 

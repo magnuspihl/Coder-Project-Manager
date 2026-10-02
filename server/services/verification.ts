@@ -14,14 +14,27 @@
  */
 
 import { isTestAuthoringError } from './review-proof.js';
-import { defaultFilePattern, parseRunOutput, type RunnerKind, type RunReport, type TestCase, type TestProfile } from './test-runners.js';
+import { defaultFilePattern, loadFailureIsNewCode, parseRunOutput, type RunnerKind, type RunReport, type TestCase, type TestProfile } from './test-runners.js';
 
 export type BaselineResult =
   /** Fails on the original code: the test genuinely exercises new behaviour. */
   | 'fails'
   /** Passes on the original code too: it guards existing behaviour, or proves nothing new. */
   | 'passes'
-  /** Could not run on the original code (e.g. it imports a module that didn't exist yet). */
+  /**
+   * The test file could not load on the original code, and the runner says the only
+   * reason is a module the task ADDS (absent at the merge-base, present now). It
+   * cannot pass without the change — but this proves the dependency, not the
+   * behaviour, so it is kept apart from `fails`. Applies to every test in the file:
+   * a load failure takes the whole file down, so a mixed file (some tests on new
+   * code, some on old) cannot be split by test.
+   */
+  | 'new_code'
+  /**
+   * Could not run on the original code for any other reason: a syntax error, a
+   * missing third-party package, an environment problem, an import of something
+   * that exists on the base but changed shape.
+   */
   | 'not_runnable';
 
 export interface VerifiedTest {
@@ -85,15 +98,34 @@ export function isTestFile(path: string, profile: TestProfile): boolean {
 
 const isReviewerProof = (path: string) => /cpm[-_]?proof/i.test(path.split('/').pop() ?? '');
 
+/** What `classifyBaseline` needs to tell "imports code the task adds" from any other load failure. */
+export interface BaselineContext {
+  runner: RunnerKind;
+  /** The test file this report is for, relative to the worktree root. */
+  testFile: string;
+  /** Files absent at the merge-base and present in the task (relative to it, like `changedPaths`). */
+  added: ReadonlySet<string>;
+  /** The scratch tree the base run happened in (to relativise absolute paths in runner output). */
+  baseDir?: string;
+}
+
 /**
  * Compare how the tests ran now with how the same file ran on the original
- * code. `not_runnable` covers both "the file didn't load" and "the test ran but
- * broke for a reason unrelated to the behaviour" — the summary never claims more
- * than "could not run without the change" for it.
+ * code. A file that did not load is `new_code` when the runner's structured
+ * output names only modules the task adds, otherwise `not_runnable` — which also
+ * covers "the test ran but broke for a reason unrelated to the behaviour"; the
+ * summary never claims more than "could not run without the change" for it.
  */
-export function classifyBaseline(current: TestCase[], base: RunReport): Map<string, BaselineResult> {
+export function classifyBaseline(current: TestCase[], base: RunReport, ctx?: BaselineContext): Map<string, BaselineResult> {
   const out = new Map<string, BaselineResult>();
   const unrunnable = !!base.suiteError || base.timedOut || base.cases.length === 0;
+  if (
+    ctx && base.suiteError && !base.timedOut && base.cases.length === 0 &&
+    loadFailureIsNewCode(ctx.runner, base.unresolved, ctx)
+  ) {
+    for (const c of current) out.set(c.name, 'new_code');
+    return out;
+  }
   for (const c of current) {
     if (unrunnable) { out.set(c.name, 'not_runnable'); continue; }
     const b = base.cases.find(x => x.name === c.name);
@@ -109,6 +141,8 @@ export interface VerificationIO {
   fingerprint(): Promise<string>;
   /** Files the task changed vs the default branch (committed, uncommitted and untracked), relative to the worktree root. */
   changedPaths(): Promise<string[]>;
+  /** The subset of the changed files that do not exist at the merge-base (added or renamed-to, committed or untracked). */
+  addedPaths(): Promise<string[]>;
   /** Run specific test files in the worktree. Resolves with the run script's raw output. */
   run(files: string[]): Promise<string>;
   /** Run the project's whole suite in the worktree. */
@@ -235,12 +269,14 @@ async function addBaseline(
       summary.notes.push('No base commit to compare against, so it is not known whether the new tests fail without the change.');
       return;
     }
+    // Needed only to explain a load failure; if it can't be listed those files stay not_runnable.
+    const added = new Set(await io.addedPaths().catch(() => [] as string[]));
     for (const file of files) {
       const current = byFile.get(file);
       if (!current) continue;
       if (outOfTime()) return;
       const baseReport = parseRunOutput(profile.runner, await io.runIn(base.dir, [file]));
-      const verdicts = classifyBaseline(current.cases, baseReport);
+      const verdicts = classifyBaseline(current.cases, baseReport, { runner: profile.runner, testFile: file, added, baseDir: base.dir });
       for (const t of summary.tests) {
         if (t.file === file && verdicts.has(t.name)) t.baseline = verdicts.get(t.name);
       }
@@ -255,7 +291,7 @@ async function addBaseline(
 
 /** Headline counts for the UI/log: how many claims are actually backed. */
 export function summariseVerification(v: VerificationSummary): {
-  passing: number; failing: number; failsWithoutChange: number; passesWithoutChange: number;
+  passing: number; failing: number; failsWithoutChange: number; passesWithoutChange: number; newCodeOnly: number;
 } {
   const passed = v.tests.filter(t => t.outcome === 'passed');
   return {
@@ -263,6 +299,7 @@ export function summariseVerification(v: VerificationSummary): {
     failing: v.tests.filter(t => t.outcome === 'failed').length,
     failsWithoutChange: passed.filter(t => t.baseline === 'fails').length,
     passesWithoutChange: passed.filter(t => t.baseline === 'passes').length,
+    newCodeOnly: passed.filter(t => t.baseline === 'new_code').length,
   };
 }
 

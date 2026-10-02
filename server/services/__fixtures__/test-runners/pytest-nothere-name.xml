@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="1" failures="0" skipped="0" tests="1" time="0.125" timestamp="2026-10-02T14:37:56.496011+00:00" hostname="Coder-Project-Manager"><testcase classname="" name="test_c" time="0.000"><error message="collection failure">ImportError while importing test module '/work/py/test_c.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.12/importlib/__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test_c.py:1: in &lt;module&gt;
+    from pkg import nothere
+E   ImportError: cannot import name 'nothere' from 'pkg' (/work/py/pkg/__init__.py)</error></testcase></testsuite></testsuites>

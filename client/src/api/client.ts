@@ -114,7 +114,7 @@ export interface StoredReview {
   proofs: StoredProof[];
 }
 
-export type BaselineResult = 'fails' | 'passes' | 'not_runnable';
+export type BaselineResult = 'fails' | 'passes' | 'new_code' | 'not_runnable';
 
 /** The harness's account of a task's tests (server: verification.ts VerificationSummary). */
 export interface VerificationSummary {

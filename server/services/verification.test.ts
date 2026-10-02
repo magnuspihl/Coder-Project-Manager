@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildVerification, classifyBaseline, isTestFile, parseNameList, summariseVerification, withBudget, type VerificationIO } from './verification.js';
-import { RESULT_MARKER, type TestProfile } from './test-runners.js';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseRunOutput, RESULT_MARKER, type RunnerKind, type TestProfile } from './test-runners.js';
 
 const profile: TestProfile = { runner: 'node-test', source: 'detected' };
 
@@ -11,12 +14,13 @@ const failTap = (name: string, error = 'boom') =>
   `${RESULT_MARKER} exit=1\nTAP version 13\nnot ok 1 - ${name}\n  ---\n  type: 'test'\n  error: '${error}'\n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  ...\n`;
 const loadFailTap = `${RESULT_MARKER} exit=1\n# Error: Cannot find module './new'\n# Subtest: a.test.ts\nnot ok 1 - a.test.ts\n  ---\n  type: 'test'\n  exitCode: 1\n  error: 'test failed'\n  ...\n`;
 
-function fakeIO(o: Partial<VerificationIO> & { changed?: string[] } = {}): VerificationIO & { calls: string[] } {
+function fakeIO(o: Partial<VerificationIO> & { changed?: string[]; added?: string[] } = {}): VerificationIO & { calls: string[] } {
   const calls: string[] = [];
   return {
     calls,
     fingerprint: o.fingerprint ?? (async () => 'f'.repeat(40)),
     changedPaths: o.changedPaths ?? (async () => o.changed ?? []),
+    addedPaths: o.addedPaths ?? (async () => o.added ?? []),
     run: o.run ?? (async f => { calls.push(`run ${f}`); return okTap('does a thing'); }),
     runSuite: o.runSuite ?? (async () => { calls.push('suite'); return okTap('a', 'b', 'c'); }),
     prepareBaseline: o.prepareBaseline ?? (async () => { calls.push('prepareBaseline'); return { dir: '/base' }; }),
@@ -65,7 +69,7 @@ test('buildVerification: lists the tests that ran, marks fail-before, runs the s
   assert.equal(v.baselineChecked, true);
   assert.deepEqual([v.suite?.passed, v.suite?.failed], [3, 0]);
   assert.ok(io.calls.includes('cleanup /base'));
-  assert.deepEqual(summariseVerification(v), { passing: 1, failing: 0, failsWithoutChange: 1, passesWithoutChange: 0 });
+  assert.deepEqual(summariseVerification(v), { passing: 1, failing: 0, failsWithoutChange: 1, passesWithoutChange: 0, newCodeOnly: 0 });
 });
 
 test('buildVerification: a test that also passes on the original code is flagged as such', async () => {
@@ -75,7 +79,7 @@ test('buildVerification: a test that also passes on the original code is flagged
   assert.equal(summariseVerification(v).passesWithoutChange, 1);
 });
 
-test('buildVerification: a test file that cannot load on the original code is not_runnable (new code), not "fails"', async () => {
+test('buildVerification: a test file that cannot load for a module the task did NOT add is not_runnable, not "fails"', async () => {
   const io = fakeIO({ changed: ['a.test.ts'], runIn: async () => loadFailTap });
   assert.equal((await buildVerification({ profile, io })).tests[0].baseline, 'not_runnable');
 });
@@ -220,3 +224,118 @@ test('withBudget: work that rejects still rejects (nothing is swallowed)', async
   await assert.rejects(withBudget(Promise.reject(new Error('boom')), 1000), /boom/);
 });
 
+
+// --- load failures caused by code the task adds ---------------------------------
+// Real runner output (captured by running each tool on a test that imports a module
+// which does not exist yet) is classified against the task's added-file list.
+
+const fxDir = join(dirname(fileURLToPath(import.meta.url)), '__fixtures__', 'test-runners');
+const baseRun = (runner: RunnerKind, file: string) =>
+  parseRunOutput(runner, `\n${RESULT_MARKER} exit=1\n${readFileSync(join(fxDir, file), 'utf8')}`.replace(/\n/g, '\r\n'));
+const cur = (...names: string[]) => names.map(name => ({ name, outcome: 'passed' as const }));
+
+const NEW_MODULE_CASES: Array<{ runner: RunnerKind; file: string; testFile: string; added: string[] }> = [
+  { runner: 'node-test', file: 'node-newmod.tap', testFile: 'src/dur.test.ts', added: ['src/dur.ts', 'src/dur.test.ts'] },
+  { runner: 'vitest', file: 'vitest-newmod.json', testFile: 'src/dur2.test.ts', added: ['src/dur2.ts', 'src/dur2.test.ts'] },
+  { runner: 'jest', file: 'jest-newmod.json', testFile: 'src/dur3.test.js', added: ['src/dur3.js', 'src/dur3.test.js'] },
+  { runner: 'pytest', file: 'pytest-newmod-module.xml', testFile: 'py/test_a.py', added: ['py/pkg/thing.py', 'py/test_a.py'] },
+  { runner: 'pytest', file: 'pytest-newmod-name.xml', testFile: 'py/test_b.py', added: ['py/pkg/thing2.py', 'py/test_b.py'] },
+];
+
+for (const c of NEW_MODULE_CASES) {
+  test(`${c.runner}: ${c.file} — a test file that cannot load only because it imports a module the task adds is labelled new_code`, () => {
+    const r = classifyBaseline(cur('t'), baseRun(c.runner, c.file), { runner: c.runner, testFile: c.testFile, added: new Set(c.added) });
+    assert.equal(r.get('t'), 'new_code');
+  });
+
+  test(`${c.runner}: ${c.file} — the same load failure is not_runnable when that module already existed on the base`, () => {
+    // The module is not in the added set (it exists at the merge-base or was merely modified).
+    const r = classifyBaseline(cur('t'), baseRun(c.runner, c.file), { runner: c.runner, testFile: c.testFile, added: new Set([c.testFile, 'src/unrelated.ts']) });
+    assert.equal(r.get('t'), 'not_runnable');
+  });
+}
+
+test('classifyBaseline: without an added-file list a load failure stays not_runnable', () => {
+  assert.equal(classifyBaseline(cur('t'), baseRun('node-test', 'node-newmod.tap')).get('t'), 'not_runnable');
+  assert.equal(classifyBaseline(cur('t'), baseRun('node-test', 'node-newmod.tap'),
+    { runner: 'node-test', testFile: 'src/dur.test.ts', added: new Set() }).get('t'), 'not_runnable');
+});
+
+test('classifyBaseline: a modified existing module that fails an assertion on the base is still an assertion-level "fails"', () => {
+  // The task only MODIFIED src/dur.ts; the test loads on the base and fails by assertion.
+  const base = { cases: [{ name: 't', outcome: 'failed' as const, message: 'AssertionError: expected 2' }] };
+  const r = classifyBaseline(cur('t'), base, { runner: 'node-test', testFile: 'src/dur.test.ts', added: new Set(['src/other.ts']) });
+  assert.equal(r.get('t'), 'fails');
+});
+
+test('classifyBaseline: genuinely broken tests (syntax error, missing third-party package, missing name in an existing module) stay not_runnable', () => {
+  const added = new Set(['src/dur.ts', 'src/dur.test.ts', 'py/pkg/thing.py', 'py/test_a.py']);
+  for (const [runner, file, testFile] of [
+    ['node-test', 'node-syntax.tap', 'src/dur.test.ts'],
+    ['vitest', 'vitest-syn.json', 'src/dur.test.ts'],
+    ['jest', 'jest-syn.json', 'src/dur.test.ts'],
+    ['pytest', 'pytest-syn.xml', 'py/test_a.py'],
+    // `nope` (python) / `./does-not-exist.ts` are not files this task adds.
+    ['pytest', 'pytest-missing.xml', 'py/test_a.py'],
+    ['node-test', 'node-missing.tap', 'src/dur.test.ts'],
+    // `from pkg import nothere`: pkg exists on the base and nothing adds pkg/nothere.py.
+    ['pytest', 'pytest-nothere-name.xml', 'py/test_a.py'],
+  ] as const) {
+    const r = classifyBaseline(cur('t'), baseRun(runner, file), { runner, testFile, added });
+    assert.equal(r.get('t'), 'not_runnable', `${runner} ${file}`);
+  }
+});
+
+test('classifyBaseline: a bare package specifier is never "new code", even if a same-named file was added', () => {
+  const base = { cases: [], suiteError: "Cannot find module 'left-pad'", unresolved: ['left-pad'] };
+  const r = classifyBaseline(cur('t'), base, { runner: 'node-test', testFile: 'src/a.test.ts', added: new Set(['left-pad.ts', 'src/left-pad.ts']) });
+  assert.equal(r.get('t'), 'not_runnable');
+});
+
+test('classifyBaseline: if any unresolved module is NOT one the task adds, the file is not_runnable', () => {
+  const base = { cases: [], suiteError: 'x', unresolved: ['./new', './old-but-moved'] };
+  const r = classifyBaseline(cur('t'), base, { runner: 'node-test', testFile: 'src/a.test.ts', added: new Set(['src/new.ts']) });
+  assert.equal(r.get('t'), 'not_runnable');
+});
+
+test('classifyBaseline: a timed-out base run is not_runnable even with a matching unresolved import', () => {
+  const base = { cases: [], suiteError: 'x', timedOut: true, unresolved: ['./new'] };
+  assert.equal(classifyBaseline(cur('t'), base, { runner: 'node-test', testFile: 'src/a.test.ts', added: new Set(['src/new.ts']) }).get('t'), 'not_runnable');
+});
+
+test('classifyBaseline: a mixed file (some tests use new code, some old) is labelled new_code as a whole, since the load failure takes every test down', () => {
+  const r = classifyBaseline(cur('uses new code', 'only uses old code'), baseRun('node-test', 'node-newmod.tap'),
+    { runner: 'node-test', testFile: 'src/dur.test.ts', added: new Set(['src/dur.ts']) });
+  assert.deepEqual([r.get('uses new code'), r.get('only uses old code')], ['new_code', 'new_code']);
+});
+
+test('classifyBaseline: absolute paths in runner output are resolved inside the scratch tree only', () => {
+  const base = { cases: [], suiteError: 'x', unresolved: ['/tmp/scratch.1/src/new.ts'] };
+  const ctx = { runner: 'node-test' as const, testFile: 'src/a.test.ts', added: new Set(['src/new.ts']) };
+  assert.equal(classifyBaseline(cur('t'), base, { ...ctx, baseDir: '/tmp/scratch.1' }).get('t'), 'new_code');
+  assert.equal(classifyBaseline(cur('t'), base, { ...ctx, baseDir: '/tmp/other' }).get('t'), 'not_runnable');
+  assert.equal(classifyBaseline(cur('t'), base, ctx).get('t'), 'not_runnable');
+});
+
+test('buildVerification: the new-module case end to end — new_code is counted apart from "fails"', async () => {
+  const io = fakeIO({
+    changed: ['src/dur.test.ts', 'src/dur.ts'],
+    added: ['src/dur.ts', 'src/dur.test.ts'],
+    runIn: async () => `\n${RESULT_MARKER} exit=1\n${readFileSync(join(fxDir, 'node-newmod.tap'), 'utf8')}`,
+  });
+  const v = await buildVerification({ profile, io });
+  assert.equal(v.tests[0].baseline, 'new_code');
+  assert.equal(v.baselineChecked, true);
+  const s = summariseVerification(v);
+  assert.equal(s.newCodeOnly, 1);
+  assert.equal(s.failsWithoutChange, 0);
+});
+
+test('buildVerification: if the added-file list cannot be read, load failures degrade to not_runnable', async () => {
+  const io = fakeIO({
+    changed: ['src/dur.test.ts'],
+    addedPaths: async () => { throw new Error('ssh hiccup'); },
+    runIn: async () => `\n${RESULT_MARKER} exit=1\n${readFileSync(join(fxDir, 'node-newmod.tap'), 'utf8')}`,
+  });
+  assert.equal((await buildVerification({ profile, io })).tests[0].baseline, 'not_runnable');
+});

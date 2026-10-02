@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import {
   buildRunCommand,
   detectProfile,
+  extractUnresolved,
   parseGoJson,
   parseRunOutput,
   parseTestProfile,
@@ -177,4 +178,27 @@ test('buildRunCommand: go runs the package directory of each file once', () => {
   const cmd = buildRunCommand({ runner: 'go', source: 'detected' }, '/w', ['pkg/a/x_cpm_proof_test.go', 'pkg/a/y_cpm_proof_test.go']);
   assert.match(cmd, /go test -json '\.\/pkg\/a'/);
   assert.equal((cmd.match(/'\.\/pkg\/a'/g) ?? []).length, 1);
+});
+
+test('the runner names the unresolved module for a load failure, per runner', () => {
+  const unresolved = (runner: 'node-test' | 'vitest' | 'jest' | 'pytest', file: string) =>
+    parseRunOutput(runner, wrap(fx(file))).unresolved;
+  assert.deepEqual(unresolved('node-test', 'node-newmod.tap'), ['./dur.js']);
+  assert.deepEqual(unresolved('vitest', 'vitest-newmod.json'), ['./dur2']);
+  assert.deepEqual(unresolved('jest', 'jest-newmod.json'), ['./dur3']);
+  assert.deepEqual(unresolved('pytest', 'pytest-newmod-module.xml'), ['pkg.thing']);
+  assert.deepEqual(unresolved('pytest', 'pytest-newmod-name.xml'), ['pkg.thing2']);
+});
+
+test('a syntax error names no unresolved module', () => {
+  for (const [runner, file] of [['node-test', 'node-syntax.tap'], ['vitest', 'vitest-syn.json'], ['jest', 'jest-syn.json'], ['pytest', 'pytest-syn.xml']] as const) {
+    assert.equal(parseRunOutput(runner, wrap(fx(file))).unresolved, undefined, `${runner}`);
+  }
+});
+
+test('extractUnresolved recognises vite import-analysis and ESM wording, and ignores other errors', () => {
+  assert.deepEqual(extractUnresolved('vitest', 'Failed to resolve import "./thing" from "src/a.test.ts". Does the file exist?'), ['./thing']);
+  assert.deepEqual(extractUnresolved('node-test', "Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/w/src/x.ts' imported from /w/src/a.test.ts"), ['/w/src/x.ts']);
+  assert.deepEqual(extractUnresolved('pytest', 'E   SyntaxError: invalid syntax'), []);
+  assert.deepEqual(extractUnresolved('go', "cannot find module providing package x"), [], 'go/dotnet stay not_runnable');
 });

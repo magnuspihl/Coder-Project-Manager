@@ -3636,7 +3636,7 @@ async function verifyTurnTests(task: Task, level: VerificationLevel): Promise<vo
       ? `[Harness] ${level === 'full' ? 'full verification' : 'running the change\'s tests'} (${describeRunner(profile)})`
       : '[Harness] no test runner found — nothing to run');
     const noIO: VerificationIO = {
-      fingerprint: async () => '', changedPaths: async () => [], run: async () => '', runSuite: async () => '',
+      fingerprint: async () => '', changedPaths: async () => [], addedPaths: async () => [], run: async () => '', runSuite: async () => '',
       prepareBaseline: async () => null, runIn: async () => '', cleanupBaseline: async () => {},
     };
     const work = buildVerification({
@@ -3652,7 +3652,7 @@ async function verifyTurnTests(task: Task, level: VerificationLevel): Promise<vo
       const c = summariseVerification(summary);
       appendStreamLog(task.id, 'verification',
         `[Harness] ${c.passing} passing / ${c.failing} failing test(s) in the change` +
-        (level === 'full' ? `, ${c.failsWithoutChange} fail without it` : '') +
+        (level === 'full' ? `, ${c.failsWithoutChange} fail without it${c.newCodeOnly ? ` (+${c.newCodeOnly} only because they import new code)` : ''}` : '') +
         (summary.suite ? `; suite ${summary.suite.passed} passed, ${summary.suite.failed} failed${summary.suite.error ? ` (${summary.suite.error.slice(0, 60)})` : ''}` : ''));
     });
     if ((await withBudget(work, budgetMs + VERIFY_GRACE_MS)).timedOut) {
@@ -3696,6 +3696,7 @@ function buildVerificationBlock(task: Task): string {
   const tag = (t: VerificationSummary['tests'][number]) =>
     t.baseline === 'fails' ? ' [fails without the change]'
     : t.baseline === 'passes' ? ' [ALSO PASSES without the change]'
+    : t.baseline === 'new_code' ? ' [fails without the change only because it imports code this change adds — proves the dependency, not the behaviour]'
     : t.baseline === 'not_runnable' ? ' [could not run without the change]' : '';
   const lines = v.tests.slice(0, 30).map(t => `- ${t.outcome === 'passed' ? 'PASS' : t.outcome === 'failed' ? 'FAIL' : 'SKIP'} "${t.name}" (${t.file})${tag(t)}`);
   const problems = v.problems.map(p => `- COULD NOT RUN ${p.file}: ${p.error.slice(0, 160)}`);
