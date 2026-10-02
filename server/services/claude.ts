@@ -3685,6 +3685,8 @@ function parseVerification(json: string | null | undefined): VerificationSummary
 export function startFullVerification(task: Task): 'started' | 'busy' | 'unavailable' {
   if (!task.worktree_path) return 'unavailable';
   if (task.status === 'working' || task.status === 'queued' || verifyingTasks.has(task.id)) return 'busy';
+  // Leave a trace of WHY a full run happened with no review: it is otherwise indistinguishable from an automatic one.
+  appendStreamLog(task.id, 'verification', '[Harness] full verification requested on demand (Run full verification / POST /verify)');
   verifyTurnTests(task, 'full').catch(() => {});
   return 'started';
 }

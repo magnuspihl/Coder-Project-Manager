@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildVerification, classifyBaseline, isTestFile, parseNameList, summariseVerification, withBudget, type VerificationIO } from './verification.js';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseRunOutput, RESULT_MARKER, type RunnerKind, type TestProfile } from './test-runners.js';
@@ -338,4 +338,18 @@ test('buildVerification: if the added-file list cannot be read, load failures de
     runIn: async () => `\n${RESULT_MARKER} exit=1\n${readFileSync(join(fxDir, 'node-newmod.tap'), 'utf8')}`,
   });
   assert.equal((await buildVerification({ profile, io })).tests[0].baseline, 'not_runnable');
+});
+
+test('a full verification can only be started by a review launch or the on-demand request — no other code path', () => {
+  const src = (f: string) => readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', f), 'utf8');
+  const claude = src('server/services/claude.ts');
+  const fullCalls = [...claude.matchAll(/verifyTurnTests\([^)]*'full'\)/g)].length;
+  assert.equal(fullCalls, 2, 'exactly: the reviewer launch and startFullVerification');
+  assert.equal([...claude.matchAll(/verifyTurnTests\([^)]*'tests'\)/g)].length, 1, 'an ordinary implementer turn runs only the quick level');
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+  const walk = (d: string): string[] => readdirSync(join(root, d), { withFileTypes: true }).flatMap(e =>
+    e.isDirectory() ? (e.name === 'node_modules' ? [] : walk(`${d}/${e.name}`)) : e.name.endsWith('.ts') && !e.name.endsWith('.test.ts') ? [`${d}/${e.name}`] : []);
+  const callers = walk('server').filter(f => /startFullVerification\(/.test(src(f)) && f !== 'server/services/claude.ts');
+  assert.deepEqual(callers, ['server/routes/tasks.ts'], 'only the POST /tasks/:id/verify route');
+  assert.equal([...src('server/routes/tasks.ts').matchAll(/startFullVerification\(/g)].length, 1);
 });

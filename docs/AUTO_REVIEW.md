@@ -1023,12 +1023,15 @@ proof-mode *review* depends only on whether a runner can be resolved (Section 17
 | **tests** (quick) | only the test files the task added or changed, each run individually | after an ordinary implementer turn that changed files |
 | **full** | the above **plus** the fail-before comparison **plus** the whole suite | when a review runs (automatic or manual), and on demand via **Run full verification** (`POST /api/tasks/:id/verify`) |
 
-**In an auto-review task the very first turn is already `full`.** The reviewer is launched straight after the
-implementer's turn and runs the full verification as its first step (`launchReviewerOnTask`), so the stored
-result — and what the card shows — is the review-time one, not a quick check that was somehow upgraded. The
-`tests` level is what a turn gets only when *no* reviewer follows (auto-review off, `NO_REVIEW_NEEDED`, or a
-turn that made no changes). This is the design, not a cache-miss path: the fingerprint cache only ever
-*skips* a repeat full run.
+**What can start a `full` run.** Exactly two things, pinned by a test: a reviewer launch (automatic *or* manual —
+`launchReviewerOnTask`) and the on-demand request (`POST /api/tasks/:id/verify`, the *Run full verification*
+button). Opening a task, `GET`ting it, a poller or a timer never computes one. An ordinary implementer turn
+gets `tests`, and only when no reviewer follows. (Canary d11106c6 had `auto_review=0` yet stored a `full`
+result stamped 3 minutes after its first turn: with no reviewer launched, the only remaining trigger is an
+on-demand request, which `computedAt` — stamped when a run *starts* — dates to that moment. The 3-minute
+gap is therefore when someone asked, not a run's duration. The original server log for that window was not
+retained, so this is by elimination; on-demand requests now write a `[Harness] full verification requested
+on demand` line to the task's stream log so the next case is attributable.)
 
 Why not full every turn: many turns are small tweaks in a conversation, and a suite run (≤180 s) after each
 would make iteration miserable for a benefit the user only needs at review time. A full result is **not
