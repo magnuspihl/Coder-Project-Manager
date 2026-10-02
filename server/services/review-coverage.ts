@@ -266,8 +266,11 @@ export function filesOpened(calls: ToolCall[], worktree: string, candidates: str
       const p = relativeTo(worktree, c.input.path);
       if (want.has(p)) opened.add(p);
     } else if (c.name === 'Bash' && typeof c.input.command === 'string') {
-      const cmd = c.input.command.replace(worktree.replace(/\/+$/, '') + '/', '');
-      for (const f of candidates) if (cmd.includes(f)) opened.add(f);
+      // Whole-token match: `cat src/data.ts` must not count as opening `a.ts`.
+      for (const tok of c.input.command.split(/[\s'"`;|&()<>=:,]+/)) {
+        const p = relativeTo(worktree, tok);
+        if (want.has(p)) opened.add(p);
+      }
     }
   }
   return opened;

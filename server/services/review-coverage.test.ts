@@ -223,3 +223,11 @@ test('the report records that the turn cap stopped the reviewer', () => {
   assert.equal(r.stoppedByTurnCap, true);
   assert.equal(r.turnCap, 46);
 });
+
+test('a Bash command naming a path that merely ends with the file name does not open the file', () => {
+  const d = buildReviewDiff(fileDiff('seen.ts') + fileDiff('a.ts', 40, 20), [], 3500);
+  const r = assessCoverage({ diff: d, worktree: WT, toolCalls: [{ name: 'Bash', input: { command: 'cat src/data.ts' } }] });
+  assert.deepEqual(r.unreviewed.map(u => u.path), ['a.ts']);
+  const ok = assessCoverage({ diff: d, worktree: WT, toolCalls: [{ name: 'Bash', input: { command: `git diff base -- "${WT}/a.ts" | head` } }] });
+  assert.deepEqual(ok.unreviewed, []);
+});
