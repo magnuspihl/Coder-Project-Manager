@@ -46,6 +46,19 @@ export interface VerifiedTest {
   baseline?: BaselineResult;
   /** Failure text, for tests that failed. */
   message?: string;
+  /**
+   * Whether the test's name is new in its file: true = absent from the file at the
+   * merge-base (or the whole file is new), false = already there. Absent = not
+   * determined (no base to read, or a summary stored before this existed), which is
+   * treated as "show it". Name-based only — see testExistedAtBase.
+   */
+  added?: boolean;
+  /**
+   * An unremarkable pre-existing test: the task did not add it (by name), it
+   * passes, and it does not fail on the original code either. It says nothing
+   * about THIS change, so the card and the reviewer prompt fold it into a count.
+   */
+  routine?: true;
 }
 
 export interface SuiteResult {
@@ -141,6 +154,11 @@ export interface VerificationIO {
   fingerprint(): Promise<string>;
   /** Files the task changed vs the default branch (committed, uncommitted and untracked), relative to the worktree root. */
   changedPaths(): Promise<string[]>;
+  /**
+   * Each file's source as it was at the merge-base; null when it did not exist
+   * there. Files missing from the result (no base, git failure) are "unknown".
+   */
+  baseSources(files: string[]): Promise<Record<string, string | null>>;
   /** The subset of the changed files that do not exist at the merge-base (added or renamed-to, committed or untracked). */
   addedPaths(): Promise<string[]>;
   /** Run specific test files in the worktree. Resolves with the run script's raw output. */
@@ -161,7 +179,27 @@ export interface VerificationIO {
  * failing the turn. `shouldStop` is polled before every run so a spent time
  * budget ends the work at the next boundary instead of grinding through the rest.
  */
-export async function buildVerification(args: {
+export async function buildVerification(args: Parameters<typeof buildVerificationRaw>[0]): Promise<VerificationSummary> {
+  const summary = await buildVerificationRaw(args);
+  if (summary.tests.length > 0 && !(args.shouldStop?.())) {
+    try {
+      const files = [...new Set(summary.tests.map(t => t.file))];
+      const [added, sources] = await Promise.all([
+        args.io.addedPaths().catch(() => [] as string[]),
+        args.io.baseSources(files).catch(() => ({} as Record<string, string | null>)),
+      ]);
+      markAddedTests(summary.tests, new Set(added), sources);
+    } catch { /* leave `added` undetermined: every test is then shown */ }
+  }
+  summary.tests = orderTests(summary.tests);
+  // "No tests apply" contradicts a change that carries tests of its own. The
+  // implementer sometimes emits the marker anyway (e.g. "not applicable, a test was
+  // added"); the harness's own findings win, so the reason is never shown then.
+  if (summary.tests.some(t => !t.routine)) delete summary.noTestsReason;
+  return summary;
+}
+
+async function buildVerificationRaw(args: {
   profile: TestProfile | null;
   io: VerificationIO;
   level?: VerificationLevel;
@@ -287,6 +325,103 @@ async function addBaseline(
   } finally {
     if (base) await io.cleanupBaseline(base.dir).catch(() => {});
   }
+}
+
+const escapeRe = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** `s` appears in `src` as a quoted string literal (how js/ts and most others write a test title). */
+function hasQuoted(src: string, s: string): boolean {
+  for (const q of ["'", '"', '`']) if (src.includes(q + s + q)) return true;
+  // A title containing its own quote is escaped in the source; don't call that "new".
+  return /['"`\\]/.test(s) && src.includes(s);
+}
+
+const hasIdentifier = (src: string, id: string) => id.length > 0 && new RegExp(`(?<![\\w$])${escapeRe(id)}(?![\\w$])`).test(src);
+
+/**
+ * Whether a test of this name was already in the file at the merge-base, judged
+ * from the old file's TEXT. Name-based and runner-agnostic on purpose: it works
+ * the same for every supported runner and costs one `git show`, but it cannot see
+ * that an existing test's BODY changed. It errs towards "added" (the safe side:
+ * the test is shown, not folded away) whenever it cannot find the name.
+ *
+ *  - jest/vitest report `describe it` joined by spaces and node:test the title:
+ *    found as a quoted literal, trying the whole name and then word-suffixes of at
+ *    least two words (the `it` title without its `describe` prefixes).
+ *  - pytest/dotnet report `module.Class.method[params]`: the method name as a word.
+ *  - go reports `TestA/sub_name`: every segment, as a word or a quoted title with
+ *    underscores for spaces.
+ */
+export function testExistedAtBase(name: string, baseSource: string): boolean {
+  const src = baseSource;
+  const trimmed = name.trim();
+  if (!trimmed) return false;
+  if (hasQuoted(src, trimmed)) return true;
+
+  if (/\s/.test(trimmed)) {
+    const parts = trimmed.split(/\s+[>›]\s+/);
+    const leaf = parts[parts.length - 1];
+    if (parts.length > 1 && hasQuoted(src, leaf)) return true;
+    const words = leaf.split(/\s+/);
+    for (let i = 1; i <= words.length - 2; i++) {
+      if (hasQuoted(src, words.slice(i).join(' '))) return true;
+    }
+    return false;
+  }
+
+  if (trimmed.includes('/')) {
+    return trimmed.split('/').every(seg => hasIdentifier(src, seg) || hasQuoted(src, seg.replace(/_/g, ' ')));
+  }
+  const leaf = (trimmed.split('.').pop() ?? trimmed).replace(/[\[(].*$/, '');
+  return hasIdentifier(src, leaf) || hasQuoted(src, leaf);
+}
+
+/**
+ * Set `added`/`routine` on each test from the files' base sources. A file that is
+ * new (listed in `addedFiles`, or absent at the base) has only added tests; a file
+ * whose base source is unknown is left undetermined.
+ */
+export function markAddedTests(tests: VerifiedTest[], addedFiles: ReadonlySet<string>, baseSources: Record<string, string | null>): void {
+  for (const t of tests) {
+    const src = baseSources[t.file];
+    if (addedFiles.has(t.file) || src === null) t.added = true;
+    else if (typeof src === 'string') t.added = !testExistedAtBase(t.name, src);
+    else continue;
+    // Anything failing, a reviewer's proof test, or a pre-existing test that fails
+    // on the original code (so it must exercise something this task changed) is evidence.
+    if (t.added === false && t.outcome !== 'failed' && t.origin !== 'reviewer' && t.baseline !== 'fails') t.routine = true;
+    else delete t.routine;
+  }
+}
+
+const evidenceRank = (t: VerifiedTest) =>
+  t.outcome === 'failed' ? 0 : t.baseline === 'fails' ? 1 : t.baseline === 'new_code' ? 2 : 3;
+
+/** Strongest evidence first (failing, fails-before, new-code, then the rest); routine tests last. Stable. */
+export function orderTests(tests: VerifiedTest[]): VerifiedTest[] {
+  const key = (t: VerifiedTest) => (t.routine ? 10 : 0) + evidenceRank(t);
+  return tests.map((t, i) => ({ t, i })).sort((a, b) => key(a.t) - key(b.t) || a.i - b.i).map(x => x.t);
+}
+
+/**
+ * The test lines of the reviewer's verification block. The change's own tests
+ * (added, changed, failing, the reviewer's proofs) are listed, strongest evidence
+ * first. Pre-existing tests in the same files that pass and say nothing about this
+ * change are folded into one count, so they neither flood the prompt nor go
+ * unmentioned — the reviewer can still see that they exist.
+ */
+export function reviewerTestLines(v: VerificationSummary, limit = 30): string[] {
+  const tag = (t: VerifiedTest) =>
+    t.baseline === 'fails' ? ' [fails without the change]'
+    : t.baseline === 'passes' ? ' [ALSO PASSES without the change]'
+    : t.baseline === 'new_code' ? ' [fails without the change only because it imports code this change adds — proves the dependency, not the behaviour]'
+    : t.baseline === 'not_runnable' ? ' [could not run without the change]' : '';
+  const evidence = v.tests.filter(t => !t.routine);
+  const routine = v.tests.length - evidence.length;
+  const lines = evidence.slice(0, limit).map(t => `- ${t.outcome === 'passed' ? 'PASS' : t.outcome === 'failed' ? 'FAIL' : 'SKIP'} "${t.name}" (${t.file})${tag(t)}`);
+  if (evidence.length > limit) lines.push(`- (+${evidence.length - limit} more tests added or changed by this change, not listed)`);
+  if (routine > 0) lines.push(`- (+${routine} existing test${routine === 1 ? '' : 's'} in the touched files, not added by this change, still pass and are not listed)`);
+  return lines;
 }
 
 /** Headline counts for the UI/log: how many claims are actually backed. */

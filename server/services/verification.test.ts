@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildVerification, classifyBaseline, isTestFile, parseNameList, summariseVerification, withBudget, type VerificationIO } from './verification.js';
+import { buildVerification, classifyBaseline, isTestFile, markAddedTests, orderTests, parseNameList, reviewerTestLines, summariseVerification, testExistedAtBase, withBudget, type VerificationIO, type VerificationSummary, type VerifiedTest } from './verification.js';
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +21,7 @@ function fakeIO(o: Partial<VerificationIO> & { changed?: string[]; added?: strin
     fingerprint: o.fingerprint ?? (async () => 'f'.repeat(40)),
     changedPaths: o.changedPaths ?? (async () => o.changed ?? []),
     addedPaths: o.addedPaths ?? (async () => o.added ?? []),
+    baseSources: o.baseSources ?? (async () => ({})),
     run: o.run ?? (async f => { calls.push(`run ${f}`); return okTap('does a thing'); }),
     runSuite: o.runSuite ?? (async () => { calls.push('suite'); return okTap('a', 'b', 'c'); }),
     prepareBaseline: o.prepareBaseline ?? (async () => { calls.push('prepareBaseline'); return { dir: '/base' }; }),
@@ -352,4 +353,102 @@ test('a full verification can only be started by a review launch or the on-deman
   const callers = walk('server').filter(f => /startFullVerification\(/.test(src(f)) && f !== 'server/services/claude.ts');
   assert.deepEqual(callers, ['server/routes/tasks.ts'], 'only the POST /tasks/:id/verify route');
   assert.equal([...src('server/routes/tasks.ts').matchAll(/startFullVerification\(/g)].length, 1);
+});
+
+// ---- Only what the task added or changed is prominent -------------------------------------
+
+const names = (...ns: string[]) => okTap(...ns);
+
+test('testExistedAtBase: finds a js title as a quoted literal, with or without its describe prefix', () => {
+  const src = `describe('Parser', () => { it('rejects empty input', () => {}); it("handles it's fine", () => {}); });`;
+  assert.equal(testExistedAtBase('rejects empty input', src), true);
+  assert.equal(testExistedAtBase('Parser rejects empty input', src), true);
+  assert.equal(testExistedAtBase('Parser > rejects empty input', src), true);
+  assert.equal(testExistedAtBase("handles it's fine", src), true);
+  assert.equal(testExistedAtBase('Parser accepts a trailing comma', src), false);
+});
+
+test('testExistedAtBase: matches pytest, dotnet and go names by their method or segments', () => {
+  assert.equal(testExistedAtBase('tests.test_a.TestA.test_old[1-2]', 'class TestA:\n    def test_old(self): pass'), true);
+  assert.equal(testExistedAtBase('tests.test_a.TestA.test_new', 'class TestA:\n    def test_old(self): pass'), false);
+  assert.equal(testExistedAtBase('test_old', 'def test_old_thing(): pass'), false, 'a longer identifier is not the same test');
+  assert.equal(testExistedAtBase('Ns.Calc.AddsTwo', 'public void AddsTwo() {}'), true);
+  assert.equal(testExistedAtBase('TestA/with_spaces', 'func TestA(t *testing.T) { t.Run("with spaces", f) }'), true);
+  assert.equal(testExistedAtBase('TestA/other', 'func TestA(t *testing.T) { t.Run("with spaces", f) }'), false);
+});
+
+test('markAddedTests: new names are added, old names are routine, and evidence is never folded away', () => {
+  const t = (name: string, extra: Partial<VerifiedTest> = {}): VerifiedTest => ({ name, file: 'a.test.ts', outcome: 'passed', origin: 'implementer', ...extra });
+  const tests = [
+    t('old passing test here'), t('brand new test here'), t('old failing test here', { outcome: 'failed' }),
+    t('old but fails without the change', { baseline: 'fails' }), t('old proof test here', { origin: 'reviewer' }),
+  ];
+  markAddedTests(tests, new Set(), { 'a.test.ts': `it('old passing test here'); it('old failing test here'); it('old but fails without the change'); it('old proof test here');` });
+  assert.deepEqual(tests.map(x => [x.name, x.added, !!x.routine]), [
+    ['old passing test here', false, true],
+    ['brand new test here', true, false],
+    ['old failing test here', false, false],
+    ['old but fails without the change', false, false],
+    ['old proof test here', false, false],
+  ]);
+});
+
+test('markAddedTests: every test in a new file is added; an unknown base leaves tests undetermined (shown)', () => {
+  const tests: VerifiedTest[] = [
+    { name: 'x one', file: 'new.test.ts', outcome: 'passed', origin: 'implementer' },
+    { name: 'y two', file: 'gone.test.ts', outcome: 'passed', origin: 'implementer' },
+    { name: 'z three', file: 'unknown.test.ts', outcome: 'passed', origin: 'implementer' },
+  ];
+  markAddedTests(tests, new Set(['new.test.ts']), { 'gone.test.ts': null });
+  assert.deepEqual(tests.map(x => [x.added, !!x.routine]), [[true, false], [true, false], [undefined, false]]);
+});
+
+test('orderTests: failing first, then fails-before, then new-code, then the rest; routine tests last; stable', () => {
+  const t = (name: string, extra: Partial<VerifiedTest> = {}): VerifiedTest => ({ name, file: 'f', outcome: 'passed', origin: 'implementer', ...extra });
+  const ordered = orderTests([
+    t('routine', { routine: true }), t('passes-before', { baseline: 'passes' }), t('new-code', { baseline: 'new_code' }),
+    t('not-runnable', { baseline: 'not_runnable' }), t('fails-before', { baseline: 'fails' }), t('red', { outcome: 'failed' }),
+  ]);
+  assert.deepEqual(ordered.map(x => x.name), ['red', 'fails-before', 'new-code', 'passes-before', 'not-runnable', 'routine']);
+});
+
+test('buildVerification: pre-existing passing tests in a touched file are marked routine; the new one leads', async () => {
+  const io = fakeIO({
+    changed: ['a.test.ts'],
+    run: async () => names('already there one', 'already there two', 'added by this task'),
+    runIn: async () => failTap('added by this task'),
+    baseSources: async () => ({ 'a.test.ts': `it('already there one'); it('already there two');` }),
+  });
+  const v = await buildVerification({ profile, io });
+  assert.deepEqual(v.tests.map(t => [t.name, !!t.routine]), [['added by this task', false], ['already there one', true], ['already there two', true]]);
+  // Whole-run counts are unchanged by the folding.
+  assert.equal(summariseVerification(v).passing, 3);
+});
+
+test('buildVerification: if the base cannot be read, every test stays prominent', async () => {
+  const io = fakeIO({ changed: ['a.test.ts'], run: async () => names('one one', 'two two'), baseSources: async () => { throw new Error('no git'); } });
+  const v = await buildVerification({ profile, io });
+  assert.deepEqual(v.tests.map(t => !!t.routine), [false, false]);
+});
+
+test('buildVerification: drops the implementer\'s no-tests reason when tests were added', async () => {
+  const io = fakeIO({ changed: ['a.test.ts'], baseSources: async () => ({ 'a.test.ts': null }) });
+  const v = await buildVerification({ profile, io, noTestsReason: 'not applicable, a test was added' });
+  assert.equal(v.noTestsReason, undefined);
+});
+
+test('buildVerification: keeps the no-tests reason when the change carries no tests', async () => {
+  const v = await buildVerification({ profile, io: fakeIO({ changed: ['README.md'] }), noTestsReason: 'docs only' });
+  assert.equal(v.noTestsReason, 'docs only');
+});
+
+test('reviewerTestLines: lists the change\'s tests in full and folds the existing ones into a count', () => {
+  const t = (name: string, extra: Partial<VerifiedTest> = {}): VerifiedTest => ({ name, file: 'a.test.ts', outcome: 'passed', origin: 'implementer', ...extra });
+  const v = { computedAt: '', level: 'full', runner: 'node-test', problems: [], filesOmitted: 0, baselineChecked: true, notes: [],
+    tests: [t('new one', { baseline: 'fails' }), t('old a', { routine: true }), t('old b', { routine: true })] } as VerificationSummary;
+  const lines = reviewerTestLines(v);
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /PASS "new one" \(a\.test\.ts\) \[fails without the change\]/);
+  assert.match(lines[1], /\+2 existing tests in the touched files.*still pass/);
+  assert.ok(!lines.join('\n').includes('old a'));
 });

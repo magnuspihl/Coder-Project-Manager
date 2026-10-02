@@ -25,7 +25,7 @@ import { getReviewDiff, hasBranchChanges, makeProofIO, makeVerificationIO, type 
 import { describeRunCommand, describeRunner, parseTestProfile, type TestProfile } from './test-runners.js';
 import { resolveTestProfile, resolveTestObligation, getStoredTestProfile, setStoredTestProfile } from './test-profile.js';
 import { buildTestingPrompt, extractNoTests, extractTestProfile } from './implementer-markers.js';
-import { buildVerification, summariseVerification, withBudget, type VerificationIO, type VerificationLevel, type VerificationSummary } from './verification.js';
+import { buildVerification, summariseVerification, reviewerTestLines, withBudget, type VerificationIO, type VerificationLevel, type VerificationSummary } from './verification.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
@@ -1352,16 +1352,47 @@ export async function getTaskBranchDiff(task: Task): Promise<{ base_ref: string 
  *
  * Returns false (without launching) if the task has no worktree or its working
  * tree has no changes to review — the caller surfaces that to the user.
+ *
+ * Resolves as soon as the task is marked `working` with the reviewer as the
+ * active role. The slow part — the review-time full verification (budget up to
+ * 480 s) and the reviewer launch — continues in the background, so the HTTP/MCP
+ * caller is never held for minutes. A failure after this point is recorded on the
+ * task (a system message, and the task returns to the user) by
+ * failReviewerLaunch, never lost.
  */
-export async function triggerManualReview(task: Task): Promise<boolean> {
+export async function triggerManualReview(
+  task: Task,
+  /** Injectable so a test can stand in for the (slow, remote) launch. */
+  launch: (task: Task, opts: { manual?: boolean }) => Promise<void> = launchReviewerOnTask,
+): Promise<boolean> {
   if (!task.worktree_path) return false;
   const hasChanges = await worktreeHasChanges(task.worktree_path, task.workspace_name, task.user_id);
   if (!hasChanges) return false;
   resetReviewLoopCount(task.id);
   addMessage(task.id, 'system', 'Manual review requested — launching the reviewer.');
   updateTaskStatus(task.id, 'working');
-  await launchReviewerOnTask(task, { manual: true });
+  setActiveTaskTurnRole(task.id, 'reviewer');
+  launch(task, { manual: true }).catch(err => failReviewerLaunch(task, err));
   return true;
+}
+
+/**
+ * A reviewer launch that failed after its request had already been answered.
+ * Records why on the task and hands it back to the user, so a background failure
+ * is visible instead of leaving the task stuck in `working`.
+ */
+export function failReviewerLaunch(task: Task, err: unknown): void {
+  const msg = (err as Error)?.message || String(err);
+  console.error(`[auto-review] Reviewer launch failed for task ${task.id}:`, msg.slice(0, 200));
+  // The user took over meanwhile (interruptReviewer already settled the task).
+  if (interruptedReviews.has(task.id)) return;
+  const open = getLatestTaskTurn(task.id);
+  if (open && open.role === 'reviewer' && !open.completed_at) {
+    completeTaskTurn(open.id, 'fail', `Reviewer launch failed: ${msg}`);
+    reviewContexts.delete(open.id);
+  }
+  addMessage(task.id, 'system', `The review could not be started: ${msg}\n\nReply to continue, or run the review again.`);
+  settleWithUnresolvedFindings(task);
 }
 
 // The machine-readable verdict contract, restated in plain text. This is
@@ -3636,7 +3667,7 @@ async function verifyTurnTests(task: Task, level: VerificationLevel): Promise<vo
       ? `[Harness] ${level === 'full' ? 'full verification' : 'running the change\'s tests'} (${describeRunner(profile)})`
       : '[Harness] no test runner found — nothing to run');
     const noIO: VerificationIO = {
-      fingerprint: async () => '', changedPaths: async () => [], addedPaths: async () => [], run: async () => '', runSuite: async () => '',
+      fingerprint: async () => '', changedPaths: async () => [], addedPaths: async () => [], baseSources: async () => ({}), run: async () => '', runSuite: async () => '',
       prepareBaseline: async () => null, runIn: async () => '', cleanupBaseline: async () => {},
     };
     const work = buildVerification({
@@ -3695,12 +3726,7 @@ export function startFullVerification(task: Task): 'started' | 'busy' | 'unavail
 function buildVerificationBlock(task: Task): string {
   const v = parseVerification(getTask(task.id)?.verification);
   if (!v) return '';
-  const tag = (t: VerificationSummary['tests'][number]) =>
-    t.baseline === 'fails' ? ' [fails without the change]'
-    : t.baseline === 'passes' ? ' [ALSO PASSES without the change]'
-    : t.baseline === 'new_code' ? ' [fails without the change only because it imports code this change adds — proves the dependency, not the behaviour]'
-    : t.baseline === 'not_runnable' ? ' [could not run without the change]' : '';
-  const lines = v.tests.slice(0, 30).map(t => `- ${t.outcome === 'passed' ? 'PASS' : t.outcome === 'failed' ? 'FAIL' : 'SKIP'} "${t.name}" (${t.file})${tag(t)}`);
+  const lines = reviewerTestLines(v);
   const problems = v.problems.map(p => `- COULD NOT RUN ${p.file}: ${p.error.slice(0, 160)}`);
   if (lines.length === 0 && problems.length === 0 && !v.suite) return '';
   const suite = v.suite
@@ -3947,6 +3973,15 @@ async function launchReviewerOnTask(task: Task, opts: { manual?: boolean } = {})
   // Bounded by its own budget, so a hung test process cannot hold the reviewer
   // turn — and with it the task — in `working`.
   await verifyTurnTests(task, 'full');
+
+  // The user may have interrupted while verification ran (the request that
+  // started the review has long since returned). interruptReviewer already
+  // settled the task and closed the turn — don't start a reviewer over that.
+  if (interruptedReviews.has(task.id)) {
+    completeTaskTurn(turn.id);
+    reviewContexts.delete(turn.id);
+    return;
+  }
 
   const gitDiff = await getGitDiff(task.worktree_path!, task.workspace_name, task.user_id);
   const format = mode === 'proof' && profile ? buildProofVerdictFormat(profile) : REVIEW_DECISION_FORMAT;

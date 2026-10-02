@@ -416,7 +416,7 @@ function buildServer(ctx: AuthCtx): McpServer {
   server.registerTool(
     'review',
     {
-      description: 'Trigger the red-team reviewer on a task awaiting feedback. The reviewer inspects the task\'s diff and emits a verdict: on "pass" the task returns to awaiting_feedback; on "fail" the issues are routed back to the implementer to fix (up to max_review_loop_count passes). The task moves to "working" while the reviewer runs. Fails if the worktree is clean (nothing to review) or the workspace is already at its task concurrency limit.',
+      description: 'Trigger the red-team reviewer on a task awaiting feedback. The reviewer inspects the task\'s diff and emits a verdict: on "pass" the task returns to awaiting_feedback; on "fail" the issues are routed back to the implementer to fix (up to max_review_loop_count passes). The call returns as soon as the review is accepted (the task is then "working" with the reviewer active); the review-time verification and reviewer launch continue in the background, and a failure there appears as a system message on the task. Fails if the worktree is clean (nothing to review) or the workspace is already at its task concurrency limit.',
       inputSchema: { task_id: z.string().describe('Task ID') },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },

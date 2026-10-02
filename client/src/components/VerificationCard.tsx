@@ -51,9 +51,14 @@ export default function VerificationCard({ summary, onRunFull, running }: {
   running?: boolean;
 }) {
   const [showAll, setShowAll] = useState(false);
+  const [showRoutine, setShowRoutine] = useState(false);
   const failing = summary.tests.filter(t => t.outcome === 'failed');
-  const visible = showAll ? summary.tests : summary.tests.slice(0, COLLAPSED_COUNT);
-  const hidden = summary.tests.length - visible.length;
+  // The server stores the tests strongest-evidence-first and marks the
+  // pre-existing, unremarkable ones `routine`; those are folded into one line.
+  const prominent = summary.tests.filter(t => !t.routine);
+  const routine = summary.tests.filter(t => t.routine);
+  const visible = showAll ? prominent : prominent.slice(0, COLLAPSED_COUNT);
+  const hidden = prominent.length - visible.length;
   const suiteBad = !!summary.suite && (summary.suite.failed > 0 || !!summary.suite.error);
 
   return (
@@ -76,34 +81,56 @@ export default function VerificationCard({ summary, onRunFull, running }: {
             : 'This change adds or modifies no tests, so its behaviour has not been verified by anything.'}
         </p>
       ) : (
-        <ul className="space-y-1">
-          {visible.map((t, i) => (
-            <li key={`${t.file}:${t.name}:${i}`} className="flex items-start gap-2 text-sm">
-              <OutcomeIcon outcome={t.outcome} />
-              <div className="min-w-0">
-                <span className="text-gray-800 dark:text-gray-100 break-words">{t.name}</span>
-                {t.origin === 'reviewer' && (
-                  <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300" title="A test the reviewer wrote to prove a defect; kept as a regression test.">
-                    reviewer's regression test
-                  </span>
-                )}
-                {t.baseline && t.outcome === 'passed' && (
-                  <span className={`ml-2 text-[11px] ${BASELINE[t.baseline].cls}`} title={BASELINE[t.baseline].title}>
-                    {BASELINE[t.baseline].label}
-                  </span>
-                )}
-                {t.outcome === 'failed' && t.message && (
-                  <p className="text-[11px] font-mono text-red-600 dark:text-red-400 whitespace-pre-wrap break-words">{t.message.split('\n')[0]}</p>
-                )}
-              </div>
-            </li>
-          ))}
-        </ul>
+        <>
+          {prominent.length > 0 && (
+            <ul className="space-y-1">
+            {visible.map((t, i) => (
+              <li key={`${t.file}:${t.name}:${i}`} className="flex items-start gap-2 text-sm">
+                <OutcomeIcon outcome={t.outcome} />
+                <div className="min-w-0">
+                  <span className="text-gray-800 dark:text-gray-100 break-words">{t.name}</span>
+                  {t.origin === 'reviewer' && (
+                    <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300" title="A test the reviewer wrote to prove a defect; kept as a regression test.">
+                      reviewer's regression test
+                    </span>
+                  )}
+                  {t.baseline && t.outcome === 'passed' && (
+                    <span className={`ml-2 text-[11px] ${BASELINE[t.baseline].cls}`} title={BASELINE[t.baseline].title}>
+                      {BASELINE[t.baseline].label}
+                    </span>
+                  )}
+                  {t.outcome === 'failed' && t.message && (
+                    <p className="text-[11px] font-mono text-red-600 dark:text-red-400 whitespace-pre-wrap break-words">{t.message.split('\n')[0]}</p>
+                  )}
+                </div>
+              </li>
+            ))}
+            </ul>
+          )}
+        </>
       )}
       {hidden > 0 && (
         <button onClick={() => setShowAll(true)} className="text-[11px] text-gray-500 dark:text-gray-400 underline hover:text-gray-700 dark:hover:text-gray-200">
           Show {hidden} more
         </button>
+      )}
+
+      {routine.length > 0 && (
+        <div className="text-[11px] text-gray-500 dark:text-gray-400">
+          <button onClick={() => setShowRoutine(v => !v)} className="underline hover:text-gray-700 dark:hover:text-gray-200" aria-expanded={showRoutine}>
+            + {routine.length} existing test{routine.length === 1 ? '' : 's'} in touched files still pass{showRoutine ? ' (hide)' : ''}
+          </button>
+          {showRoutine && (
+            <ul className="mt-1 space-y-0.5">
+              {routine.map((t, i) => (
+                <li key={`${t.file}:${t.name}:${i}`} className="flex items-start gap-2">
+                  <OutcomeIcon outcome={t.outcome} />
+                  <span className="break-words">{t.name}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       )}
 
       {summary.problems.map(p => (

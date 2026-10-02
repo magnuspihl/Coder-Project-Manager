@@ -130,6 +130,10 @@ export interface VerificationSummary {
     origin: 'implementer' | 'reviewer';
     baseline?: BaselineResult;
     message?: string;
+    /** New in its file by name (see server verification.ts). Absent = not determined. */
+    added?: boolean;
+    /** Pre-existing, passing and not failing on the original code: folded into a count, not listed. */
+    routine?: true;
   }>;
   problems: Array<{ file: string; error: string }>;
   filesOmitted: number;

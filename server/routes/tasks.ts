@@ -758,7 +758,9 @@ router.post('/tasks/:taskId/review', requireAuth, async (req: Request, res: Resp
       res.status(400).json({ error: 'No changes to review — the task\'s branch has no changes relative to the default branch.' });
       return;
     }
-    res.json({ task: getTask(task.id) });
+    // Accepted, not finished: verification and the reviewer launch continue in
+    // the background (a failure there is recorded on the task as a system message).
+    res.status(202).json({ task: getTask(task.id) });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to launch reviewer' });
   }
