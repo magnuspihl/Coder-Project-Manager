@@ -60,7 +60,7 @@ ${framework}
 - Name each test as the behaviour it verifies, in plain English a non-programmer can read: "rejects usernames containing @, $, € or ¥" — not "test_validate_3". These names are shown to the user as the checklist of what was verified.
 - Test the requirements and their edge cases, not implementation details. A test that cannot fail proves nothing; prefer one that would have failed before your change.
 - Run the tests before you finish and fix failures. If something cannot be run, say so plainly.
-- Skip tests only when there is no testable behaviour (docs, comments, pure styling, config, a question or diagnosis). Then end your final response with this exact line, giving the reason:
+- Skip tests only when there is no testable behaviour (docs, comments, pure styling, config, a question or diagnosis). Only then, end your final response with this exact line, giving the reason. If you added or changed ANY test, never write this line — not even as "not applicable" or "a test was added":
 
 ${NO_TESTS_MARKER}: <one short reason>
 

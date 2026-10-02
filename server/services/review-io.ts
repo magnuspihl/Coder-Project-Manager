@@ -154,6 +154,22 @@ export function makeVerificationIO(exec: Exec, worktree: string, profile: TestPr
       ].join('\n'));
       return parseNameList(out.split('@@S@@')[1] ?? '');
     },
+    baseSources: async files => {
+      if (files.length === 0) return {};
+      const parts = files.map(f =>
+        `echo "@@CPM_F@@ "${shellQuote(f)}; if git -C "$WT" cat-file -e "$base":${shellQuote(f)} 2>/dev/null; then echo @@CPM_HAVE@@; git -C "$WT" show "$base":${shellQuote(f)} 2>/dev/null; else echo @@CPM_ABSENT@@; fi`);
+      const out = await exec([`WT=${shellQuote(worktree)}`, BASE_SNIPPET, `[ -n "$base" ] || exit 0`, `echo @@S@@`, ...parts].join('\n'), 60_000);
+      const result: Record<string, string | null> = {};
+      for (const chunk of (out.split('@@S@@')[1] ?? '').split('@@CPM_F@@ ').slice(1)) {
+        const nl = chunk.indexOf('\n');
+        if (nl < 0) continue;
+        const file = chunk.slice(0, nl).trim();
+        const body = chunk.slice(nl + 1);
+        if (body.startsWith('@@CPM_ABSENT@@')) result[file] = null;
+        else if (body.startsWith('@@CPM_HAVE@@')) result[file] = body.slice('@@CPM_HAVE@@'.length).replace(/^\r?\n/, '');
+      }
+      return result;
+    },
     fingerprint: async () => {
       const out = await exec([
         `WT=${shellQuote(worktree)}`,

@@ -20,8 +20,16 @@ human call is needed. This document should be read alongside `SPEC.md` and `WORK
   button next to **Complete** in the task detail UI, the `POST /api/tasks/:taskId/review` route, or
   the `review` MCP tool. A manual review resets the loop counter, then routes its verdict through the
   same `finalizeReviewer` path as auto-review (pass → `awaiting_feedback`; fail → back to the
-  Implementer, capped by the loop limit). It is rejected if the branch has no work or another task is
-  running on the workspace.
+  Implementer, capped by the loop limit). It is rejected if the branch has no work or the workspace is at
+  its task concurrency limit. **The route answers immediately** (`202`, task `working`, `active_turn_role:
+  reviewer`) once those synchronous checks pass: the review-time full verification (budget up to 480 s) and
+  the reviewer launch continue in the background. A failure after the response is never lost —
+  `failReviewerLaunch` closes the reviewer turn as failed, adds a system message ("The review could not be
+  started: …") and returns the task to `awaiting_feedback`. Interrupting during that verification window
+  works: the launch notices the interrupt and does not start a reviewer over it. Every other route that
+  starts verification or a reviewer already follows this rule (`POST /verify` returns `202` and runs in the
+  background; the Fix / Fix-all routes only queue the task and start `processQueue` in the background;
+  auto-review runs from the turn-completion handler, not a request).
 
 **What stays the same:**
 - All task states (`queued`, `working`, `awaiting_feedback`, `completed`, `failed`, `cancelled`)
@@ -1105,14 +1113,47 @@ of showing stale numbers. Proof runs get the same treatment (`CPM_PROOF_BUDGET_S
 the ssh kill (the PTY hang-up normally ends the remote process group); the reviewer/implementer `claude`
 processes themselves are bounded by `--max-turns`, not wall-clock, as before.
 
-The reviewer receives these results as facts (`buildVerificationBlock`) and is asked to **audit the tests**:
+**What the card leads with: what this task added or changed.** A task that touches a test file used to list
+every test in it, and most of those pass on the original code too and prove nothing about the change — a wall
+of ticks that defeats the card's purpose. Each test is now marked (`markAddedTests`, pure, in
+`verification.ts`):
+
+- `added: true` — its name is not in that file at the merge-base (or the whole file is new).
+- `routine: true` — a pre-existing test (`added: false`) that passes, is not a reviewer proof test, and does
+  **not** fail on the original code. Nothing about it is evidence for this change.
+- Everything else — added tests, **anything failing**, reviewer proof tests, and an old-named test that fails
+  without the change (it must exercise something the task changed) — stays prominent. A file whose base source
+  cannot be read leaves `added` undetermined and its tests prominent: the filter errs toward showing.
+
+**"Added" is name-based; "changed" is not detected.** A test whose body was edited under an unchanged name is
+not noticed (unless it fails on the original code, which makes it prominent anyway). This was chosen because
+it is the one mechanism that is cheap and identical across all six runners: one `git show <merge-base>:<file>`
+per touched file (`VerificationIO.baseSources`), then `testExistedAtBase` looks for the name in the old
+text — as a quoted title (jest/vitest/node:test, trying the whole name and then ≥2-word suffixes to peel off
+`describe` prefixes), as the method name (pytest/dotnet, parameters stripped), or segment by segment (go
+subtests, underscores for spaces). Misses (parameterised titles built at run time, `it.each`) read as *added*,
+so the error is toward showing a test, never hiding one. Comparing bodies was rejected: finding a test's body
+needs a per-language parser.
+
+The stored `tests` array is ordered strongest-evidence-first (`orderTests`): currently failing, then
+`fails` (fails on the original code, assertion level), then `new_code`, then the rest (`passes`,
+`not_runnable`, no baseline), then the `routine` ones. The card renders the prominent tests and folds the rest
+into an expandable "+ N existing tests in touched files still pass". Whole-suite counts and the headline
+counts (`summariseVerification`) are unchanged — they still count every test.
+
+The reviewer receives these results as facts (`buildVerificationBlock`, test lines from `reviewerTestLines`) —
+filtered the same way, so it is not flooded: the change's own tests are listed, and the routine ones become one
+line ("+N existing tests in the touched files … still pass and are not listed") so it knows they exist. It is asked to **audit the tests**:
 does each assertion check what its name says, is any requirement untested? Weak or missing coverage is an
 advisory finding (a missing test cannot itself be demonstrated by a failing test).
 
 **UI.** A *What was verified* card at the end of the conversation (absent in workspaces where the obligation
 is off) lists each test as a tick/cross with its
 name and baseline label, the suite tally, files that could not be run, and — when there are no tests — the
-implementer's stated reason or a plain "nothing verified this change". It says on its face what is and isn't
+implementer's stated reason or a plain "nothing verified this change". The no-tests reason is shown only when
+the change carries no tests of its own: the implementer sometimes emits `NO_TESTS_NEEDED` even though it added
+one ("not applicable, a test was added"), so the prompt now says never to write the line when any test was added
+or changed, and `buildVerification` drops the stored reason whenever any non-routine test exists. It says on its face what is and isn't
 trustworthy: **names are the implementer's words; a tick means the harness ran the test and it passed.**
 
 **Limits.** Tests the implementer writes share the implementer's understanding of the requirement — the
@@ -1127,5 +1168,7 @@ verdict parser, the per-runner output parsers (against captured real output), pr
 routing, the implementer markers, the verification summary, and — against real temporary git repositories
 with a real `node:test` runner and a local shell standing in for `coder ssh` — the whole
 write → run → classify → clean-up path and the fail-before baseline. `review-findings.test.ts` needs
-better-sqlite3's native module and skips itself if it is not built.
+better-sqlite3's native module and skips itself if it is not built; so does `manual-review.test.ts`, which
+pins that the review trigger returns before the verification/launch finishes and that a failure after the
+response is recorded on the task.
 
