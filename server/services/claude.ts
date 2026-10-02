@@ -16,12 +16,16 @@ import { getValidCoderTokenForUser, forceRefreshCoderTokenForUser } from './sess
 import { resolveAccountToken, markAccountUsed } from './claude-accounts.js';
 import { writeRemoteStdin } from './ssh-stdin.js';
 import { combineExecOutput, redactSecrets } from './exec-output.js';
+import {
+  assessCoverage, coverageOutcome, exemptNote, omittedFilesBlock, partialLabel, partialMessage, reviewerTurnCap, toolCallsFromContent,
+  type CoverageReport, type ReviewDiff, type ToolCall,
+} from './review-coverage.js';
 import { parseReviewDecision, extractProofFiles, type ReviewDecision, type ReviewIssue } from './review-verdict.js';
 import {
   assignRepairFiles, formatFindingForImplementer, opinionIssues, repairable, rerunProof, routeReview, tally, toStored, verifyProofs,
   PROOF_INSTRUCTIONS, type ReviewMode, type StoredReview, type VerifiedIssue,
 } from './review-proof.js';
-import { getReviewDiff, hasBranchChanges, makeProofIO, makeVerificationIO, type Exec } from './review-io.js';
+import { getReviewDiff, getReviewDiffInfo, hasBranchChanges, makeProofIO, makeVerificationIO, type Exec } from './review-io.js';
 import { describeRunCommand, describeRunner, parseTestProfile, type TestProfile } from './test-runners.js';
 import { resolveTestProfile, resolveTestObligation, getStoredTestProfile, setStoredTestProfile } from './test-profile.js';
 import { buildTestingPrompt, extractNoTests, extractTestProfile } from './implementer-markers.js';
@@ -1288,6 +1292,17 @@ async function getGitDiff(worktreePath: string, workspaceName: string, userId?: 
   }
 }
 
+/** The reviewer's diff plus what it left out; null when the workspace can't be asked. */
+async function getReviewDiffForTask(
+  worktreePath: string, workspaceName: string, userId?: string | null, onlyFiles?: string[],
+): Promise<ReviewDiff | null> {
+  try {
+    return await getReviewDiffInfo((cmd, timeoutMs = 20000, maxBuffer) => sshExec(workspaceName, cmd, timeoutMs, userId, maxBuffer), worktreePath, undefined, { onlyFiles });
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Full diff of a task's branch + working tree against the repo's default
  * branch (main/master). Like getGitDiff it resolves the merge-base with the
@@ -1363,16 +1378,22 @@ export async function getTaskBranchDiff(task: Task): Promise<{ base_ref: string 
 export async function triggerManualReview(
   task: Task,
   /** Injectable so a test can stand in for the (slow, remote) launch. */
-  launch: (task: Task, opts: { manual?: boolean }) => Promise<void> = launchReviewerOnTask,
+  launch: (task: Task, opts: ReviewLaunchOpts) => Promise<void> = launchReviewerOnTask,
+  /** Review only the files the latest review did not see (the "review remaining files" re-run). */
+  opts: { remainingOnly?: boolean } = {},
 ): Promise<boolean> {
   if (!task.worktree_path) return false;
+  const remainingFiles = opts.remainingOnly ? unreviewedFilesOfLatestReview(task.id) : undefined;
+  if (opts.remainingOnly && !remainingFiles?.length) return false;
   const hasChanges = await worktreeHasChanges(task.worktree_path, task.workspace_name, task.user_id);
   if (!hasChanges) return false;
   resetReviewLoopCount(task.id);
-  addMessage(task.id, 'system', 'Manual review requested — launching the reviewer.');
+  addMessage(task.id, 'system', remainingFiles
+    ? `Review of the remaining files requested — launching the reviewer for: ${remainingFiles.join(', ')}.`
+    : 'Manual review requested — launching the reviewer.');
   updateTaskStatus(task.id, 'working');
   setActiveTaskTurnRole(task.id, 'reviewer');
-  launch(task, { manual: true }).catch(err => failReviewerLaunch(task, err));
+  launch(task, { manual: true, remainingFiles }).catch(err => failReviewerLaunch(task, err));
   return true;
 }
 
@@ -1413,6 +1434,15 @@ REVIEW_DECISION: {"outcome":"fail","summary":"<one sentence>","issues":["<specif
 Entries in "issues" may be a plain string, or an object {"text":"...","reraises":"<ref>"} when you are re-raising a finding you were told about. Always use "reraises" for those — it reopens that finding in place instead of piling a near-duplicate onto the user.
 
 ONE PROBLEM PER ENTRY IN "issues". Each entry is triaged individually by the user — they fix, dismiss, or mark it done one by one — so every entry you add is a separate decision they have to make. Do NOT split one problem across several entries: two call sites needing the same guard is ONE issue naming both, and the remedy for an issue belongs inside that issue's text, never as its own entry. Merge anything that would be fixed by a single edit.`;
+
+// Appended to either verdict format. The reviewer's account of what it read is a
+// CLAIM: the harness cross-checks it against the tool calls it actually made
+// (review-coverage.ts), so honesty here costs nothing and a false claim is caught.
+const COVERAGE_FORMAT = `
+
+Add a "coverage" field to the JSON of EVERY verdict, pass or fail, listing the changed files you did and did not read:
+"coverage":{"reviewed":["<path>","..."],"notReviewed":[{"file":"<path>","reason":"<why>"}]}
+A file belongs in "reviewed" only if you saw its diff or opened it with Read/Grep. If the diff you were given was cut off, open each file you were not shown BEFORE deciding; anything you still did not read goes in "notReviewed". Never pass over code you have not seen without saying so here.`;
 
 // Proof-mode counterpart of REVIEW_DECISION_FORMAT. Restated in the -p prompt for
 // the same reason: the appended system prompt is not reliably re-attached to a
@@ -3917,7 +3947,26 @@ async function remoteClaudeSessionExists(
   }
 }
 
-async function launchReviewerOnTask(task: Task, opts: { manual?: boolean } = {}): Promise<void> {
+/** Files the latest completed reviewer turn recorded as unreviewed (empty when it was fully covered). */
+export function unreviewedFilesOfLatestReview(taskId: string): string[] {
+  const turns = getTaskTurns(taskId).filter(t => t.role === 'reviewer' && t.completed_at && t.review_proofs);
+  const last = turns[turns.length - 1];
+  if (!last?.review_proofs) return [];
+  try {
+    const stored = JSON.parse(last.review_proofs) as StoredReview;
+    return (stored.coverage?.unreviewed ?? []).map(u => u.path);
+  } catch {
+    return [];
+  }
+}
+
+interface ReviewLaunchOpts {
+  manual?: boolean;
+  /** Review ONLY these files: a re-run for what an earlier pass did not see. */
+  remainingFiles?: string[];
+}
+
+async function launchReviewerOnTask(task: Task, opts: ReviewLaunchOpts = {}): Promise<void> {
   // Fresh reviewer turn — clear any stale interrupt guard from a prior pass so
   // this run's verdict is allowed to route.
   interruptedReviews.delete(task.id);
@@ -3983,14 +4032,24 @@ async function launchReviewerOnTask(task: Task, opts: { manual?: boolean } = {})
     return;
   }
 
-  const gitDiff = await getGitDiff(task.worktree_path!, task.workspace_name, task.user_id);
-  const format = mode === 'proof' && profile ? buildProofVerdictFormat(profile) : REVIEW_DECISION_FORMAT;
+  const diff = await getReviewDiffForTask(task.worktree_path!, task.workspace_name, task.user_id, opts.remainingFiles);
+  const diffText = diff
+    ? diff.text + omittedFilesBlock(diff) + exemptNote(diff)
+    : '(could not retrieve diff)';
+  const baseTurns = Number(mode === 'proof' ? REVIEWER_PROOF_MAX_TURNS : REVIEWER_MAX_TURNS);
+  const turnCap = Number.isFinite(baseTurns) ? reviewerTurnCap(baseTurns, diff?.omitted.length ?? 0) : null;
+  const known = reviewContexts.get(turn.id);
+  if (known && diff) { known.diff = diff; if (turnCap) known.turnCap = turnCap; }
+  const scopeNote = opts.remainingFiles
+    ? `\nThis is a FOLLOW-UP review. An earlier pass already covered the rest of the change; it did not see these files, and ONLY they are in scope now: ${opts.remainingFiles.join(', ')}. Read each one.\n`
+    : '';
+  const format = (mode === 'proof' && profile ? buildProofVerdictFormat(profile) : REVIEW_DECISION_FORMAT) + COVERAGE_FORMAT;
 
-  const reviewerPrompt = `Original task:\n${task.prompt}\n${buildUserDirectionBlock(task.id)}${buildWaiverBlock(task.id, turn.id, mode)}${buildRefutedBlock(task.id, turn.id)}${buildVerificationBlock(task)}\nChanges made by the implementer:\n${gitDiff}\n\n---\nReview the change adversarially, then emit your verdict. ${format}`;
+  const reviewerPrompt = `Original task:\n${task.prompt}\n${buildUserDirectionBlock(task.id)}${buildWaiverBlock(task.id, turn.id, mode)}${buildRefutedBlock(task.id, turn.id)}${buildVerificationBlock(task)}\nChanges made by the implementer:\n${diffText}\n${scopeNote}\n---\nReview the change adversarially, then emit your verdict. ${format}`;
 
   await executeReviewer(task, turn.id, reviewerSessionId, {
     prompt: reviewerPrompt,
-    maxTurns: mode === 'proof' ? REVIEWER_PROOF_MAX_TURNS : REVIEWER_MAX_TURNS,
+    maxTurns: turnCap ? String(turnCap) : (mode === 'proof' ? REVIEWER_PROOF_MAX_TURNS : REVIEWER_MAX_TURNS),
     resume: canResumeReviewer,
     phase: 'review',
     mode,
@@ -4007,13 +4066,22 @@ type ReviewerPhase = 'review' | 'wrap_up' | 'repair';
  * memory, like the interrupt guards: a server restart mid-review already
  * abandons the reviewer (reconnectWorkingTasks only reconnects implementers).
  */
-const reviewContexts = new Map<string, {
+interface ReviewContext {
   mode: ReviewMode;
   profile: TestProfile | null;
   /** Output of the run(s) before a wrap-up resume, which holds the PROOF_FILE blocks. */
   priorText?: string;
   pending?: { decision: ReviewDecision; verified: VerifiedIssue[] };
-}>();
+  /** What the reviewer was shown, and what the harness left out (see review-coverage.ts). */
+  diff?: ReviewDiff;
+  /** The reviewer's turn cap for this review (raised for omitted files). */
+  turnCap?: number;
+  /** Tool calls from every process of this review — the evidence coverage is checked against. */
+  toolCalls?: ToolCall[];
+  /** The turn cap cut the reviewer off at some point in this review. */
+  cutOff?: boolean;
+}
+const reviewContexts = new Map<string, ReviewContext>();
 
 interface ExecuteReviewerOpts {
   prompt: string;
@@ -4207,6 +4275,8 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
   // `error_max_turns`. We track it so finalize can tell "the reviewer chose not
   // to emit a verdict" apart from "the reviewer was cut off before it could."
   let resultSubtype: string | null = null;
+  // The reviewer's tool calls, for checking its coverage claim against what it opened.
+  const toolCalls: ToolCall[] = [];
 
   const poll = async () => {
     if (polling) return;
@@ -4252,6 +4322,7 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
             for (const block of (event.message as { content: Array<{ type: string; text?: string }> }).content) {
               if (block.type === 'text' && block.text) turnText += block.text;
             }
+            toolCalls.push(...toolCallsFromContent((event.message as { content: unknown }).content));
             if (turnText) {
               allAssistantText += turnText;
               addMessage(task.id, 'assistant', turnText, undefined, undefined, undefined, undefined, undefined, turnId);
@@ -4316,6 +4387,7 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
               for (const block of (event.message as { content: Array<{ type: string; text?: string }> }).content) {
                 if (block.type === 'text' && block.text) turnText += block.text;
               }
+              toolCalls.push(...toolCallsFromContent((event.message as { content: unknown }).content));
               // Mirror the in-loop path: persist the flushed text as a message so
               // the reviewer's final output (incl. the verdict line) is visible in
               // the conversation, not just used for routing.
@@ -4335,7 +4407,7 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
             }
           } catch { /* not a complete JSON event — nothing to recover */ }
         }
-        finalizeReviewer(task, turnId, reviewerSessionId, allAssistantText, resultSubtype, phase);
+        finalizeReviewer(task, turnId, reviewerSessionId, allAssistantText, resultSubtype, phase, toolCalls);
       }
     } catch (err) {
       console.error(`[auto-review] Poll error for task ${task.id}:`, (err as Error).message?.slice(0, 100));
@@ -4356,6 +4428,7 @@ function finalizeReviewer(
   allText: string,
   resultSubtype?: string | null,
   phase: ReviewerPhase = 'review',
+  toolCalls: ToolCall[] = [],
 ): void {
   const current = getTask(task.id);
   if (!current) return;
@@ -4372,7 +4445,14 @@ function finalizeReviewer(
 
   // Server restarted mid-review: the in-memory context is gone. Opinion mode is
   // the only thing that needs nothing but the text in hand.
-  const ctx = reviewContexts.get(turnId) ?? { mode: 'opinion' as ReviewMode, profile: null };
+  const stored = reviewContexts.get(turnId);
+  const cutOffNow = typeof resultSubtype === 'string' && resultSubtype.includes('max_turns');
+  const ctx: ReviewContext = {
+    ...(stored ?? { mode: 'opinion' as ReviewMode, profile: null }),
+    toolCalls: [...(stored?.toolCalls ?? []), ...toolCalls],
+    cutOff: !!stored?.cutOff || cutOffNow,
+  };
+  if (stored) reviewContexts.set(turnId, ctx);
   // A wrap-up run is a fresh process, so `allText` is only ITS output. The
   // PROOF_FILE blocks were emitted by the run before it — carry them over.
   const fullText = ctx.priorText ? `${ctx.priorText}\n${allText}` : allText;
@@ -4382,8 +4462,8 @@ function finalizeReviewer(
     // Distinguish a genuine no-verdict from a turn-limit cutoff. The latter is
     // the common cause of a "cut off" reviewer: the CLI aborted the session
     // (subtype `error_max_turns`) before the reviewer reached its verdict.
-    const cutOff = typeof resultSubtype === 'string' && resultSubtype.includes('max_turns');
-    const maxTurns = ctx.mode === 'proof' ? REVIEWER_PROOF_MAX_TURNS : REVIEWER_MAX_TURNS;
+    const cutOff = cutOffNow;
+    const maxTurns = ctx.turnCap ?? (ctx.mode === 'proof' ? REVIEWER_PROOF_MAX_TURNS : REVIEWER_MAX_TURNS);
 
     // Recovery: the reviewer produced no parseable verdict. In practice this is
     // the common case — the model writes a thorough prose review and simply
@@ -4394,7 +4474,7 @@ function finalizeReviewer(
     if (phase === 'review') {
       console.warn(`[auto-review] Reviewer for task ${task.id} emitted no verdict${cutOff ? ' (hit turn limit)' : ''} — resuming once for the decision`);
       appendStreamLog(task.id, 'reviewer_output', '[Reviewer] no verdict emitted — asking for final decision');
-      const format = ctx.mode === 'proof' && ctx.profile ? buildProofVerdictFormat(ctx.profile) : REVIEW_DECISION_FORMAT;
+      const format = (ctx.mode === 'proof' && ctx.profile ? buildProofVerdictFormat(ctx.profile) : REVIEW_DECISION_FORMAT) + COVERAGE_FORMAT;
       const wrapUpPrompt = `You finished your review but did not output the required REVIEW_DECISION line — without it the automated pipeline cannot proceed. Do NOT investigate further, run any tools, ask any questions, or add commentary. Based only on what you have already reviewed, output your verdict now as your entire response and nothing else${ctx.mode === 'proof' ? ' (plus PROOF_FILE blocks for any test you have not yet written out in full)' : ''}.\n\n${format}`;
       reviewContexts.set(turnId, { ...ctx, priorText: fullText });
       executeReviewer(task, turnId, reviewerSessionId, {
@@ -4452,7 +4532,7 @@ async function completeReview(
   reviewerSessionId: string,
   decision: ReviewDecision,
   fullText: string,
-  ctx: { mode: ReviewMode; profile: TestProfile | null },
+  ctx: ReviewContext,
 ): Promise<void> {
   if (!(ctx.mode === 'proof' && ctx.profile)) {
     routeVerifiedReview(task, turnId, decision, 'opinion', opinionIssues(decision), null);
@@ -4547,15 +4627,35 @@ function routeVerifiedReview(
   verified: VerifiedIssue[],
   profile: TestProfile | null,
 ): void {
+  const rctx = reviewContexts.get(turnId);
   reviewContexts.delete(turnId);
   const routed = routeReview(mode, decision, verified);
   const blockingTexts = routed.blocking.map(v => v.issue.text);
-  const summary = reviewSummary(decision, routed);
 
+  // Coverage is checked, not trusted: what the reviewer was shown plus the files
+  // its tool calls opened, against what changed. A confirmed finding fails the
+  // review regardless; a pass over unseen files is only a PARTIAL review.
+  const coverage: CoverageReport | null = rctx?.diff
+    ? assessCoverage({
+        diff: rctx.diff,
+        worktree: task.worktree_path ?? '',
+        toolCalls: rctx.toolCalls ?? [],
+        claimed: decision.coverage,
+        stoppedByTurnCap: rctx.cutOff,
+        turnCap: rctx.turnCap,
+      })
+    : null;
+  const kind = coverageOutcome(routed.outcome, coverage);
+  const partial = kind === 'partial' && coverage !== null;
+  const summary = partial ? `${partialLabel(coverage)} — ${reviewSummary(decision, routed)}` : reviewSummary(decision, routed);
+
+  // The column keeps its two-value CHECK: a partial review is stored as a pass
+  // over the files it saw, and the verdict inside review_proofs says "partial".
   completeTaskTurn(turnId, routed.outcome, summary, blockingTexts.length ? blockingTexts : undefined);
-  setTurnReview(turnId, mode, JSON.stringify(toStored(routed, verified)));
-  appendStreamLog(task.id, routed.outcome === 'pass' ? 'reviewer_pass' : 'reviewer_fail',
-    `[Reviewer] ${routed.outcome.toUpperCase()}: ${summary}${mode === 'proof' ? ` (${tally(routed)})` : ''}`);
+  const storedReview: StoredReview = { ...toStored(routed, verified), ...(coverage ? { verdict: kind, coverage } : {}) };
+  setTurnReview(turnId, mode, JSON.stringify(storedReview));
+  appendStreamLog(task.id, partial ? 'reviewer_partial' : routed.outcome === 'pass' ? 'reviewer_pass' : 'reviewer_fail',
+    `[Reviewer] ${partial ? 'PARTIAL' : routed.outcome.toUpperCase()}: ${summary}${mode === 'proof' ? ` (${tally(routed)})` : ''}`);
   for (const v of routed.refuted) {
     // Kept for reviewer-quality signal: a refuted claim is a reviewer hallucination caught.
     console.log(`[auto-review] Task ${task.id}: refuted finding — "${v.issue.text.slice(0, 120)}" (${v.proofPath})`);
@@ -4614,6 +4714,16 @@ function routeVerifiedReview(
   const verifiedCount = verifyClaimedFixes(task.id, reraisedIds);
   if (verifiedCount > 0) {
     console.log(`[auto-review] Task ${task.id}: ${verifiedCount} claimed fix(es) verified by reviewer`);
+  }
+
+  if (partial) {
+    // Not a pass: the reviewer never saw part of the change, so its silence on
+    // outstanding findings proves nothing — leave them open — and nothing is sent
+    // back to the implementer, since nothing is known to be wrong with the code.
+    console.log(`[auto-review] Task ${task.id} partial review — not seen: ${coverage.unreviewed.map(u => u.path).join(', ')}`);
+    addMessage(task.id, 'system', partialMessage(coverage));
+    settleWithUnresolvedFindings(task, { holdCompletion: true });
+    return;
   }
 
   if (routed.outcome === 'pass') {
@@ -4743,9 +4853,14 @@ ${lines.join('\n').slice(0, REVIEW_CONTEXT_CHAR_BUDGET)}
  * is exactly the case where it isn't. It is conditional on something actually
  * being open, so an ordinary deferred completion still flushes untouched.
  */
-function settleWithUnresolvedFindings(task: Task): void {
+function settleWithUnresolvedFindings(task: Task, opts: { holdCompletion?: boolean } = {}): void {
   const current = getTask(task.id) ?? task;
-  if (current.pending_complete && hasOpenBlockingFindings(task.id)) {
+  if (current.pending_complete && opts.holdCompletion) {
+    // A partial review is not the "review passed" a deferred completion waits for.
+    setPendingComplete(task.id, false);
+    addMessage(task.id, 'system',
+      'Pending completion cancelled — the review was only partial, so part of the change has not been reviewed. Review the remaining files or complete the task yourself.');
+  } else if (current.pending_complete && hasOpenBlockingFindings(task.id)) {
     setPendingComplete(task.id, false);
     addMessage(task.id, 'system',
       'Pending completion cancelled — there are review findings that need your decision. Triage them, then complete the task.');

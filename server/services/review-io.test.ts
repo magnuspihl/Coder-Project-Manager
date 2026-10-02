@@ -11,7 +11,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getReviewDiff, hasBranchChanges, makeProofIO, makeVerificationIO, isScratchDir, type Exec } from './review-io.js';
+import { getReviewDiff, getReviewDiffInfo, hasBranchChanges, makeProofIO, makeVerificationIO, isScratchDir, type Exec } from './review-io.js';
 import { rerunProof, routeReview, verifyProofs } from './review-proof.js';
 import { extractProofFiles, parseReviewDecision } from './review-verdict.js';
 import { buildVerification } from './verification.js';
@@ -308,6 +308,18 @@ test('committed work: the reviewer is shown the committed diff and untracked fil
     assert.match(diff, /-export function greet/, 'shows what the committed change replaced');
     assert.match(diff, /Untracked files:\nsrc\/scratch\.ts/);
     assert.doesNotMatch(diff, /no diff output/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a real repo: a tiny diff budget records the committed and untracked files it left out, relative to the merge-base', { skip }, async () => {
+  const dir = makeCommittedTaskRepo();
+  try {
+    writeFileSync(join(dir, 'src/scratch.ts'), 'export {};\n');
+    const info = await getReviewDiffInfo(exec, dir, 700);
+    assert.ok(info.changed.includes('src/greet.ts') && info.changed.includes('src/scratch.ts'), info.changed.join(','));
+    assert.ok(info.omitted.some(o => o.path === 'src/scratch.ts' && /untracked/.test(o.reason)));
+    const full = await getReviewDiffInfo(exec, dir, 32_000);
+    assert.deepEqual(full.omitted.map(o => o.path), ['src/scratch.ts'], 'only the untracked file lacks a diff when everything fits');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

@@ -13,6 +13,7 @@
  * classification and routing can be tested without a workspace.
  */
 
+import type { CoverageReport } from './review-coverage.js';
 import type { ProofFile, ReviewDecision, ReviewIssue } from './review-verdict.js';
 import type { ReviewFinding } from './tasks.js';
 import {
@@ -379,6 +380,9 @@ export interface StoredProof {
 export interface StoredReview {
   mode: ReviewMode;
   proofs: StoredProof[];
+  /** 'partial': a pass over code the reviewer did not see. Absent on reviews that predate coverage checking. */
+  verdict?: 'pass' | 'fail' | 'partial';
+  coverage?: CoverageReport;
 }
 
 export function toStored(routed: RoutedReview, all: VerifiedIssue[]): StoredReview {

@@ -1161,6 +1161,56 @@ reviewer audit and the human reading the checklist are the check on that, which 
 English. Repos with dependencies outside the tree (a venv, a compiled `dist/`) may show
 `couldn't run without the change`. Monorepos with several roots need `cwd` in the profile.
 
+## 19. Coverage: a review must not "pass" code it never saw
+
+Observed on two dogfood reviews: the reviewer said "the diff was truncated, I didn't see `verification.ts`"
+and still emitted `pass`. A pass from a reviewer that never saw the code is false confidence, so the harness
+now tracks coverage itself rather than trusting the verdict.
+
+**What the reviewer was shown** (`review-coverage.ts`, `buildReviewDiff`; fetched by `getReviewDiffInfo` in
+`review-io.ts`). "Changed" is the same merge-base definition as everywhere in `review-io.ts` (`BASE_SNIPPET`:
+committed + uncommitted + untracked). The diff is packed whole file by file within the 32k-char budget; one
+file may be cut, only at a hunk boundary. Whatever did not fit is recorded exactly — path, reason, and for a cut
+file how many hunks of how many were shown. Untracked files have no diff, so they are always "omitted".
+
+**Exempt files.** Lockfiles (`package-lock.json`, `yarn.lock`, `Cargo.lock`, …), generated output (`dist/`,
+`*.min.js`, `*.map`, …) and binaries are left out of the diff first (they cost budget and need no review) and
+are listed to the reviewer as exempt. They never make a review partial.
+
+**The reviewer is told, and must read them.** When anything was omitted the prompt lists each file and says the
+reviewer MUST open every one with Read/Grep before deciding, and that the harness checks its tool calls. The
+turn cap is raised modestly for it: +3 turns per omitted file, at most +24 (`reviewerTurnCap`).
+
+**The verdict carries coverage.** `REVIEW_DECISION` gains an optional
+`"coverage":{"reviewed":[…],"notReviewed":[{"file","reason"}]}`. The parser is tolerant: strings or objects,
+a few key spellings, placeholders dropped; a missing or garbled field leaves `coverage` undefined, meaning
+"unverified", and the tool-call evidence alone decides.
+
+**The harness checks, it does not trust** (`assessCoverage`). The poller records the reviewer's `tool_use`
+blocks (kept across the wrap-up resume). A changed, non-exempt file counts as reviewed only if its whole diff was
+shown, or the reviewer opened it: `Read` of it, `Grep` pointed at that file, or a read-only `Bash` command naming
+it. A `Grep` over a directory is a search, not a read. A claim of "reviewed" never counts without one of those.
+The reviewer's own admission ("not reviewed") can only add to the unreviewed set, and never beats a tool call
+that proves the file was opened.
+
+**Outcome.** `coverageOutcome`: a `fail` with a confirmed proof stays a fail, regardless of coverage. A `pass`
+with any unreviewed file becomes a **partial review**:
+
+- stored on the turn inside `review_proofs` as `{"verdict":"partial","coverage":{…}}` — `review_outcome` stays
+  `pass` because that column has a two-value CHECK constraint and a migration is not worth it here. The
+  summary reads "Partial review — not seen: a.ts, b.ts";
+- shown as an amber "Partial review — not seen: …" badge with the per-file reasons, not the green one;
+- not a pass for completion: it does not close outstanding findings (`closeOutstandingOnPass`) and it cancels a
+  deferred "complete when the review passes";
+- never loops back to the implementer: nothing is known to be wrong. The task settles to `awaiting_feedback`;
+- says so when the turn cap was what stopped the reading (`stoppedByTurnCap`, `turnCap` in the report);
+- offers **Review remaining files** (`POST /tasks/:id/review` with `{"remaining":true}`). The server reads the
+  unreviewed list from the latest review itself (never from the client) and the re-run is scoped to exactly
+  those files (`onlyFiles`), so the rest of the change is neither shown nor re-required.
+
+Not covered: a server restart mid-review loses the in-memory context (`reviewContexts`), so that review has no
+coverage record and is reported as before.
+
 ### Running the tests
 
 `npm test` runs every `server/**/*.test.ts` with `node:test` via `tsx` (no extra dependency). They cover the
