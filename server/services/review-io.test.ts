@@ -139,7 +139,7 @@ test('verification: lists the change\'s tests, compares them with the original c
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('verification: a test that imports a module which only exists after the change is "not_runnable" before it', { skip }, async () => {
+test('verification: a test that imports a module the change adds is "new_code" before it, not "not_runnable"', { skip }, async () => {
   const dir = makeRepo();
   try {
     writeFileSync(join(dir, 'src/farewell.ts'), "export const bye = () => 'bye';\n");
@@ -147,7 +147,25 @@ test('verification: a test that imports a module which only exists after the cha
       "import test from 'node:test'; import assert from 'node:assert/strict'; import { bye } from './farewell.ts';\ntest('says bye', () => { assert.equal(bye(), 'bye'); });\n");
     const v = await buildVerification({ profile: PROFILE, io: makeVerificationIO(exec, dir, PROFILE) });
     assert.equal(v.tests[0].outcome, 'passed');
-    assert.equal(v.tests[0].baseline, 'not_runnable');
+    assert.equal(v.tests[0].baseline, 'new_code');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('verification: a test that imports a missing third-party package stays "not_runnable" before the change', { skip }, async () => {
+  const dir = makeRepo();
+  try {
+    writeFileSync(join(dir, 'src/farewell.ts'), "export const bye = () => 'bye';\n");
+    writeFileSync(join(dir, 'src/farewell.test.ts'),
+      "import test from 'node:test'; import assert from 'node:assert/strict'; import { nope } from 'not-a-real-package-xyz';\ntest('says bye', () => { assert.equal(nope, 1); });\n");
+    const v = await buildVerification({ profile: PROFILE, io: makeVerificationIO(exec, dir, PROFILE) });
+    assert.equal(v.tests.length, 0, 'it cannot load now either');
+    const io = makeVerificationIO(exec, dir, PROFILE);
+    const base = await io.prepareBaseline(['src/farewell.test.ts']);
+    try {
+      const report = parseRunOutput('node-test', await io.runIn(base!.dir, ['src/farewell.test.ts']));
+      assert.ok(report.suiteError);
+      assert.ok(!report.unresolved?.some(u => u.startsWith('.')), 'a package name is not a relative import');
+    } finally { await io.cleanupBaseline(base!.dir); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -312,6 +330,31 @@ test('committed work: deleted files are not reported as changed tests', { skip }
     git(dir, 'add', '-A'); git(dir, 'commit', '-q', '-m', 'delete it');
     const v = await buildVerification({ profile: PROFILE, io: makeVerificationIO(exec, dir, PROFILE) });
     assert.deepEqual(v.tests, []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a new module and its test: the original-code run cannot load, and is labelled new_code (real git + real node:test)', { skip }, async () => {
+  const dir = makeRepo();
+  try {
+    git(dir, 'checkout', '-q', '-b', 'task/newmod');
+    writeFileSync(join(dir, 'src/dur.ts'), 'export const parse = (s: string) => s.length;\n');
+    writeFileSync(join(dir, 'src/dur.test.ts'),
+      "import test from 'node:test'; import assert from 'node:assert/strict'; import { parse } from './dur.ts';\n" +
+      "test('parses a duration', () => { assert.equal(parse('1s'), 2); });\n");
+    git(dir, 'add', '-A'); git(dir, 'commit', '-q', '-m', 'add module');
+    writeFileSync(join(dir, 'src/untracked.ts'), 'export {};\n');
+    const io = makeVerificationIO(exec, dir, PROFILE);
+    assert.deepEqual((await io.addedPaths()).filter(p => p !== '.gitignore').sort(), ['src/dur.test.ts', 'src/dur.ts', 'src/untracked.ts']);
+    const v = await buildVerification({ profile: PROFILE, io });
+    assert.deepEqual(v.tests.map(t => [t.name, t.outcome, t.baseline]), [['parses a duration', 'passed', 'new_code']]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a modified module: addedPaths excludes it and the test keeps its assertion-level "fails" baseline', { skip }, async () => {
+  const dir = makeCommittedTaskRepo();
+  try {
+    const io = makeVerificationIO(exec, dir, PROFILE);
+    assert.deepEqual((await io.addedPaths()).filter(p => p !== '.gitignore'), ['src/greet.test.ts'], 'src/greet.ts was modified, not added');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

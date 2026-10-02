@@ -50,6 +50,14 @@ export interface RunReport {
    * from a failed case, which means a test really ran and failed.
    */
   suiteError?: string;
+  /**
+   * Module specifiers the runner reported it could not resolve when loading the
+   * test file — the structured part of a load failure, extracted per runner
+   * (see `extractUnresolved`). JS: the import path as written (or an absolute
+   * path); pytest: the dotted module name. Empty/absent when the load failure
+   * was anything else (syntax error, env problem, a missing package…).
+   */
+  unresolved?: string[];
   /** The runner was killed by the harness timeout. */
   timedOut?: boolean;
 }
@@ -298,6 +306,7 @@ export function parseTap(text: string): RunReport {
   const lines = text.split('\n');
   const cases: TestCase[] = [];
   let suiteError: string | undefined;
+  let unresolved: string[] = [];
   let diag: string[] = [];
 
   for (let i = 0; i < lines.length; i++) {
@@ -340,6 +349,7 @@ export function parseTap(text: string): RunReport {
       yaml.failureType === 'cancelledByParent'
     ) {
       suiteError = tail(diag.join('\n') || yaml.error || `${name} failed to run`);
+      unresolved = extractUnresolved('node-test', diag.join('\n'));
     } else {
       cases.push({
         name,
@@ -349,7 +359,7 @@ export function parseTap(text: string): RunReport {
     }
     diag = [];
   }
-  return { cases, suiteError };
+  return { cases, suiteError, ...(unresolved.length ? { unresolved } : {}) };
 }
 
 function firstJsonObject(text: string): unknown {
@@ -373,6 +383,7 @@ export function parseJestJson(text: string): RunReport {
 
   const cases: TestCase[] = [];
   const suiteErrors: string[] = [];
+  const unresolved: string[] = [];
   for (const suite of data.testResults) {
     const results = suite.assertionResults ?? [];
     for (const a of results) {
@@ -385,15 +396,17 @@ export function parseJestJson(text: string): RunReport {
     // error) or blew up in a hook; either way it isn't evidence about the code.
     if (suite.status === 'failed' && !results.some(a => a.status === 'failed')) {
       suiteErrors.push(tail((suite.message || `${suite.name ?? 'suite'} failed to run`).replace(ANSI, '')));
+      unresolved.push(...extractUnresolved('jest', (suite.message ?? '').replace(ANSI, '')));
     }
   }
-  return { cases, suiteError: suiteErrors.length ? suiteErrors.join('\n\n') : undefined };
+  return { cases, suiteError: suiteErrors.length ? suiteErrors.join('\n\n') : undefined, ...(unresolved.length ? { unresolved } : {}) };
 }
 
 /** pytest `--junitxml`. */
 export function parseJunit(xml: string): RunReport {
   const cases: TestCase[] = [];
   const suiteErrors: string[] = [];
+  const unresolved: string[] = [];
   const re = /<testcase\b([^>]*?)(?:\/>|>([\s\S]*?)<\/testcase>)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(xml)) !== null) {
@@ -410,14 +423,16 @@ export function parseJunit(xml: string): RunReport {
     } else if (error) {
       // In pytest an <error> is a collection failure or a fixture/setup error —
       // the test body never ran — so it is a suite-level problem, not a verdict.
-      suiteErrors.push(tail(decodeXml(error[2] ?? /message="([^"]*)"/.exec(error[1] ?? error[3] ?? '')?.[1] ?? 'error')));
+      const errText = decodeXml(error[2] ?? /message="([^"]*)"/.exec(error[1] ?? error[3] ?? '')?.[1] ?? 'error');
+      suiteErrors.push(tail(errText));
+      unresolved.push(...extractUnresolved('pytest', errText));
     } else if (/<skipped\b/.test(body)) {
       cases.push({ name, outcome: 'skipped' });
     } else {
       cases.push({ name, outcome: 'passed' });
     }
   }
-  return { cases, suiteError: suiteErrors.length ? suiteErrors.join('\n\n') : undefined };
+  return { cases, suiteError: suiteErrors.length ? suiteErrors.join('\n\n') : undefined, ...(unresolved.length ? { unresolved } : {}) };
 }
 
 /** `go test -json`. */
@@ -469,6 +484,114 @@ export function parseTrx(xml: string): RunReport {
     } else cases.push({ name, outcome: 'skipped' });
   }
   return { cases };
+}
+
+// ---------------------------------------------------------------------------
+// Load failures caused by code the task adds
+// ---------------------------------------------------------------------------
+
+/**
+ * Pull the unresolved-module specifiers out of a load failure's text. The wording
+ * is each runner's own, so it lives here per runner (fixtures: `*-newmod.*`,
+ * `pytest-nothere-name.xml`, captured from real runs). Only "this module/package
+ * could not be found" messages count — a syntax error, an environment problem or
+ * an ImportError for a name in a module that exists yield nothing.
+ */
+export function extractUnresolved(runner: RunnerKind, text: string): string[] {
+  const out = new Set<string>();
+  const all = (re: RegExp, pick: (m: RegExpExecArray) => string) => {
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) out.add(pick(m));
+  };
+  switch (runner) {
+    case 'node-test':
+    case 'jest':
+    case 'vitest':
+      // node (CJS and ESM), jest and vitest-on-node: "Cannot find module './x' …".
+      all(/Cannot find module '([^']+)'/g, m => m[1]);
+      // vite's import analysis: `Failed to resolve import "./x" from "src/a.test.ts"`.
+      all(/Failed to resolve import "([^"]+)"/g, m => m[1]);
+      break;
+    case 'pytest':
+      all(/ModuleNotFoundError: No module named '([^']+)'/g, m => m[1]);
+      // `from pkg import newmod` where pkg exists but pkg/newmod.py does not (yet).
+      all(/ImportError: cannot import name '([\w]+)' from '([\w.]+)'/g, m => `${m[2]}.${m[1]}`);
+      break;
+    default:
+      // go/dotnet: a missing package is a build failure whose wording is not
+      // captured from real runs here, so it stays "could not run".
+      break;
+  }
+  return [...out];
+}
+
+const JS_EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts', '.json'];
+/** `import './x.js'` in TypeScript means `./x.ts` (or .tsx); likewise .mjs→.mts, .cjs→.cts. */
+const JS_EXT_SWAPS: Record<string, string[]> = {
+  '.js': ['.ts', '.tsx'], '.jsx': ['.tsx'], '.mjs': ['.mts'], '.cjs': ['.cts'],
+};
+
+function normaliseRel(p: string): string | null {
+  const parts: string[] = [];
+  for (const seg of p.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') { if (!parts.length) return null; parts.pop(); } else parts.push(seg);
+  }
+  return parts.join('/');
+}
+
+/** Repo-relative files a JS import specifier written in `testFile` could mean. Empty for bare (package) specifiers. */
+function jsCandidates(spec: string, testFile: string, baseDir?: string): string[] {
+  let p: string | null = null;
+  if (spec.startsWith('./') || spec.startsWith('../')) {
+    p = normaliseRel(`${testFile.split('/').slice(0, -1).join('/')}/${spec}`);
+  } else if (spec.startsWith('/') && baseDir) {
+    // The runner reported an absolute path: only meaningful inside the scratch tree we ran in.
+    const root = baseDir.replace(/\/$/, '') + '/';
+    if (spec.startsWith(root)) p = normaliseRel(spec.slice(root.length));
+  }
+  if (!p) return [];
+  const out = [p];
+  const ext = /\.[cm]?[jt]sx?$/.exec(p)?.[0];
+  if (ext) for (const e of JS_EXT_SWAPS[ext] ?? []) out.push(p.slice(0, -ext.length) + e);
+  for (const e of JS_EXTS) out.push(p + e);
+  for (const e of JS_EXTS) out.push(`${p}/index${e}`);
+  return out;
+}
+
+function pythonMatches(module: string, added: ReadonlySet<string>): boolean {
+  const rel = module.replace(/\./g, '/');
+  // `endsWith` rather than equality: src-layout projects import `pkg.x` from `src/pkg/x.py`.
+  const hit = (f: string, tail: string) => f === tail || f.endsWith('/' + tail);
+  for (const f of added) {
+    if (!f.endsWith('.py')) continue;
+    if (hit(f, `${rel}.py`) || hit(f, `${rel}/__init__.py`)) return true;
+    // A whole new package (or namespace directory): `import newpkg.x` fails with "No module named 'newpkg'".
+    if (f.startsWith(rel + '/') || f.includes('/' + rel + '/')) return true;
+  }
+  return false;
+}
+
+/**
+ * True when a test file failed to load on the original code ONLY because of
+ * modules the task adds: the runner named at least one unresolved module and every
+ * one of them is a file that is absent at the merge-base and present in `added`.
+ * A bare package name, a module that exists on the base, or anything the runner
+ * did not name as unresolved returns false — those stay "could not run".
+ */
+export function loadFailureIsNewCode(
+  runner: RunnerKind,
+  unresolved: readonly string[] | undefined,
+  ctx: { testFile: string; added: ReadonlySet<string>; baseDir?: string },
+): boolean {
+  if (!unresolved?.length || ctx.added.size === 0) return false;
+  return unresolved.every(spec => {
+    if (runner === 'pytest') return pythonMatches(spec, ctx.added);
+    if (runner === 'node-test' || runner === 'vitest' || runner === 'jest') {
+      return jsCandidates(spec, ctx.testFile, ctx.baseDir).some(c => ctx.added.has(c));
+    }
+    return false;
+  });
 }
 
 /**

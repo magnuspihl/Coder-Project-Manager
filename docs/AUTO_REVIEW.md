@@ -1023,6 +1023,16 @@ proof-mode *review* depends only on whether a runner can be resolved (Section 17
 | **tests** (quick) | only the test files the task added or changed, each run individually | after an ordinary implementer turn that changed files |
 | **full** | the above **plus** the fail-before comparison **plus** the whole suite | when a review runs (automatic or manual), and on demand via **Run full verification** (`POST /api/tasks/:id/verify`) |
 
+**What can start a `full` run.** Exactly two things, pinned by a test: a reviewer launch (automatic *or* manual —
+`launchReviewerOnTask`) and the on-demand request (`POST /api/tasks/:id/verify`, the *Run full verification*
+button). Opening a task, `GET`ting it, a poller or a timer never computes one. An ordinary implementer turn
+gets `tests`, and only when no reviewer follows. (Canary d11106c6 had `auto_review=0` yet stored a `full`
+result stamped 3 minutes after its first turn: with no reviewer launched, the only remaining trigger is an
+on-demand request, which `computedAt` — stamped when a run *starts* — dates to that moment. The 3-minute
+gap is therefore when someone asked, not a run's duration. The original server log for that window was not
+retained, so this is by elimination; on-demand requests now write a `[Harness] full verification requested
+on demand` line to the task's stream log so the next case is attributable.)
+
 Why not full every turn: many turns are small tweaks in a conversation, and a suite run (≤180 s) after each
 would make iteration miserable for a benefit the user only needs at review time. A full result is **not
 recomputed when the tree is unchanged** since the last one (a hash of `HEAD`, the diff against the merge-base
@@ -1042,9 +1052,47 @@ What it computes:
    `git archive` of the merge-base, the test files laid over it, `node_modules` symlinked — no worktree
    metadata is written to the repository). Labels: `fails without the change` (genuinely exercises the new
    behaviour), `also passes without the change` (guards existing behaviour or proves nothing new),
-   `couldn't run without the change` (e.g. imports a module that didn't exist yet — never claimed to be more
-   than that);
+   `new code: fails without the change` (the file cannot even load on the original code, only because it
+   imports a module the task adds — see 18.1), `couldn't run without the change` (any other reason the file
+   did not load — never claimed to be more than that);
 3. *(full)* the project's whole suite (pass/fail/skip counts; an incomplete run is *not* reported as a pass).
+
+### 18.1 Tests for brand-new modules (`new_code`)
+
+A task that adds a module and its tests used to get `not_runnable` on every test (the import cannot resolve
+on the base), which reads as "unknown" when the truth is "this cannot pass without the change". The baseline
+now tells the causes apart, **from structured runner output plus the task's added-file list**, not from a
+guess at an error string:
+
+* **`new_code`** — the base run produced a suite-level load failure (no test ran, not a timeout), the runner
+  named the modules it could not resolve, and **every one** of them is a file that is absent at the
+  merge-base and present in the task (`VerificationIO.addedPaths()`: `git diff --diff-filter=A` against the
+  same merge-base as `changedPaths`, plus untracked files; renames count as added at the new path).
+  Distinct from `fails` because it is slightly weaker evidence: it proves the test *depends on* the new
+  code, not that its assertions check the behaviour. The card says "new code: fails without the change".
+* **`not_runnable`** — everything else: a syntax error, a bare package specifier (a missing third-party
+  dependency, even if a same-named file was added), an env problem, an unresolved import that exists on the
+  base, a timeout, an unreadable added-file list, or any load failure where the runner named *no* module
+  (go/dotnet, below).
+* A test that **loads** on the base keeps the assertion-level verdict (`fails` / `passes`), regardless of
+  which modules the task added: a *modified* existing module is never `new_code`.
+
+Where error text is matched it is per runner, in `extractUnresolved` (`test-runners.ts`), producing
+`RunReport.unresolved`; fixtures are real runs (`*-newmod.*`, `pytest-nothere-name.xml`):
+
+| Runner | Recognised | Resolved against the added files |
+|---|---|---|
+| node:test, jest, vitest | `Cannot find module '<spec>'`, vite's `Failed to resolve import "<spec>"` | relative specifiers from the test file's directory, with the TS convention (`./x.js` → `x.ts`/`x.tsx`), extension probing and `index.*`; absolute paths only inside the scratch tree; bare specifiers never |
+| pytest | `ModuleNotFoundError: No module named 'a.b'`; `ImportError: cannot import name 'b' from 'a'` (read as `a.b`, i.e. `from a import newmod`) | `a/b.py`, `a/b/__init__.py`, or any added `.py` under a new `a/` (also under a `src/` prefix) |
+| go, dotnet | — | not classified: a missing package is a build failure whose wording is not captured from real runs, so these stay `not_runnable` |
+
+**Mixed files.** A load failure takes the whole file down, so the baseline cannot say which individual
+tests needed new code. The choice: **every test in the file gets `new_code`** when the file's only blocker is
+new code. That is the honest reading of "this file cannot pass without the change", it stays visibly weaker
+than `fails`, and the alternative (`not_runnable` for the whole file) would throw away the one fact we do
+know. Caveat: a runner reports the *first* unresolved import, so a file with one new-code import and an
+unrelated second broken one is `new_code` until the first is fixed; the current-tree run (which must pass
+for a tick at all) rules out the second being broken now.
 
 **Hard limits — a hung test cannot hold a task in `working`.** Every layer is bounded: each run is wrapped in
 `timeout -k 5` *inside the workspace* (120 s per file, 180 s per suite; it signals the whole process group, so

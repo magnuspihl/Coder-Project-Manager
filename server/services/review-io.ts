@@ -144,6 +144,16 @@ export function makeVerificationIO(exec: Exec, worktree: string, profile: TestPr
       ].join('\n'));
       return parseNameList(out.split('@@S@@')[1] ?? '');
     },
+    addedPaths: async () => {
+      // --no-renames: a renamed file's new path is absent at the base, so it counts as added.
+      const out = await exec([
+        `WT=${shellQuote(worktree)}`,
+        BASE_SNIPPET,
+        `echo @@S@@`,
+        `{ git -C "$WT" -c core.quotepath=off diff --name-only --no-renames --diff-filter=A "$base" 2>/dev/null; git -C "$WT" ls-files --others --exclude-standard 2>/dev/null; } | sort -u`,
+      ].join('\n'));
+      return parseNameList(out.split('@@S@@')[1] ?? '');
+    },
     fingerprint: async () => {
       const out = await exec([
         `WT=${shellQuote(worktree)}`,
