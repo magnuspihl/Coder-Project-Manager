@@ -18,10 +18,18 @@ export interface ReviewIssue {
   proofPath?: string;
 }
 
+/** What the reviewer SAYS it looked at. A claim — the harness checks it against the reviewer's tool calls. */
+export interface ReviewCoverage {
+  reviewed: string[];
+  notReviewed: Array<{ file: string; reason: string }>;
+}
+
 export interface ReviewDecision {
   outcome: 'pass' | 'fail';
   summary: string;
   issues?: ReviewIssue[];
+  /** Absent when the reviewer gave no usable coverage field — treated as unverified. */
+  coverage?: ReviewCoverage;
 }
 
 // The literal placeholder tokens from the verdict template / worked example in
@@ -74,6 +82,38 @@ function normaliseEntry(x: unknown): ReviewIssue[] {
   return [issue];
 }
 
+/** An echoed template token (`<path>`) is not a file. */
+const isPlaceholderPath = (f: string) => /^<[^>]*>$/.test(f);
+
+function fileList(x: unknown): string[] {
+  return Array.isArray(x)
+    ? x.flatMap(e => str(e) ?? (e && typeof e === 'object' ? str((e as Record<string, unknown>).file) ?? str((e as Record<string, unknown>).path) ?? [] : []))
+        .filter(f => !isPlaceholderPath(f))
+    : [];
+}
+
+/**
+ * Normalise the optional `coverage` field. Tolerant: `notReviewed` entries may be
+ * plain paths or `{file|path, reason}`, and a few spellings of the key are
+ * accepted. Anything that is not an object with at least one usable list is
+ * dropped — callers then treat coverage as unverified rather than as an error.
+ */
+function normaliseCoverage(x: unknown): ReviewCoverage | undefined {
+  if (!x || typeof x !== 'object' || Array.isArray(x)) return undefined;
+  const o = x as Record<string, unknown>;
+  const reviewed = fileList(o.reviewed);
+  const rawNot = [o.notReviewed, o.not_reviewed, o.unreviewed, o.notSeen].find(Array.isArray) as unknown[] | undefined;
+  const notReviewed = (rawNot ?? []).flatMap(e => {
+    if (typeof e === 'string') return str(e) && !isPlaceholderPath(e.trim()) ? [{ file: e.trim(), reason: '' }] : [];
+    if (!e || typeof e !== 'object') return [];
+    const r = e as Record<string, unknown>;
+    const file = str(r.file) ?? str(r.path);
+    return file && !isPlaceholderPath(file) ? [{ file, reason: str(r.reason) ?? '' }] : [];
+  });
+  if (reviewed.length === 0 && notReviewed.length === 0 && !rawNot && !Array.isArray(o.reviewed)) return undefined;
+  return { reviewed, notReviewed };
+}
+
 /**
  * Extract and validate the balanced JSON object that begins at the first `{`
  * at or after `from`. Returns the decision or null if no valid object is found.
@@ -122,7 +162,8 @@ function extractDecisionAt(text: string, from: number): ReviewDecision | null {
       ...(Array.isArray(parsed.issues) ? parsed.issues : []),
     ];
     const realIssues = entries.flatMap(normaliseEntry);
-    return { outcome: parsed.outcome, summary, issues: realIssues.length ? realIssues : undefined };
+    const coverage = normaliseCoverage(parsed.coverage);
+    return { outcome: parsed.outcome, summary, issues: realIssues.length ? realIssues : undefined, ...(coverage ? { coverage } : {}) };
   } catch {
     return null;
   }

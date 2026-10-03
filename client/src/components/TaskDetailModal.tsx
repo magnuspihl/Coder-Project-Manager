@@ -1360,6 +1360,18 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     closeAndNotify();
   };
 
+  const handleReviewRemaining = async () => {
+    setReviewing(true);
+    try {
+      await reviewTask(taskId, { remaining: true });
+      await loadData();
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : 'Failed to start review');
+    } finally {
+      setReviewing(false);
+    }
+  };
+
   const handleReview = async () => {
     setReviewing(true);
     try {
@@ -2083,6 +2095,64 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     const opinionMode = turn.review_mode === 'opinion';
     const tally = proofTally(stored);
     const refuted = stored?.proofs.filter(p => p.status === 'refuted') ?? [];
+
+    // Nothing wrong found in what the reviewer saw, but it never saw all of the
+    // change: neither a pass nor a fail. The coverage detail lives in the proofs.
+    if (turn.review_outcome === 'partial') {
+      const cov = stored?.coverage ?? { reviewed: [], readViaTool: [], unreviewed: [], exempt: [], claimUnverified: true, stoppedByTurnCap: false };
+      const names = cov.unreviewed.map(u => u.path);
+      const label = `Partial review — not seen: ${names.slice(0, 4).join(', ')}${names.length > 4 ? ` (+${names.length - 4} more)` : ''}`;
+      const advisory = findingsForTurn(turn.id).filter(f => f.severity === 'advisory');
+      return (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 py-1">
+            <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
+            <span
+              className="flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full border text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/30 border-amber-200 dark:border-amber-800 max-w-[80%]"
+              title="The reviewer found no confirmed defect in what it saw, but it did not see all of the change. This is not a pass."
+            >
+              <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" /></svg>
+              <span className="truncate">{label}</span>
+            </span>
+            <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
+          </div>
+          <div className="rounded-lg p-3 bg-amber-50/60 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-800 mr-8 space-y-2">
+            <p className="text-[11px] font-medium text-amber-800 dark:text-amber-200">
+              No defect was confirmed in the {cov.reviewed.length} file{cov.reviewed.length === 1 ? '' : 's'} the reviewer saw, but {names.length} changed file{names.length === 1 ? ' was' : 's were'} never reviewed. Nothing is known to be wrong, so nothing was sent back to the implementer.
+            </p>
+            <ul className="list-disc list-outside ml-4 space-y-0.5 text-[11px] text-amber-900 dark:text-amber-200">
+              {cov.unreviewed.map(u => (
+                <li key={u.path}><span className="font-mono break-all">{u.path}</span> — {u.reason}</li>
+              ))}
+            </ul>
+            {cov.stoppedByTurnCap && (
+              <p className="text-[11px] text-amber-800 dark:text-amber-200">
+                The reviewer ran out of turns{cov.turnCap ? ` (limit ${cov.turnCap})` : ''} while reading — a budget stop, not a finding.
+              </p>
+            )}
+            {cov.claimUnverified && (
+              <p className="text-[10px] text-amber-700/80 dark:text-amber-300/80">The reviewer gave no usable coverage report; this is based on its tool calls alone.</p>
+            )}
+            {task?.status === 'awaiting_feedback' && (
+              <button
+                onClick={handleReviewRemaining}
+                disabled={reviewing}
+                className="text-xs font-medium px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-50 transition-colors"
+              >
+                {reviewing ? 'Starting…' : 'Review remaining files'}
+              </button>
+            )}
+            {advisory.length > 0 && (
+              <div className="space-y-2 pt-1">
+                <p className="text-[11px] font-medium text-amber-800 dark:text-amber-200">Advisory notes — the reviewer could not prove {advisory.length === 1 ? 'this' : 'these'} with a test</p>
+                {advisory.map((f, i) => renderFinding(f, i, task?.status === 'awaiting_feedback'))}
+              </div>
+            )}
+            <RefutedClaims proofs={refuted} />
+          </div>
+        </div>
+      );
+    }
 
     if (turn.review_outcome === 'pass') {
       // Advisory notes are findings the reviewer could not demonstrate with a

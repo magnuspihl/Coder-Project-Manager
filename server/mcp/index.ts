@@ -202,7 +202,7 @@ function buildServer(ctx: AuthCtx): McpServer {
   server.registerTool(
     'get_task',
     {
-      description: 'Get a task with its message history. When message_limit is set, returns the most recent N messages (in chronological order), not the oldest. Each message includes an "author" field ("implementer", "reviewer", "user", "system", or "participant:<workspace>") and "turn_role", since the implementer and the read-only reviewer are both stored with role "assistant".',
+      description: 'Get a task with its message history. When message_limit is set, returns the most recent N messages (in chronological order), not the oldest. Each reviewer turn has a review_outcome of "pass", "fail" or "partial" (a review that did not see all the changed files — not a pass). Each message includes an "author" field ("implementer", "reviewer", "user", "system", or "participant:<workspace>") and "turn_role", since the implementer and the read-only reviewer are both stored with role "assistant".',
       inputSchema: {
         task_id: z.string().describe('Task ID'),
         message_limit: z.number().int().positive().max(500).optional().describe('If set, return only the most recent N messages (newest, in chronological order). Omit for the full history.'),
@@ -416,7 +416,7 @@ function buildServer(ctx: AuthCtx): McpServer {
   server.registerTool(
     'review',
     {
-      description: 'Trigger the red-team reviewer on a task awaiting feedback. The reviewer inspects the task\'s diff and emits a verdict: on "pass" the task returns to awaiting_feedback; on "fail" the issues are routed back to the implementer to fix (up to max_review_loop_count passes). The call returns as soon as the review is accepted (the task is then "working" with the reviewer active); the review-time verification and reviewer launch continue in the background, and a failure there appears as a system message on the task. Fails if the worktree is clean (nothing to review) or the workspace is already at its task concurrency limit.',
+      description: 'Trigger the red-team reviewer on a task awaiting feedback. The reviewer inspects the task\'s diff and emits a verdict: on "pass" the task returns to awaiting_feedback; on "partial" (nothing wrong found, but the reviewer never saw some changed files, listed in the review_proofs coverage of that turn) the task returns to awaiting_feedback and is NOT reviewed — do not report it as passed; on "fail" the issues are routed back to the implementer to fix (up to max_review_loop_count passes). The call returns as soon as the review is accepted (the task is then "working" with the reviewer active); the review-time verification and reviewer launch continue in the background, and a failure there appears as a system message on the task. Fails if the worktree is clean (nothing to review) or the workspace is already at its task concurrency limit.',
       inputSchema: { task_id: z.string().describe('Task ID') },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },

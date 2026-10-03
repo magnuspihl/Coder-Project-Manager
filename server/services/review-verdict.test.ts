@@ -85,3 +85,27 @@ test('extractProofFiles: unterminated blocks are ignored, and the last block for
 test('extractProofFiles: CRLF input (PTY output) is handled', () => {
   assert.equal(extractProofFiles('PROOF_FILE: a.cpm-proof.test.ts\r\n```\r\nX\r\n```\r\n')[0].content, 'X\n');
 });
+
+test('parses the reviewer\'s coverage claim, with notReviewed entries as paths or objects', () => {
+  const d = parseReviewDecision('REVIEW_DECISION: {"outcome":"pass","summary":"s","coverage":{"reviewed":["a.ts"],"notReviewed":["b.ts",{"file":"c.ts","reason":"too long"}]}}');
+  assert.deepEqual(d?.coverage, { reviewed: ['a.ts'], notReviewed: [{ file: 'b.ts', reason: '' }, { file: 'c.ts', reason: 'too long' }] });
+});
+
+test('a missing coverage field leaves coverage undefined (unverified), not an error', () => {
+  const d = parseReviewDecision('REVIEW_DECISION: {"outcome":"pass","summary":"s"}');
+  assert.equal(d?.outcome, 'pass');
+  assert.equal(d?.coverage, undefined);
+});
+
+test('a garbled coverage field is ignored without losing the verdict', () => {
+  for (const bad of ['"coverage":"all of it"', '"coverage":[1,2]', '"coverage":null', '"coverage":{"reviewed":"a.ts"}', '"coverage":{}']) {
+    const d = parseReviewDecision(`REVIEW_DECISION: {"outcome":"pass","summary":"s",${bad}}`);
+    assert.equal(d?.outcome, 'pass', bad);
+    assert.equal(d?.coverage, undefined, bad);
+  }
+});
+
+test('echoed coverage template placeholders are not treated as files', () => {
+  const d = parseReviewDecision('REVIEW_DECISION: {"outcome":"pass","summary":"s","coverage":{"reviewed":["<path>"],"notReviewed":[{"file":"<path>","reason":"<why>"}]}}');
+  assert.deepEqual(d?.coverage, { reviewed: [], notReviewed: [] });
+});

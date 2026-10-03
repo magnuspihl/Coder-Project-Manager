@@ -76,13 +76,20 @@ export interface Task {
   deleted_at: string | null;
 }
 
+/**
+ * How a reviewer turn ended. 'partial' is a review that found nothing wrong in
+ * what it saw but did not see all of the change: it is neither a pass (the
+ * unseen code is unchecked) nor a fail (nothing is known to be wrong).
+ */
+export type ReviewTurnOutcome = 'pass' | 'fail' | 'partial';
+
 export interface TaskTurn {
   id: string;
   task_id: string;
   role: 'implementer' | 'reviewer';
   turn_number: number;
   claude_session_id: string | null;
-  review_outcome: 'pass' | 'fail' | null;
+  review_outcome: ReviewTurnOutcome | null;
   review_summary: string | null;
   review_issues: string | null;
   /** 'proof' when findings had to be backed by failing tests, 'opinion' when no test setup was found. */
@@ -648,7 +655,7 @@ export function getLatestTaskTurn(taskId: string): TaskTurn | undefined {
   return db.prepare('SELECT * FROM task_turns WHERE task_id = ? ORDER BY turn_number DESC LIMIT 1').get(taskId) as TaskTurn | undefined;
 }
 
-export function completeTaskTurn(turnId: string, outcome?: 'pass' | 'fail', summary?: string, issues?: string[]): void {
+export function completeTaskTurn(turnId: string, outcome?: ReviewTurnOutcome, summary?: string, issues?: string[]): void {
   const db = getDb();
   const now = new Date().toISOString();
   db.prepare(

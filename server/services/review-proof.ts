@@ -13,6 +13,7 @@
  * classification and routing can be tested without a workspace.
  */
 
+import type { CoverageReport } from './review-coverage.js';
 import type { ProofFile, ReviewDecision, ReviewIssue } from './review-verdict.js';
 import type { ReviewFinding } from './tasks.js';
 import {
@@ -379,6 +380,8 @@ export interface StoredProof {
 export interface StoredReview {
   mode: ReviewMode;
   proofs: StoredProof[];
+  /** What the harness found the reviewer saw. Absent on reviews that predate coverage checking. */
+  coverage?: CoverageReport;
 }
 
 export function toStored(routed: RoutedReview, all: VerifiedIssue[]): StoredReview {

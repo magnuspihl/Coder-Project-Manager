@@ -82,7 +82,8 @@ export interface TaskTurn {
   role: 'implementer' | 'reviewer';
   turn_number: number;
   claude_session_id: string | null;
-  review_outcome: 'pass' | 'fail' | null;
+  /** 'partial': nothing wrong found in what the reviewer saw, but it did not see all of the change — not a pass. */
+  review_outcome: 'pass' | 'fail' | 'partial' | null;
   review_summary: string | null;
   review_issues: string | null;
   /** 'proof': findings had to be backed by failing tests. 'opinion': no test runner was found. */
@@ -109,9 +110,21 @@ export interface StoredProof {
   output: string;
 }
 
+/** What the harness concluded about which changed files the reviewer actually saw (server: review-coverage.ts). */
+export interface ReviewCoverage {
+  reviewed: string[];
+  readViaTool: string[];
+  unreviewed: Array<{ path: string; reason: string }>;
+  exempt: Array<{ path: string; reason: string }>;
+  claimUnverified: boolean;
+  stoppedByTurnCap: boolean;
+  turnCap?: number;
+}
+
 export interface StoredReview {
   mode: 'proof' | 'opinion';
   proofs: StoredProof[];
+  coverage?: ReviewCoverage;
 }
 
 export type BaselineResult = 'fails' | 'passes' | 'new_code' | 'not_runnable';
@@ -680,8 +693,12 @@ export const reopenTask = (taskId: string) =>
 export const retryTask = (taskId: string) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/retry`, { method: 'POST' });
 
-export const reviewTask = (taskId: string) =>
-  request<{ task: Task }>(`/api/tasks/${taskId}/review`, { method: 'POST' });
+/** `remaining`: review only the files the latest review did not see. */
+export const reviewTask = (taskId: string, opts: { remaining?: boolean } = {}) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}/review`, {
+    method: 'POST',
+    ...(opts.remaining ? { body: JSON.stringify({ remaining: true }) } : {}),
+  });
 
 export const resetTaskSession = (taskId: string, continuationPrompt: string) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/reset-session`, {

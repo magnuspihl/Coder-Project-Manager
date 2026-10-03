@@ -753,8 +753,13 @@ router.post('/tasks/:taskId/review', requireAuth, async (req: Request, res: Resp
     return;
   }
   try {
-    const launched = await triggerManualReview(task);
+    const remainingOnly = req.body?.remaining === true;
+    const launched = await triggerManualReview(task, undefined, { remainingOnly });
     if (!launched) {
+      if (remainingOnly) {
+        res.status(400).json({ error: 'The latest review has no unreviewed files to review.' });
+        return;
+      }
       res.status(400).json({ error: 'No changes to review — the task\'s branch has no changes relative to the default branch.' });
       return;
     }

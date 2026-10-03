@@ -368,6 +368,13 @@ test('testExistedAtBase: finds a js title as a quoted literal, with or without i
   assert.equal(testExistedAtBase('Parser accepts a trailing comma', src), false);
 });
 
+test('testExistedAtBase: finds a title whose apostrophe or quote is backslash-escaped in the source', () => {
+  const src = "test('lists the change\\'s tests', () => {});\ntest(\"says \\\"hi\\\"\", () => {});\n";
+  assert.equal(testExistedAtBase("lists the change's tests", src), true);
+  assert.equal(testExistedAtBase('says "hi"', src), true);
+  assert.equal(testExistedAtBase("lists the user's tests", src), false);
+});
+
 test('testExistedAtBase: matches pytest, dotnet and go names by their method or segments', () => {
   assert.equal(testExistedAtBase('tests.test_a.TestA.test_old[1-2]', 'class TestA:\n    def test_old(self): pass'), true);
   assert.equal(testExistedAtBase('tests.test_a.TestA.test_new', 'class TestA:\n    def test_old(self): pass'), false);

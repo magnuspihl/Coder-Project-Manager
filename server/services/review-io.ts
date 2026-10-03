@@ -8,6 +8,7 @@
 import type { ProofIO } from './review-proof.js';
 import { buildRunCommand, shellQuote, type TestProfile } from './test-runners.js';
 import { parseNameList, type VerificationIO } from './verification.js';
+import { buildReviewDiff, type BuildDiffOptions, type ReviewDiff } from './review-coverage.js';
 
 /** Runs `command` in the workspace and resolves with its (trimmed) stdout. */
 export type Exec = (command: string, timeoutMs?: number, maxBuffer?: number) => Promise<string>;
@@ -63,16 +64,25 @@ export function reviewDiffScript(worktree: string): string {
   ].join('\n');
 }
 
-/** The diff handed to the reviewer, capped at ~8000 tokens. */
-export async function getReviewDiff(exec: Exec, worktree: string, maxChars = 32_000): Promise<string> {
+/**
+ * The diff handed to the reviewer, capped at ~8000 tokens, together with the
+ * harness's record of which changed files did not fit (see review-coverage.ts).
+ * Same merge-base definition of "changed" as everything else in this file.
+ */
+export async function getReviewDiffInfo(
+  exec: Exec,
+  worktree: string,
+  maxChars = 32_000,
+  opts: BuildDiffOptions = {},
+): Promise<ReviewDiff> {
   const out = await exec(reviewDiffScript(worktree), 30_000, 16 * 1024 * 1024);
   const [diff, untracked] = out.replace(/\r\n?/g, '\n').split(UNTRACKED_MARKER);
-  const parts: string[] = [];
-  if (diff?.trim()) parts.push(diff.trim());
-  if (untracked?.trim()) parts.push(`Untracked files:\n${untracked.trim()}`);
-  const combined = parts.join('\n\n');
-  if (combined.length > maxChars) return combined.slice(0, maxChars) + '\n\n[diff truncated — use Read tool to inspect remaining files]';
-  return combined || '(no diff output)';
+  return buildReviewDiff(diff ?? '', parseNameList(untracked ?? ''), maxChars, opts);
+}
+
+/** The diff text alone. */
+export async function getReviewDiff(exec: Exec, worktree: string, maxChars = 32_000): Promise<string> {
+  return (await getReviewDiffInfo(exec, worktree, maxChars)).text;
 }
 
 const RUN_BUFFER = 8 * 1024 * 1024;
