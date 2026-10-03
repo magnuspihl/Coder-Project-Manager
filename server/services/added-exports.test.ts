@@ -52,7 +52,10 @@ test('Python top-level names: defs, classes, assignments and imports, but not ne
   ].join('\n');
   const r = pythonTopLevelNames(src)!;
   assert.deepEqual(sorted(r.all), ['C', 'CONST', 'ab', 'f', 'g', 'os', 'p', 'q', 'typed', 'y', 'zz']);
-  assert.deepEqual(sorted(r.defined), ['C', 'CONST', 'f', 'g', 'p', 'q', 'typed', 'y', 'zz']);
+  // `from x import …` is a dependency here; only the module's own names are its API.
+  assert.deepEqual(sorted(r.defined), ['C', 'CONST', 'f', 'g', 'p', 'q', 'typed']);
+  // Relative imports, and absolute ones from the package the file lives in, are re-exports.
+  assert.deepEqual(sorted(pythonTopLevelNames('from .impl import a\nfrom pkg.other import b\nfrom typing import C\n', 'src/pkg/__init__.py')!.defined), ['a', 'b']);
 });
 
 test('Python top-level names: a star import or a module __getattr__ makes them unknown', () => {
@@ -78,8 +81,10 @@ test('addedExports: a changed signature adds no name', () => {
   assert.deepEqual(sorted(addedExports('pkg/dur.py', 'def f(a):\n    pass\n', 'def f(a, b):\n    pass\n')), []);
 });
 
-test('addedExports: dropping a plain Python import is not a removal, but a removed def or re-export is', () => {
+test('addedExports: dropping a dependency import is not a removal, but a removed def or re-export is', () => {
   assert.deepEqual(sorted(addedExports('m.py', 'import os\ndef a(): pass\n', 'def a(): pass\ndef b(): pass\n')), ['b']);
+  assert.deepEqual(sorted(addedExports('pkg/m.py', 'from typing import Optional\ndef a(): pass\n', 'def a(): pass\ndef b(): pass\n')), ['b']);
+  assert.equal(addedExports('pkg/__init__.py', 'from pkg.impl import old_name\n', 'from pkg.impl import new_name\n'), null);
   assert.equal(addedExports('m.py', 'def a(): pass\ndef old(): pass\n', 'def a(): pass\ndef b(): pass\n'), null);
   // A package __init__ renaming what it re-exports is a rename, not new code.
   assert.equal(addedExports('pkg/__init__.py', 'from .impl import old_name\n', 'from .impl import new_name\n'), null);

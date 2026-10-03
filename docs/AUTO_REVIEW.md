@@ -1113,8 +1113,10 @@ merge-base (`changedPaths` minus `addedPaths`) — the harness reads the file at
 * Python: top-level `def`/`async def`/`class`, assignments, and the names `import`/`from … import` bind.
   `from x import *` or a module-level `__getattr__` make the set unknown.
 * **Renames are not additions.** If the task removed any export from the same file (Python: a top-level
-  def/class/assignment or `from … import` binding — how a package `__init__` re-exports — that is no
-  longer bound; a dropped plain `import x` doesn't count), the new names are not
+  def/class/assignment, or a re-export from the project itself — `from .impl import x`, or `from pkg.impl
+  import x` in a file under `pkg/`, which is how a package `__init__` re-exports — that is no longer bound;
+  dropping a dependency import such as `from typing import Optional` or `import os` is tidying and doesn't
+  count), the new names are not
   claimed as added: a removal next to an addition is indistinguishable from a rename, which is a changed
   API. This also forgoes the rarer "removed one function, added an unrelated one" case — on the safe side.
 

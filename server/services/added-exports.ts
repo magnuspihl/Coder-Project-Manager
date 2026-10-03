@@ -113,14 +113,19 @@ export interface PythonNames {
   all: Set<string>;
   /**
    * The ones that can be the module's API — what a rename would remove: its own
-   * defs/classes/assignments and `from … import` bindings (a package `__init__`
-   * re-exports this way). Plain `import x` module bindings are left out.
+   * defs/classes/assignments, and names it re-exports from its OWN project:
+   * `from .impl import x`, or `from pkg.impl import x` inside `pkg/` (how a package
+   * `__init__` re-exports). Imports from elsewhere (`from typing import Optional`,
+   * `import os`) are dependencies, which code tidying drops freely.
    */
   defined: Set<string>;
 }
 
 /** Names bound at the top level of a Python module, or null when they cannot be enumerated. */
-export function pythonTopLevelNames(source: string): PythonNames | null {
+export function pythonTopLevelNames(source: string, path = ''): PythonNames | null {
+  // The packages `path` lives in (`src/pkg/sub/m.py` → src, pkg, sub): an absolute import from one is a project re-export.
+  const ownPackages = new Set(path.split('/').slice(0, -1));
+  const isOwnModule = (mod: string) => mod.startsWith('.') || ownPackages.has(mod.split('.')[0]);
   const all = new Set<string>();
   const defined = new Set<string>();
   // Blank out triple-quoted strings so a docstring line starting with `def ` is not code.
@@ -133,8 +138,9 @@ export function pythonTopLevelNames(source: string): PythonNames | null {
     if ((m = /^(?:async\s+)?def\s+(\w+)/.exec(line)) || (m = /^class\s+(\w+)/.exec(line))) {
       all.add(m[1]); defined.add(m[1]);
       if (m[1] === '__getattr__') return null;
-    } else if ((m = /^from\s+[\w.]+\s+import\s+(.*)$/.exec(line))) {
-      let list = m[1];
+    } else if ((m = /^from\s+([\w.]+)\s+import\s+(.*)$/.exec(line))) {
+      const reexport = isOwnModule(m[1]);
+      let list = m[2];
       if (list.trim().startsWith('(')) {
         while (!list.includes(')') && i + 1 < lines.length) list += ' ' + lines[++i].replace(/#.*$/, '');
         list = list.replace(/[()]/g, '');
@@ -143,7 +149,8 @@ export function pythonTopLevelNames(source: string): PythonNames | null {
         if (item === '*') return null;
         const parts = item.split(/\s+as\s+/);
         const name = (parts[1] ?? parts[0]).trim();
-        all.add(name); defined.add(name);
+        all.add(name);
+        if (reexport) defined.add(name);
       }
     } else if ((m = /^import\s+(.*)$/.exec(line))) {
       for (const item of splitList(m[1])) {
@@ -170,10 +177,10 @@ export function pythonTopLevelNames(source: string): PythonNames | null {
  */
 export function addedExports(path: string, baseSource: string, currentSource: string): Set<string> | null {
   if (isPython(path)) {
-    const before = pythonTopLevelNames(baseSource);
-    const after = pythonTopLevelNames(currentSource);
+    const before = pythonTopLevelNames(baseSource, path);
+    const after = pythonTopLevelNames(currentSource, path);
     if (!before || !after) return null;
-    // A dropped `import os` is tidying; a dropped def/class/assignment or `from … import` binding (a re-export) is a removal.
+    // A dropped dependency import is tidying; a dropped def/class/assignment or project re-export is a removal.
     for (const n of before.defined) if (!after.all.has(n)) return null;
     return new Set([...after.all].filter(n => !before.all.has(n)));
   }
