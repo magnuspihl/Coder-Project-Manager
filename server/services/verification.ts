@@ -332,8 +332,11 @@ const escapeRe = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 /** `s` appears in `src` as a quoted string literal (how js/ts and most others write a test title). */
 function hasQuoted(src: string, s: string): boolean {
   for (const q of ["'", '"', '`']) if (src.includes(q + s + q)) return true;
-  // A title containing its own quote is escaped in the source; don't call that "new".
-  return /['"`\\]/.test(s) && src.includes(s);
+  // A title containing its own quote or backslash is usually ESCAPED in the source
+  // ('change\'s tests' reports as "change's tests"); don't call that "new" — look
+  // for the title both as the runner reports it and as it is written in code.
+  if (!/['"`\\]/.test(s)) return false;
+  return src.includes(s) || src.includes(s.replace(/(['"`\\])/g, '\\$1'));
 }
 
 const hasIdentifier = (src: string, id: string) => id.length > 0 && new RegExp(`(?<![\\w$])${escapeRe(id)}(?![\\w$])`).test(src);

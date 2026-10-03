@@ -3949,9 +3949,9 @@ async function remoteClaudeSessionExists(
 
 /** Files the latest completed reviewer turn recorded as unreviewed (empty when it was fully covered). */
 export function unreviewedFilesOfLatestReview(taskId: string): string[] {
-  const turns = getTaskTurns(taskId).filter(t => t.role === 'reviewer' && t.completed_at && t.review_proofs);
+  const turns = getTaskTurns(taskId).filter(t => t.role === 'reviewer' && t.completed_at);
   const last = turns[turns.length - 1];
-  if (!last?.review_proofs) return [];
+  if (last?.review_outcome !== 'partial' || !last.review_proofs) return [];
   try {
     const stored = JSON.parse(last.review_proofs) as StoredReview;
     return (stored.coverage?.unreviewed ?? []).map(u => u.path);
@@ -4082,6 +4082,8 @@ interface ReviewContext {
   cutOff?: boolean;
 }
 const reviewContexts = new Map<string, ReviewContext>();
+/** The in-memory review state, exposed so tests can stand in for a finished reviewer run. */
+export const _reviewContextsForTest = reviewContexts;
 
 interface ExecuteReviewerOpts {
   prompt: string;
@@ -4619,7 +4621,7 @@ async function finishRepair(task: Task, turnId: string, text: string): Promise<v
  * the task or send the implementer back. In proof mode the outcome is decided by
  * evidence (routeReview), not by the reviewer's own `outcome`.
  */
-function routeVerifiedReview(
+export function routeVerifiedReview(
   task: Task,
   turnId: string,
   decision: ReviewDecision,
@@ -4649,10 +4651,10 @@ function routeVerifiedReview(
   const partial = kind === 'partial' && coverage !== null;
   const summary = partial ? `${partialLabel(coverage)} — ${reviewSummary(decision, routed)}` : reviewSummary(decision, routed);
 
-  // The column keeps its two-value CHECK: a partial review is stored as a pass
-  // over the files it saw, and the verdict inside review_proofs says "partial".
-  completeTaskTurn(turnId, routed.outcome, summary, blockingTexts.length ? blockingTexts : undefined);
-  const storedReview: StoredReview = { ...toStored(routed, verified), ...(coverage ? { verdict: kind, coverage } : {}) };
+  // One source of truth for the verdict: task_turns.review_outcome ('partial' is
+  // a first-class value). review_proofs carries only the coverage detail.
+  completeTaskTurn(turnId, kind, summary, blockingTexts.length ? blockingTexts : undefined);
+  const storedReview: StoredReview = { ...toStored(routed, verified), ...(coverage ? { coverage } : {}) };
   setTurnReview(turnId, mode, JSON.stringify(storedReview));
   appendStreamLog(task.id, partial ? 'reviewer_partial' : routed.outcome === 'pass' ? 'reviewer_pass' : 'reviewer_fail',
     `[Reviewer] ${partial ? 'PARTIAL' : routed.outcome.toUpperCase()}: ${summary}${mode === 'proof' ? ` (${tally(routed)})` : ''}`);

@@ -2096,10 +2096,10 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     const tally = proofTally(stored);
     const refuted = stored?.proofs.filter(p => p.status === 'refuted') ?? [];
 
-    // A pass over code the reviewer never saw. review_outcome stays 'pass' (the
-    // column is two-valued); the harness records the real verdict beside the proofs.
-    if (turn.review_outcome === 'pass' && stored?.verdict === 'partial' && stored.coverage) {
-      const cov = stored.coverage;
+    // Nothing wrong found in what the reviewer saw, but it never saw all of the
+    // change: neither a pass nor a fail. The coverage detail lives in the proofs.
+    if (turn.review_outcome === 'partial') {
+      const cov = stored?.coverage ?? { reviewed: [], readViaTool: [], unreviewed: [], exempt: [], claimUnverified: true, stoppedByTurnCap: false };
       const names = cov.unreviewed.map(u => u.path);
       const label = `Partial review — not seen: ${names.slice(0, 4).join(', ')}${names.length > 4 ? ` (+${names.length - 4} more)` : ''}`;
       const advisory = findingsForTurn(turn.id).filter(f => f.severity === 'advisory');

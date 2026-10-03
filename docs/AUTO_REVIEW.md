@@ -482,7 +482,7 @@ CREATE TABLE task_turns (
   turn_number INTEGER NOT NULL,           -- 1-indexed, sequential across both roles
   claude_session_id TEXT,                 -- New UUID for reviewer; task's session_id for implementer
   prompt TEXT,                            -- Prompt used for this turn
-  review_outcome TEXT CHECK (review_outcome IN ('pass', 'fail', NULL)),
+  review_outcome TEXT CHECK (review_outcome IS NULL OR review_outcome IN ('pass', 'fail', 'partial')),
   review_summary TEXT,                    -- Reviewer's one-sentence summary
   review_issues TEXT,                     -- JSON array of issue strings (reviewer fail only)
   files_changed INTEGER,                  -- 1 if worktree was dirty, 0 if clean, NULL for reviewer turns
@@ -1196,9 +1196,10 @@ that proves the file was opened.
 **Outcome.** `coverageOutcome`: a `fail` with a confirmed proof stays a fail, regardless of coverage. A `pass`
 with any unreviewed file becomes a **partial review**:
 
-- stored on the turn inside `review_proofs` as `{"verdict":"partial","coverage":{…}}` — `review_outcome` stays
-  `pass` because that column has a two-value CHECK constraint and a migration is not worth it here. The
-  summary reads "Partial review — not seen: a.ts, b.ts";
+- stored as `task_turns.review_outcome = 'partial'` — a first-class value, so every reader (MCP `get_task`,
+  the API, filters) sees it and nothing mistakes it for a pass. `review_proofs` carries only the coverage detail
+  (`{"coverage":{…}}`); there is no second copy of the verdict. The summary reads
+  "Partial review — not seen: a.ts, b.ts";
 - shown as an amber "Partial review — not seen: …" badge with the per-file reasons, not the green one;
 - not a pass for completion: it does not close outstanding findings (`closeOutstandingOnPass`) and it cancels a
   deferred "complete when the review passes";
@@ -1207,6 +1208,14 @@ with any unreviewed file becomes a **partial review**:
 - offers **Review remaining files** (`POST /tasks/:id/review` with `{"remaining":true}`). The server reads the
   unreviewed list from the latest review itself (never from the client) and the re-run is scoped to exactly
   those files (`onlyFiles`), so the rest of the change is neither shown nor re-required.
+
+**Migration.** Existing databases get `widenTaskTurnOutcome` (`server/db/index.ts`): `task_turns` is rebuilt
+(create new, copy by column name, drop, rename, recreate the index) in one transaction with `foreign_keys` OFF
+around it — `review_findings.turn_id` cascades, so dropping the old table with enforcement on would delete every
+finding. It runs after the `review_mode`/`review_proofs` ALTERs, because the rebuild copies those columns, and is
+a no-op once the table already allows `partial` (fresh installs get it from `schema.sql`). The old constraint,
+`IN ('pass','fail',NULL)`, never rejected anything (NULL in the list makes the test NULL, which a CHECK accepts);
+the new one is `IS NULL OR … IN (…)` and does.
 
 Not covered: a server restart mid-review loses the in-memory context (`reviewContexts`), so that review has no
 coverage record and is reported as before.

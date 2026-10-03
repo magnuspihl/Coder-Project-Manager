@@ -406,7 +406,7 @@ export function getDb(): Database.Database {
     role TEXT NOT NULL CHECK (role IN ('implementer', 'reviewer')),
     turn_number INTEGER NOT NULL,
     claude_session_id TEXT,
-    review_outcome TEXT CHECK (review_outcome IN ('pass', 'fail', NULL)),
+    review_outcome TEXT CHECK (review_outcome IS NULL OR review_outcome IN ('pass', 'fail', 'partial')),
     review_summary TEXT,
     review_issues TEXT,
     files_changed INTEGER,
@@ -508,6 +508,11 @@ export function getDb(): Database.Database {
   const turnCols = db.prepare("PRAGMA table_info(task_turns)").all() as Array<{ name: string }>;
   if (!turnCols.some(c => c.name === 'review_mode')) db.exec("ALTER TABLE task_turns ADD COLUMN review_mode TEXT");
   if (!turnCols.some(c => c.name === 'review_proofs')) db.exec("ALTER TABLE task_turns ADD COLUMN review_proofs TEXT");
+
+  // review_outcome gained 'partial'. SQLite can't ALTER a CHECK, so the table is
+  // rebuilt — AFTER the review_mode/review_proofs ALTERs above, since the rebuild
+  // copies every column by name.
+  widenTaskTurnOutcome(db);
 
   // Per-delta token usage events, so consumers can attribute tokens to a
   // rolling time window (e.g. "tokens in the last 5 hours") instead of only the
@@ -674,6 +679,68 @@ export function getDb(): Database.Database {
   }
 
   return db;
+}
+
+/**
+ * Rebuild task_turns so review_outcome accepts 'partial' (a review that did not
+ * see all of the change — neither a pass nor a fail). A no-op when the table
+ * already allows it (fresh installs get it from schema.sql). Exported for tests.
+ *
+ * Note the old constraint, `IN ('pass', 'fail', NULL)`, never rejected anything:
+ * `x IN (…, NULL)` is NULL — not false — for a non-member, and a CHECK passes on
+ * NULL. So 'partial' would have been accepted without a rebuild, and so would
+ * 'bogus'. The rebuilt constraint is spelled `IS NULL OR … IN (…)` so it actually
+ * enforces the three values.
+ *
+ * foreign_keys must be OFF around the rebuild: review_findings.turn_id is
+ * ON DELETE CASCADE, so dropping the old table with enforcement on would delete
+ * every finding. The pragma is a no-op inside a transaction, hence it brackets
+ * the BEGIN/COMMIT rather than sitting in it. Rows are copied verbatim.
+ */
+export function widenTaskTurnOutcome(db: Database.Database): boolean {
+  const sql = (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='task_turns'").get() as { sql: string } | undefined)?.sql ?? '';
+  if (!sql || sql.includes("'partial'")) return false;
+
+  const cols = (db.prepare("PRAGMA table_info(task_turns)").all() as Array<{ name: string }>).map(c => c.name);
+  const wanted = ['id', 'task_id', 'role', 'turn_number', 'claude_session_id', 'review_outcome', 'review_summary', 'review_issues', 'review_mode', 'review_proofs', 'files_changed', 'started_at', 'completed_at'];
+  const missing = wanted.filter(c => !cols.includes(c));
+  if (missing.length) throw new Error(`task_turns is missing ${missing.join(', ')} — refusing to rebuild it`);
+  const list = wanted.join(', ');
+
+  // Violations that were already there are not ours to block startup over.
+  const violationsBefore = (db.pragma('foreign_key_check') as unknown[]).length;
+  db.pragma('foreign_keys = OFF');
+  try {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE task_turns_new (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          role TEXT NOT NULL CHECK (role IN ('implementer', 'reviewer')),
+          turn_number INTEGER NOT NULL,
+          claude_session_id TEXT,
+          review_outcome TEXT CHECK (review_outcome IS NULL OR review_outcome IN ('pass', 'fail', 'partial')),
+          review_summary TEXT,
+          review_issues TEXT,
+          review_mode TEXT,
+          review_proofs TEXT,
+          files_changed INTEGER,
+          started_at TEXT NOT NULL DEFAULT (datetime('now')),
+          completed_at TEXT
+        );
+        INSERT INTO task_turns_new (${list}) SELECT ${list} FROM task_turns;
+        DROP TABLE task_turns;
+        ALTER TABLE task_turns_new RENAME TO task_turns;
+        CREATE INDEX IF NOT EXISTS idx_task_turns_task ON task_turns(task_id, turn_number);
+      `);
+      const violationsAfter = (db.pragma('foreign_key_check') as unknown[]).length;
+      if (violationsAfter > violationsBefore) throw new Error(`the task_turns rebuild introduced ${violationsAfter - violationsBefore} foreign key violation(s)`);
+    })();
+  } finally {
+    db.pragma('foreign_keys = ON');
+  }
+  console.log("[migration] task_turns.review_outcome now allows 'partial'");
+  return true;
 }
 
 /**

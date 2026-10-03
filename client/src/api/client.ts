@@ -82,7 +82,8 @@ export interface TaskTurn {
   role: 'implementer' | 'reviewer';
   turn_number: number;
   claude_session_id: string | null;
-  review_outcome: 'pass' | 'fail' | null;
+  /** 'partial': nothing wrong found in what the reviewer saw, but it did not see all of the change — not a pass. */
+  review_outcome: 'pass' | 'fail' | 'partial' | null;
   review_summary: string | null;
   review_issues: string | null;
   /** 'proof': findings had to be backed by failing tests. 'opinion': no test runner was found. */
@@ -123,8 +124,6 @@ export interface ReviewCoverage {
 export interface StoredReview {
   mode: 'proof' | 'opinion';
   proofs: StoredProof[];
-  /** 'partial': a pass over code the reviewer did not see. review_outcome stays 'pass' for those turns. */
-  verdict?: 'pass' | 'fail' | 'partial';
   coverage?: ReviewCoverage;
 }
 

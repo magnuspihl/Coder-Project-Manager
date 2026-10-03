@@ -380,8 +380,7 @@ export interface StoredProof {
 export interface StoredReview {
   mode: ReviewMode;
   proofs: StoredProof[];
-  /** 'partial': a pass over code the reviewer did not see. Absent on reviews that predate coverage checking. */
-  verdict?: 'pass' | 'fail' | 'partial';
+  /** What the harness found the reviewer saw. Absent on reviews that predate coverage checking. */
   coverage?: CoverageReport;
 }
 
