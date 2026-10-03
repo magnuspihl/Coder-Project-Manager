@@ -1107,12 +1107,14 @@ merge-base (`changedPaths` minus `addedPaths`) — the harness reads the file at
 
 * JS/TS: `export function/class/const/let/var/enum/interface/type/namespace`, `export { a, b as c }` (with or
   without `from`), `export * as ns`, `export default`, CommonJS `exports.x =` / `module.exports.x =` /
-  `module.exports = { … }`. Comments and string contents are ignored. `export * from`, destructured exports,
+  `module.exports = { … }`. Comments and string contents are ignored; a `'`/`"` that doesn't close on its
+  line (an apostrophe in JSX text, a regex like `/'/`) is not a string and blanks only the rest of that line. `export * from`, destructured exports,
   `module.exports = <anything but an object literal>` make the set unknown → `not_runnable`.
 * Python: top-level `def`/`async def`/`class`, assignments, and the names `import`/`from … import` bind.
   `from x import *` or a module-level `__getattr__` make the set unknown.
 * **Renames are not additions.** If the task removed any export from the same file (Python: a top-level
-  def/class/assignment that is no longer bound; dropped imports don't count), the new names are not
+  def/class/assignment or `from … import` binding — how a package `__init__` re-exports — that is no
+  longer bound; a dropped plain `import x` doesn't count), the new names are not
   claimed as added: a removal next to an addition is indistinguishable from a rename, which is a changed
   API. This also forgoes the rarer "removed one function, added an unrelated one" case — on the safe side.
 

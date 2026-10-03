@@ -52,7 +52,7 @@ test('Python top-level names: defs, classes, assignments and imports, but not ne
   ].join('\n');
   const r = pythonTopLevelNames(src)!;
   assert.deepEqual(sorted(r.all), ['C', 'CONST', 'ab', 'f', 'g', 'os', 'p', 'q', 'typed', 'y', 'zz']);
-  assert.deepEqual(sorted(r.defined), ['C', 'CONST', 'f', 'g', 'p', 'q', 'typed']);
+  assert.deepEqual(sorted(r.defined), ['C', 'CONST', 'f', 'g', 'p', 'q', 'typed', 'y', 'zz']);
 });
 
 test('Python top-level names: a star import or a module __getattr__ makes them unknown', () => {
@@ -78,9 +78,17 @@ test('addedExports: a changed signature adds no name', () => {
   assert.deepEqual(sorted(addedExports('pkg/dur.py', 'def f(a):\n    pass\n', 'def f(a, b):\n    pass\n')), []);
 });
 
-test('addedExports: Python import tidying is not a removal, but a removed def is', () => {
+test('addedExports: dropping a plain Python import is not a removal, but a removed def or re-export is', () => {
   assert.deepEqual(sorted(addedExports('m.py', 'import os\ndef a(): pass\n', 'def a(): pass\ndef b(): pass\n')), ['b']);
   assert.equal(addedExports('m.py', 'def a(): pass\ndef old(): pass\n', 'def a(): pass\ndef b(): pass\n'), null);
+  // A package __init__ renaming what it re-exports is a rename, not new code.
+  assert.equal(addedExports('pkg/__init__.py', 'from .impl import old_name\n', 'from .impl import new_name\n'), null);
+  assert.deepEqual(sorted(addedExports('pkg/__init__.py', 'from .impl import a\n', 'from .impl import a, b\n')), ['b']);
+});
+
+test('JS exports: an apostrophe in JSX text or a regex literal does not hide the exports after it', () => {
+  assert.deepEqual(sorted(jsExportedNames("export function Badge() { return <p>Don't panic</p>; }\nexport function size() {}\n")), ['Badge', 'size']);
+  assert.deepEqual(sorted(jsExportedNames("const APOS = /'/g;\nexport function clean() {}\nexport const q = \"it's\";\n")), ['clean', 'q']);
 });
 
 test('addedExports: unsupported languages and unknowable export sets give no answer', () => {

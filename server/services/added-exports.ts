@@ -28,9 +28,13 @@ function stripJs(src: string): string {
     if (c === "'" || c === '"' || c === '`') {
       // Bodies are kept only when they are a single token: import specifiers and
       // `exports['x']` need them; a string full of `export function …` text does not.
+      // A '/" string cannot span lines, so one that hasn't closed by the end of the
+      // line was never a string — an apostrophe in JSX text (`Don't`) or a regex
+      // literal (`/'/`) — and costs at most the rest of that line, not the file.
       let j = i + 1;
       let body = '';
-      while (j < src.length && src[j] !== c) { if (src[j] === '\\') { body += src[j]; j++; } body += src[j] ?? ''; j++; }
+      while (j < src.length && src[j] !== c && (c === '`' || src[j] !== '\n')) { if (src[j] === '\\') { body += src[j]; j++; } body += src[j] ?? ''; j++; }
+      if (c !== '`' && src[j] !== c) { out += '\n'; i = j; continue; }
       out += c + (c === '`' || /\s/.test(body) ? '' : body) + c;
       i = j;
       continue;
@@ -107,7 +111,11 @@ const PY_KEYWORDS = new Set(['else', 'try', 'finally', 'except', 'elif', 'if', '
 export interface PythonNames {
   /** Every name bound at module level (defs, classes, assignments, imports). */
   all: Set<string>;
-  /** Only the ones the module defines itself (def/class/assignment) — what a rename would remove. */
+  /**
+   * The ones that can be the module's API — what a rename would remove: its own
+   * defs/classes/assignments and `from … import` bindings (a package `__init__`
+   * re-exports this way). Plain `import x` module bindings are left out.
+   */
   defined: Set<string>;
 }
 
@@ -134,7 +142,8 @@ export function pythonTopLevelNames(source: string): PythonNames | null {
       for (const item of splitList(list.replace(/\\$/, ''))) {
         if (item === '*') return null;
         const parts = item.split(/\s+as\s+/);
-        all.add((parts[1] ?? parts[0]).trim());
+        const name = (parts[1] ?? parts[0]).trim();
+        all.add(name); defined.add(name);
       }
     } else if ((m = /^import\s+(.*)$/.exec(line))) {
       for (const item of splitList(m[1])) {
@@ -164,7 +173,7 @@ export function addedExports(path: string, baseSource: string, currentSource: st
     const before = pythonTopLevelNames(baseSource);
     const after = pythonTopLevelNames(currentSource);
     if (!before || !after) return null;
-    // Imports come and go as code is tidied; only a def/class/assignment the module no longer binds is a removal.
+    // A dropped `import os` is tidying; a dropped def/class/assignment or `from … import` binding (a re-export) is a removal.
     for (const n of before.defined) if (!after.all.has(n)) return null;
     return new Set([...after.all].filter(n => !before.all.has(n)));
   }
