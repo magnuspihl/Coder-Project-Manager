@@ -54,6 +54,7 @@ import { findUserWorkspaceById } from '../services/workspace-cache.js';
 import { auditEnabled, auditView, countImplementerTurns, getLatestAudit, setTaskAudit } from '../services/audits.js';
 import { findingById, findingTaskPrompt } from '../services/audit-report.js';
 import { formatFindingForImplementer, PROOF_INSTRUCTIONS } from '../services/review-proof.js';
+import { isFixRequestText, countFixRequestItems } from '../services/message-kinds.js';
 import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview, triggerManualAudit, wakeTaskNow, startFullVerification, FINDING_REPORT_FORMAT } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
@@ -439,7 +440,10 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
     return;
   }
 
-  const userMessage = addMessage(task.id, 'user', message, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
+  // The client's "Apply fixes" button posts the reviewer's issues as an ordinary
+  // reply; tag it so the timeline collapses it like the inbox Fix prompt.
+  const userMessage = addMessage(task.id, 'user', message, undefined, req.user!.username, undefined, req.authSource, req.clientLabel, undefined,
+    isFixRequestText(message) ? { kind: 'fix_request', meta: { count: countFixRequestItems(message) } } : undefined);
 
   // The auto-wake budget bounds wake-ups taken *without* user input, so a reply
   // refills it. The armed wake itself is cleared by launchTask when this turn
@@ -555,7 +559,8 @@ router.post('/tasks/:taskId/findings/fix', requireAuth, (req: Request, res: Resp
     : '';
   const body = `${REVIEW_FIX_REPLY_PREFIX}. Each is tagged with a ref you must report against.\n\n${issueList}${proofNote}${waiverNote}\n\n${FINDING_REPORT_FORMAT}`;
 
-  addMessage(task.id, 'user', body, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
+  addMessage(task.id, 'user', body, undefined, req.user!.username, undefined, req.authSource, req.clientLabel, undefined,
+    { kind: 'fix_request', meta: { count: selected.length, confirmed: selected.filter(f => f.proof_status === 'confirmed' && f.proof_path).length } });
   selected.forEach(f => setReviewFindingState(f.id, 'fixing'));
   resetReviewLoopCount(task.id);
   if (task.pending_complete) setPendingComplete(task.id, false);

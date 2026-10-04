@@ -1152,6 +1152,17 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     }
   };
 
+  // Collapsed agent-facing messages (review hand-off / fix prompts) the user opened.
+  const [expandedAgentMessages, setExpandedAgentMessages] = useState<Set<string>>(new Set());
+  const toggleAgentMessage = (id: string) => {
+    setExpandedAgentMessages(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
   const toggleReviewDetails = (turnId: string) => {
     setExpandedReviews(prev => {
       const next = new Set(prev);
@@ -2777,6 +2788,33 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                     );
                   }
 
+                  // Agent-to-agent traffic (review hand-off, Fix prompts): one summary
+                  // row, expandable to the full text. The summary comes from the server.
+                  if (msg.kind === 'review_handoff' || msg.kind === 'fix_request') {
+                    const open = expandedAgentMessages.has(msg.id);
+                    return (
+                      <React.Fragment key={msg.id}>
+                        <div className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50 text-xs text-gray-500 dark:text-gray-400">
+                          <button
+                            type="button"
+                            onClick={() => toggleAgentMessage(msg.id)}
+                            aria-expanded={open}
+                            className="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:text-gray-700 dark:hover:text-gray-200"
+                          >
+                            <svg className={`w-3 h-3 shrink-0 transition-transform ${open ? 'rotate-90' : ''}`} viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clipRule="evenodd" /></svg>
+                            <span className="flex-1 font-medium">{msg.meta?.summary || 'Sent to implementer'}</span>
+                            <span className="text-gray-400 dark:text-gray-500">{new Date(msg.created_at).toLocaleTimeString()}</span>
+                          </button>
+                          {open && (
+                            <div className="px-3 pb-3 pt-1 border-t border-gray-200 dark:border-gray-700 text-sm">
+                              <Markdown content={msg.content} breaks />
+                            </div>
+                          )}
+                        </div>
+                      </React.Fragment>
+                    );
+                  }
+
                   const checkpoint = msg.role === 'assistant' ? checkpointByMessage.get(msg.id) : undefined;
                   const isStale = !!msg.stale_at;
 
@@ -2802,6 +2840,10 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         ? 'bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 mr-8'
                         : msg.role === 'assistant'
                         ? 'bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 mr-8'
+                        : msg.kind === 'review_escalation'
+                        ? 'bg-amber-50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700 text-gray-800 dark:text-gray-200 text-sm'
+                        : msg.kind === 'partial_review'
+                        ? 'bg-amber-50/60 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-800 text-gray-700 dark:text-gray-300 text-sm'
                         : msg.content.startsWith('Error:')
                         ? 'bg-red-50 dark:bg-red-900/20 border border-red-100 dark:border-red-800 text-red-700 dark:text-red-400 text-sm'
                         : 'bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 text-sm'

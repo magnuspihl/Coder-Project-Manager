@@ -263,6 +263,10 @@ export interface Message {
   client_label?: string | null;
   /** Set once a rollback restored the worktree to a point before this message. */
   stale_at?: string | null;
+  /** What a CPM-authored message is (e.g. review_handoff); null for ordinary messages. */
+  kind?: string | null;
+  /** `summary` is the one-line row for agent-facing kinds, computed by the server. */
+  meta?: { count?: number; confirmed?: number; summary?: string } | null;
   created_at: string;
 }
 

@@ -3,6 +3,7 @@ import { v4 as uuid } from 'uuid';
 import { execFile } from 'child_process';
 import { getDefaultAccountId } from './claude-accounts.js';
 import { linkAttachmentsToTask } from '../routes/uploads.js';
+import { resolveMessageTag, type MessageKind, type MessageMeta } from './message-kinds.js';
 
 export interface Task {
   id: string;
@@ -164,6 +165,10 @@ export interface Message {
   client_label?: string | null;
   /** Set once a rollback restores the worktree to a point before this message. */
   stale_at?: string | null;
+  /** What a CPM-authored message is; null for ordinary messages. See message-kinds.ts. */
+  kind?: string | null;
+  /** Counts + summary line for `kind` (parsed). Raw JSON is stored in the column. */
+  meta?: MessageMeta | null;
   created_at: string;
 }
 
@@ -1012,13 +1017,16 @@ export function addMessage(
   source?: string | null,
   clientLabel?: string | null,
   turnId?: string | null,
+  /** Tags the message for the timeline (collapse / formatting). See message-kinds.ts. */
+  tag?: { kind: MessageKind; meta?: MessageMeta },
 ): Message {
   const db = getDb();
   const id = uuid();
   const now = new Date().toISOString();
+  const metaJson = tag?.meta ? JSON.stringify(tag.meta) : null;
   db.prepare(
-    'INSERT INTO messages (id, task_id, role, content, cost, username, participant_id, source, client_label, turn_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(id, taskId, role, content, cost ?? null, username ?? null, participantId ?? null, source ?? null, clientLabel ?? null, turnId ?? null, now);
+    'INSERT INTO messages (id, task_id, role, content, cost, username, participant_id, source, client_label, turn_id, kind, meta, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, taskId, role, content, cost ?? null, username ?? null, participantId ?? null, source ?? null, clientLabel ?? null, turnId ?? null, tag?.kind ?? null, metaJson, now);
 
   // Extract verification URL from assistant messages and store on the task
   if (role === 'assistant') {
@@ -1029,7 +1037,7 @@ export function addMessage(
   }
 
   // Return constructed message without a read-back query
-  return { id, task_id: taskId, role, content, cost: cost ?? null, participant_id: participantId ?? null, turn_id: turnId ?? null, created_at: now };
+  return { id, task_id: taskId, role, content, cost: cost ?? null, participant_id: participantId ?? null, turn_id: turnId ?? null, kind: tag?.kind ?? null, meta: tag?.meta ?? null, created_at: now };
 }
 
 /**
@@ -1095,16 +1103,27 @@ export function recordContextTokens(taskId: string, tokens: number): void {
   getDb().prepare('UPDATE tasks SET context_tokens = ? WHERE id = ?').run(tokens, taskId);
 }
 
+/**
+ * A stored row as the API presents it: `meta` parsed, and a row written before
+ * `kind` existed given a best-effort kind from its text (fallback only).
+ */
+function hydrateMessage(row: Message & { meta?: unknown }): Message {
+  const { kind, meta } = resolveMessageTag({
+    role: row.role,
+    content: row.content,
+    kind: row.kind,
+    meta: typeof row.meta === 'string' ? row.meta : null,
+  });
+  return { ...row, kind, meta };
+}
+
 export function getMessages(taskId: string, limit?: number, offset?: number): Message[] {
   const db = getDb();
-  if (limit) {
-    return db
-      .prepare('SELECT * FROM messages WHERE task_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?')
-      .all(taskId, limit, offset || 0) as Message[];
-  }
-  return db
-    .prepare('SELECT * FROM messages WHERE task_id = ? ORDER BY created_at ASC')
-    .all(taskId) as Message[];
+  const rows = limit
+    ? db.prepare('SELECT * FROM messages WHERE task_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?')
+        .all(taskId, limit, offset || 0)
+    : db.prepare('SELECT * FROM messages WHERE task_id = ? ORDER BY created_at ASC').all(taskId);
+  return (rows as Message[]).map(hydrateMessage);
 }
 
 export function getMessageCount(taskId: string): number {

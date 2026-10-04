@@ -64,6 +64,7 @@ skipIfNoDb('responds immediately with the task working under the reviewer, witho
   const now = T.getTask(task.id)!;
   assert.equal(now.status, 'working');
   assert.equal(now.active_turn_role, 'reviewer');
+  assert.equal(T.getMessages(task.id).find(m => /Manual review requested/.test(m.content))?.kind, 'review_started', 'tagged, not left for the client to pattern-match');
 });
 
 skipIfNoDb('records a launch failure that happens after the response as a message and hands the task back', async () => {

@@ -25,6 +25,7 @@ import {
   assignRepairFiles, formatFindingForImplementer, opinionIssues, repairable, rerunProof, routeReview, tally, toStored, verifyProofs,
   PROOF_INSTRUCTIONS, type ReviewMode, type StoredReview, type VerifiedIssue,
 } from './review-proof.js';
+import { formatHandoffMarkdown, formatHandoffIssueTexts, formatEscalationMarkdown } from './message-kinds.js';
 import { getReviewDiff, getReviewDiffInfo, hasBranchChanges, makeProofIO, makeVerificationIO, type Exec } from './review-io.js';
 import { auditEnabled, auditDue, countImplementerTurns, createAudit, finishAudit, getLatestAudit, getRunningAudit, setAuditPhase, setAuditSnapshot, skipAudit } from './audits.js';
 import { allCitations, assembleReport, auditGate, cleanImplementerSummary, parseDiscrepancies, parseModelAudit, type AuditReport } from './audit-report.js';
@@ -1396,7 +1397,8 @@ export async function triggerManualReview(
   resetReviewLoopCount(task.id);
   addMessage(task.id, 'system', remainingFiles
     ? `Review of the remaining files requested — launching the reviewer for: ${remainingFiles.join(', ')}.`
-    : 'Manual review requested — launching the reviewer.');
+    : 'Manual review requested — launching the reviewer.',
+    undefined, undefined, undefined, undefined, undefined, undefined, { kind: 'review_started' });
   updateTaskStatus(task.id, 'working');
   setActiveTaskTurnRole(task.id, 'reviewer');
   launch(task, { manual: true, remainingFiles }).catch(err => failReviewerLaunch(task, err));
@@ -4739,7 +4741,7 @@ export function routeVerifiedReview(
     // outstanding findings proves nothing — leave them open — and nothing is sent
     // back to the implementer, since nothing is known to be wrong with the code.
     console.log(`[auto-review] Task ${task.id} partial review — not seen: ${coverage.unreviewed.map(u => u.path).join(', ')}`);
-    addMessage(task.id, 'system', partialMessage(coverage));
+    addMessage(task.id, 'system', partialMessage(coverage), undefined, undefined, undefined, undefined, undefined, undefined, { kind: 'partial_review', meta: { count: coverage.unreviewed.length } });
     settleWithUnresolvedFindings(task, { holdCompletion: true });
     maybeLaunchAudit(task);
     return;
@@ -4824,7 +4826,24 @@ function handBackForFixes(task: Task, issueTexts: string[], profile: TestProfile
     ? `The reviewer found the following issues with your previous implementation. Each is tagged with a ref you must report against.\n\n${issueList}\n\n${hasProof ? PROOF_INSTRUCTIONS + '\n\n' : ''}Address what you can, then report on every one of them. Original task:\n${refreshed.prompt}\n\n${FINDING_REPORT_FORMAT}`
     : `The reviewer found the following issues with your previous implementation:\n\n${issueList}\n\nPlease address these issues. Original task:\n${refreshed.prompt}`;
 
-  addMessage(task.id, 'system', `Auto-review found issues — resuming implementer:\n${issueList}`);
+  // What the human sees in the transcript: markdown, failure output trimmed (the
+  // full output is on the review card). The implementer's own prompt is retryPrompt
+  // above and is untouched.
+  const confirmedCount = toFix.filter(f => f.proof_status === 'confirmed' && f.proof_path).length;
+  const handoffCount = toFix.length > 0 ? toFix.length : issueTexts.length;
+  const handoffText = toFix.length > 0
+    ? formatHandoffMarkdown(toFix.map(f => ({
+        ref: f.id.slice(0, 8),
+        body: f.body,
+        reraised: f.revision > 0,
+        requirement: f.requirement,
+        proofPath: f.proof_status === 'confirmed' ? f.proof_path : null,
+        runCommand: runCommand(f),
+        proofOutput: f.proof_output,
+      })))
+    : formatHandoffIssueTexts(issueTexts);
+  addMessage(task.id, 'system', handoffText, undefined, undefined, undefined, undefined, undefined, undefined,
+    { kind: 'review_handoff', meta: { count: handoffCount, confirmed: confirmedCount } });
   setActiveTaskTurnRole(task.id, 'implementer');
   launchTask(refreshed, true, retryPrompt).catch(err => {
     console.error(`[auto-review] Failed to re-launch implementer for task ${task.id}:`, (err as Error).message?.slice(0, 200));
@@ -4892,12 +4911,9 @@ function settleWithUnresolvedFindings(task: Task, opts: { holdCompletion?: boole
 }
 
 function escalateToUser(task: Task, issues: string[]): void {
-  const issueList = issues.map((s, i) => `${i + 1}. ${s}`).join('\n');
-  addMessage(task.id, 'system',
-    `Auto-review has spent its fix budget for this task (${MAX_REVIEW_LOOPS} automated rounds) without resolving all issues. ` +
-    `Further reviews will report findings but will not send them back automatically — use "Fix" on a finding to spend another round. ` +
-    `Your input is needed.\n\nUnresolved issues:\n${issueList}`
-  );
+  addMessage(task.id, 'system', formatEscalationMarkdown(MAX_REVIEW_LOOPS, issues),
+    undefined, undefined, undefined, undefined, undefined, undefined,
+    { kind: 'review_escalation', meta: { count: issues.length } });
   settleWithUnresolvedFindings(task);
 }
 
@@ -4980,7 +4996,7 @@ function startAudit(task: Task, trigger: 'auto' | 'manual', implementerTurns: nu
     const msg = (err as Error)?.message || String(err);
     console.error(`[audit] Task ${task.id} audit failed:`, msg.slice(0, 200));
     if (!run.cancelled && finishAudit(row.id, 'failed', { reason: msg.slice(0, 500) })) {
-      addMessage(task.id, 'system', `The audit could not be completed: ${msg.slice(0, 300)}`);
+      addMessage(task.id, 'system', `The audit could not be completed: ${msg.slice(0, 300)}`, undefined, undefined, undefined, undefined, undefined, undefined, { kind: 'audit_failed' });
     }
   }).finally(() => {
     if (auditRuns.get(task.id) === run) auditRuns.delete(task.id);
@@ -5007,7 +5023,7 @@ async function runAudit(task: Task, auditId: string, run: AuditRun, trigger: 'au
   if (run.cancelled) return;
   const gate = trigger === 'auto' ? auditGate(snap.diff) : (snap.diff.trim() ? { run: true as const } : { run: false as const, reason: 'audit skipped: no changes against the default branch' });
   if (!gate.run) {
-    if (skipAudit(auditId, gate.reason)) addMessage(task.id, 'system', gate.reason);
+    if (skipAudit(auditId, gate.reason)) addMessage(task.id, 'system', gate.reason, undefined, undefined, undefined, undefined, undefined, undefined, { kind: 'audit_skipped' });
     return;
   }
   setAuditSnapshot(auditId, { baseSha: snap.baseSha, headSha: snap.headSha, tree: snap.tree }, run.sessionId);
