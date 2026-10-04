@@ -51,6 +51,7 @@ import {
   type TaskRequestItem,
   type ReviewFinding,
   type VerificationSummary,
+  type ReviewCoverage,
   type TaskCheckpoint,
   setFindingState,
   fixFindings,
@@ -371,6 +372,22 @@ interface TaskDetailModalProps {
   taskId: string;
   onClose: () => void;
   onTaskChanged?: () => void;
+}
+
+function CoverageNotes({ cov }: { cov?: ReviewCoverage }) {
+  const exempt = cov?.exempt ?? [];
+  const carried = cov?.carried ?? [];
+  if (!exempt.length && !carried.length) return null;
+  return (
+    <div className="text-[10px] text-gray-500 dark:text-gray-400 space-y-0.5">
+      {carried.length > 0 && (
+        <p title={carried.map(c => c.path).join('\n')}>{carried.length} file{carried.length === 1 ? '' : 's'} carried over — {carried[0].reason}</p>
+      )}
+      {exempt.length > 0 && (
+        <p title={exempt.map(e => `${e.path} (${e.reason})`).join('\n')}>{exempt.length} file{exempt.length === 1 ? '' : 's'} exempt from review (lockfiles, generated output, the reviewer's own proof tests, captured fixtures)</p>
+      )}
+    </div>
+  );
 }
 
 export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: TaskDetailModalProps) {
@@ -2130,6 +2147,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                 The reviewer ran out of turns{cov.turnCap ? ` (limit ${cov.turnCap})` : ''} while reading — a budget stop, not a finding.
               </p>
             )}
+            <CoverageNotes cov={stored?.coverage} />
             {cov.claimUnverified && (
               <p className="text-[10px] text-amber-700/80 dark:text-amber-300/80">The reviewer gave no usable coverage report; this is based on its tool calls alone.</p>
             )}
@@ -2183,6 +2201,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
             <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
           </div>
           {opinionMode && <div className="mr-8"><OpinionNote /></div>}
+          {(stored?.coverage?.carried?.length || stored?.coverage?.exempt.length) ? <div className="mr-8"><CoverageNotes cov={stored.coverage} /></div> : null}
           {(advisory.length > 0 || refuted.length > 0) && (
             <div className="mr-8 space-y-2">
               {advisory.length > 0 && (

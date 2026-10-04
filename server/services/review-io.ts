@@ -53,31 +53,70 @@ export async function hasBranchChanges(exec: Exec, worktree: string): Promise<bo
   return m[1] === 'yes';
 }
 
-/** Everything the task changed vs the default branch: the tracked diff (committed + uncommitted), then untracked file names. */
-export function reviewDiffScript(worktree: string): string {
+const TREE_MARKER = '@@CPM_TREE@@';
+const SINCE_MARKER = '@@CPM_SINCE@@';
+const SINCE_MISSING = '@@CPM_SINCE_MISSING@@';
+const TREE_ID = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+
+/**
+ * Everything the task changed vs the default branch: the tracked diff (committed + uncommitted), then untracked file names,
+ * then the git tree of the worktree as it is right now (committed, uncommitted and untracked, built in a throwaway index so
+ * the real one is untouched) and — when `sinceTree` is given — the files that differ between that tree and this one.
+ * `sinceTree` is compared by content, so a rebase or amend that keeps a file's content keeps it "unchanged"; a tree that no
+ * longer exists in the repository prints SINCE_MISSING and the caller falls back to the merge-base.
+ */
+export function reviewDiffScript(worktree: string, sinceTree?: string): string {
+  const since = sinceTree && TREE_ID.test(sinceTree)
+    ? [
+        `if [ -n "$T" ] && git -C "$WT" cat-file -e ${sinceTree}^{tree} 2>/dev/null; then echo ${SINCE_MARKER}; git -C "$WT" -c core.quotepath=off diff-tree -r --name-only --no-renames ${sinceTree} "$T" 2>/dev/null; else echo ${SINCE_MISSING}; fi`,
+      ]
+    : [];
   return [
     `WT=${shellQuote(worktree)}`,
     BASE_SNIPPET,
     `git -C "$WT" -c core.quotepath=off diff --no-color "$base" 2>/dev/null`,
     `echo ${UNTRACKED_MARKER}`,
     `git -C "$WT" ls-files --others --exclude-standard 2>/dev/null`,
+    `T=$( export GIT_INDEX_FILE="$(mktemp -u)"; git -C "$WT" read-tree HEAD >/dev/null 2>&1 && git -C "$WT" add -A >/dev/null 2>&1 && git -C "$WT" write-tree 2>/dev/null; rm -f "$GIT_INDEX_FILE" )`,
+    `echo ${TREE_MARKER}$T`,
+    ...since,
   ].join('\n');
+}
+
+export interface ReviewDiffOptions extends BuildDiffOptions {
+  /** The tree of an earlier fully covered review, with what that review covered (see pickBaselineReview). */
+  baselineReview?: { reviewNumber: number; tree: string; reviewed: string[] } | null;
 }
 
 /**
  * The diff handed to the reviewer, capped at ~8000 tokens, together with the
  * harness's record of which changed files did not fit (see review-coverage.ts).
- * Same merge-base definition of "changed" as everything else in this file.
+ * Same merge-base definition of "changed" as everything else in this file; a
+ * re-review additionally carries over files an earlier fully covered review
+ * already covered and that have not changed since.
  */
 export async function getReviewDiffInfo(
   exec: Exec,
   worktree: string,
   maxChars = 32_000,
-  opts: BuildDiffOptions = {},
+  opts: ReviewDiffOptions = {},
 ): Promise<ReviewDiff> {
-  const out = await exec(reviewDiffScript(worktree), 30_000, 16 * 1024 * 1024);
-  const [diff, untracked] = out.replace(/\r\n?/g, '\n').split(UNTRACKED_MARKER);
-  return buildReviewDiff(diff ?? '', parseNameList(untracked ?? ''), maxChars, opts);
+  const useBaseline = !opts.onlyFiles && opts.baselineReview ? opts.baselineReview : null;
+  const out = await exec(reviewDiffScript(worktree, useBaseline?.tree), 30_000, 16 * 1024 * 1024);
+  const norm = out.replace(/\r\n?/g, '\n');
+  const [diff, rest = ''] = norm.split(UNTRACKED_MARKER);
+  const [untracked, afterTree = ''] = rest.split(TREE_MARKER);
+  const [treeLine = '', sinceBlock = ''] = afterTree.split(/\n(?=@@CPM_SINCE)/);
+  const tree = TREE_ID.test(treeLine.trim()) ? treeLine.trim() : undefined;
+  let baseline = null;
+  if (useBaseline && sinceBlock.startsWith(SINCE_MARKER)) {
+    baseline = {
+      reviewNumber: useBaseline.reviewNumber,
+      reviewed: useBaseline.reviewed,
+      changedSince: parseNameList(sinceBlock.slice(SINCE_MARKER.length)),
+    };
+  }
+  return buildReviewDiff(diff ?? '', parseNameList(untracked ?? ''), maxChars, { onlyFiles: opts.onlyFiles, baseline, tree });
 }
 
 /** The diff text alone. */

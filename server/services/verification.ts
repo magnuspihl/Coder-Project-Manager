@@ -382,9 +382,64 @@ function hasQuoted(src: string, s: string): boolean {
 
 const hasIdentifier = (src: string, id: string) => id.length > 0 && new RegExp(`(?<![\\w$])${escapeRe(id)}(?![\\w$])`).test(src);
 
+/** Smallest amount of fixed text a generated title must have before a match on it means anything. */
+const MIN_TEMPLATE_LITERAL = 8;
+
+interface TitleTemplate { re: RegExp; literal: number }
+
 /**
- * Whether a test of this name was already in the file at the merge-base, judged
- * from the old file's TEXT. Name-based and runner-agnostic on purpose: it works
+ * The template literals used AS A TEST TITLE in `src` that interpolate (`${runner}: passing test is
+ * reported passed`), as anchored regexes: the fixed text exact, each `${…}` any
+ * text. A loop or table that generates test titles never writes the title out, so
+ * a literal search for the reported name cannot find it — this can.
+ */
+function titleTemplates(src: string): TitleTemplate[] {
+  const out: TitleTemplate[] = [];
+  for (const m of src.matchAll(/\b(?:test|it|describe|suite|specify)(?:\.\w+)*\(\s*`((?:[^`\\]|\\.)*)`/g)) {
+    if (!m[1].includes('${')) continue;
+    const parts = m[1].split(/\$\{[^}]*\}/);
+    const literal = parts.reduce((n, p) => n + p.trim().length, 0);
+    out.push({ re: new RegExp(`^${parts.map(escapeRe).join('[\\s\\S]+')}$`), literal });
+  }
+  return out;
+}
+
+/** The ways a reported name can be written in a test file: whole, without its describe prefixes, or as word-suffixes of the leaf. */
+function titleCandidates(name: string): string[] {
+  const parts = name.split(/\s+[>›]\s+/);
+  const leaf = parts[parts.length - 1];
+  const words = leaf.split(/\s+/);
+  const out = new Set([name, leaf]);
+  for (let i = 1; i <= words.length - 2; i++) out.add(words.slice(i).join(' '));
+  return [...out];
+}
+
+/**
+ * `existed` / `new` / `unknown`: whether a test of this name was in the file at
+ * the merge-base, judged from the old file's TEXT. `unknown` is a name that is not
+ * written out anywhere AND a title in the file is generated too loosely to rule it
+ * out (`${name}`) — it cannot be called added or pre-existing, so it is neither.
+ */
+export function testBaseStatus(name: string, baseSource: string): 'existed' | 'new' | 'unknown' {
+  const trimmed = name.trim();
+  if (!trimmed) return 'new';
+  if (testExistedByText(trimmed, baseSource)) return 'existed';
+  if (/\s/.test(trimmed) || trimmed.includes('${') === false) {
+    const templates = titleTemplates(baseSource);
+    const cands = titleCandidates(trimmed);
+    if (templates.some(t => t.literal >= MIN_TEMPLATE_LITERAL && cands.some(c => t.re.test(c)))) return 'existed';
+    if (templates.some(t => t.literal < MIN_TEMPLATE_LITERAL)) return 'unknown';
+  }
+  return 'new';
+}
+
+/** Whether a test of this name was already in the file at the merge-base (see testBaseStatus; `unknown` counts as no). */
+export function testExistedAtBase(name: string, baseSource: string): boolean {
+  return testBaseStatus(name, baseSource) === 'existed';
+}
+
+/**
+ * Text-only part of the check. Name-based and runner-agnostic on purpose: it works
  * the same for every supported runner and costs one `git show`, but it cannot see
  * that an existing test's BODY changed. It errs towards "added" (the safe side:
  * the test is shown, not folded away) whenever it cannot find the name.
@@ -396,10 +451,7 @@ const hasIdentifier = (src: string, id: string) => id.length > 0 && new RegExp(`
  *  - go reports `TestA/sub_name`: every segment, as a word or a quoted title with
  *    underscores for spaces.
  */
-export function testExistedAtBase(name: string, baseSource: string): boolean {
-  const src = baseSource;
-  const trimmed = name.trim();
-  if (!trimmed) return false;
+function testExistedByText(trimmed: string, src: string): boolean {
   if (hasQuoted(src, trimmed)) return true;
 
   if (/\s/.test(trimmed)) {
@@ -429,8 +481,12 @@ export function markAddedTests(tests: VerifiedTest[], addedFiles: ReadonlySet<st
   for (const t of tests) {
     const src = baseSources[t.file];
     if (addedFiles.has(t.file) || src === null) t.added = true;
-    else if (typeof src === 'string') t.added = !testExistedAtBase(t.name, src);
-    else continue;
+    else if (typeof src === 'string') {
+      const status = testBaseStatus(t.name, src);
+      // Unknown (a generated title we cannot trace) is neither added nor pre-existing: say nothing.
+      if (status === 'unknown') { delete t.added; delete t.routine; continue; }
+      t.added = status === 'new';
+    } else continue;
     // Anything failing, a reviewer's proof test, or a pre-existing test that fails
     // on the original code (so it must exercise something this task changed) is evidence.
     if (t.added === false && t.outcome !== 'failed' && t.origin !== 'reviewer' && t.baseline !== 'fails') t.routine = true;

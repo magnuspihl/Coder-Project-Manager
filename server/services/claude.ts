@@ -17,7 +17,7 @@ import { resolveAccountToken, markAccountUsed } from './claude-accounts.js';
 import { writeRemoteStdin } from './ssh-stdin.js';
 import { combineExecOutput, redactSecrets } from './exec-output.js';
 import {
-  assessCoverage, coverageOutcome, exemptNote, omittedFilesBlock, partialLabel, partialMessage, reviewerTurnCap, toolCallsFromContent,
+  assessCoverage, carriedNote, coverageOutcome, exemptNote, pickBaselineReview, omittedFilesBlock, partialLabel, partialMessage, reviewerTurnCap, toolCallsFromContent,
   type CoverageReport, type ReviewDiff, type ToolCall,
 } from './review-coverage.js';
 import { parseReviewDecision, extractProofFiles, type ReviewDecision, type ReviewIssue } from './review-verdict.js';
@@ -1295,9 +1295,10 @@ async function getGitDiff(worktreePath: string, workspaceName: string, userId?: 
 /** The reviewer's diff plus what it left out; null when the workspace can't be asked. */
 async function getReviewDiffForTask(
   worktreePath: string, workspaceName: string, userId?: string | null, onlyFiles?: string[],
+  baselineReview?: ReturnType<typeof pickBaselineReview>,
 ): Promise<ReviewDiff | null> {
   try {
-    return await getReviewDiffInfo((cmd, timeoutMs = 20000, maxBuffer) => sshExec(workspaceName, cmd, timeoutMs, userId, maxBuffer), worktreePath, undefined, { onlyFiles });
+    return await getReviewDiffInfo((cmd, timeoutMs = 20000, maxBuffer) => sshExec(workspaceName, cmd, timeoutMs, userId, maxBuffer), worktreePath, undefined, { onlyFiles, baselineReview });
   } catch {
     return null;
   }
@@ -4032,14 +4033,18 @@ async function launchReviewerOnTask(task: Task, opts: ReviewLaunchOpts = {}): Pr
     return;
   }
 
-  const diff = await getReviewDiffForTask(task.worktree_path!, task.workspace_name, task.user_id, opts.remainingFiles);
+  // A re-review is measured against the last fully covered review, not the whole branch.
+  const baselineReview = opts.remainingFiles ? null : pickBaselineReview(
+    getTaskTurns(task.id).filter(t => t.role === 'reviewer' && t.completed_at && t.id !== turn.id)
+      .map(t => ({ turnNumber: t.turn_number, stored: t.review_proofs })));
+  const diff = await getReviewDiffForTask(task.worktree_path!, task.workspace_name, task.user_id, opts.remainingFiles, baselineReview);
   const diffText = diff
-    ? diff.text + omittedFilesBlock(diff) + exemptNote(diff)
+    ? diff.text + omittedFilesBlock(diff) + exemptNote(diff) + carriedNote(diff)
     : '(could not retrieve diff)';
   const baseTurns = Number(mode === 'proof' ? REVIEWER_PROOF_MAX_TURNS : REVIEWER_MAX_TURNS);
   const turnCap = Number.isFinite(baseTurns) ? reviewerTurnCap(baseTurns, diff?.omitted.length ?? 0) : null;
   const known = reviewContexts.get(turn.id);
-  if (known && diff) { known.diff = diff; if (turnCap) known.turnCap = turnCap; }
+  if (known && diff) { known.diff = diff; known.scoped = !!opts.remainingFiles; if (turnCap) known.turnCap = turnCap; }
   const scopeNote = opts.remainingFiles
     ? `\nThis is a FOLLOW-UP review. An earlier pass already covered the rest of the change; it did not see these files, and ONLY they are in scope now: ${opts.remainingFiles.join(', ')}. Read each one.\n`
     : '';
@@ -4080,6 +4085,8 @@ interface ReviewContext {
   toolCalls?: ToolCall[];
   /** The turn cap cut the reviewer off at some point in this review. */
   cutOff?: boolean;
+  /** A "review remaining files" run: it covers only part of the change. */
+  scoped?: boolean;
 }
 const reviewContexts = new Map<string, ReviewContext>();
 /** The in-memory review state, exposed so tests can stand in for a finished reviewer run. */
@@ -4645,6 +4652,7 @@ export function routeVerifiedReview(
         claimed: decision.coverage,
         stoppedByTurnCap: rctx.cutOff,
         turnCap: rctx.turnCap,
+        scoped: rctx.scoped,
       })
     : null;
   const kind = coverageOutcome(routed.outcome, coverage);
