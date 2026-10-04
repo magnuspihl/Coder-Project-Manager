@@ -1224,7 +1224,13 @@ file how many hunks of how many were shown. Untracked files have no diff, so the
 
 **Exempt files.** Lockfiles (`package-lock.json`, `yarn.lock`, `Cargo.lock`, …), generated output (`dist/`,
 `*.min.js`, `*.map`, …) and binaries are left out of the diff first (they cost budget and need no review) and
-are listed to the reviewer as exempt. They never make a review partial.
+are listed to the reviewer as exempt. They never make a review partial. Two more exemptions keep the badge
+meaningful (`exemptReason`, the one place the rules live; exempt files are listed in the prompt and on the card):
+
+- **The reviewer's own proof tests** — any `*.cpm-proof.*` file. The harness wrote and ran them itself.
+- **Captured-output fixtures** — a data file (`.json`, `.xml`, `.tap`, `.txt`, `.snap`) under a `__fixtures__`,
+  `fixtures` or `testdata` directory. Deliberately conservative: it takes BOTH the directory AND the extension, so a
+  code file (`.ts`, `.py`, …) in a fixtures directory, or a `.json` config elsewhere, still has to be reviewed.
 
 **The reviewer is told, and must read them.** When anything was omitted the prompt lists each file and says the
 reviewer MUST open every one with Read/Grep before deciding, and that the harness checks its tool calls. The
@@ -1268,6 +1274,38 @@ the new one is `IS NULL OR … IN (…)` and does.
 
 Not covered: a server restart mid-review loses the in-memory context (`reviewContexts`), so that review has no
 coverage record and is reported as before.
+
+### Re-reviews are measured against the delta
+
+Reading the whole merge-base diff again on every review made nearly every re-review "partial" for files the last
+review had already covered. So a review that follows a **fully covered** one (no unreviewed files) is measured
+against what changed since it:
+
+- **Recording.** `getReviewDiffInfo` snapshots the worktree as a git tree (a throwaway `GIT_INDEX_FILE` +
+  `git add -A` + `git write-tree`; the real index and working tree are untouched). A review that is complete and
+  not scoped stores it as `coverage.reviewedTree` inside `review_proofs` — no new column, no migration.
+- **Baseline.** `pickBaselineReview` takes the latest completed reviewer turn with a complete `coverage` and a
+  `reviewedTree`. The script then runs `git diff-tree` between that tree and the current one.
+- **Carry-over.** A file in the merge-base diff that review covered (read, shown, or carried itself) and that is
+  not in that tree-diff is *carried over*: left out of the diff and the obligation, recorded as
+  `coverage.carried` with the reason "covered by review N, unchanged since", and mentioned to the reviewer. A file
+  changed since, or never covered, is owed again. The comparison is by content, so an amend or rebase that keeps a
+  file's content keeps it carried (a merge of main does not disturb files the task didn't touch).
+- **Fallbacks.** No earlier fully covered review → today's merge-base behaviour. The recorded tree no longer
+  exists in the repository (history rewritten and garbage-collected) → merge-base. A "review remaining files" run
+  stays scoped to exactly its files, ignores the baseline, and never records a tree (it covers only part).
+
+### Verification card: generated test titles
+
+`testExistedAtBase` decides from the merge-base file's text whether a reported test name was already there, so
+pre-existing tests fold into the "existing tests still pass" line. A title produced by a loop
+(`` test(`${runner}: passing test is reported passed`) ``) is never written out, so the literal search failed and
+`node-test: passing test is reported passed` showed as prominent. It now also matches the name against the
+file's interpolating title templates (`${…}` = any text, with at least 8 characters of fixed text so `${name}`
+can't match everything). A name nobody can trace in a file that generates titles too loosely to rule it out
+(`test(`${n}`)`) is `unknown`: `added` is left unset and the test is neither called added nor folded away.
+Note the baseline run cannot settle this: it runs the *current* test file against the base code, so every test
+that exists now "ran at base".
 
 ### Running the tests
 

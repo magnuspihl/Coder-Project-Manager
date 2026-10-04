@@ -116,6 +116,8 @@ export interface ReviewCoverage {
   readViaTool: string[];
   unreviewed: Array<{ path: string; reason: string }>;
   exempt: Array<{ path: string; reason: string }>;
+  /** Covered by an earlier fully covered review and unchanged since. */
+  carried?: Array<{ path: string; reason: string }>;
   claimUnverified: boolean;
   stoppedByTurnCap: boolean;
   turnCap?: number;

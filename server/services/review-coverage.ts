@@ -27,6 +27,22 @@ export interface ExemptFile {
   reason: string;
 }
 
+/** A file the reviewer need not read again: an earlier review covered it and it has not changed since. */
+export interface CarriedFile {
+  path: string;
+  reason: string;
+}
+
+/** What an earlier, fully covered review established — the baseline a re-review is measured against. */
+export interface ReviewBaseline {
+  /** 1-based position among this task's reviews, for the reason text. */
+  reviewNumber: number;
+  /** Files that review covered (read or shown), including ones it carried over itself. */
+  reviewed: string[];
+  /** Files that differ between that review's tree and the tree now. */
+  changedSince: string[];
+}
+
 /** The diff handed to the reviewer, plus the harness's record of what it left out. */
 export interface ReviewDiff {
   text: string;
@@ -36,6 +52,10 @@ export interface ReviewDiff {
   shown: string[];
   omitted: OmittedFile[];
   exempt: ExemptFile[];
+  /** Changed files left out because an earlier fully covered review already covered them and they are unchanged since. */
+  carried: CarriedFile[];
+  /** Git tree of the worktree as the reviewer saw it; recorded so the NEXT review can measure its delta from here. */
+  tree?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -51,10 +71,22 @@ const BINARY_EXT = /\.(png|jpe?g|gif|webp|ico|bmp|pdf|woff2?|ttf|otf|eot|zip|gz|
 const GENERATED = /(\.min\.(js|css)|\.map|\.generated\.\w+|\.pb\.go|_pb2\.py)$/i;
 const GENERATED_DIR = /(^|\/)(dist|build|coverage|node_modules|\.next|__generated__)\//;
 
-/** Why a file needs no review, or null if it does. Lockfiles and generated/binary output are exempt. */
+/** The reviewer's own proof tests (`x.cpm-proof.test.ts`): the harness wrote and ran them. */
+const PROOF_FILE = /\.cpm[-_]?proof\./i;
+/**
+ * Captured test-runner output and similar test data. Deliberately narrow: BOTH a
+ * fixtures-style directory AND a data extension. A code file (.ts, .py…) in a
+ * fixtures directory is real code and still has to be reviewed.
+ */
+const FIXTURE_DIR = /(^|\/)(__fixtures__|fixtures|testdata)\//i;
+const FIXTURE_DATA_EXT = /\.(json|xml|tap|txt|snap)$/i;
+
+/** Why a file needs no review, or null if it does. Lockfiles, generated/binary output, the reviewer's proof tests and captured fixtures are exempt. */
 export function exemptReason(path: string): string | null {
   const base = path.slice(path.lastIndexOf('/') + 1);
   if (LOCKFILES.has(base)) return 'lockfile';
+  if (PROOF_FILE.test(base)) return "the reviewer's own proof test (written and run by the harness)";
+  if (FIXTURE_DIR.test(path) && FIXTURE_DATA_EXT.test(base)) return 'captured test fixture (data, not code)';
   if (BINARY_EXT.test(base)) return 'binary file';
   if (GENERATED.test(base) || GENERATED_DIR.test(path)) return 'generated output';
   return null;
@@ -110,6 +142,54 @@ export interface BuildDiffOptions {
    * scope: neither shown nor counted as unreviewed.
    */
   onlyFiles?: string[];
+  /**
+   * An earlier review whose coverage was complete. Files it covered that have not
+   * changed since are carried over instead of being owed again. Ignored for an
+   * `onlyFiles` run, which stays scoped to exactly what it was asked about.
+   */
+  baseline?: ReviewBaseline | null;
+  /** The worktree's git tree now (see ReviewDiff.tree). */
+  tree?: string;
+}
+
+/** Split `paths` into those still owed a review and those carried over from `baseline`. */
+export function carryOver(paths: string[], baseline: ReviewBaseline | null | undefined): { owed: string[]; carried: CarriedFile[] } {
+  if (!baseline) return { owed: paths, carried: [] };
+  const reviewed = new Set(baseline.reviewed);
+  const changed = new Set(baseline.changedSince);
+  const owed: string[] = [];
+  const carried: CarriedFile[] = [];
+  for (const path of paths) {
+    if (reviewed.has(path) && !changed.has(path)) carried.push({ path, reason: `covered by review ${baseline.reviewNumber}, unchanged since` });
+    else owed.push(path);
+  }
+  return { owed, carried };
+}
+
+/** The shape of a stored review that `pickBaseline` needs. */
+export interface StoredReviewRef {
+  turnNumber: number;
+  /** The review's stored JSON (task_turns.review_proofs). */
+  stored: string | null;
+}
+
+/**
+ * The most recent review whose coverage was complete and whose reviewed tree was
+ * recorded. `reviews` is every completed reviewer turn of the task, oldest first;
+ * the review number is its position in that list. A scoped ("remaining files")
+ * run records no tree, so it never qualifies.
+ */
+export function pickBaselineReview(reviews: StoredReviewRef[]): { reviewNumber: number; tree: string; reviewed: string[] } | null {
+  for (let i = reviews.length - 1; i >= 0; i--) {
+    const raw = reviews[i].stored;
+    if (!raw) continue;
+    try {
+      const c = (JSON.parse(raw) as { coverage?: CoverageReport }).coverage;
+      if (!c?.reviewedTree || c.unreviewed.length > 0) continue;
+      return { reviewNumber: i + 1, tree: c.reviewedTree, reviewed: [...c.reviewed, ...(c.carried ?? []).map(f => f.path)] };
+    } catch { /* unreadable: not a baseline */ }
+  }
+  return null;
 }
 
 /**
@@ -125,16 +205,26 @@ export function buildReviewDiff(rawDiff: string, untracked: string[], maxChars: 
   untracked = untracked.filter(f => !scope || scope.has(f));
   const exempt: ExemptFile[] = [];
   const candidates: Section[] = [];
+  const baseline = scope ? null : opts.baseline;
+  const carried: CarriedFile[] = [];
+  const carriedPaths = new Set<string>();
+  const carry = (path: string): boolean => {
+    const { carried: c } = carryOver([path], baseline);
+    if (!c.length) return false;
+    carried.push(...c);
+    carriedPaths.add(path);
+    return true;
+  };
   for (const s of sections) {
     const why = s.binary ? 'binary file' : exemptReason(s.path);
     if (why) exempt.push({ path: s.path, reason: why });
-    else candidates.push(s);
+    else if (!carry(s.path)) candidates.push(s);
   }
   for (const f of untracked) {
     const why = exemptReason(f);
     if (why) exempt.push({ path: f, reason: why });
   }
-  const untrackedNeeded = untracked.filter(f => !exemptReason(f));
+  const untrackedNeeded = untracked.filter(f => !exemptReason(f) && !carry(f));
 
   const untrackedBlock = untrackedNeeded.length ? `Untracked files:\n${untrackedNeeded.join('\n')}` : '';
   let remaining = Math.max(0, maxChars - untrackedBlock.length - 600); // 600: room for the notes below
@@ -172,6 +262,7 @@ export function buildReviewDiff(rawDiff: string, untracked: string[], maxChars: 
   const body = candidates.filter(s => included.has(s)).map(s => included.get(s)!.trimEnd()).join('\n');
   const notes: string[] = [];
   if (exempt.length) notes.push(`Diff left out as exempt from review (${exempt.map(e => `${e.path}: ${e.reason}`).join('; ')}).`);
+  if (carried.length) notes.push(`Diff left out because an earlier review already covered these files and they have not changed since (${carried.map(c => c.path).join(', ')}).`);
   const parts = [body, untrackedBlock, notes.join('\n')].filter(Boolean);
   const text = parts.join('\n\n');
 
@@ -183,6 +274,8 @@ export function buildReviewDiff(rawDiff: string, untracked: string[], maxChars: 
     shown: shown.filter(p => !omittedPaths.has(p)),
     omitted,
     exempt,
+    carried,
+    ...(opts.tree ? { tree: opts.tree } : {}),
   };
 }
 
@@ -195,7 +288,7 @@ export function omittedFilesBlock(diff: ReviewDiff): string {
     return `- ${o.path} — ${o.reason}${hunks}${how}`;
   }).join('\n');
   const exempt = diff.exempt.length
-    ? `\nExempt from review (generated or lockfile — you need not read these):\n${diff.exempt.map(e => `- ${e.path} (${e.reason})`).join('\n')}\n`
+    ? `\nExempt from review (generated, lockfile, your own proof tests or captured test fixtures — you need not read these):\n${diff.exempt.map(e => `- ${e.path} (${e.reason})`).join('\n')}\n`
     : '';
   return `\nTHE DIFF ABOVE IS INCOMPLETE. These changed files were NOT (fully) shown to you:\n${list}\n${exempt}
 You MUST open EVERY file in that list with Read (or Grep on that file) BEFORE you emit a verdict. The harness checks your tool calls: a file you did not read counts as unreviewed no matter what you claim, and a "pass" with unreviewed files is reported to the user as a PARTIAL review, not a pass. Do not skip files because they look unimportant.\n`;
@@ -204,8 +297,14 @@ You MUST open EVERY file in that list with Read (or Grep on that file) BEFORE yo
 /** Only the exempt note, for a diff that fit entirely. */
 export function exemptNote(diff: ReviewDiff): string {
   return diff.omitted.length === 0 && diff.exempt.length
-    ? `\n(${diff.exempt.length} generated/lockfile diff(s) were left out as exempt: ${diff.exempt.map(e => e.path).join(', ')}.)\n`
+    ? `\n(${diff.exempt.length} diff(s) were left out as exempt — generated, lockfile, proof test or captured fixture: ${diff.exempt.map(e => e.path).join(', ')}.)\n`
     : '';
+}
+
+/** Tells the reviewer which files it is NOT being asked to re-read, and why. Empty when nothing was carried over. */
+export function carriedNote(diff: ReviewDiff): string {
+  if (!diff.carried.length) return '';
+  return `\nThis is a RE-REVIEW. These files were fully covered by an earlier review and have not changed since, so they are not in the diff above and you need not read them (reason: ${diff.carried[0].reason}):\n${diff.carried.map(c => `- ${c.path}`).join('\n')}\n`;
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +392,10 @@ export interface CoverageReport {
   readViaTool: string[];
   unreviewed: UnreviewedFile[];
   exempt: ExemptFile[];
+  /** Files carried over from an earlier fully covered review (unchanged since); not owed again. */
+  carried?: CarriedFile[];
+  /** The worktree tree this review was done against; recorded only when the review was complete and unscoped, so it can be the next review's baseline. */
+  reviewedTree?: string;
   /** The reviewer gave no usable coverage field, so only the tool-call evidence was used. */
   claimUnverified: boolean;
   /** The reviewer ran out of turns while reading. */
@@ -308,6 +411,8 @@ export interface AssessInput {
   claimed?: ReviewCoverage;
   stoppedByTurnCap?: boolean;
   turnCap?: number;
+  /** This was a "review remaining files" run: it covers only part of the change, so it is never a baseline. */
+  scoped?: boolean;
 }
 
 /**
@@ -342,6 +447,8 @@ export function assessCoverage(input: AssessInput): CoverageReport {
     readViaTool: reviewed.filter(p => opened.has(p)),
     unreviewed,
     exempt: diff.exempt,
+    ...(diff.carried.length ? { carried: diff.carried } : {}),
+    ...(diff.tree && !input.scoped && unreviewed.length === 0 ? { reviewedTree: diff.tree } : {}),
     claimUnverified: !claimed,
     stoppedByTurnCap: !!input.stoppedByTurnCap,
     ...(input.turnCap ? { turnCap: input.turnCap } : {}),

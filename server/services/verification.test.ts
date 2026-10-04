@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildVerification, classifyBaseline, isTestFile, markAddedTests, orderTests, parseNameList, reviewerTestLines, summariseVerification, testExistedAtBase, withBudget, type VerificationIO, type VerificationSummary, type VerifiedTest } from './verification.js';
+import { buildVerification, classifyBaseline, isTestFile, markAddedTests, orderTests, parseNameList, reviewerTestLines, summariseVerification, testBaseStatus, testExistedAtBase, withBudget, type VerificationIO, type VerificationSummary, type VerifiedTest } from './verification.js';
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -620,4 +620,55 @@ test('buildVerification: an ordinary assertion failure on the base reads no extr
   const v = await buildVerification({ profile: { runner: 'node-test', source: 'detected' }, io });
   assert.equal(v.tests[0].baseline, 'fails');
   assert.equal(reads, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Generated test titles (loops / template literals) — the real titles from test-runners.test.ts
+// ---------------------------------------------------------------------------
+
+const GENERATED_TITLES_SOURCE = [
+  "for (const { runner, file } of CASES) {",
+  "  test(`${runner}: passing test is reported passed`, () => {});",
+  "  test(`${runner}: ${scenario === 'syn' ? 'a syntax error' : 'a missing import'} is a suite error and yields no failed case`, () => {});",
+  "}",
+  "test('splitRunOutput strips colour', () => {});",
+].join('\n');
+
+test('a test whose title comes from a template literal is recognised as already existing at the base', () => {
+  assert.equal(testExistedAtBase('node-test: passing test is reported passed', GENERATED_TITLES_SOURCE), true);
+  assert.equal(testExistedAtBase('vitest: a syntax error is a suite error and yields no failed case', GENERATED_TITLES_SOURCE), true);
+  assert.equal(testExistedAtBase('pytest: a missing import is a suite error and yields no failed case', GENERATED_TITLES_SOURCE), true);
+});
+
+test('a genuinely new test is still new in a file that generates other titles', () => {
+  assert.equal(testExistedAtBase('a brand new behaviour nobody wrote before', GENERATED_TITLES_SOURCE), false);
+  assert.equal(testBaseStatus('jest: something else entirely happens here', GENERATED_TITLES_SOURCE), 'new');
+});
+
+test('generated pre-existing tests fold into the routine line instead of showing as prominent', () => {
+  const names = [
+    'node-test: passing test is reported passed',
+    'vitest: a syntax error is a suite error and yields no failed case',
+  ];
+  const tests: VerifiedTest[] = names.map(name => ({ name, file: 'server/services/test-runners.test.ts', outcome: 'passed', origin: 'implementer', baseline: 'not_runnable' }));
+  markAddedTests(tests, new Set(), { 'server/services/test-runners.test.ts': GENERATED_TITLES_SOURCE });
+  assert.deepEqual(tests.map(t => [t.added, t.routine]), [[false, true], [false, true]]);
+});
+
+test('a title generated too loosely to trace is neither "added" nor folded away', () => {
+  const src = 'for (const n of names) test(`${n}`, () => {});\n';
+  assert.equal(testBaseStatus('some mystery test name', src), 'unknown');
+  const tests: VerifiedTest[] = [{ name: 'some mystery test name', file: 'x.test.ts', outcome: 'passed', origin: 'implementer' }];
+  markAddedTests(tests, new Set(), { 'x.test.ts': src });
+  assert.equal(tests[0].added, undefined);
+  assert.equal(tests[0].routine, undefined);
+});
+
+test("the real test-runners.test.ts: its generated titles are found in its own source", () => {
+  const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'test-runners.test.ts'), 'utf8');
+  for (const name of [
+    'node-test: passing test is reported passed',
+    'vitest: a syntax error is a suite error and yields no failed case',
+    'jest: a missing import is a suite error and yields no failed case',
+  ]) assert.equal(testExistedAtBase(name, src), true, name);
 });

@@ -37,7 +37,7 @@ const dbTest = (name: string, fn: () => void | Promise<void>) =>
 
 const decision = { outcome: 'pass' as const, summary: 'nothing wrong in what I read' };
 const diff = (omitted: string[]) => ({
-  text: '', changed: ['seen.ts', ...omitted], shown: ['seen.ts'], exempt: [],
+  text: '', changed: ['seen.ts', ...omitted], shown: ['seen.ts'], exempt: [], carried: [],
   omitted: omitted.map(path => ({ path, reason: 'too large for the diff budget' })),
 });
 
