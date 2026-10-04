@@ -1318,3 +1318,6 @@ better-sqlite3's native module and skips itself if it is not built; so does `man
 pins that the review trigger returns before the verification/launch finishes and that a failure after the
 response is recorded on the task.
 
+## See also
+
+`AUDITOR.md` — the non-blocking auditor that runs after a review settles on pass or partial: an independent account of what was built, and where it duplicates or deviates.

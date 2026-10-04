@@ -399,3 +399,29 @@ CREATE TABLE IF NOT EXISTS rate_limits (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (subscription_key, type)
 );
+
+-- The auditor: an independent account of what a task built (see docs/AUDITOR.md).
+-- One row per audit run. 'running' rows are abandoned (-> 'cancelled') on server
+-- restart; 'cancelled' means a user reply made the audited code stale and is
+-- retried at the next pass/partial review. report_json is the phase-1 report as
+-- soon as it is written (discrepancies null until phase 2 completes).
+-- implementer_turns / tree / head_sha pin what code the audit is about, so the
+-- UI and MCP can say "stale" once an implementer turn has run since.
+CREATE TABLE IF NOT EXISTS task_audits (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  status TEXT NOT NULL CHECK (status IN ('running', 'done', 'failed', 'cancelled', 'skipped')),
+  phase TEXT,
+  trigger_kind TEXT NOT NULL DEFAULT 'auto',
+  implementer_turns INTEGER NOT NULL DEFAULT 0,
+  base_sha TEXT,
+  head_sha TEXT,
+  tree TEXT,
+  session_id TEXT,
+  report_json TEXT,
+  reason TEXT,
+  started_at TEXT NOT NULL DEFAULT (datetime('now')),
+  completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_audits_task ON task_audits(task_id, started_at);

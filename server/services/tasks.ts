@@ -54,6 +54,8 @@ export interface Task {
   source: string | null;
   client_label: string | null;
   auto_review: number;
+  /** Auditor switch: null follows auto_review (see auditEnabled in audits.ts). */
+  audit: number | null;
   review_loop_count: number;
   active_turn_role: string | null;
   /**

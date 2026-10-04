@@ -393,6 +393,11 @@ export function getDb(): Database.Database {
   if (!tasksCols5.some(c => c.name === 'auto_review')) {
     db.exec("ALTER TABLE tasks ADD COLUMN auto_review INTEGER NOT NULL DEFAULT 0");
   }
+  // Per-task auditor switch. NULL = follow auto_review (so existing tasks and the
+  // auto-review toggle need no backfill); 0/1 = an explicit choice.
+  if (!tasksCols5.some(c => c.name === 'audit')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN audit INTEGER");
+  }
   if (!tasksCols5.some(c => c.name === 'review_loop_count')) {
     db.exec("ALTER TABLE tasks ADD COLUMN review_loop_count INTEGER NOT NULL DEFAULT 0");
   }
