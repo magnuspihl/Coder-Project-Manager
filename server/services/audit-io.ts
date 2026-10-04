@@ -131,13 +131,13 @@ export async function readAddedExports(exec: Exec, worktree: string, snap: Audit
   const candidates = snap.files
     .filter(f => (f.status === 'A' || f.status === 'M' || f.status === 'R') && /\.([cm]?[jt]sx?|pyi?)$/.test(f.path) && !exemptReason(f.path) && !/(\.|\/)(test|spec)\.|(^|\/)(__tests__|tests?)\//i.test(f.path))
     .slice(0, 60);
-  const pairs = await readPairs(exec, worktree, snap.baseSha, candidates.map(f => f.path));
+  const pairs = await readPairs(exec, worktree, snap.baseSha, candidates.flatMap(f => (f.oldPath ? [f.path, f.oldPath] : [f.path])));
   const out: Array<{ path: string; name: string }> = [];
   for (const f of candidates) {
     const pair = pairs.get(f.path);
     if (!pair || pair.head === null) continue;
-    // A renamed file's old exports are not new ones; its base content is looked up under the old path.
-    const baseText = f.status === 'R' ? '' : pair.base ?? '';
+    // A renamed file's old exports are not new ones: its base content is under the old path.
+    const baseText = (f.oldPath ? pairs.get(f.oldPath)?.base : pair.base) ?? '';
     const added = addedExports(f.path, baseText, pair.head);
     if (!added) continue;
     for (const name of [...added].sort()) if (name !== 'default') out.push({ path: f.path, name });
