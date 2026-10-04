@@ -55,6 +55,10 @@ import {
   type TaskCheckpoint,
   setFindingState,
   fixFindings,
+  runAudit,
+  setTaskAudit,
+  makeAuditFindingTask,
+  type AuditView,
 } from '../api/client';
 import { playChime } from '../utils/chime';
 import { playListenChime } from '../utils/listenChime';
@@ -72,6 +76,7 @@ import { useVoiceRecorder } from '../hooks/useVoiceRecorder';
 import { useVoiceMode } from '../hooks/useVoiceMode';
 import { FindingEvidence, OpinionNote, RefutedClaims, parseStoredReview, proofTally } from './ReviewEvidence';
 import VerificationCard from './VerificationCard';
+import AuditCard from './AuditCard';
 
 function timeAgo(iso: string): string {
   const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -417,6 +422,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const [switchingReviewerModel, setSwitchingReviewerModel] = useState(false);
   const [verifyingSince, setVerifyingSince] = useState<{ before: string | null; at: number } | null>(null);
   const [switchingAutoReview, setSwitchingAutoReview] = useState(false);
+  const [audit, setAudit] = useState<AuditView | null>(null);
+  const [switchingAudit, setSwitchingAudit] = useState(false);
   const [completing, setCompleting] = useState(false);
   const [reviewing, setReviewing] = useState(false);
   const [wakeBusy, setWakeBusy] = useState(false);
@@ -564,8 +571,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     // the commit even though it began after the pre-bump.
     const seqAtStart = editSeqRef.current;
     try {
-      const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments, turns: newTurns, taskRequests: newTaskRequests, findings: newFindings, checkpoints: newCheckpoints } = await getTaskDetail(taskId);
+      const { task: newTask, messages: newMessages, participants: newParticipants, attachments: newAttachments, turns: newTurns, taskRequests: newTaskRequests, findings: newFindings, checkpoints: newCheckpoints, audit: newAudit } = await getTaskDetail(taskId);
       setTaskRequests(newTaskRequests || []);
+      setAudit(newAudit ?? null);
       if (prevStatusRef.current && prevStatusRef.current !== 'awaiting_feedback' && newTask.status === 'awaiting_feedback') {
         playChime();
       }
@@ -1414,6 +1422,43 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     } catch (err: unknown) {
       setVerifyingSince(null);
       alert(err instanceof Error ? err.message : 'Failed to start verification');
+    }
+  };
+
+  // The audit is non-blocking and reports back through the modal's own polling.
+  const handleRunAudit = async () => {
+    try {
+      const { audit: started } = await runAudit(taskId);
+      setAudit(started);
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : 'Failed to start the audit');
+    }
+  };
+
+  // "Make this a task": the finding becomes a pending task request (the same card a [TASK_REQUEST] produces).
+  const handleMakeAuditTask = async (findingId: string) => {
+    try {
+      const { taskRequest } = await makeAuditFindingTask(taskId, findingId);
+      setTaskRequests(prev => [...prev, taskRequest]);
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : 'Failed to create the task');
+      throw err;
+    }
+  };
+
+  const handleChangeAudit = async (enabled: boolean) => {
+    if (!task) return;
+    setSwitchingAudit(true);
+    editSeqRef.current++;
+    try {
+      const { task: updated } = await setTaskAudit(taskId, enabled);
+      setTask(prev => (prev ? { ...prev, audit: updated.audit, audit_enabled: enabled } : prev));
+      lastTaskJsonRef.current = '';
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : 'Failed to change the audit setting');
+    } finally {
+      editSeqRef.current++;
+      setSwitchingAudit(false);
     }
   };
 
@@ -2510,6 +2555,25 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                     <option value="on">auto-review on</option>
                     <option value="off">auto-review off</option>
                   </select>
+                  {/* Auditor: an independent account of what was built, run once after a
+                      review passes. Follows auto-review until set explicitly. Never
+                      blocks the task or sends work back. */}
+                  <select
+                    value={task.audit_enabled ? 'on' : 'off'}
+                    onChange={(e) => handleChangeAudit(e.target.value === 'on')}
+                    disabled={switchingAudit}
+                    title={task.audit_enabled
+                      ? 'Audit is on — after a review passes, an independent auditor reports what was built and where it duplicates existing code'
+                      : 'Audit is off — use "Run audit" on the task to run it by hand'}
+                    className={`hidden sm:inline-block text-xs px-1.5 py-0.5 rounded font-medium border-0 focus:outline-none focus:ring-1 disabled:opacity-50 cursor-pointer ${
+                      task.audit_enabled
+                        ? 'bg-teal-50 dark:bg-teal-900/20 text-teal-700 dark:text-teal-400 focus:ring-teal-500'
+                        : 'bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 focus:ring-gray-500'
+                    }`}
+                  >
+                    <option value="on">audit on</option>
+                    <option value="off">audit off</option>
+                  </select>
                   {/* Reviewer model — only meaningful while auto-review is on, so
                       it stays hidden otherwise rather than adding a dead control
                       to an already-busy header. Defaults to "same as task", which
@@ -2889,6 +2953,25 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   running={verifyingSince !== null}
                   onRunFull={task.status === 'awaiting_feedback' || task.status === 'completed' ? handleRunFullVerification : undefined}
                 />
+              )}
+
+              {/* The auditor's independent account of what was built (server: audits.ts). */}
+              {task.status !== 'working' && task.status !== 'queued' && audit && (
+                <AuditCard
+                  audit={audit}
+                  onRun={handleRunAudit}
+                  onMakeTask={handleMakeAuditTask}
+                  canRun={!!task.worktree_path && (task.status === 'awaiting_feedback' || task.status === 'completed')}
+                />
+              )}
+              {!audit && task.worktree_path && (task.status === 'awaiting_feedback' || task.status === 'completed') && (
+                <button
+                  onClick={handleRunAudit}
+                  className="self-start text-xs px-2 py-1 rounded border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800"
+                  data-testid="run-audit"
+                >
+                  Run audit
+                </button>
               )}
 
               {/* Participant thinking indicator */}

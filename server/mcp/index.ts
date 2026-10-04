@@ -33,10 +33,11 @@ import {
   stopTaskParticipant,
   cleanupPortRange,
   withWorkspaceLock,
-  triggerManualReview,
+  triggerManualReview, triggerManualAudit,
   getTaskBranchDiff,
   MAX_REVIEW_LOOPS,
 } from '../services/claude.js';
+import { auditSummary, auditView, countImplementerTurns, getLatestAudit } from '../services/audits.js';
 import { handleTaskCompletionGit, removeTaskWorktree } from '../services/git.js';
 import { listWorkspaces, getWorkspace, stopWorkspace, startWorkspace, CoderAuthError } from '../services/coder.js';
 
@@ -230,7 +231,25 @@ function buildServer(ctx: AuthCtx): McpServer {
         messages: attributeMessages(messages, turns, participants),
         turns,
         participants,
+        // Counts only — the full report is get_audit, to keep this output small.
+        audit: auditSummary(getLatestAudit(task_id), countImplementerTurns(task_id)),
       });
+    },
+  );
+
+  server.registerTool(
+    'get_audit',
+    {
+      description: 'Get the auditor\'s report for a task: an independent account of what was built, written from the code and the task prompt WITHOUT the implementer\'s summary, then compared with that summary. Fields: status (running, done, failed, cancelled, skipped — with reason), stale (true when the code changed after the audit; stale_label says so), and report: summary; structure (new and modified files); reuseFindings (kind reused, possible_duplicate or new, each with file:line citations); deviations from the repo\'s conventions; hardToReverse (schema, route, MCP tool, dependency and env-var changes, computed from the diff by the harness, not the model); discrepancies between the implementer\'s summary and the code (null if that comparison did not happen — see discrepanciesNote); unassessedExports (new exports the auditor gave no reuse entry for). Every citation carries a check: ok=false means it could not be verified — do not trust it. A possible_duplicate with verified=false has a citation that does not resolve at the merge-base. Never blocks the task; it reports to the human.',
+      inputSchema: { task_id: z.string().describe('Task ID') },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ task_id }) => {
+      const task = getOwnedTask(task_id, ctx);
+      if (!task) return errorResult('Task not found');
+      const row = getLatestAudit(task_id);
+      if (!row) return jsonResult({ task_id, audit: null, note: 'No audit has run for this task. Use the audit tool to run one.' });
+      return jsonResult({ task_id, audit: auditView(row, countImplementerTurns(task_id)) });
     },
   );
 
@@ -445,6 +464,25 @@ function buildServer(ctx: AuthCtx): McpServer {
       } catch (err) {
         return errorResult(`Failed to launch reviewer: ${(err as Error).message}`);
       }
+    },
+  );
+
+  server.registerTool(
+    'audit',
+    {
+      description: 'Run the auditor on a task now: a fresh read-only session that reads the task prompt, the branch diff against the default branch and the repo\'s architecture guidance (never the implementer\'s summary), reports what was built and where it duplicates existing code or departs from the repo\'s conventions, then compares its account with the implementer\'s summary. It never changes the task\'s status or sends work back. Returns as soon as the audit has started (status running); read the result with get_audit. Fails if the task is working, has no worktree, or already has an audit running.',
+      inputSchema: { task_id: z.string().describe('Task ID') },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    async ({ task_id }) => {
+      const task = getOwnedTask(task_id, ctx);
+      if (!task) return errorResult('Task not found');
+      if (task.status === 'working') {
+        return errorResult('The task is working — audit it once the turn has finished, so the audit is of finished code.');
+      }
+      const result = triggerManualAudit(task);
+      if (!result.started) return errorResult(result.reason ?? 'Could not start the audit');
+      return jsonResult({ ok: true, audit: auditView(getLatestAudit(task.id)!, countImplementerTurns(task.id)) });
     },
   );
 

@@ -17,7 +17,7 @@ import { resolveAccountToken, markAccountUsed } from './claude-accounts.js';
 import { writeRemoteStdin } from './ssh-stdin.js';
 import { combineExecOutput, redactSecrets } from './exec-output.js';
 import {
-  assessCoverage, carriedNote, coverageOutcome, exemptNote, pickBaselineReview, omittedFilesBlock, partialLabel, partialMessage, reviewerTurnCap, toolCallsFromContent,
+  assessCoverage, buildReviewDiff, carriedNote, coverageOutcome, exemptNote, pickBaselineReview, omittedFilesBlock, partialLabel, partialMessage, reviewerTurnCap, toolCallsFromContent,
   type CoverageReport, type ReviewDiff, type ToolCall,
 } from './review-coverage.js';
 import { parseReviewDecision, extractProofFiles, type ReviewDecision, type ReviewIssue } from './review-verdict.js';
@@ -26,6 +26,11 @@ import {
   PROOF_INSTRUCTIONS, type ReviewMode, type StoredReview, type VerifiedIssue,
 } from './review-proof.js';
 import { getReviewDiff, getReviewDiffInfo, hasBranchChanges, makeProofIO, makeVerificationIO, type Exec } from './review-io.js';
+import { auditEnabled, auditDue, countImplementerTurns, createAudit, finishAudit, getLatestAudit, getRunningAudit, setAuditPhase, setAuditSnapshot, skipAudit } from './audits.js';
+import { allCitations, assembleReport, auditGate, cleanImplementerSummary, parseDiscrepancies, parseModelAudit, type AuditReport } from './audit-report.js';
+import { computeHardToReverse } from './audit-facts.js';
+import { AUDITOR_SYSTEM_PROMPT, bundleGuidance, buildPhase1Prompt, buildPhase2Prompt, buildReportRecoveryPrompt } from './audit-prompt.js';
+import { buildLineIndex, readAddedExports, readGuidanceDocs, readPackageJsons, readSnapshot } from './audit-io.js';
 import { describeRunCommand, describeRunner, parseTestProfile, type TestProfile } from './test-runners.js';
 import { resolveTestProfile, resolveTestObligation, getStoredTestProfile, setStoredTestProfile } from './test-profile.js';
 import { buildTestingPrompt, extractNoTests, extractTestProfile } from './implementer-markers.js';
@@ -2761,6 +2766,9 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
     // (rather than only in the wake poller) is what makes a user reply
     // implicitly cancel the wake.
     clearTaskWake(task.id);
+    // The code is about to change: an audit still running is about code that will
+    // not exist. It is recorded as cancelled and redone at the next pass/partial.
+    cancelAudit(task.id, 'code is changing');
     // Clear any opt-out flag from a prior turn before this one starts streaming.
     noReviewDeclared.delete(task.id);
     findingReports.delete(task.id);
@@ -4733,6 +4741,7 @@ export function routeVerifiedReview(
     console.log(`[auto-review] Task ${task.id} partial review — not seen: ${coverage.unreviewed.map(u => u.path).join(', ')}`);
     addMessage(task.id, 'system', partialMessage(coverage));
     settleWithUnresolvedFindings(task, { holdCompletion: true });
+    maybeLaunchAudit(task);
     return;
   }
 
@@ -4752,6 +4761,7 @@ export function routeVerifiedReview(
     // inside the helper is a no-op here and a deferred completion still flushes
     // — which is the whole point of "review passed, complete it".
     settleWithUnresolvedFindings(task);
+    maybeLaunchAudit(task);
     return;
   }
 
@@ -4889,6 +4899,303 @@ function escalateToUser(task: Task, issues: string[]): void {
     `Your input is needed.\n\nUnresolved issues:\n${issueList}`
   );
   settleWithUnresolvedFindings(task);
+}
+
+// ---------------------------------------------------------------------------
+// Auditor (see docs/AUDITOR.md)
+// ---------------------------------------------------------------------------
+//
+// An independent, read-only account of what a task built. It runs AFTER the
+// verifier settles on pass/partial, never during a fail loop, and never sends
+// work back: it only reports to the human. Deliberately not a task turn and not
+// the active role — it must not hold the task in `working`, block a reply, or
+// start the next queued task late.
+
+const AUDITOR_MAX_TURNS = process.env.CLAUDE_AUDITOR_MAX_TURNS || '40';
+const AUDITOR_COMPARE_MAX_TURNS = '8';
+const AUDITOR_RECOVERY_MAX_TURNS = '4';
+/** Wall-clock bound for one `claude` process of the audit. */
+const AUDIT_PROCESS_TIMEOUT_MS = 15 * 60 * 1000;
+/** The diff in the auditor's prompt; it has read access to the whole repo for the rest. */
+const AUDIT_DIFF_CHARS = 60_000;
+// Read-only like the reviewer, and without the test/lint runners: the auditor
+// has no reason to execute anything.
+const AUDITOR_ALLOWED_TOOLS = REVIEWER_ALLOWED_TOOLS.split(',').filter(t => !/^Bash\((npm|npx|go|pytest|cargo)\b/.test(t)).join(',');
+
+interface AuditRun {
+  auditId: string;
+  sessionId: string;
+  /** Set by cancelAudit; every await in the run checks it before doing more. */
+  cancelled: boolean;
+}
+const auditRuns = new Map<string, AuditRun>();
+
+const auditOutputPath = (auditId: string) => `/tmp/cpm-audit-${auditId}.jsonl`;
+const auditExitPath = (auditId: string) => `/tmp/cpm-audit-${auditId}.exit`;
+
+/**
+ * Stop a task's running audit and record it as cancelled with `reason`. Called
+ * whenever an implementer turn launches, so a reply never leaves an audit of
+ * code that is about to change `running`; the next pass/partial review audits
+ * again (auditDue). Returns whether there was anything to cancel.
+ */
+export function cancelAudit(taskId: string, reason = 'code is changing'): boolean {
+  const run = auditRuns.get(taskId);
+  const row = getRunningAudit(taskId);
+  if (!run && !row) return false;
+  if (run) { run.cancelled = true; auditRuns.delete(taskId); }
+  if (row) finishAudit(row.id, 'cancelled', { reason });
+  const task = getTask(taskId);
+  const pattern = (run?.sessionId ?? row?.session_id ?? '').replace(/[^a-zA-Z0-9-]/g, '');
+  if (task && pattern.length >= 8) {
+    sshExec(task.workspace_name, `pkill -f ${pattern} || true`, 10000, task.user_id)
+      .catch(err => console.error(`[audit] Remote pkill failed for task ${taskId}:`, (err as Error).message?.slice(0, 120)));
+  }
+  console.log(`[audit] Task ${taskId}: audit cancelled — ${reason}`);
+  return true;
+}
+
+/** The auto path: called where a review settles on pass or partial. Never throws, never blocks. */
+export function maybeLaunchAudit(task: Task): void {
+  const fresh = getTask(task.id) ?? task;
+  if (!auditEnabled(fresh) || auditRuns.has(task.id)) return;
+  const turns = countImplementerTurns(task.id);
+  if (!auditDue(getLatestAudit(task.id), turns)) return;
+  startAudit(fresh, 'auto', turns);
+}
+
+/** The on-demand path (button, route, MCP `audit`). False = there is no worktree to audit or one is already running. */
+export function triggerManualAudit(task: Task): { started: boolean; reason?: string } {
+  if (!task.worktree_path) return { started: false, reason: 'the task has no worktree to audit' };
+  if (auditRuns.has(task.id) || getRunningAudit(task.id)) return { started: false, reason: 'an audit is already running for this task' };
+  startAudit(task, 'manual', countImplementerTurns(task.id));
+  return { started: true };
+}
+
+function startAudit(task: Task, trigger: 'auto' | 'manual', implementerTurns: number): void {
+  const row = createAudit({ taskId: task.id, trigger, implementerTurns });
+  const run: AuditRun = { auditId: row.id, sessionId: randomUUID(), cancelled: false };
+  auditRuns.set(task.id, run);
+  runAudit(task, row.id, run, trigger).catch(err => {
+    const msg = (err as Error)?.message || String(err);
+    console.error(`[audit] Task ${task.id} audit failed:`, msg.slice(0, 200));
+    if (!run.cancelled && finishAudit(row.id, 'failed', { reason: msg.slice(0, 500) })) {
+      addMessage(task.id, 'system', `The audit could not be completed: ${msg.slice(0, 300)}`);
+    }
+  }).finally(() => {
+    if (auditRuns.get(task.id) === run) auditRuns.delete(task.id);
+  });
+}
+
+/** The implementer's last message of its last turn that said anything, markers stripped. */
+function lastImplementerSummary(taskId: string): string {
+  const turns = getTaskTurns(taskId).filter(t => t.role === 'implementer');
+  const msgs = getMessages(taskId).filter(m => m.role === 'assistant' && m.turn_id);
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const mine = msgs.filter(m => m.turn_id === turns[i].id);
+    if (mine.length) return cleanImplementerSummary(mine[mine.length - 1].content);
+  }
+  return '';
+}
+
+async function runAudit(task: Task, auditId: string, run: AuditRun, trigger: 'auto' | 'manual'): Promise<void> {
+  const worktree = task.worktree_path;
+  if (!worktree) { skipAudit(auditId, 'audit skipped: the task has no worktree'); return; }
+  const exec: Exec = (cmd, timeoutMs = 20000, maxBuffer) => sshExec(task.workspace_name, cmd, timeoutMs, task.user_id, maxBuffer);
+
+  const snap = await readSnapshot(exec, worktree);
+  if (run.cancelled) return;
+  const gate = trigger === 'auto' ? auditGate(snap.diff) : (snap.diff.trim() ? { run: true as const } : { run: false as const, reason: 'audit skipped: no changes against the default branch' });
+  if (!gate.run) {
+    if (skipAudit(auditId, gate.reason)) addMessage(task.id, 'system', gate.reason);
+    return;
+  }
+  setAuditSnapshot(auditId, { baseSha: snap.baseSha, headSha: snap.headSha, tree: snap.tree }, run.sessionId);
+
+  // Facts are the harness's; the model only annotates them.
+  const [docs, pkgs, exportsAdded] = await Promise.all([
+    readGuidanceDocs(exec, worktree),
+    readPackageJsons(exec, worktree, snap),
+    readAddedExports(exec, worktree, snap),
+  ]);
+  if (run.cancelled) return;
+  const facts = computeHardToReverse({ diff: snap.diff, packageJsons: pkgs });
+
+  const shown = buildReviewDiff(snap.diff, [], AUDIT_DIFF_CHARS);
+  const omitted = shown.omitted.length ? `(${shown.omitted.length} file(s) did not fit and are listed only by name — read them with \`git diff ${snap.baseSha.slice(0, 12)} -- <path>\`: ${shown.omitted.map(o => o.path).join(', ')})\n` : '';
+  const prompt1 = buildPhase1Prompt({
+    taskTitle: task.title || task.prompt.slice(0, 80),
+    taskPrompt: task.prompt,
+    diff: shown.text,
+    diffNote: `Merge-base: ${snap.baseSha.slice(0, 12)} (committed, uncommitted and untracked changes since it).\n${omitted}`,
+    stat: snap.files.map(f => `${f.status} ${f.path}`).join('\n'),
+    guidance: bundleGuidance(docs),
+    facts,
+    addedExports: exportsAdded,
+  });
+
+  appendStreamLog(task.id, 'auditor_start', `[Auditor] auditing ${snap.files.length} changed file(s)`);
+  let phase1 = await runAuditProcess(task, run, { prompt: prompt1, resume: false, maxTurns: AUDITOR_MAX_TURNS });
+  if (run.cancelled) return;
+  let model = parseModelAudit(phase1.text);
+  if (!model) {
+    // Cut off by the turn cap, or forgot the marker: one resumed turn to write it.
+    phase1 = await runAuditProcess(task, run, { prompt: buildReportRecoveryPrompt(), resume: true, maxTurns: AUDITOR_RECOVERY_MAX_TURNS });
+    if (run.cancelled) return;
+    model = parseModelAudit(phase1.text);
+  }
+  if (!model) throw new Error('the auditor did not produce a parsable AUDIT_REPORT');
+
+  const base = { worktree, facts, addedExports: exportsAdded };
+  const index1 = await buildLineIndex(exec, worktree, snap.baseSha, allCitations(model));
+  if (run.cancelled) return;
+  const report1 = assembleReport({ ...base, model, index: index1 });
+  // Phase 1 is written down BEFORE the auditor sees the self-report.
+  setAuditPhase(auditId, 'comparing', report1);
+
+  const summary = lastImplementerSummary(task.id);
+  if (!summary) {
+    finishAudit(auditId, 'done', { report: { ...report1, discrepanciesNote: 'no implementer summary to compare against' } });
+    return;
+  }
+
+  let report: AuditReport = report1;
+  try {
+    const phase2 = await runAuditProcess(task, run, { prompt: buildPhase2Prompt({ implementerSummary: summary }), resume: true, maxTurns: AUDITOR_COMPARE_MAX_TURNS });
+    if (run.cancelled) return;
+    const found = parseDiscrepancies(phase2.text);
+    if (found) {
+      const index2 = await buildLineIndex(exec, worktree, snap.baseSha, allCitations(model, found));
+      if (run.cancelled) return;
+      report = assembleReport({ ...base, model, index: index2, discrepancies: found });
+    } else {
+      report = { ...report1, discrepanciesNote: 'the auditor did not return a usable comparison with the implementer\'s summary' };
+    }
+  } catch (err) {
+    // Phase 1 stands; losing the comparison must not lose the audit.
+    if (run.cancelled) return;
+    report = { ...report1, discrepanciesNote: `the comparison with the implementer's summary failed: ${(err as Error).message.slice(0, 200)}` };
+  }
+  if (finishAudit(auditId, 'done', { report })) {
+    appendStreamLog(task.id, 'auditor_done', `[Auditor] ${report.summary.slice(0, 200)}`);
+  }
+}
+
+/**
+ * One `claude` process of the audit: the same isolation as the reviewer
+ * (`--setting-sources ''`, read-only allowlist, turn cap, reviewer model), run
+ * detached on the workspace and polled until it exits. Resolves with everything
+ * the auditor wrote. Throws on launch failure, timeout, or a pinned-token failure.
+ */
+async function runAuditProcess(
+  task: Task,
+  run: AuditRun,
+  opts: { prompt: string; resume: boolean; maxTurns: string },
+): Promise<{ text: string; subtype: string | null }> {
+  const fresh = getTask(task.id);
+  if (fresh) task = { ...task, model: fresh.model, claude_account_id: fresh.claude_account_id, reviewer_model: fresh.reviewer_model };
+
+  const outputFile = auditOutputPath(run.auditId);
+  const exitFile = auditExitPath(run.auditId);
+  const parts: string[] = ['claude', '-p', shellEscape(opts.prompt)];
+  parts.push(opts.resume ? '--resume' : '--session-id', shellEscape(run.sessionId));
+  parts.push('--output-format', 'stream-json', '--verbose');
+  parts.push('--allowedTools', shellEscape(AUDITOR_ALLOWED_TOOLS));
+  pushDisallowedTools(parts, AUDITOR_ALLOWED_TOOLS);
+  // No CLAUDE.md discovery: the guidance reaches the auditor through the prompt.
+  parts.push('--setting-sources', shellEscape(''));
+  parts.push('--max-turns', opts.maxTurns);
+  const modelSpec = task.reviewer_model || REVIEWER_MODEL || task.model || '';
+  const isOllama = modelSpec.startsWith('ollama/');
+  const actualModel = isOllama ? modelSpec.slice('ollama/'.length) : modelSpec;
+  if (actualModel) parts.push('--model', shellEscape(actualModel));
+  pushAppendSystemPrompt(parts, [AUDITOR_SYSTEM_PROMPT, HARNESS_REMINDER_NOTE]);
+
+  let remoteCmd = 'export PATH="$HOME/.local/bin:$PATH" && ';
+  if (isOllama) remoteCmd += `export ANTHROPIC_BASE_URL="${OLLAMA_BASE_URL}" ANTHROPIC_API_KEY="" ANTHROPIC_AUTH_TOKEN=ollama && `;
+  remoteCmd += `cd ${shellEscape(task.worktree_path!)} && `;
+  remoteCmd += `rm -f ${shellEscape(outputFile)} ${shellEscape(exitFile)} && `;
+  remoteCmd += `${parts.join(' ')} > ${shellEscape(outputFile)} 2>&1; echo $? > ${shellEscape(exitFile)}`;
+
+  let accountAuth: AccountAuth = NO_ACCOUNT_AUTH;
+  try {
+    if (!isOllama) {
+      accountAuth = await buildAccountAuth(
+        task.workspace_name, task.claude_account_id, task.user_id,
+        remoteAuthTokenPath(`audit-${run.auditId}`), exitFile,
+        isLocalWorkspace(task.workspace_name) ? 'env' : 'file', '[audit]',
+      );
+      remoteCmd = accountAuth.prefix + remoteCmd;
+    }
+    // Stale output of the previous process of THIS audit (phase 1 → 2) must not be read as this one's.
+    await sshExec(task.workspace_name,
+      `rm -f ${shellEscape(outputFile)} ${shellEscape(exitFile)}`, 15000, task.user_id).catch(() => {});
+    if (run.cancelled) return { text: '', subtype: null };
+
+    const proc = isLocalWorkspace(task.workspace_name)
+      ? spawn('bash', ['-c', remoteCmd], { env: accountAuth.env ?? { ...process.env }, stdio: 'ignore', detached: true })
+      : spawn('coder', ['ssh', task.workspace_name, '--', remoteCmd], { env: await buildCoderEnv(task.user_id), stdio: 'ignore', detached: true });
+    let spawnError: Error | null = null;
+    proc.on('error', err => { spawnError = err as Error; });
+    proc.unref();
+
+    let linesRead = 0;
+    let text = '';
+    let subtype: string | null = null;
+    const started = Date.now();
+    const take = (event: { type: string; [key: string]: unknown }) => {
+      if (event.type === 'assistant' && (event.message as { content?: unknown })?.content) {
+        let t = '';
+        for (const block of (event.message as { content: Array<{ type: string; text?: string }> }).content) {
+          if (block.type === 'text' && block.text) t += block.text;
+        }
+        if (t) { text += t + '\n'; appendStreamLog(task.id, 'auditor_output', `[Auditor] ${t.slice(0, 200)}`); }
+      } else if (event.type === 'result') {
+        if (typeof event.subtype === 'string') subtype = event.subtype;
+        const rt = extractResultText(event);
+        if (rt && !text.trimEnd().endsWith(rt.trimEnd())) text += rt + '\n';
+        const u = extractTokenUsage(event);
+        if (u.inputTokens > 0 || u.outputTokens > 0 || u.cacheReadTokens > 0 || u.cacheCreationTokens > 0) {
+          addTokenUsage(task.id, u.inputTokens, u.outputTokens, u.cacheReadTokens, u.cacheCreationTokens);
+        }
+      }
+    };
+
+    for (;;) {
+      await new Promise(r => setTimeout(r, 3000));
+      if (run.cancelled) return { text: '', subtype: null };
+      if (spawnError) throw new Error(`could not start the auditor: ${(spawnError as Error).message}`);
+      if (Date.now() - started > AUDIT_PROCESS_TIMEOUT_MS) {
+        sshExec(task.workspace_name, `pkill -f ${run.sessionId.replace(/[^a-zA-Z0-9-]/g, '')} || true`, 10000, task.user_id).catch(() => {});
+        throw new Error(`the auditor did not finish within ${Math.round(AUDIT_PROCESS_TIMEOUT_MS / 60000)} minutes`);
+      }
+      let polled;
+      try {
+        polled = await pollOutputAndExit(task.workspace_name, outputFile, exitFile, linesRead, undefined, task.user_id);
+      } catch (err) {
+        console.error(`[audit] Poll error for task ${task.id}:`, (err as Error).message?.slice(0, 100));
+        continue;
+      }
+      if (run.cancelled) return { text: '', subtype: null };
+      const { jsonPart, exitPart, truncated } = polled;
+      if (isUnreadableOversizedLine(jsonPart, truncated)) { linesRead++; continue; }
+      const lines = jsonPart.split('\n');
+      const partial = lines.pop() ?? '';
+      for (const line of lines) {
+        linesRead++;
+        if (!line.trim()) continue;
+        try { take(JSON.parse(line)); } catch { /* not an event */ }
+      }
+      const done = exitPart !== 'RUNNING' && exitPart !== '' && !truncated;
+      if (!done) continue;
+      if (partial.trim()) { try { take(JSON.parse(partial)); } catch { /* nothing recoverable */ } }
+      if (parseInt(exitPart, 10) === AUTH_STAGING_EXIT_CODE) throw new Error(AUTH_STAGING_MESSAGE);
+      sshExec(task.workspace_name, `rm -f ${shellEscape(outputFile)} ${shellEscape(exitFile)}`, 10000, task.user_id).catch(() => {});
+      return { text, subtype };
+    }
+  } finally {
+    accountAuth.cleanup?.();
+  }
 }
 
 /** The latest implementer turn for a task if it's still open, else null. */

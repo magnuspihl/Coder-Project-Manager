@@ -217,6 +217,9 @@ export interface Task {
   claude_account_id: string | null;
   caveman: string | null;
   auto_review: number;
+  /** Auditor switch: null follows auto_review. `audit_enabled` is the effective value. */
+  audit?: number | null;
+  audit_enabled?: boolean;
   review_loop_count: number;
   active_turn_role: 'implementer' | 'reviewer' | null;
   pending_complete?: number;
@@ -593,8 +596,58 @@ export interface AttachmentInfo {
   created_at: string;
 }
 
+export interface CheckedCite { cite: string; ok: boolean; tree: 'base' | 'head' | null; reason?: string }
+export interface AuditReuseFinding {
+  id: string;
+  name: string;
+  kind: 'reused' | 'possible_duplicate' | 'new';
+  newCite: string | null;
+  existingCite: string | null;
+  note: string;
+  checks?: { new: CheckedCite; existing: CheckedCite };
+  verified?: boolean;
+}
+export interface AuditDeviation { id: string; text: string; cites: string[]; checks?: CheckedCite[]; verified?: boolean }
+export interface AuditDiscrepancy { id: string; kind: 'unsupported_claim' | 'unmentioned'; text: string; cites: string[]; checks?: CheckedCite[]; verified?: boolean }
+export interface AuditHardFact { id: string; kind: 'dependency' | 'schema' | 'route' | 'mcp_tool' | 'env_var'; detail: string; file: string | null; note?: string }
+export interface AuditReport {
+  summary: string;
+  structure: { added: Array<{ path: string; purpose: string }>; modified: Array<{ path: string; change: string }> };
+  reuseFindings: AuditReuseFinding[];
+  deviations: AuditDeviation[];
+  hardToReverse: AuditHardFact[];
+  discrepancies: AuditDiscrepancy[] | null;
+  discrepanciesNote?: string;
+  unassessedExports: string[];
+}
+export interface AuditView {
+  id: string;
+  status: 'running' | 'done' | 'failed' | 'cancelled' | 'skipped';
+  phase: string | null;
+  trigger: 'auto' | 'manual';
+  reason: string | null;
+  stale: boolean;
+  stale_label: string | null;
+  head_sha: string | null;
+  started_at: string;
+  completed_at: string | null;
+  report: AuditReport | null;
+}
+
+/** Run the auditor now. Accepted, not finished: the card fills in via the task's polling. */
+export const runAudit = (taskId: string) =>
+  request<{ audit: AuditView }>(`/api/tasks/${taskId}/audit`, { method: 'POST' });
+
+/** true / false = explicit; null = follow auto-review. */
+export const setTaskAudit = (taskId: string, audit: boolean | null) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}`, { method: 'PUT', body: JSON.stringify({ audit }) });
+
+/** "Make this a task": the finding becomes a pending task request on this task. */
+export const makeAuditFindingTask = (taskId: string, findingId: string) =>
+  request<{ taskRequest: TaskRequestItem }>(`/api/tasks/${taskId}/audit/findings/${findingId}/task-request`, { method: 'POST' });
+
 export const getTaskDetail = (taskId: string) =>
-  request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[]; turns: TaskTurn[]; taskRequests: TaskRequestItem[]; findings: ReviewFinding[]; checkpoints: TaskCheckpoint[] }>(`/api/tasks/${taskId}`);
+  request<{ task: Task; messages: Message[]; participants: TaskParticipant[]; attachments: AttachmentInfo[]; turns: TaskTurn[]; taskRequests: TaskRequestItem[]; findings: ReviewFinding[]; checkpoints: TaskCheckpoint[]; audit: AuditView | null }>(`/api/tasks/${taskId}`);
 
 /**
  * Roll the task's worktree back to the state right after an earlier turn.

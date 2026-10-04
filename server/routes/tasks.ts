@@ -35,6 +35,7 @@ import {
   resetReviewLoopCount,
   getTaskRequest,
   getPendingTaskRequestsForTask,
+  createTaskRequestFromTask,
   approveTaskRequest,
   dismissTaskRequest,
   setTaskRequestTarget,
@@ -50,8 +51,10 @@ import {
   getTaskCheckpoint,
 } from '../services/tasks.js';
 import { findUserWorkspaceById } from '../services/workspace-cache.js';
+import { auditEnabled, auditView, countImplementerTurns, getLatestAudit, setTaskAudit } from '../services/audits.js';
+import { findingById, findingTaskPrompt } from '../services/audit-report.js';
 import { formatFindingForImplementer, PROOF_INSTRUCTIONS } from '../services/review-proof.js';
-import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview, wakeTaskNow, startFullVerification, FINDING_REPORT_FORMAT } from '../services/claude.js';
+import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview, triggerManualAudit, wakeTaskNow, startFullVerification, FINDING_REPORT_FORMAT } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, removeTaskWorktree, rollbackTaskToCheckpoint } from '../services/git.js';
@@ -256,7 +259,9 @@ router.get('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
   const taskRequests = getPendingTaskRequestsForTask(task.id);
   const findings = getReviewFindings(task.id);
   const checkpoints = getTaskCheckpoints(task.id);
-  res.json({ task: { ...task, activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages, participants, attachments, turns, taskRequests, findings, checkpoints });
+  const latestAudit = getLatestAudit(task.id);
+  const audit = latestAudit ? auditView(latestAudit, countImplementerTurns(task.id)) : null;
+  res.json({ task: { ...task, audit_enabled: auditEnabled(task), activity, total_cost_usd: totalCostUsd, rate_limit: rateLimit }, messages, totalMessages, participants, attachments, turns, taskRequests, findings, checkpoints, audit });
 });
 
 // Get stream log for a task (loaded on demand)
@@ -368,6 +373,15 @@ router.put('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
   // from the next decision" contract as model/subscription: a reviewer already
   // running finishes, but its verdict no longer bounces back to the implementer,
   // and no further turn launches one.
+  let newAudit: boolean | null | undefined;
+  if (req.body.audit !== undefined) {
+    if (req.body.audit !== null && typeof req.body.audit !== 'boolean') {
+      res.status(400).json({ error: 'audit must be a boolean, or null to follow auto-review' });
+      return;
+    }
+    newAudit = req.body.audit;
+  }
+
   let newAutoReview: boolean | undefined;
   if (req.body.autoReview !== undefined) {
     if (typeof req.body.autoReview !== 'boolean') {
@@ -377,6 +391,7 @@ router.put('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
     newAutoReview = req.body.autoReview;
   }
 
+  if (newAudit !== undefined) setTaskAudit(task.id, newAudit);
   if (req.body.position !== undefined) {
     updateTaskPosition(task.id, req.body.position);
   }
@@ -769,6 +784,47 @@ router.post('/tasks/:taskId/review', requireAuth, async (req: Request, res: Resp
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to launch reviewer' });
   }
+});
+
+// The auditor (docs/AUDITOR.md): the latest audit of the task, its status, and
+// whether the code has changed since.
+router.get('/tasks/:taskId/audit', requireAuth, (req: Request, res: Response) => {
+  const row = getLatestAudit(req.params.taskId);
+  res.json({ audit: row ? auditView(row, countImplementerTurns(req.params.taskId)) : null });
+});
+
+// Run the auditor now. Non-blocking: it reports to the human and never changes the task's status.
+router.post('/tasks/:taskId/audit', requireAuth, (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  if (task.status === 'working') {
+    res.status(409).json({ error: 'The task is working — audit it once the turn has finished, so the audit is of finished code.' });
+    return;
+  }
+  const result = triggerManualAudit(task);
+  if (!result.started) {
+    res.status(409).json({ error: result.reason });
+    return;
+  }
+  res.status(202).json({ audit: auditView(getLatestAudit(task.id)!, countImplementerTurns(task.id)) });
+});
+
+// "Make this a task": turns one finding into a pending task request — the same
+// object a [TASK_REQUEST] block produces, approved or dismissed the same way.
+router.post('/tasks/:taskId/audit/findings/:findingId/task-request', requireAuth, (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  const row = getLatestAudit(req.params.taskId);
+  const report = row ? auditView(row, 0).report : null;
+  const finding = report ? findingById(report, req.params.findingId) : null;
+  if (!task || !finding) {
+    res.status(404).json({ error: 'Audit finding not found' });
+    return;
+  }
+  const request = createTaskRequestFromTask(task.id, findingTaskPrompt(finding.kind, finding.text, finding.cites, task.title || task.prompt.slice(0, 80)));
+  res.status(201).json({ taskRequest: request });
 });
 
 // Roll the task's worktree back to an earlier turn's checkpoint. Lands the

@@ -17,6 +17,7 @@ import { handleMcpRequest, handleMcpMethodNotAllowed } from './mcp/index.js';
 
 // Initialize database on import
 import './db/index.js';
+import { abandonRunningAudits } from './services/audits.js';
 import { reconnectWorkingTasks, startRateLimitRetryPoller, startWakePoller } from './services/claude.js';
 import { startWorktreeReconciler } from './services/git.js';
 import { startPortJanitor } from './services/port-janitor.js';
@@ -64,6 +65,8 @@ app.delete('/mcp', requireAuth, handleMcpMethodNotAllowed);
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Coder Project Manager running on http://localhost:${PORT}`);
+  // An audit's runner lives in memory; whatever a restart left 'running' is not running.
+  try { abandonRunningAudits(); } catch (err) { console.error('[audit] Could not clear stale audits:', (err as Error).message?.slice(0, 200)); }
   reconnectWorkingTasks().catch(err => {
     console.error('[recovery] Unhandled error during task reconnect:', (err as Error).message?.slice(0, 200));
   });
