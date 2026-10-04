@@ -50,15 +50,32 @@ async function validateBearerToken(token: string): Promise<CoderUser | null> {
   }
 }
 
+const strictUtf8 = new TextDecoder('utf-8', { fatal: true });
+
+/**
+ * Recover the text a client meant to send in a header value.
+ *
+ * Node's HTTP parser decodes header values as Latin-1 (ISO-8859-1) per the
+ * spec, so a client sending UTF-8 bytes (e.g. "Mímir") arrives mojibake'd as
+ * "MÃ­mir" — round-trip through the original bytes and re-decode as UTF-8.
+ * But a client that sends Latin-1 bytes (fetch/undici does, for any character
+ * ≤ U+00FF) already arrives correct, and its bytes are not valid UTF-8; forcing
+ * them through a lenient decode turns "í" into U+FFFD. So only take the UTF-8
+ * reading when the bytes actually are UTF-8. ASCII is unchanged either way.
+ */
+export function decodeHeaderText(raw: string): string {
+  const bytes = Buffer.from(raw, 'latin1');
+  try {
+    return strictUtf8.decode(bytes);
+  } catch {
+    return raw;
+  }
+}
+
 function extractClientLabel(req: Request): string | null {
   const raw = req.headers['x-client-name'];
   if (typeof raw !== 'string') return null;
-  // Node's HTTP parser decodes header values as Latin-1 (ISO-8859-1) per the
-  // spec, so a client sending UTF-8 bytes (e.g. "Mímir") arrives mojibake'd as
-  // "MÃ­mir". Round-trip through the original bytes and re-decode as UTF-8.
-  // This is a no-op for pure ASCII labels.
-  const decoded = Buffer.from(raw, 'latin1').toString('utf8');
-  const trimmed = decoded.trim().slice(0, 64);
+  const trimmed = decodeHeaderText(raw).trim().slice(0, 64);
   return trimmed || null;
 }
 
