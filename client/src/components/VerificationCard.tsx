@@ -15,12 +15,12 @@ const BASELINE: Record<BaselineResult, { label: string; cls: string; title: stri
   new_code: {
     label: 'new code: fails without the change',
     cls: 'text-green-700 dark:text-green-400',
-    title: 'On the original code this test file could not even load, because it imports a module this task adds. That proves the test depends on the new code, not that its assertions check the behaviour — weaker evidence than a test that loads and fails. Every test in the file gets this label, since a load failure takes the whole file down.',
+    title: 'On the original code this test could not get past code this task adds: it imports a module this task creates, or a function (or other export) this task adds to an existing module, which did not exist there yet. That proves the test depends on the new code, not that its assertions check the behaviour — weaker evidence than a test that loads and fails. When the whole file could not load, every test in it gets this label.',
   },
   not_runnable: {
     label: "couldn't run without the change",
     cls: 'text-gray-500 dark:text-gray-400',
-    title: 'The test could not run against the original code for a reason other than new code (a syntax error, a missing package, an environment problem, or an import whose exports changed), so it is unknown whether it fails there.',
+    title: 'The test could not run against the original code for a reason other than new code (a syntax error, a missing package, an environment problem, or an import that was renamed or changed shape), so it is unknown whether it fails there.',
   },
 };
 

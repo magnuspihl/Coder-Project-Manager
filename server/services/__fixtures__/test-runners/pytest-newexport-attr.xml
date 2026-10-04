@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="2" time="0.027" timestamp="2026-10-03T14:04:51.948751+00:00" hostname="Coder-Project-Manager"><testcase classname="test_attr" name="test_parses_seconds" time="0.000" /><testcase classname="test_attr" name="test_formats_milliseconds" time="0.000"><failure message="AttributeError: module 'pkg.dur' has no attribute 'format_duration'. Did you mean: 'parse_duration'?">def test_formats_milliseconds():
+&gt;       assert dur.format_duration(2000) == '2s'
+               ^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'pkg.dur' has no attribute 'format_duration'. Did you mean: 'parse_duration'?
+
+test_attr.py:9: AttributeError</failure></testcase></testsuite></testsuites>

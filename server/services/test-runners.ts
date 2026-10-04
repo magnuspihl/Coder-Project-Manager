@@ -10,6 +10,8 @@
  * captured runner output — see __fixtures__/test-runners.
  */
 
+import type { ImportBinding } from './added-exports.js';
+
 export type RunnerKind = 'node-test' | 'vitest' | 'jest' | 'pytest' | 'go' | 'dotnet';
 
 export const RUNNER_KINDS: RunnerKind[] = ['node-test', 'vitest', 'jest', 'pytest', 'go', 'dotnet'];
@@ -58,9 +60,39 @@ export interface RunReport {
    * was anything else (syntax error, env problem, a missing package…).
    */
   unresolved?: string[];
+  /**
+   * Named imports the runner reported a module does not provide when loading the
+   * test file (see `extractMissingExports`). The module exists; the name doesn't.
+   */
+  missingExports?: MissingExport[];
   /** The runner was killed by the harness timeout. */
   timedOut?: boolean;
 }
+
+/** "Module `from` has no export `name`", as a runner reported it. */
+export interface MissingExport {
+  name: string;
+  /** The module as the runner named it: a JS import specifier, or a dotted Python module. */
+  from: string;
+  /** The module's file, when the runner printed it (absolute, in the tree that ran). */
+  file?: string;
+  /** The file whose import failed, when the runner printed it (absolute); otherwise the test file. */
+  importer?: string;
+}
+
+/**
+ * A failed test's message, read as "a name the test imported was undefined when
+ * it was used" (see `missingAtCall`):
+ *  - `binding`: a bare local name (`formatDuration is not a function`);
+ *  - `member`: a property of an imported module object — `namespace` is the
+ *    test's own namespace binding (`dur.formatDuration`), or absent when the
+ *    object is one the runner's transform generated (`(0 , _dur.formatDuration)`);
+ *  - `module`: the runner named the module itself (pytest's AttributeError).
+ */
+export type CallTimeMiss =
+  | { kind: 'binding'; local: string }
+  | { kind: 'member'; name: string; namespace?: string }
+  | { kind: 'module'; name: string; from: string };
 
 export const RESULT_MARKER = '@@CPM_RESULT@@';
 
@@ -307,6 +339,7 @@ export function parseTap(text: string): RunReport {
   const cases: TestCase[] = [];
   let suiteError: string | undefined;
   let unresolved: string[] = [];
+  let missingExports: MissingExport[] = [];
   let diag: string[] = [];
 
   for (let i = 0; i < lines.length; i++) {
@@ -350,6 +383,7 @@ export function parseTap(text: string): RunReport {
     ) {
       suiteError = tail(diag.join('\n') || yaml.error || `${name} failed to run`);
       unresolved = extractUnresolved('node-test', diag.join('\n'));
+      missingExports = extractMissingExports('node-test', diag.join('\n'));
     } else {
       cases.push({
         name,
@@ -359,7 +393,7 @@ export function parseTap(text: string): RunReport {
     }
     diag = [];
   }
-  return { cases, suiteError, ...(unresolved.length ? { unresolved } : {}) };
+  return { cases, suiteError, ...(unresolved.length ? { unresolved } : {}), ...(missingExports.length ? { missingExports } : {}) };
 }
 
 function firstJsonObject(text: string): unknown {
@@ -407,6 +441,7 @@ export function parseJunit(xml: string): RunReport {
   const cases: TestCase[] = [];
   const suiteErrors: string[] = [];
   const unresolved: string[] = [];
+  const missingExports: MissingExport[] = [];
   const re = /<testcase\b([^>]*?)(?:\/>|>([\s\S]*?)<\/testcase>)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(xml)) !== null) {
@@ -426,13 +461,19 @@ export function parseJunit(xml: string): RunReport {
       const errText = decodeXml(error[2] ?? /message="([^"]*)"/.exec(error[1] ?? error[3] ?? '')?.[1] ?? 'error');
       suiteErrors.push(tail(errText));
       unresolved.push(...extractUnresolved('pytest', errText));
+      missingExports.push(...extractMissingExports('pytest', errText));
     } else if (/<skipped\b/.test(body)) {
       cases.push({ name, outcome: 'skipped' });
     } else {
       cases.push({ name, outcome: 'passed' });
     }
   }
-  return { cases, suiteError: suiteErrors.length ? suiteErrors.join('\n\n') : undefined, ...(unresolved.length ? { unresolved } : {}) };
+  return {
+    cases,
+    suiteError: suiteErrors.length ? suiteErrors.join('\n\n') : undefined,
+    ...(unresolved.length ? { unresolved } : {}),
+    ...(missingExports.length ? { missingExports } : {}),
+  };
 }
 
 /** `go test -json`. */
@@ -573,25 +614,209 @@ function pythonMatches(module: string, added: ReadonlySet<string>): boolean {
 }
 
 /**
+ * Pull "module X does not provide name N" out of a load failure's text, per
+ * runner (fixtures: `*-newexport-*`, captured from real runs):
+ *  - node:test under native ESM (plain `.mjs`, or tsx with `"type": "module"`)
+ *    fails at link time: `SyntaxError: The requested module './x.js' does not
+ *    provide an export named 'n'`, preceded by the importing file's `path:line`.
+ *  - pytest fails at collection: `ImportError: cannot import name 'n' from 'a.b'
+ *    (/path/a/b.py)`. The same text also means "a.b is a new submodule", so it is
+ *    ALSO in `extractUnresolved`; the classifier accepts either explanation.
+ *  - vitest, jest and CommonJS-mode node:test never fail at load for this: the
+ *    transformed import is just `undefined` until called — see `missingAtCall`.
+ */
+export function extractMissingExports(runner: RunnerKind, text: string): MissingExport[] {
+  const out: MissingExport[] = [];
+  let m: RegExpExecArray | null;
+  switch (runner) {
+    case 'node-test': {
+      const re = /The requested module '([^']+)' does not provide an export named '([^']+)'/g;
+      while ((m = re.exec(text)) !== null) {
+        // Node prints the failing import's location (`/abs/file.ts:3`) above the excerpt.
+        const before = text.slice(0, m.index).split('\n');
+        const loc = before.map(l => /^(?:file:\/\/)?(\/\S+?):\d+$/.exec(l.trim())).filter(Boolean).pop();
+        out.push({ name: m[2], from: m[1], ...(loc ? { importer: loc[1] } : {}) });
+      }
+      break;
+    }
+    case 'pytest': {
+      const re = /ImportError: cannot import name '(\w+)' from '([\w.]+)'(?: \(([^)\n]+)\))?/g;
+      while ((m = re.exec(text)) !== null) {
+        const file = m[3] && m[3].startsWith('/') ? m[3] : undefined;
+        out.push({ name: m[1], from: m[2], ...(file ? { file } : {}) });
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return out;
+}
+
+/**
+ * The module objects each runner's transform generates for an import, so that
+ * `(0 , <obj>.name) is not a function` can be read as "the imported `name` was
+ * undefined". Captured from real runs (`*-newexport-*`): tsx/esbuild in CommonJS
+ * mode (`import_dur`), vite's SSR transform (`__vite_ssr_import_1__`), babel
+ * (`_dur`) and tsc/ts-jest (`dur_1`).
+ */
+const GENERATED_IMPORT_OBJECT: Partial<Record<RunnerKind, RegExp>> = {
+  'node-test': /^import_[\w$]+$/,
+  vitest: /^__vite_ssr_import_\d+__$/,
+  jest: /^(?:_[\w$]+|[\w$]+_\d+)$/,
+};
+
+/**
+ * Read a failed test's message as "something the test imported was undefined
+ * when it was used" — or null. Per runner, from real runs (`*-newexport-*`):
+ * JS runners report `TypeError: … is not a function / constructor` (node:test
+ * prefixes its error code); pytest reports `AttributeError: module 'a.b' has no
+ * attribute 'n'`. Whether that name really is an export the task adds is decided
+ * by the caller from the diff — this only parses the runner's wording.
+ */
+export function missingAtCall(runner: RunnerKind, message: string | undefined): CallTimeMiss | null {
+  if (!message) return null;
+  if (runner === 'pytest') {
+    const m = /AttributeError: module '([\w.]+)' has no attribute '(\w+)'/.exec(message);
+    return m ? { kind: 'module', from: m[1], name: m[2] } : null;
+  }
+  const generated = GENERATED_IMPORT_OBJECT[runner];
+  if (!generated) return null;
+  const line = message.split('\n').find(l => /\bTypeError\b/.test(l));
+  const m = line && /(?<![\w$.])(?:\(0\s*,\s*)?([\w$]+)(?:\.([\w$]+))?\)?\s+is not a (?:function|constructor)\b/.exec(line);
+  if (!m) return null;
+  if (!m[2]) return { kind: 'binding', local: m[1] };
+  return generated.test(m[1]) ? { kind: 'member', name: m[2] } : { kind: 'member', name: m[2], namespace: m[1] };
+}
+
+/** What deciding "only new code" needs beyond the runner's output. */
+export interface NewCodeContext {
+  /** The test file, relative to the worktree root. */
+  testFile: string;
+  /** Files absent at the merge-base and present in the task. */
+  added: ReadonlySet<string>;
+  /** The scratch tree the base run happened in (to relativise absolute paths in runner output). */
+  baseDir?: string;
+  /**
+   * For files that exist at the merge-base and that the task changed: the names
+   * each one exports now and did not then (`addedExports` in added-exports.ts);
+   * null when that could not be determined. A file missing from the map was not looked at.
+   */
+  addedExports?: ReadonlyMap<string, ReadonlySet<string> | null>;
+  /** The test file's imports (JS), to trace a call-time miss back to a module. */
+  testImports?: readonly ImportBinding[];
+}
+
+const relInside = (abs: string, baseDir?: string): string | null => {
+  if (!baseDir) return null;
+  const root = baseDir.replace(/\/$/, '') + '/';
+  return abs.startsWith(root) ? normaliseRel(abs.slice(root.length)) : null;
+};
+
+/** One "module `from` lacks `name`" reference, to be checked against the diff. */
+interface ExportRef { name: string; from: string; importer?: string; file?: string }
+
+/** The repo file a reference points at, among `pool` (files the task changed that exist at the base). */
+function moduleFileFor(runner: RunnerKind, ref: ExportRef, ctx: NewCodeContext, pool: Iterable<string>): string | null {
+  const files = [...pool];
+  if (runner === 'pytest') {
+    if (ref.file) {
+      const rel = relInside(ref.file, ctx.baseDir);
+      return rel && files.includes(rel) ? rel : null;
+    }
+    const rel = ref.from.replace(/\./g, '/');
+    const hit = files.filter(f => [`${rel}.py`, `${rel}/__init__.py`].some(t => f === t || f.endsWith('/' + t)));
+    return hit.length === 1 ? hit[0] : null;
+  }
+  const importer = (ref.importer && relInside(ref.importer, ctx.baseDir)) || ctx.testFile;
+  return jsCandidates(ref.from, importer, ctx.baseDir).find(c => files.includes(c)) ?? null;
+}
+
+/** The (module, name) pairs a call-time miss could mean, through the test file's own imports. */
+function callTimeRefs(miss: CallTimeMiss, imports: readonly ImportBinding[]): ExportRef[] {
+  if (miss.kind === 'module') return [{ name: miss.name, from: miss.from }];
+  let hits: ImportBinding[];
+  if (miss.kind === 'binding') hits = imports.filter(b => b.local === miss.local && b.imported !== '*');
+  else if (miss.namespace) hits = imports.filter(b => b.imported === '*' && b.local === miss.namespace);
+  else {
+    // A generated module object stands for a named import of that name — or, when
+    // there is none (vite rewrites `ns.x` too), for the namespace imports.
+    hits = imports.filter(b => b.imported === miss.name);
+    if (hits.length === 0) hits = imports.filter(b => b.imported === '*');
+  }
+  return hits.map(b => ({ name: miss.kind === 'binding' ? b.imported : miss.name, from: b.spec }));
+}
+
+function isAddedExport(runner: RunnerKind, ref: ExportRef, ctx: NewCodeContext): boolean {
+  if (!ctx.addedExports) return false;
+  const file = moduleFileFor(runner, ref, ctx, ctx.addedExports.keys());
+  return !!file && !!ctx.addedExports.get(file)?.has(ref.name);
+}
+
+/**
+ * The changed files whose exports must be compared with the merge-base to
+ * classify this base run: the modules a missing name (at load, or in a failed
+ * test) points at. `pool` = files the task changed that exist at the base.
+ * Empty when nothing in the run is a missing-name failure.
+ */
+export function exportFilesToCheck(runner: RunnerKind, report: RunReport, ctx: NewCodeContext, pool: ReadonlySet<string>): string[] {
+  const refs: ExportRef[] = [...(report.missingExports ?? [])];
+  for (const c of report.cases) {
+    const miss = c.outcome === 'failed' ? missingAtCall(runner, c.message) : null;
+    if (miss) refs.push(...callTimeRefs(miss, ctx.testImports ?? []));
+  }
+  return [...new Set(refs.map(r => moduleFileFor(runner, r, ctx, pool)).filter((f): f is string => !!f))];
+}
+
+/** Whether any failure in this base run is worth tracing through the test file's imports. */
+export function hasCallTimeMiss(runner: RunnerKind, report: RunReport): boolean {
+  return report.cases.some(c => c.outcome === 'failed' && !!missingAtCall(runner, c.message));
+}
+
+/**
  * True when a test file failed to load on the original code ONLY because of
- * modules the task adds: the runner named at least one unresolved module and every
- * one of them is a file that is absent at the merge-base and present in `added`.
- * A bare package name, a module that exists on the base, or anything the runner
- * did not name as unresolved returns false — those stay "could not run".
+ * code the task adds. Every module the runner named as unresolved must be a file
+ * absent at the merge-base and present in `added`, and every name it said a
+ * module does not provide must be one the task adds to that (existing) file —
+ * per the file's diff, see `addedExports`. Nothing named, a bare package name, a
+ * module that exists on the base, or a name the task did not add (a rename, a
+ * typo) returns false — those stay "could not run".
  */
 export function loadFailureIsNewCode(
   runner: RunnerKind,
-  unresolved: readonly string[] | undefined,
-  ctx: { testFile: string; added: ReadonlySet<string>; baseDir?: string },
+  report: Pick<RunReport, 'unresolved' | 'missingExports'>,
+  ctx: NewCodeContext,
 ): boolean {
-  if (!unresolved?.length || ctx.added.size === 0) return false;
-  return unresolved.every(spec => {
+  const unresolved = report.unresolved ?? [];
+  const missing = report.missingExports ?? [];
+  if (unresolved.length + missing.length === 0) return false;
+  const newModule = (spec: string) => {
+    if (ctx.added.size === 0) return false;
     if (runner === 'pytest') return pythonMatches(spec, ctx.added);
     if (runner === 'node-test' || runner === 'vitest' || runner === 'jest') {
       return jsCandidates(spec, ctx.testFile, ctx.baseDir).some(c => ctx.added.has(c));
     }
     return false;
-  });
+  };
+  // pytest's "cannot import name 'b' from 'a'" is both `a.b` (unresolved) and
+  // (a, b) (missing): either a new submodule a/b.py or a new name in a explains it.
+  const pairedExport = (spec: string) =>
+    runner === 'pytest' && missing.some(e => `${e.from}.${e.name}` === spec && isAddedExport(runner, e, ctx));
+  return unresolved.every(spec => newModule(spec) || pairedExport(spec)) &&
+    missing.every(e => isAddedExport(runner, e, ctx) || (runner === 'pytest' && newModule(`${e.from}.${e.name}`)));
+}
+
+/**
+ * True when a test that loaded on the original code failed there only because a
+ * name it imported did not exist yet: the runner's message is a call-time miss
+ * (`missingAtCall`) and every import it can mean is a name the task adds to an
+ * existing file.
+ */
+export function callFailureIsNewExport(runner: RunnerKind, message: string | undefined, ctx: NewCodeContext): boolean {
+  const miss = missingAtCall(runner, message);
+  if (!miss) return false;
+  const refs = callTimeRefs(miss, ctx.testImports ?? []);
+  return refs.length > 0 && refs.every(r => isAddedExport(runner, r, ctx));
 }
 
 /**

@@ -6,7 +6,9 @@ import { fileURLToPath } from 'node:url';
 import {
   buildRunCommand,
   detectProfile,
+  extractMissingExports,
   extractUnresolved,
+  missingAtCall,
   parseGoJson,
   parseRunOutput,
   parseTestProfile,
@@ -201,4 +203,91 @@ test('extractUnresolved recognises vite import-analysis and ESM wording, and ign
   assert.deepEqual(extractUnresolved('node-test', "Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/w/src/x.ts' imported from /w/src/a.test.ts"), ['/w/src/x.ts']);
   assert.deepEqual(extractUnresolved('pytest', 'E   SyntaxError: invalid syntax'), []);
   assert.deepEqual(extractUnresolved('go', "cannot find module providing package x"), [], 'go/dotnet stay not_runnable');
+});
+
+
+// --- a name the task adds to an EXISTING module, as each runner reports it on the base ---
+// Captured by running each tool on a test that imports `formatDuration` (pytest:
+// `format_duration`) from a module that, at the merge-base, only has `parseDuration`.
+
+test('node:test under native ESM (tsx, "type": "module"): the file does not load, and the missing export is named with its importer', () => {
+  const r = parseRunOutput('node-test', wrap(fx('node-newexport-esm.tap')));
+  assert.ok(r.suiteError);
+  assert.deepEqual(r.cases, []);
+  assert.deepEqual(r.missingExports, [{ name: 'formatDuration', from: './dur.js', importer: '/work/src/dur.test.ts' }]);
+  assert.equal(r.unresolved, undefined, 'the module itself was found');
+});
+
+test('node:test with plain .mjs: the same link-time SyntaxError names the missing export', () => {
+  const r = parseRunOutput('node-test', wrap(fx('node-newexport-mjs.tap')));
+  assert.deepEqual(r.missingExports, [{ name: 'formatDuration', from: './dur.mjs', importer: '/work/src/dur.test.mjs' }]);
+});
+
+test('node:test under tsx in CommonJS mode: the file loads, and only the test calling the missing export fails, as undefined at call time', () => {
+  const r = parseRunOutput('node-test', wrap(fx('node-newexport-cjs.tap')));
+  assert.equal(r.suiteError, undefined);
+  assert.equal(r.missingExports, undefined);
+  assert.deepEqual(r.cases.map(c => [c.name, c.outcome]), [['parses seconds', 'passed'], ['formats milliseconds as seconds', 'failed']]);
+  assert.deepEqual(missingAtCall('node-test', r.cases[1].message), { kind: 'member', name: 'formatDuration' });
+});
+
+test('node:test call-time misses: a destructured require is a bare binding, a namespace import keeps its namespace', () => {
+  const req = parseRunOutput('node-test', wrap(fx('node-newexport-require.tap'))).cases[1];
+  assert.deepEqual(missingAtCall('node-test', req.message), { kind: 'binding', local: 'formatDuration' });
+  const ns = parseRunOutput('node-test', wrap(fx('node-newexport-namespace.tap'))).cases[1];
+  assert.deepEqual(missingAtCall('node-test', ns.message), { kind: 'member', name: 'formatDuration', namespace: 'dur' });
+});
+
+test('vitest: a missing export is undefined at call time — "is not a function" and "is not a constructor" both name it', () => {
+  const r = parseRunOutput('vitest', wrap(fx('vitest-newexport.json')));
+  assert.equal(r.suiteError, undefined);
+  const byName = Object.fromEntries(r.cases.map(c => [c.name, c]));
+  assert.equal(byName['parses seconds'].outcome, 'passed');
+  assert.deepEqual(missingAtCall('vitest', byName['formats milliseconds as seconds'].message), { kind: 'member', name: 'formatDuration' });
+  assert.deepEqual(missingAtCall('vitest', byName['a timer starts at zero'].message), { kind: 'member', name: 'Timer' });
+  // vite rewrites a namespace import to its own module object too.
+  const ns = parseRunOutput('vitest', wrap(fx('vitest-newexport-namespace.json'))).cases.find(c => c.outcome === 'failed')!;
+  assert.deepEqual(missingAtCall('vitest', ns.message), { kind: 'member', name: 'formatDuration' });
+});
+
+test('jest: a missing export is undefined at call time, whether the test uses require, babel or ts-jest', () => {
+  const failed = (file: string) => parseRunOutput('jest', wrap(fx(file))).cases.find(c => c.outcome === 'failed')!;
+  assert.deepEqual(missingAtCall('jest', failed('jest-newexport-cjs.json').message), { kind: 'binding', local: 'formatDuration' });
+  assert.deepEqual(missingAtCall('jest', failed('jest-newexport-babel.json').message), { kind: 'member', name: 'formatDuration' });
+  assert.deepEqual(missingAtCall('jest', failed('jest-newexport-ts.json').message), { kind: 'member', name: 'formatDuration' });
+});
+
+test('pytest: "cannot import name" at collection names the module, its file and the missing name', () => {
+  const r = parseRunOutput('pytest', wrap(fx('pytest-newexport-from.xml')));
+  assert.ok(r.suiteError);
+  assert.deepEqual(r.missingExports, [{ name: 'format_duration', from: 'pkg.dur', file: '/work/py/pkg/dur.py' }]);
+  // The same text could also mean a new submodule pkg/dur/format_duration.py; that reading stays available.
+  assert.deepEqual(r.unresolved, ['pkg.dur.format_duration']);
+});
+
+test('pytest: a missing module attribute used inside a test is a call-time miss naming the module', () => {
+  const r = parseRunOutput('pytest', wrap(fx('pytest-newexport-attr.xml')));
+  const failed = r.cases.find(c => c.outcome === 'failed')!;
+  assert.deepEqual(missingAtCall('pytest', failed.message), { kind: 'module', from: 'pkg.dur', name: 'format_duration' });
+});
+
+test('ordinary failures are not read as a missing import', () => {
+  assert.equal(missingAtCall('node-test', 'AssertionError: ERR_ASSERTION: Expected values to be strictly equal'), null);
+  assert.equal(missingAtCall('jest', 'Error: expect(received).toBe(expected)'), null);
+  assert.equal(missingAtCall('pytest', "AttributeError: 'NoneType' object has no attribute 'split'"), null);
+  assert.equal(missingAtCall('vitest', undefined), null);
+  // A non-import object is reported as a namespace candidate; the classifier then finds no such import.
+  assert.deepEqual(missingAtCall('jest', 'TypeError: items.map is not a function'), { kind: 'member', name: 'map', namespace: 'items' });
+});
+
+test('a syntax error or a missing module names no missing export', () => {
+  for (const [runner, file] of [['node-test', 'node-syntax.tap'], ['node-test', 'node-missing.tap'], ['pytest', 'pytest-syn.xml'], ['pytest', 'pytest-missing.xml']] as const) {
+    assert.equal(parseRunOutput(runner, wrap(fx(file))).missingExports, undefined, `${runner} ${file}`);
+  }
+});
+
+test('go and dotnet: missing names are not recognised, so those stay "could not run"', () => {
+  assert.deepEqual(extractMissingExports('go', './a_test.go:5:2: undefined: FormatDuration'), []);
+  assert.equal(missingAtCall('go', './a_test.go:5:2: undefined: FormatDuration'), null);
+  assert.equal(missingAtCall('dotnet', "error CS0117: 'Dur' does not contain a definition for 'Format'"), null);
 });

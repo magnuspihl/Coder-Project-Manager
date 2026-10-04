@@ -3697,7 +3697,7 @@ async function verifyTurnTests(task: Task, level: VerificationLevel): Promise<vo
       ? `[Harness] ${level === 'full' ? 'full verification' : 'running the change\'s tests'} (${describeRunner(profile)})`
       : '[Harness] no test runner found — nothing to run');
     const noIO: VerificationIO = {
-      fingerprint: async () => '', changedPaths: async () => [], addedPaths: async () => [], baseSources: async () => ({}), run: async () => '', runSuite: async () => '',
+      fingerprint: async () => '', changedPaths: async () => [], addedPaths: async () => [], baseSources: async () => ({}), currentSources: async () => ({}), run: async () => '', runSuite: async () => '',
       prepareBaseline: async () => null, runIn: async () => '', cleanupBaseline: async () => {},
     };
     const work = buildVerification({

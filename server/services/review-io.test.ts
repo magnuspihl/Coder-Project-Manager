@@ -362,6 +362,61 @@ test('a new module and its test: the original-code run cannot load, and is label
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+// A task that adds `shout` to src/greet.ts (which exists at the merge-base with only `greet`).
+const SHOUT_TEST =
+  "import test from 'node:test'; import assert from 'node:assert/strict'; import { greet, shout } from './greet.ts';\n" +
+  "test('still greets', () => { assert.equal(greet('Bo'), 'hi Bo'); });\n" +
+  "test('shouts the greeting', () => { assert.equal(shout('Bo'), 'HI BO'); });\n";
+const GREET_WITH_SHOUT =
+  "export function greet(name: string): string { return 'hi ' + name; }\n" +
+  "export function shout(name: string): string { return greet(name).toUpperCase(); }\n";
+
+test('a function added to an existing module, tsx in CommonJS mode: only its test is new_code, the old one still "passes" (real git + real node:test)', { skip }, async () => {
+  const dir = makeRepo();
+  try {
+    writeFileSync(join(dir, 'src/greet.ts'), GREET_WITH_SHOUT);
+    writeFileSync(join(dir, 'src/greet.test.ts'), SHOUT_TEST);
+    const io = makeVerificationIO(exec, dir, PROFILE);
+    const now = await io.currentSources(['src/greet.ts', 'src/nope.ts']);
+    assert.equal(now['src/greet.ts']?.replace(/\r\n/g, '\n'), GREET_WITH_SHOUT, 'read from the worktree (PTY line endings aside)');
+    assert.equal(now['src/nope.ts'], null);
+    const v = await buildVerification({ profile: PROFILE, io });
+    assert.deepEqual(v.tests.map(t => [t.name, t.outcome, t.baseline]).sort(),
+      [['shouts the greeting', 'passed', 'new_code'], ['still greets', 'passed', 'passes']]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a function added to an existing module, native ESM ("type": "module"): the file cannot load on the base and is new_code (real git + real node:test)', { skip }, async () => {
+  const dir = makeRepo();
+  try {
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module' }));
+    git(dir, 'add', '-A'); git(dir, 'commit', '-q', '-m', 'esm');
+    writeFileSync(join(dir, 'src/greet.ts'), GREET_WITH_SHOUT);
+    writeFileSync(join(dir, 'src/greet.test.ts'), SHOUT_TEST);
+    const v = await buildVerification({ profile: PROFILE, io: makeVerificationIO(exec, dir, PROFILE) });
+    assert.deepEqual(v.tests.map(t => [t.name, t.outcome, t.baseline]).sort(),
+      [['shouts the greeting', 'passed', 'new_code'], ['still greets', 'passed', 'new_code']]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a renamed export stays "not_runnable" on the base, in CommonJS and native ESM alike (real git + real node:test)', { skip }, async () => {
+  for (const esm of [false, true]) {
+    const dir = makeRepo();
+    try {
+      // The base has greet() and yell(); the task renames yell to shout.
+      writeFileSync(join(dir, 'src/greet.ts'), "export function greet(name: string): string { return 'hi ' + name; }\nexport function yell(name: string): string { return greet(name).toUpperCase(); }\n");
+      if (esm) writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module' }));
+      git(dir, 'add', '-A'); git(dir, 'commit', '-q', '-m', 'base with yell');
+      writeFileSync(join(dir, 'src/greet.ts'), GREET_WITH_SHOUT);
+      writeFileSync(join(dir, 'src/greet.test.ts'), SHOUT_TEST);
+      const v = await buildVerification({ profile: PROFILE, io: makeVerificationIO(exec, dir, PROFILE) });
+      const shout = v.tests.find(t => t.name === 'shouts the greeting')!;
+      assert.equal(shout.outcome, 'passed');
+      assert.equal(shout.baseline, 'not_runnable', esm ? 'esm' : 'cjs');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
 test('a modified module: addedPaths excludes it and the test keeps its assertion-level "fails" baseline', { skip }, async () => {
   const dir = makeCommittedTaskRepo();
   try {

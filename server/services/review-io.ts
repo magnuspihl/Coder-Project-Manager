@@ -139,6 +139,20 @@ export function isScratchDir(dir: string): boolean {
   return /^\/[\w./-]*tmp[\w./-]*\/[\w.-]+$/.test(dir) && !dir.includes('..');
 }
 
+/** Parse `@@CPM_F@@ <file>` + `@@CPM_HAVE@@`/`@@CPM_ABSENT@@` chunks (after `@@S@@`) into file → source | null. */
+function parseSources(out: string): Record<string, string | null> {
+  const result: Record<string, string | null> = {};
+  for (const chunk of (out.split('@@S@@')[1] ?? '').split('@@CPM_F@@ ').slice(1)) {
+    const nl = chunk.indexOf('\n');
+    if (nl < 0) continue;
+    const file = chunk.slice(0, nl).trim();
+    const body = chunk.slice(nl + 1);
+    if (body.startsWith('@@CPM_ABSENT@@')) result[file] = null;
+    else if (body.startsWith('@@CPM_HAVE@@')) result[file] = body.slice('@@CPM_HAVE@@'.length).replace(/^\r?\n/, '');
+  }
+  return result;
+}
+
 export function makeVerificationIO(exec: Exec, worktree: string, profile: TestProfile): VerificationIO {
   const runScript = (dir: string, files: string[]) =>
     exec(buildRunCommand(profile, dir, files), files.length ? FILE_RUN_MS : SUITE_RUN_MS, RUN_BUFFER);
@@ -169,16 +183,13 @@ export function makeVerificationIO(exec: Exec, worktree: string, profile: TestPr
       const parts = files.map(f =>
         `echo "@@CPM_F@@ "${shellQuote(f)}; if git -C "$WT" cat-file -e "$base":${shellQuote(f)} 2>/dev/null; then echo @@CPM_HAVE@@; git -C "$WT" show "$base":${shellQuote(f)} 2>/dev/null; else echo @@CPM_ABSENT@@; fi`);
       const out = await exec([`WT=${shellQuote(worktree)}`, BASE_SNIPPET, `[ -n "$base" ] || exit 0`, `echo @@S@@`, ...parts].join('\n'), 60_000);
-      const result: Record<string, string | null> = {};
-      for (const chunk of (out.split('@@S@@')[1] ?? '').split('@@CPM_F@@ ').slice(1)) {
-        const nl = chunk.indexOf('\n');
-        if (nl < 0) continue;
-        const file = chunk.slice(0, nl).trim();
-        const body = chunk.slice(nl + 1);
-        if (body.startsWith('@@CPM_ABSENT@@')) result[file] = null;
-        else if (body.startsWith('@@CPM_HAVE@@')) result[file] = body.slice('@@CPM_HAVE@@'.length).replace(/^\r?\n/, '');
-      }
-      return result;
+      return parseSources(out);
+    },
+    currentSources: async files => {
+      if (files.length === 0) return {};
+      const parts = files.map(f =>
+        `echo "@@CPM_F@@ "${shellQuote(f)}; if [ -f "$WT"/${shellQuote(f)} ]; then echo @@CPM_HAVE@@; cat "$WT"/${shellQuote(f)}; else echo @@CPM_ABSENT@@; fi`);
+      return parseSources(await exec([`WT=${shellQuote(worktree)}`, `echo @@S@@`, ...parts].join('\n'), 60_000));
     },
     fingerprint: async () => {
       const out = await exec([

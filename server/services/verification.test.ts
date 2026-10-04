@@ -5,6 +5,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseRunOutput, RESULT_MARKER, type RunnerKind, type TestProfile } from './test-runners.js';
+import { addedExports, jsImports } from './added-exports.js';
 
 const profile: TestProfile = { runner: 'node-test', source: 'detected' };
 
@@ -22,6 +23,7 @@ function fakeIO(o: Partial<VerificationIO> & { changed?: string[]; added?: strin
     changedPaths: o.changedPaths ?? (async () => o.changed ?? []),
     addedPaths: o.addedPaths ?? (async () => o.added ?? []),
     baseSources: o.baseSources ?? (async () => ({})),
+    currentSources: o.currentSources ?? (async () => ({})),
     run: o.run ?? (async f => { calls.push(`run ${f}`); return okTap('does a thing'); }),
     runSuite: o.runSuite ?? (async () => { calls.push('suite'); return okTap('a', 'b', 'c'); }),
     prepareBaseline: o.prepareBaseline ?? (async () => { calls.push('prepareBaseline'); return { dir: '/base' }; }),
@@ -458,4 +460,164 @@ test('reviewerTestLines: lists the change\'s tests in full and folds the existin
   assert.match(lines[0], /PASS "new one" \(a\.test\.ts\) \[fails without the change\]/);
   assert.match(lines[1], /\+2 existing tests in the touched files.*still pass/);
   assert.ok(!lines.join('\n').includes('old a'));
+});
+
+// --- names the task adds to modules that already existed at the merge-base -------
+// Real runner output (`*-newexport-*`), captured on a base where src/dur.ts (py:
+// pkg/dur.py) has only parseDuration and the test also imports formatDuration.
+// "Exports the task adds" come from the module's two versions, never from the error.
+
+const DUR_BASE = 'export function parseDuration(s: string): number { return parseInt(s, 10) * 1000; }\n';
+const DUR_NOW = DUR_BASE + 'export function formatDuration(ms: number): string { return `${ms / 1000}s`; }\nexport class Timer { elapsed = 0; }\n';
+const DUR_RENAMED_BASE = DUR_BASE + 'export function fmt(ms: number): string { return `${ms / 1000}s`; }\n';
+const PY_BASE = "def parse_duration(s):\n    return int(s.rstrip('s')) * 1000\n";
+const PY_NOW = PY_BASE + "\n\ndef format_duration(ms):\n    return f'{ms // 1000}s'\n";
+
+/** The test sources as captured (only their imports matter). */
+const TEST_SRC = {
+  esNamed: "import { parseDuration, formatDuration } from './dur.js';",
+  esNamedTimer: "import { parseDuration, formatDuration, Timer } from './dur';",
+  esNamespace: "import * as dur from './dur.js';",
+  esNamespaceVite: "import * as dur from './dur';",
+  cjs: "const { parseDuration, formatDuration } = require('./dur.js');",
+  jestCjs: "const { parseDuration, formatDuration } = require('./dur');",
+  jestEs: "import { parseDuration, formatDuration } from './dur';",
+};
+
+const NEW_EXPORT_CASES: Array<{
+  label: string; runner: RunnerKind; file: string; testFile: string; module: string; testSrc?: string;
+  /** Verdict per test name, for a load failure every test in the file. */
+  expect: Record<string, string>;
+}> = [
+  { label: 'node:test, tsx ESM (fails to load)', runner: 'node-test', file: 'node-newexport-esm.tap', testFile: 'src/dur.test.ts', module: 'src/dur.ts',
+    expect: { 'parses seconds': 'new_code', 'formats milliseconds as seconds': 'new_code' } },
+  { label: 'node:test, plain .mjs (fails to load)', runner: 'node-test', file: 'node-newexport-mjs.tap', testFile: 'src/dur.test.mjs', module: 'src/dur.mjs',
+    expect: { 'parses seconds': 'new_code', 'formats milliseconds as seconds': 'new_code' } },
+  { label: 'node:test, tsx CommonJS (undefined at call time)', runner: 'node-test', file: 'node-newexport-cjs.tap', testFile: 'src/dur.test.ts', module: 'src/dur.ts', testSrc: TEST_SRC.esNamed,
+    expect: { 'parses seconds': 'passes', 'formats milliseconds as seconds': 'new_code' } },
+  { label: 'node:test, destructured require', runner: 'node-test', file: 'node-newexport-require.tap', testFile: 'src/dur.test.js', module: 'src/dur.js', testSrc: TEST_SRC.cjs,
+    expect: { 'parses seconds': 'passes', 'formats milliseconds as seconds': 'new_code' } },
+  { label: 'node:test, namespace import', runner: 'node-test', file: 'node-newexport-namespace.tap', testFile: 'src/dur.test.ts', module: 'src/dur.ts', testSrc: TEST_SRC.esNamespace,
+    expect: { 'parses seconds': 'passes', 'formats milliseconds as seconds': 'new_code' } },
+  { label: 'vitest, function and class', runner: 'vitest', file: 'vitest-newexport.json', testFile: 'src/dur.test.ts', module: 'src/dur.ts', testSrc: TEST_SRC.esNamedTimer,
+    expect: { 'parses seconds': 'passes', 'formats milliseconds as seconds': 'new_code', 'a timer starts at zero': 'new_code' } },
+  { label: 'vitest, namespace import', runner: 'vitest', file: 'vitest-newexport-namespace.json', testFile: 'src/dur.test.ts', module: 'src/dur.ts', testSrc: TEST_SRC.esNamespaceVite,
+    expect: { 'parses seconds': 'passes', 'formats milliseconds as seconds': 'new_code' } },
+  { label: 'jest, require', runner: 'jest', file: 'jest-newexport-cjs.json', testFile: 'src/dur.test.js', module: 'src/dur.js', testSrc: TEST_SRC.jestCjs,
+    expect: { 'parses seconds': 'passes', 'formats milliseconds as seconds': 'new_code' } },
+  { label: 'jest, babel', runner: 'jest', file: 'jest-newexport-babel.json', testFile: 'src/dur.test.js', module: 'src/dur.js', testSrc: TEST_SRC.jestEs,
+    expect: { 'parses seconds': 'passes', 'formats milliseconds as seconds': 'new_code' } },
+  { label: 'jest, ts-jest', runner: 'jest', file: 'jest-newexport-ts.json', testFile: 'src/dur.test.ts', module: 'src/dur.ts', testSrc: TEST_SRC.jestEs,
+    expect: { 'parses seconds': 'passes', 'formats milliseconds as seconds': 'new_code' } },
+  { label: 'pytest, from-import (fails to collect)', runner: 'pytest', file: 'pytest-newexport-from.xml', testFile: 'py/test_from.py', module: 'py/pkg/dur.py',
+    expect: { 'test_from.test_parses_seconds': 'new_code', 'test_from.test_formats_milliseconds': 'new_code' } },
+  { label: 'pytest, module attribute (undefined at call time)', runner: 'pytest', file: 'pytest-newexport-attr.xml', testFile: 'py/test_attr.py', module: 'py/pkg/dur.py',
+    expect: { 'test_attr.test_parses_seconds': 'passes', 'test_attr.test_formats_milliseconds': 'new_code' } },
+];
+
+/**
+ * The context addBaseline builds: the module's export diff, the test's imports,
+ * the scratch dir the base ran in (`/work` in the fixtures). `history`: the task
+ * added the export, renamed an old one to it, or only changed an existing one's signature.
+ */
+function exportCtx(c: (typeof NEW_EXPORT_CASES)[number], history: 'added' | 'renamed' | 'existed') {
+  const py = c.runner === 'pytest';
+  const [base, now] = py
+    ? { added: [PY_BASE, PY_NOW], renamed: [PY_BASE + '\n\ndef fmt(ms):\n    pass\n', PY_NOW], existed: [PY_NOW, PY_NOW.replace('(ms)', '(ms, unit)')] }[history]
+    : { added: [DUR_BASE, DUR_NOW], renamed: [DUR_RENAMED_BASE, DUR_NOW], existed: [DUR_NOW, DUR_NOW.replace('(ms: number)', '(ms: number, unit: string)')] }[history];
+  return {
+    runner: c.runner, testFile: c.testFile, added: new Set<string>(), baseDir: '/work',
+    addedExports: new Map([[c.module, addedExports(c.module, base, now)]]),
+    ...(c.testSrc ? { testImports: jsImports(c.testSrc) } : {}),
+  };
+}
+const curFor = (c: (typeof NEW_EXPORT_CASES)[number]) => cur(...Object.keys(c.expect));
+/** What the export-diff cases expect when the name was NOT added: the same, with new_code → not_runnable. */
+const withoutNewCode = (expect: Record<string, string>) =>
+  Object.fromEntries(Object.entries(expect).map(([k, v]) => [k, v === 'new_code' ? 'not_runnable' : v]));
+
+for (const c of NEW_EXPORT_CASES) {
+  test(`${c.label}: a test of a function the task adds to an existing module is labelled new_code`, () => {
+    const r = classifyBaseline(curFor(c), baseRun(c.runner, c.file), exportCtx(c, 'added'));
+    assert.deepEqual(Object.fromEntries(r), c.expect);
+  });
+
+  test(`${c.label}: the same failure is not_runnable when the export was renamed, not added`, () => {
+    const r = classifyBaseline(curFor(c), baseRun(c.runner, c.file), exportCtx(c, 'renamed'));
+    assert.deepEqual(Object.fromEntries(r), withoutNewCode(c.expect));
+  });
+
+  test(`${c.label}: the same failure is not_runnable when the name already existed at the base (a changed signature)`, () => {
+    const r = classifyBaseline(curFor(c), baseRun(c.runner, c.file), exportCtx(c, 'existed'));
+    assert.deepEqual(Object.fromEntries(r), withoutNewCode(c.expect));
+  });
+}
+
+test('new export: without the module\'s diff (could not be read) the failure stays not_runnable', () => {
+  const r = classifyBaseline(cur('t'), baseRun('node-test', 'node-newexport-esm.tap'), { runner: 'node-test', testFile: 'src/dur.test.ts', added: new Set(), baseDir: '/work' });
+  assert.equal(r.get('t'), 'not_runnable');
+  const unknown = classifyBaseline(cur('t'), baseRun('node-test', 'node-newexport-esm.tap'),
+    { runner: 'node-test', testFile: 'src/dur.test.ts', added: new Set(), baseDir: '/work', addedExports: new Map([['src/dur.ts', null]]) });
+  assert.equal(unknown.get('t'), 'not_runnable');
+});
+
+test('new export: a name the task added to a DIFFERENT module than the one imported stays not_runnable', () => {
+  const r = classifyBaseline(cur('formats milliseconds as seconds'), baseRun('jest', 'jest-newexport-babel.json'), {
+    runner: 'jest', testFile: 'src/dur.test.js', added: new Set(), testImports: jsImports(TEST_SRC.jestEs),
+    addedExports: new Map([['src/other.js', new Set(['formatDuration'])], ['src/dur.js', new Set<string>()]]),
+  });
+  assert.equal(r.get('formats milliseconds as seconds'), 'not_runnable');
+});
+
+test('new export: a TypeError on something the test did not import (a bug, not a missing export) stays as before', () => {
+  const base = { cases: [{ name: 't', outcome: 'failed' as const, message: 'TypeError: items.map is not a function' }] };
+  const ctx = { runner: 'jest' as const, testFile: 'src/a.test.js', added: new Set<string>(), testImports: jsImports(TEST_SRC.jestEs), addedExports: new Map([['src/dur.js', new Set(['map'])]]) };
+  assert.equal(classifyBaseline(cur('t'), base, ctx).get('t'), 'not_runnable');
+});
+
+test('new export: a load failure that ALSO names a missing third-party package stays not_runnable', () => {
+  const base = { ...baseRun('node-test', 'node-newexport-esm.tap'), unresolved: ['left-pad'] };
+  assert.equal(classifyBaseline(cur('t'), base, exportCtx(NEW_EXPORT_CASES[0], 'added')).get('t'), 'not_runnable');
+});
+
+test('new export: a syntax error stays not_runnable even when the task adds exports', () => {
+  for (const [runner, file] of [['node-test', 'node-syntax.tap'], ['vitest', 'vitest-syn.json'], ['jest', 'jest-syn.json'], ['pytest', 'pytest-syn.xml']] as const) {
+    const r = classifyBaseline(cur('t'), baseRun(runner, file), {
+      runner, testFile: 'src/dur.test.ts', added: new Set(), testImports: jsImports(TEST_SRC.esNamed),
+      addedExports: new Map([['src/dur.ts', new Set(['formatDuration'])], ['py/pkg/dur.py', new Set(['format_duration'])]]),
+    });
+    assert.equal(r.get('t'), 'not_runnable', `${runner} ${file}`);
+  }
+});
+
+test('new export: go and dotnet build failures over a missing name stay not_runnable', () => {
+  const go = { cases: [], suiteError: './dur_test.go:9:6: undefined: FormatDuration\nFAIL\tp [build failed]' };
+  assert.equal(classifyBaseline(cur('t'), go, { runner: 'go', testFile: 'dur_test.go', added: new Set(), addedExports: new Map([['dur.go', new Set(['FormatDuration'])]]) }).get('t'), 'not_runnable');
+});
+
+test('buildVerification: reads the imported module at the base and now, and labels only the test using the new export', async () => {
+  const sourcesAsked: string[] = [];
+  const io = fakeIO({
+    changed: ['src/dur.ts', 'src/dur.test.ts'],
+    added: [],
+    run: async () => okTap('parses seconds', 'formats milliseconds as seconds'),
+    runIn: async () => `${RESULT_MARKER} exit=1\n${readFileSync(join(fxDir, 'node-newexport-cjs.tap'), 'utf8')}`,
+    baseSources: async files => { sourcesAsked.push(`base ${files.join(',')}`); return { 'src/dur.ts': DUR_BASE, 'src/dur.test.ts': null }; },
+    currentSources: async files => { sourcesAsked.push(`now ${files.join(',')}`); return { 'src/dur.ts': DUR_NOW, 'src/dur.test.ts': TEST_SRC.esNamed }; },
+  });
+  const v = await buildVerification({ profile: { runner: 'node-test', source: 'detected' }, io });
+  const byName = Object.fromEntries(v.tests.map(t => [t.name, t.baseline]));
+  assert.deepEqual(byName, { 'parses seconds': 'passes', 'formats milliseconds as seconds': 'new_code' });
+  assert.deepEqual(sourcesAsked.slice(0, 3), ['now src/dur.test.ts', 'base src/dur.ts', 'now src/dur.ts']);
+});
+
+test('buildVerification: an ordinary assertion failure on the base reads no extra sources', async () => {
+  let reads = 0;
+  const io = fakeIO({
+    changed: ['src/dur.ts', 'src/dur.test.ts'],
+    currentSources: async () => { reads++; return {}; },
+  });
+  const v = await buildVerification({ profile: { runner: 'node-test', source: 'detected' }, io });
+  assert.equal(v.tests[0].baseline, 'fails');
+  assert.equal(reads, 0);
 });

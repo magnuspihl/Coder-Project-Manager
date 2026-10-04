@@ -1060,47 +1060,96 @@ What it computes:
    `git archive` of the merge-base, the test files laid over it, `node_modules` symlinked — no worktree
    metadata is written to the repository). Labels: `fails without the change` (genuinely exercises the new
    behaviour), `also passes without the change` (guards existing behaviour or proves nothing new),
-   `new code: fails without the change` (the file cannot even load on the original code, only because it
-   imports a module the task adds — see 18.1), `couldn't run without the change` (any other reason the file
+   `new code: fails without the change` (on the original code the test cannot get past code the task adds:
+   a module it creates, or an export it adds to an existing module — see 18.1), `couldn't run without the change` (any other reason the file
    did not load — never claimed to be more than that);
 3. *(full)* the project's whole suite (pass/fail/skip counts; an incomplete run is *not* reported as a pass).
 
-### 18.1 Tests for brand-new modules (`new_code`)
+### 18.1 Tests for new code: new modules and new exports (`new_code`)
 
 A task that adds a module and its tests used to get `not_runnable` on every test (the import cannot resolve
-on the base), which reads as "unknown" when the truth is "this cannot pass without the change". The baseline
-now tells the causes apart, **from structured runner output plus the task's added-file list**, not from a
-guess at an error string:
+on the base), which reads as "unknown" when the truth is "this cannot pass without the change". The same was
+true of the far more common case: a test of a function the task adds to a module that **already exists** —
+on the base the import fails, or the name is `undefined`, because the export isn't there yet. The baseline
+now tells the causes apart, **from structured runner output plus the task's own diff**, not from a guess at
+an error string:
 
-* **`new_code`** — the base run produced a suite-level load failure (no test ran, not a timeout), the runner
-  named the modules it could not resolve, and **every one** of them is a file that is absent at the
-  merge-base and present in the task (`VerificationIO.addedPaths()`: `git diff --diff-filter=A` against the
-  same merge-base as `changedPaths`, plus untracked files; renames count as added at the new path).
+* **`new_code`** — one of:
+  * **new module**: the base run produced a suite-level load failure (no test ran, not a timeout), the runner
+    named the modules it could not resolve, and **every one** of them is a file that is absent at the
+    merge-base and present in the task (`VerificationIO.addedPaths()`: `git diff --diff-filter=A` against the
+    same merge-base as `changedPaths`, plus untracked files; renames count as added at the new path);
+  * **new export, at load**: a suite-level load failure where every name the runner said a module does not
+    provide is an export **the task adds to that file** (below), and every unresolved module (if any) is new;
+    every test in the file gets the label;
+  * **new export, at call time**: the file loaded, and a test failed because a name it imported was
+    `undefined` when used (`… is not a function` / `is not a constructor`; pytest `module 'a.b' has no
+    attribute 'n'`), and that name, traced through the test file's own imports, is an export the task adds.
+    Only that test gets the label; its neighbours keep their assertion-level `fails`/`passes`.
+
   Distinct from `fails` because it is slightly weaker evidence: it proves the test *depends on* the new
   code, not that its assertions check the behaviour. The card says "new code: fails without the change".
 * **`not_runnable`** — everything else: a syntax error, a bare package specifier (a missing third-party
   dependency, even if a same-named file was added), an env problem, an unresolved import that exists on the
-  base, a timeout, an unreadable added-file list, or any load failure where the runner named *no* module
-  (go/dotnet, below).
-* A test that **loads** on the base keeps the assertion-level verdict (`fails` / `passes`), regardless of
-  which modules the task added: a *modified* existing module is never `new_code`.
+  base, a **renamed export**, a **changed signature** (the name existed at the base, so nothing was added),
+  a name added to a different module than the one imported, a module whose exports cannot be enumerated, a
+  timeout, an unreadable added-file list or source, or any failure where the runner named *no* module or
+  name (go/dotnet, below).
+* A test that **loads and fails by assertion** on the base keeps that verdict (`fails` / `passes`),
+  regardless of which modules the task added or changed.
 
-Where error text is matched it is per runner, in `extractUnresolved` (`test-runners.ts`), producing
-`RunReport.unresolved`; fixtures are real runs (`*-newmod.*`, `pytest-nothere-name.xml`):
+**"Exports the task adds" come from the file's diff, never from the error.** For each existing file a
+missing name points at — resolved from the import specifier (relative to the importing file node printed, else
+the test file) or pytest's printed module path, and only among files the task changed that exist at the
+merge-base (`changedPaths` minus `addedPaths`) — the harness reads the file at the merge-base
+(`VerificationIO.baseSources`) and now (`VerificationIO.currentSources`) and compares the exported names
+(`addedExports`, `added-exports.ts`, pure and lexical):
 
-| Runner | Recognised | Resolved against the added files |
-|---|---|---|
-| node:test, jest, vitest | `Cannot find module '<spec>'`, vite's `Failed to resolve import "<spec>"` | relative specifiers from the test file's directory, with the TS convention (`./x.js` → `x.ts`/`x.tsx`), extension probing and `index.*`; absolute paths only inside the scratch tree; bare specifiers never |
-| pytest | `ModuleNotFoundError: No module named 'a.b'`; `ImportError: cannot import name 'b' from 'a'` (read as `a.b`, i.e. `from a import newmod`) | `a/b.py`, `a/b/__init__.py`, or any added `.py` under a new `a/` (also under a `src/` prefix) |
-| go, dotnet | — | not classified: a missing package is a build failure whose wording is not captured from real runs, so these stay `not_runnable` |
+* JS/TS: `export function/class/const/let/var/enum/interface/type/namespace`, `export { a, b as c }` (with or
+  without `from`), `export * as ns`, `export default`, CommonJS `exports.x =` / `module.exports.x =` /
+  `module.exports = { … }`. Comments and string contents are ignored; a `'`/`"` that doesn't close on its
+  line (an apostrophe in JSX text, a regex like `/'/`) is not a string and blanks only the rest of that line. `export * from`, destructured exports,
+  `module.exports = <anything but an object literal>` make the set unknown → `not_runnable`.
+* Python: top-level `def`/`async def`/`class`, assignments, and the names `import`/`from … import` bind.
+  `from x import *` or a module-level `__getattr__` make the set unknown.
+* **Renames are not additions.** If the task removed any export from the same file (Python: a top-level
+  def/class/assignment, or a re-export from the project itself — `from .impl import x`, or `from pkg.impl
+  import x` in a file under `pkg/`, which is how a package `__init__` re-exports — that is no longer bound;
+  dropping a dependency import such as `from typing import Optional` or `import os` is tidying and doesn't
+  count), the new names are not
+  claimed as added: a removal next to an addition is indistinguishable from a rename, which is a changed
+  API. This also forgoes the rarer "removed one function, added an unrelated one" case — on the safe side.
+
+To trace a call-time miss the harness also reads the test file (`jsImports`): named, aliased, default and
+namespace imports and destructured `require`. A bare name must be one of the test's own bindings; a
+property of a namespace binding (`dur.x`) goes to that namespace's module; a property of a module object the
+runner's transform generated (below) goes to the test's named import of that name (or, with none, its
+namespace imports). A `TypeError` on anything else (`items.map is not a function`) is a bug, not a missing
+export, and is classified as before.
+
+Where error text is matched it is per runner, in `test-runners.ts` (`extractUnresolved`,
+`extractMissingExports`, `missingAtCall`), producing `RunReport.unresolved`/`missingExports`; fixtures are
+real runs (`*-newmod.*`, `pytest-nothere-name.xml`, `*-newexport-*`):
+
+| Runner | New module | New export | Resolved against |
+|---|---|---|---|
+| node:test | `Cannot find module '<spec>'` | native ESM (`.mjs`, or tsx with `"type": "module"`): load-time `SyntaxError: The requested module '<spec>' does not provide an export named '<n>'`, with the importer's `path:line` above it. tsx in CommonJS mode: call-time `(0 , import_<m>.<n>) is not a function`; a destructured `require`: `<n> is not a function`; a namespace: `<ns>.<n> is not a function` | relative specifiers from the importing file's directory, with the TS convention (`./x.js` → `x.ts`/`x.tsx`), extension probing and `index.*`; absolute paths only inside the scratch tree; bare specifiers never |
+| vitest | vite's `Failed to resolve import "<spec>"`, `Cannot find module` | call-time only (vite rewrites imports): `(0 , __vite_ssr_import_<k>__.<n>) is not a function`, `__vite_ssr_import_<k>__.<n> is not a constructor`; namespace imports are rewritten the same way | as above |
+| jest | `Cannot find module '<spec>'` | call-time only: `<n> is not a function` (CommonJS `require`), `(0 , _<m>.<n>)` (babel), `(0 , <m>_1.<n>)` (ts-jest/tsc) | as above |
+| pytest | `ModuleNotFoundError: No module named 'a.b'`; `ImportError: cannot import name 'b' from 'a'` read as `a.b` (`from a import newmod`) | collection-time `ImportError: cannot import name '<n>' from '<a.b>' (<path>)` — the same text as the new-submodule case; either explanation is accepted. Call-time `AttributeError: module '<a.b>' has no attribute '<n>'` | new module: `a/b.py`, `a/b/__init__.py`, or any added `.py` under a new `a/` (also under a `src/` prefix). New export: the printed path inside the scratch tree, else the one changed `a/b.py` / `a/b/__init__.py` |
+| go, dotnet | — | — | not classified: a missing package or name is a build failure (`undefined: X`, `CS0117`) whose wording is not captured from real runs, and a build failure can't be split per test, so these stay `not_runnable` |
 
 **Mixed files.** A load failure takes the whole file down, so the baseline cannot say which individual
 tests needed new code. The choice: **every test in the file gets `new_code`** when the file's only blocker is
 new code. That is the honest reading of "this file cannot pass without the change", it stays visibly weaker
 than `fails`, and the alternative (`not_runnable` for the whole file) would throw away the one fact we do
-know. Caveat: a runner reports the *first* unresolved import, so a file with one new-code import and an
-unrelated second broken one is `new_code` until the first is fixed; the current-tree run (which must pass
-for a tick at all) rules out the second being broken now.
+know. Caveat: a runner reports the *first* unresolved import or missing export, so a file with one new-code
+import and an unrelated second broken one is `new_code` until the first is fixed; the current-tree run (which
+must pass for a tick at all) rules out the second being broken now. Call-time misses don't have this
+problem: they are per test.
+
+**Cost.** The extra reads happen only when a base run failed over a missing name: one read of the test file
+(call-time, JS) and one `git show` plus one `cat` per module it points at. Everything else costs nothing more.
 
 **Hard limits — a hung test cannot hold a task in `working`.** Every layer is bounded: each run is wrapped in
 `timeout -k 5` *inside the workspace* (120 s per file, 180 s per suite; it signals the whole process group, so
