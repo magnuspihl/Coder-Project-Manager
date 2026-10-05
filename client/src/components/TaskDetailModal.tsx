@@ -3,6 +3,7 @@ import {
   getTaskDetail,
   getStreamLog,
   replyToTask,
+  applyFixesToTask,
   completeTask,
   reopenTask,
   retryTask,
@@ -1177,12 +1178,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
   const handleApplyFixes = async (turn: TaskTurn) => {
     if (applyingFixes || sending) return;
     const issues = parseIssues(turn);
-    const body = issues.length > 0
-      ? `Please apply fixes for the issues the reviewer found:\n\n${issues.map((s, i) => `${i + 1}. ${s}`).join('\n')}`
-      : `Please apply the fixes the reviewer suggested${turn.review_summary ? `: ${turn.review_summary}` : '.'}`;
     setApplyingFixes(true);
     try {
-      await replyToTask(taskId, body);
+      await applyFixesToTask(taskId, issues, turn.review_summary ?? undefined);
       onTaskChanged?.();
       await loadData();
     } catch (err: any) {

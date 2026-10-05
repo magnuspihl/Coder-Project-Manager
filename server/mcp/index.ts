@@ -331,13 +331,13 @@ function buildServer(ctx: AuthCtx): McpServer {
       if (task.status !== 'awaiting_feedback') {
         return errorResult(`Task is not awaiting feedback (current status: ${task.status})`);
       }
-      addMessage(task.id, 'user', message, undefined, ctx.username, undefined, ctx.authSource, ctx.clientLabel);
+      addMessage(task.id, 'user', message, { username: ctx.username, source: ctx.authSource, clientLabel: ctx.clientLabel });
       // Mirrors the REST reply route: a reply refills the auto-wake budget, and
       // the armed wake itself is cleared when launchTask starts the turn.
       resetTaskWakeCount(task.id);
       if (task.pending_complete) {
         setPendingComplete(task.id, false);
-        addMessage(task.id, 'system', 'Pending completion cancelled — reply received.', undefined, undefined, undefined, ctx.authSource, ctx.clientLabel);
+        addMessage(task.id, 'system', 'Pending completion cancelled — reply received.', { source: ctx.authSource, clientLabel: ctx.clientLabel });
       }
       // Queue and let processQueue resume the session — same path as the REST
       // reply route. Queueing + lock-serialized launch (instead of calling
@@ -392,7 +392,7 @@ function buildServer(ctx: AuthCtx): McpServer {
         if (working && working.id !== fresh.id) {
           if (!fresh.pending_complete) {
             setPendingComplete(fresh.id, true);
-            addMessage(fresh.id, 'system', `Completion queued — will finalize after task "${working.title}" finishes on this workspace.`, undefined, undefined, undefined, ctx.authSource, ctx.clientLabel);
+            addMessage(fresh.id, 'system', `Completion queued — will finalize after task "${working.title}" finishes on this workspace.`, { source: ctx.authSource, clientLabel: ctx.clientLabel });
           }
           return { code: 202 };
         }

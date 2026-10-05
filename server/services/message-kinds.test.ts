@@ -13,7 +13,7 @@ import { opinionIssues } from './review-proof.js';
 import {
   formatEscalationMarkdown, formatHandoffIssueTexts, formatHandoffMarkdown, formatPartialMarkdown,
   handoffSummary, inferLegacyKind, isAgentFacingKind, resolveMessageTag, summaryFor, trimFailureOutput,
-  fixRequestSummary, numberedList, isFixRequestText,
+  fixRequestSummary, numberedList, isFixRequestText, buildFixRequestText, REVIEW_FIX_REPLY_PREFIX,
 } from './message-kinds.js';
 
 // ---------------------------------------------------------------------------
@@ -192,6 +192,17 @@ test('unreadable stored meta is treated as no meta rather than failing the read'
   assert.equal(t.meta?.summary, 'Review found 0 issues → sent to implementer');
 });
 
+test('the server builds the "Apply fixes" prompt from the issues, led by the one shared prefix', () => {
+  const text = buildFixRequestText(['first', 'second']);
+  assert.equal(text, `${REVIEW_FIX_REPLY_PREFIX}:\n\n1. first\n2. second`);
+  assert.ok(isFixRequestText(text), 'what the server writes is what the legacy fallback and replay filter recognise');
+});
+
+test('with no issues the Fix prompt falls back to the reviewer summary', () => {
+  assert.match(buildFixRequestText([], 'tighten the guard'), /^Please apply the fixes the reviewer suggested: tighten the guard$/);
+  assert.match(buildFixRequestText([]), /suggested\.$/);
+});
+
 // ---------------------------------------------------------------------------
 // Against a real temporary database
 // ---------------------------------------------------------------------------
@@ -225,8 +236,7 @@ const newTask = (ws: string) => T.createTask({ workspaceId: ws, workspaceName: '
 
 dbTest('a tagged message is stored with its kind and counts and read back with a computed summary', () => {
   const task = newTask('k1');
-  T.addMessage(task.id, 'system', legacyHandoff, undefined, undefined, undefined, undefined, undefined, undefined,
-    { kind: 'review_handoff', meta: { count: 3, confirmed: 3 } });
+  T.addMessage(task.id, 'system', legacyHandoff, { kind: 'review_handoff', meta: { count: 3, confirmed: 3 } });
   const back = T.getMessages(task.id).find(m => m.role === 'system')!;
   assert.equal(back.kind, 'review_handoff');
   assert.equal(back.meta?.count, 3);
@@ -287,4 +297,21 @@ dbTest('spending the fix budget posts a tagged, numbered escalation instead of h
   assert.match(msg.content, /^1\. first problem$/m);
   assert.match(msg.content, /^2\. second problem$/m);
   assert.equal(T.getTask(task.id)!.status, 'awaiting_feedback');
+});
+
+dbTest('a Fix reply stored with an explicit kind is tagged without anyone reading its text, and is not replayed to the reviewer', () => {
+  const task = newTask('k6');
+  const text = buildFixRequestText(['a', 'b']);
+  T.addMessage(task.id, 'user', text, { username: 'tester', kind: 'fix_request', meta: { count: 2 } });
+  const back = T.getMessages(task.id).find(m => m.content === text)!;
+  assert.equal(back.kind, 'fix_request');
+  assert.equal(back.meta?.summary, 'Fix request: 2 findings → sent to implementer');
+  assert.ok(!T.getUserReplies(task.id).includes(text), 'auto-generated Fix replies are not real user direction');
+});
+
+dbTest('addMessage takes its optional parts as an options object and stores them', () => {
+  const task = newTask('k7');
+  const m = T.addMessage(task.id, 'user', 'hi', { username: 'tester', source: 'api', clientLabel: 'cli' });
+  const row = getDb().prepare('SELECT username, source, client_label FROM messages WHERE id = ?').get(m.id);
+  assert.deepEqual({ ...row as object }, { username: 'tester', source: 'api', client_label: 'cli' });
 });

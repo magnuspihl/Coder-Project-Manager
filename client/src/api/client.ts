@@ -916,3 +916,10 @@ export const sendTaskParticipantCatchUp = (taskId: string, participantId: string
 
 export const touchTask = (taskId: string) =>
   request<{ previousOpenedAt: string | null; openedAt: string }>(`/api/tasks/${taskId}/touch`, { method: 'POST' });
+
+/** "Apply fixes": the server writes the prompt from the reviewer's issues and tags it a fix request. */
+export const applyFixesToTask = (taskId: string, issues: string[], summary?: string) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}/reply`, {
+    method: 'POST',
+    body: JSON.stringify({ kind: 'fix_request', fixIssues: issues, ...(summary ? { fixSummary: summary } : {}) }),
+  });

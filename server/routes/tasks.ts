@@ -46,7 +46,6 @@ import {
   findingRef,
   clearTaskWake,
   resetTaskWakeCount,
-  REVIEW_FIX_REPLY_PREFIX,
   getTaskCheckpoints,
   getTaskCheckpoint,
 } from '../services/tasks.js';
@@ -54,7 +53,7 @@ import { findUserWorkspaceById } from '../services/workspace-cache.js';
 import { auditEnabled, auditView, countImplementerTurns, getLatestAudit, setTaskAudit } from '../services/audits.js';
 import { findingById, findingTaskPrompt } from '../services/audit-report.js';
 import { formatFindingForImplementer, PROOF_INSTRUCTIONS } from '../services/review-proof.js';
-import { isFixRequestText, countFixRequestItems } from '../services/message-kinds.js';
+import { buildFixRequestText, REVIEW_FIX_REPLY_PREFIX } from '../services/message-kinds.js';
 import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview, triggerManualAudit, wakeTaskNow, startFullVerification, FINDING_REPORT_FORMAT } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
@@ -405,14 +404,9 @@ router.put('/tasks/:taskId', requireAuth, (req: Request, res: Response) => {
     // Logged to the conversation, unlike model/subscription switches: this one
     // changes what happens when the current turn ends, so "why did the reviewer
     // stop running?" needs an answer in the transcript.
-    addMessage(
-      task.id,
-      'system',
-      newAutoReview
+    addMessage(task.id, 'system', newAutoReview
         ? 'Auto-review enabled — the reviewer will run after the next code-changing turn.'
-        : 'Auto-review disabled for this task — turns will surface to you without a review pass.',
-      undefined, undefined, undefined, req.authSource, req.clientLabel,
-    );
+        : 'Auto-review disabled for this task — turns will surface to you without a review pass.', { source: req.authSource, clientLabel: req.clientLabel });
     // A disabled task must not carry a stale loop count into a later re-enable:
     // it would start partway to the escalation limit.
     if (!newAutoReview) resetReviewLoopCount(task.id);
@@ -434,16 +428,29 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
     return;
   }
 
-  const { message, attachmentIds, completeAfter } = req.body;
+  const { attachmentIds, completeAfter, kind, fixIssues, fixSummary } = req.body;
+  // The client's "Apply fixes" button says what it is sending (kind: 'fix_request'
+  // + the reviewer's issues) and the server writes the prompt, so the wording
+  // lives in one place and nothing has to sniff the text to classify it.
+  const isFixRequest = kind === 'fix_request';
+  if (isFixRequest && !(Array.isArray(fixIssues) && fixIssues.every((i: unknown) => typeof i === 'string')) && fixIssues !== undefined) {
+    res.status(400).json({ error: 'fixIssues must be an array of strings' });
+    return;
+  }
+  const message: unknown = isFixRequest
+    ? buildFixRequestText((fixIssues as string[] | undefined) ?? [], typeof fixSummary === 'string' ? fixSummary : undefined)
+    : req.body.message;
   if (!message || typeof message !== 'string') {
     res.status(400).json({ error: 'Message is required' });
     return;
   }
 
-  // The client's "Apply fixes" button posts the reviewer's issues as an ordinary
-  // reply; tag it so the timeline collapses it like the inbox Fix prompt.
-  const userMessage = addMessage(task.id, 'user', message, undefined, req.user!.username, undefined, req.authSource, req.clientLabel, undefined,
-    isFixRequestText(message) ? { kind: 'fix_request', meta: { count: countFixRequestItems(message) } } : undefined);
+  const userMessage = addMessage(task.id, 'user', message, {
+    username: req.user!.username,
+    source: req.authSource,
+    clientLabel: req.clientLabel,
+    ...(isFixRequest ? { kind: 'fix_request' as const, meta: { count: Array.isArray(fixIssues) ? fixIssues.length : 0 } } : {}),
+  });
 
   // The auto-wake budget bounds wake-ups taken *without* user input, so a reply
   // refills it. The armed wake itself is cleared by launchTask when this turn
@@ -465,7 +472,7 @@ router.post('/tasks/:taskId/reply', requireAuth, async (req: Request, res: Respo
     setPendingComplete(task.id, true);
   } else if (task.pending_complete) {
     setPendingComplete(task.id, false);
-    addMessage(task.id, 'system', 'Pending completion cancelled — reply received.', undefined, undefined, undefined, req.authSource, req.clientLabel);
+    addMessage(task.id, 'system', 'Pending completion cancelled — reply received.', { source: req.authSource, clientLabel: req.clientLabel });
   }
 
   if (Array.isArray(attachmentIds) && attachmentIds.length > 0) {
@@ -559,8 +566,7 @@ router.post('/tasks/:taskId/findings/fix', requireAuth, (req: Request, res: Resp
     : '';
   const body = `${REVIEW_FIX_REPLY_PREFIX}. Each is tagged with a ref you must report against.\n\n${issueList}${proofNote}${waiverNote}\n\n${FINDING_REPORT_FORMAT}`;
 
-  addMessage(task.id, 'user', body, undefined, req.user!.username, undefined, req.authSource, req.clientLabel, undefined,
-    { kind: 'fix_request', meta: { count: selected.length, confirmed: selected.filter(f => f.proof_status === 'confirmed' && f.proof_path).length } });
+  addMessage(task.id, 'user', body, { username: req.user!.username, source: req.authSource, clientLabel: req.clientLabel, kind: 'fix_request', meta: { count: selected.length, confirmed: selected.filter(f => f.proof_status === 'confirmed' && f.proof_path).length } });
   selected.forEach(f => setReviewFindingState(f.id, 'fixing'));
   resetReviewLoopCount(task.id);
   if (task.pending_complete) setPendingComplete(task.id, false);
@@ -641,7 +647,7 @@ router.post('/tasks/:taskId/complete', requireAuth, async (req: Request, res: Re
     if (working && working.id !== fresh.id) {
       if (!fresh.pending_complete) {
         setPendingComplete(fresh.id, true);
-        addMessage(fresh.id, 'system', `Completion queued — will finalize after task "${working.title}" finishes on this workspace.`, undefined, undefined, undefined, req.authSource, req.clientLabel);
+        addMessage(fresh.id, 'system', `Completion queued — will finalize after task "${working.title}" finishes on this workspace.`, { source: req.authSource, clientLabel: req.clientLabel });
       }
       return { code: 202 };
     }
@@ -862,7 +868,7 @@ router.post('/tasks/:taskId/checkpoints/:checkpointId/rollback', requireAuth, as
     // Holds the same per-workspace lock a launch would, so this can't race a
     // concurrently-starting task on the same workspace touching the same worktree.
     const summary = await withWorkspaceLock(task.workspace_id, () => rollbackTaskToCheckpoint(task, checkpoint));
-    addMessage(task.id, 'system', `🔙 ${summary}`, undefined, undefined, undefined, req.authSource, req.clientLabel);
+    addMessage(task.id, 'system', `🔙 ${summary}`, { source: req.authSource, clientLabel: req.clientLabel });
     res.json({
       task: getTask(task.id),
       messages: getMessages(task.id),
@@ -888,7 +894,7 @@ router.post('/tasks/:taskId/checkout', requireAuth, async (req: Request, res: Re
   }
   try {
     const message = await checkoutTaskBranch(task);
-    addMessage(task.id, 'system', message, undefined, undefined, undefined, req.authSource, req.clientLabel);
+    addMessage(task.id, 'system', message, { source: req.authSource, clientLabel: req.clientLabel });
     res.json({ ok: true, message });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to checkout branch' });
@@ -908,12 +914,12 @@ router.post('/tasks/:taskId/retry', requireAuth, async (req: Request, res: Respo
   }
 
   const continuationPrompt = 'Continue where you left off.';
-  addMessage(task.id, 'user', continuationPrompt, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
+  addMessage(task.id, 'user', continuationPrompt, { username: req.user!.username, source: req.authSource, clientLabel: req.clientLabel });
 
   // Retry → cancel pending completion; user is re-engaging.
   if (task.pending_complete) {
     setPendingComplete(task.id, false);
-    addMessage(task.id, 'system', 'Pending completion cancelled — retry requested.', undefined, undefined, undefined, req.authSource, req.clientLabel);
+    addMessage(task.id, 'system', 'Pending completion cancelled — retry requested.', { source: req.authSource, clientLabel: req.clientLabel });
   }
 
   // Queue and let processQueue handle concurrency — it will resume immediately
@@ -950,8 +956,8 @@ router.post('/tasks/:taskId/reset-session', requireAuth, async (req: Request, re
   }
 
   resetTaskSession(task.id);
-  addMessage(task.id, 'system', 'Session reset — starting a fresh Claude session. Prior messages remain visible here but are not in the agent\'s context.', undefined, undefined, undefined, req.authSource, req.clientLabel);
-  addMessage(task.id, 'user', continuationPrompt, undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
+  addMessage(task.id, 'system', 'Session reset — starting a fresh Claude session. Prior messages remain visible here but are not in the agent\'s context.', { source: req.authSource, clientLabel: req.clientLabel });
+  addMessage(task.id, 'user', continuationPrompt, { username: req.user!.username, source: req.authSource, clientLabel: req.clientLabel });
 
   if (task.pending_complete) {
     setPendingComplete(task.id, false);
@@ -994,10 +1000,10 @@ router.post('/tasks/:taskId/compact-session', requireAuth, async (req: Request, 
     return;
   }
 
-  addMessage(task.id, 'system', 'Compacting session — Claude will summarize prior turns to free up context.', undefined, undefined, undefined, req.authSource, req.clientLabel);
+  addMessage(task.id, 'system', 'Compacting session — Claude will summarize prior turns to free up context.', { source: req.authSource, clientLabel: req.clientLabel });
   // Stored bare; launchTask attaches the summarization instructions on the way
   // out, so the chat shows a clean "/compact" rather than the instruction blob.
-  addMessage(task.id, 'user', '/compact', undefined, req.user!.username, undefined, req.authSource, req.clientLabel);
+  addMessage(task.id, 'user', '/compact', { username: req.user!.username, source: req.authSource, clientLabel: req.clientLabel });
 
   if (task.pending_complete) {
     setPendingComplete(task.id, false);
@@ -1057,7 +1063,7 @@ router.delete('/tasks/:taskId/wake', requireAuth, (req: Request, res: Response) 
   }
   if (task.wake_at) {
     clearTaskWake(task.id);
-    addMessage(task.id, 'system', 'Scheduled wake-up cancelled.', undefined, undefined, undefined, req.authSource, req.clientLabel);
+    addMessage(task.id, 'system', 'Scheduled wake-up cancelled.', { source: req.authSource, clientLabel: req.clientLabel });
   }
   res.json({ task: getTask(task.id) });
 });
@@ -1197,7 +1203,7 @@ router.post('/tasks/:taskId/participants', requireAuth, (req: Request, res: Resp
   }
 
   const participant = addTaskParticipant(task.id, workspaceId, workspaceName);
-  addMessage(task.id, 'system', `${workspaceName} joined as an advisor.`, undefined, undefined, undefined, req.authSource, req.clientLabel);
+  addMessage(task.id, 'system', `${workspaceName} joined as an advisor.`, { source: req.authSource, clientLabel: req.clientLabel });
 
   res.status(201).json({ participant: { ...participant, running: false, activity: null } });
 });
@@ -1221,7 +1227,7 @@ router.delete('/tasks/:taskId/participants/:participantId', requireAuth, (req: R
   }
 
   removeTaskParticipant(participant.id);
-  addMessage(task.id, 'system', `${participant.workspace_name} left the task.`, undefined, undefined, undefined, req.authSource, req.clientLabel);
+  addMessage(task.id, 'system', `${participant.workspace_name} left the task.`, { source: req.authSource, clientLabel: req.clientLabel });
 
   res.json({ ok: true });
 });
@@ -1254,7 +1260,7 @@ router.post('/tasks/:taskId/participants/:participantId/message', requireAuth, a
   }
 
   // Store user message tagged with participant
-  addMessage(task.id, 'user', message, undefined, req.user!.username, participant.id, req.authSource, req.clientLabel);
+  addMessage(task.id, 'user', message, { username: req.user!.username, participantId: participant.id, source: req.authSource, clientLabel: req.clientLabel });
 
   // Check if this participant has spoken before (to determine resume)
   const msgs = getMessages(req.params.taskId);
@@ -1353,7 +1359,7 @@ router.post('/tasks/:taskId/task-requests/:requestId/approve', requireAuth, asyn
   const msg = crossWorkspace
     ? `Task created in ${workspaceName}: "${created.title}" (${created.id})`
     : `Task created: "${created.title}" (${created.id})`;
-  addMessage(task.id, 'system', msg, undefined, undefined, undefined, req.authSource, req.clientLabel);
+  addMessage(task.id, 'system', msg, { source: req.authSource, clientLabel: req.clientLabel });
 
   res.json({ task: created });
   runInBackground(`approve-launch ${created.id}`, () => processQueue(workspaceId));

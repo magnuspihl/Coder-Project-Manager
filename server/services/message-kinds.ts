@@ -167,14 +167,23 @@ export function formatPartialMarkdown(opts: {
 // Legacy rows (written before `kind` existed)
 // ---------------------------------------------------------------------------
 
-const FIX_REPLY_PREFIXES = [
-  'Please apply fixes for the issues the reviewer found',
-  'Please apply the fixes the reviewer suggested',
-];
+/** Lead-in of the Fix prompt. The single source: tasks.ts, the routes and the legacy read-time fallback all use it. */
+export const REVIEW_FIX_REPLY_PREFIX = 'Please apply fixes for the issues the reviewer found';
+/** The older "Apply suggested fixes" shape, used when a verdict carried no issues list. */
+export const REVIEW_FIX_REPLY_SUGGESTED_PREFIX = 'Please apply the fixes the reviewer suggested';
+/** Every auto-generated "go fix the review" reply shape. None is real user direction. */
+export const REVIEW_FIX_REPLY_PREFIXES = [REVIEW_FIX_REPLY_PREFIX, REVIEW_FIX_REPLY_SUGGESTED_PREFIX];
 
-/** True for the auto-generated "go fix the review" reply shapes. */
+/** The prompt for the "Apply fixes" reply, built from the reviewer's issues. */
+export function buildFixRequestText(issues: string[], summary?: string): string {
+  return issues.length > 0
+    ? `${REVIEW_FIX_REPLY_PREFIX}:\n\n${numberedList(issues)}`
+    : `${REVIEW_FIX_REPLY_SUGGESTED_PREFIX}${summary ? `: ${summary}` : '.'}`;
+}
+
+/** True for an auto-generated Fix reply. READ-TIME FALLBACK for legacy rows only; never used to tag a new message. */
 export function isFixRequestText(content: string): boolean {
-  return FIX_REPLY_PREFIXES.some(p => content.startsWith(p));
+  return REVIEW_FIX_REPLY_PREFIXES.some(p => content.startsWith(p));
 }
 
 /** How many numbered/ref-tagged findings a fix-request body lists. */

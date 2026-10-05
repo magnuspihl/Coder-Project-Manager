@@ -1397,8 +1397,7 @@ export async function triggerManualReview(
   resetReviewLoopCount(task.id);
   addMessage(task.id, 'system', remainingFiles
     ? `Review of the remaining files requested — launching the reviewer for: ${remainingFiles.join(', ')}.`
-    : 'Manual review requested — launching the reviewer.',
-    undefined, undefined, undefined, undefined, undefined, undefined, { kind: 'review_started' });
+    : 'Manual review requested — launching the reviewer.', { kind: 'review_started' });
   updateTaskStatus(task.id, 'working');
   setActiveTaskTurnRole(task.id, 'reviewer');
   launch(task, { manual: true, remainingFiles }).catch(err => failReviewerLaunch(task, err));
@@ -3327,7 +3326,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
         const rawTurnText = stripFindingReport(task.id, stripImplementerMarkers(task.id, extractAssistantTurnText((event.message as { content: Array<{ type: string; text?: string; name?: string; input?: unknown }> }).content)));
         const turnText = compactRun ? rewriteCompactionFailure(rawTurnText) : rawTurnText;
         if (turnText) {
-          const msg = addMessage(task.id, 'assistant', turnText, undefined, undefined, undefined, undefined, undefined, turnId);
+          const msg = addMessage(task.id, 'assistant', turnText, { turnId });
           lastSavedMessageId = msg.id;
           lastSavedMessageText = turnText;
           parseTaskRequestsForTask(task, turnText);
@@ -3356,7 +3355,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
         // write a structured system message instead of leaking the raw error
         // string as a confusing "assistant said: Prompt is too long" entry.
         if (!fatal && resultText && resultText !== lastSavedMessageText) {
-          const msg = addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined, undefined, undefined, undefined, undefined, turnId);
+          const msg = addMessage(task.id, 'assistant', resultText, { cost: event.total_cost_usd as number | undefined, turnId });
           lastSavedMessageId = msg.id;
           lastSavedMessageText = resultText;
           parseTaskRequestsForTask(task, resultText);
@@ -4344,7 +4343,7 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
             toolCalls.push(...toolCallsFromContent((event.message as { content: unknown }).content));
             if (turnText) {
               allAssistantText += turnText;
-              addMessage(task.id, 'assistant', turnText, undefined, undefined, undefined, undefined, undefined, turnId);
+              addMessage(task.id, 'assistant', turnText, { turnId });
               appendStreamLog(task.id, 'reviewer_output', `[Reviewer] ${turnText.slice(0, 200)}`);
             }
           } else if (event.type === 'tool_use') {
@@ -4355,7 +4354,7 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
             const resultText = extractResultText(event);
             if (resultText && resultText !== allAssistantText.slice(-resultText.length)) {
               allAssistantText += resultText;
-              addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined, undefined, undefined, undefined, undefined, turnId);
+              addMessage(task.id, 'assistant', resultText, { cost: event.total_cost_usd as number | undefined, turnId });
             }
             const { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens } = extractTokenUsage(event);
             if (inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0 || cacheCreationTokens > 0) addTokenUsage(task.id, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
@@ -4412,7 +4411,7 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
               // the conversation, not just used for routing.
               if (turnText) {
                 allAssistantText += turnText;
-                addMessage(task.id, 'assistant', turnText, undefined, undefined, undefined, undefined, undefined, turnId);
+                addMessage(task.id, 'assistant', turnText, { turnId });
               }
             } else if (event.type === 'result') {
               if (typeof event.subtype === 'string') resultSubtype = event.subtype;
@@ -4421,7 +4420,7 @@ function startReviewerPolling(task: Task, turnId: string, reviewerSessionId: str
               // recorded the same final assistant text) so we don't double-append.
               if (resultText && resultText !== allAssistantText.slice(-resultText.length)) {
                 allAssistantText += resultText;
-                addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined, undefined, undefined, undefined, undefined, turnId);
+                addMessage(task.id, 'assistant', resultText, { cost: event.total_cost_usd as number | undefined, turnId });
               }
             }
           } catch { /* not a complete JSON event — nothing to recover */ }
@@ -4741,7 +4740,7 @@ export function routeVerifiedReview(
     // outstanding findings proves nothing — leave them open — and nothing is sent
     // back to the implementer, since nothing is known to be wrong with the code.
     console.log(`[auto-review] Task ${task.id} partial review — not seen: ${coverage.unreviewed.map(u => u.path).join(', ')}`);
-    addMessage(task.id, 'system', partialMessage(coverage), undefined, undefined, undefined, undefined, undefined, undefined, { kind: 'partial_review', meta: { count: coverage.unreviewed.length } });
+    addMessage(task.id, 'system', partialMessage(coverage), { kind: 'partial_review', meta: { count: coverage.unreviewed.length } });
     settleWithUnresolvedFindings(task, { holdCompletion: true });
     maybeLaunchAudit(task);
     return;
@@ -4842,8 +4841,7 @@ function handBackForFixes(task: Task, issueTexts: string[], profile: TestProfile
         proofOutput: f.proof_output,
       })))
     : formatHandoffIssueTexts(issueTexts);
-  addMessage(task.id, 'system', handoffText, undefined, undefined, undefined, undefined, undefined, undefined,
-    { kind: 'review_handoff', meta: { count: handoffCount, confirmed: confirmedCount } });
+  addMessage(task.id, 'system', handoffText, { kind: 'review_handoff', meta: { count: handoffCount, confirmed: confirmedCount } });
   setActiveTaskTurnRole(task.id, 'implementer');
   launchTask(refreshed, true, retryPrompt).catch(err => {
     console.error(`[auto-review] Failed to re-launch implementer for task ${task.id}:`, (err as Error).message?.slice(0, 200));
@@ -4911,9 +4909,7 @@ function settleWithUnresolvedFindings(task: Task, opts: { holdCompletion?: boole
 }
 
 function escalateToUser(task: Task, issues: string[]): void {
-  addMessage(task.id, 'system', formatEscalationMarkdown(MAX_REVIEW_LOOPS, issues),
-    undefined, undefined, undefined, undefined, undefined, undefined,
-    { kind: 'review_escalation', meta: { count: issues.length } });
+  addMessage(task.id, 'system', formatEscalationMarkdown(MAX_REVIEW_LOOPS, issues), { kind: 'review_escalation', meta: { count: issues.length } });
   settleWithUnresolvedFindings(task);
 }
 
@@ -4996,7 +4992,7 @@ function startAudit(task: Task, trigger: 'auto' | 'manual', implementerTurns: nu
     const msg = (err as Error)?.message || String(err);
     console.error(`[audit] Task ${task.id} audit failed:`, msg.slice(0, 200));
     if (!run.cancelled && finishAudit(row.id, 'failed', { reason: msg.slice(0, 500) })) {
-      addMessage(task.id, 'system', `The audit could not be completed: ${msg.slice(0, 300)}`, undefined, undefined, undefined, undefined, undefined, undefined, { kind: 'audit_failed' });
+      addMessage(task.id, 'system', `The audit could not be completed: ${msg.slice(0, 300)}`, { kind: 'audit_failed' });
     }
   }).finally(() => {
     if (auditRuns.get(task.id) === run) auditRuns.delete(task.id);
@@ -5023,7 +5019,7 @@ async function runAudit(task: Task, auditId: string, run: AuditRun, trigger: 'au
   if (run.cancelled) return;
   const gate = trigger === 'auto' ? auditGate(snap.diff) : (snap.diff.trim() ? { run: true as const } : { run: false as const, reason: 'audit skipped: no changes against the default branch' });
   if (!gate.run) {
-    if (skipAudit(auditId, gate.reason)) addMessage(task.id, 'system', gate.reason, undefined, undefined, undefined, undefined, undefined, undefined, { kind: 'audit_skipped' });
+    if (skipAudit(auditId, gate.reason)) addMessage(task.id, 'system', gate.reason, { kind: 'audit_skipped' });
     return;
   }
   setAuditSnapshot(auditId, { baseSha: snap.baseSha, headSha: snap.headSha, tree: snap.tree }, run.sessionId);
@@ -5506,7 +5502,7 @@ async function processRemainingOutput(task: Task): Promise<{ resultSeen: boolean
     db.transaction(() => {
       deleteCurrentSessionAssistantMessages(task.id, turnId);
       for (const m of stagedMessages) {
-        addMessage(task.id, 'assistant', m.text, m.cost, undefined, undefined, undefined, undefined, turnId);
+        addMessage(task.id, 'assistant', m.text, { cost: m.cost, turnId });
       }
       if (stagedInputTokens > 0 || stagedOutputTokens > 0 || stagedCacheReadTokens > 0 || stagedCacheCreationTokens > 0) {
         addTokenUsage(task.id, stagedInputTokens, stagedOutputTokens, stagedCacheReadTokens, stagedCacheCreationTokens);
@@ -6504,7 +6500,7 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant, b
         for (const block of msg.content || []) {
           if (block.type === 'text' && block.text) {
             taskActivity.set(pollKey, { timestamp: now, summary: block.text.slice(0, 200).replace(/\n/g, ' ') });
-            const saved = addMessage(task.id, 'assistant', block.text, undefined, participant.workspace_name, participant.id);
+            const saved = addMessage(task.id, 'assistant', block.text, { username: participant.workspace_name, participantId: participant.id });
             lastSavedMessageId = saved.id; lastSavedMessageText = block.text;
             parseTaskRequestsForTask(task, block.text);
             parseOutputFilesForTask(task, block.text, participant.workspace_name, baseDir, saved.id).catch(err =>
@@ -6514,7 +6510,7 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant, b
             const question = formatAskUserQuestion(block.input);
             if (question) {
               taskActivity.set(pollKey, { timestamp: now, summary: 'Asking the user a question' });
-              const saved = addMessage(task.id, 'assistant', question, undefined, participant.workspace_name, participant.id);
+              const saved = addMessage(task.id, 'assistant', question, { username: participant.workspace_name, participantId: participant.id });
               lastSavedMessageId = saved.id; lastSavedMessageText = question;
             }
           } else if (block.type === 'tool_use') {
@@ -6525,7 +6521,7 @@ function startTaskParticipantPolling(task: Task, participant: TaskParticipant, b
         const fatal = extractFatalError(event);
         const resultText = extractResultText(event);
         if (!fatal && resultText && resultText !== lastSavedMessageText) {
-          const saved = addMessage(task.id, 'assistant', resultText, event.total_cost_usd as number | undefined, participant.workspace_name, participant.id);
+          const saved = addMessage(task.id, 'assistant', resultText, { cost: event.total_cost_usd as number | undefined, username: participant.workspace_name, participantId: participant.id });
           lastSavedMessageId = saved.id; lastSavedMessageText = resultText;
           parseTaskRequestsForTask(task, resultText);
           parseOutputFilesForTask(task, resultText, participant.workspace_name, baseDir, saved.id).catch(err =>
