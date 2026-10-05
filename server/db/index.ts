@@ -605,6 +605,14 @@ export function getDb(): Database.Database {
   if (!msgCols3.some(c => c.name === 'stale_at')) {
     db.exec("ALTER TABLE messages ADD COLUMN stale_at TEXT");
   }
+  // Message kind + summary counts, so the timeline can collapse agent-to-agent
+  // traffic without pattern-matching text. Nullable: old rows keep NULL.
+  if (!msgCols3.some(c => c.name === 'kind')) {
+    db.exec("ALTER TABLE messages ADD COLUMN kind TEXT");
+  }
+  if (!msgCols3.some(c => c.name === 'meta')) {
+    db.exec("ALTER TABLE messages ADD COLUMN meta TEXT");
+  }
   db.exec(`CREATE TABLE IF NOT EXISTS task_checkpoints (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,

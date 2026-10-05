@@ -9,6 +9,7 @@
  */
 
 import type { ReviewCoverage } from './review-verdict.js';
+import { formatPartialMarkdown } from './message-kinds.js';
 
 /** A changed file whose diff the reviewer was not (fully) given. */
 export interface OmittedFile {
@@ -473,11 +474,12 @@ export function partialLabel(report: Pick<CoverageReport, 'unreviewed'>, max = 4
   return `Partial review — not seen: ${head}${names.length > max ? ` (+${names.length - max} more)` : ''}`;
 }
 
-/** The sentence the harness adds to the task conversation for a partial review. */
+/** The markdown the harness adds to the task conversation for a partial review. */
 export function partialMessage(report: CoverageReport): string {
-  const lines = report.unreviewed.map(u => `- ${u.path} — ${u.reason}`).join('\n');
-  const cap = report.stoppedByTurnCap
-    ? ` The reviewer hit its turn limit${report.turnCap ? ` (${report.turnCap})` : ''} before it could read everything, so this is a budget stop, not a finding.`
-    : '';
-  return `${partialLabel(report, 6)}.${cap} The reviewer found no confirmed defect in what it saw, but it did not see these files, so this is NOT a pass:\n${lines}\nNothing is wrong with the code as far as is known — use "Review remaining files" to have the reviewer read only these.`;
+  return formatPartialMarkdown({
+    label: partialLabel(report, 6),
+    unreviewed: report.unreviewed,
+    stoppedByTurnCap: report.stoppedByTurnCap,
+    turnCap: report.turnCap,
+  });
 }

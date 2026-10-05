@@ -263,6 +263,10 @@ export interface Message {
   client_label?: string | null;
   /** Set once a rollback restored the worktree to a point before this message. */
   stale_at?: string | null;
+  /** What a CPM-authored message is (e.g. review_handoff); null for ordinary messages. */
+  kind?: string | null;
+  /** `summary` is the one-line row for agent-facing kinds, computed by the server. */
+  meta?: { count?: number; confirmed?: number; summary?: string } | null;
   created_at: string;
 }
 
@@ -912,3 +916,10 @@ export const sendTaskParticipantCatchUp = (taskId: string, participantId: string
 
 export const touchTask = (taskId: string) =>
   request<{ previousOpenedAt: string | null; openedAt: string }>(`/api/tasks/${taskId}/touch`, { method: 'POST' });
+
+/** "Apply fixes": the server writes the prompt from the reviewer's issues and tags it a fix request. */
+export const applyFixesToTask = (taskId: string, issues: string[], summary?: string) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}/reply`, {
+    method: 'POST',
+    body: JSON.stringify({ kind: 'fix_request', fixIssues: issues, ...(summary ? { fixSummary: summary } : {}) }),
+  });

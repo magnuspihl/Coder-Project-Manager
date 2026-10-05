@@ -127,6 +127,11 @@ CREATE TABLE IF NOT EXISTS messages (
   -- message — the message stays in the transcript for the record, but no
   -- longer reflects the task's current file state. See task_checkpoints.
   stale_at TEXT,
+  -- What a CPM-authored message is (review_handoff, partial_review, …) and a
+  -- small JSON blob of counts for its summary line. NULL for ordinary messages
+  -- and for rows written before these existed. See services/message-kinds.ts.
+  kind TEXT,
+  meta TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
