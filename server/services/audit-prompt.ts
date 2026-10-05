@@ -109,7 +109,7 @@ ${i.diff}
 
 ## Your job
 1. **summary / structure**: what was built, from the code.
-2. **reuseFindings**: for EVERY export listed here, one entry — and also for any other new module, class or significant function you see. Before answering "reused" or "possible_duplicate", SEARCH the repository (Grep/Glob) for existing code that does the same job; the usual failure is an author who never found the existing code, the second is one who found it and built beside it to avoid touching shared code.
+2. **reuseFindings**: for EVERY export listed here, EXACTLY ONE entry whose "name" is that export's exact name — never one entry covering several exports ("a / b / c" is not accepted; each name is matched against the checklist one by one) — and also for any other new module, class or significant function you see. Before answering "reused" or "possible_duplicate", SEARCH the repository (Grep/Glob) for existing code that does the same job; the usual failure is an author who never found the existing code, the second is one who found it and built beside it to avoid touching shared code.
    - "reused": the new code uses or extends existing code — cite both.
    - "possible_duplicate": it overlaps code that existed BEFORE this change — cite both, the new code and the existing code, and say in one line what overlaps. The existing code must be pre-existing (use \`git show <merge-base>:path\` if unsure), not another file this change added.
    - "new": nothing existing does this job — say in the note what you searched for. Use it only after searching; it is not a way to skip the search.
@@ -124,22 +124,69 @@ Finish with exactly one line, the last thing you write, in this shape (valid JSO
 ${REPORT_SHAPE}`;
 }
 
+export interface TurnSummary {
+  /** 1-based position among the task's implementer turns. */
+  turn: number;
+  /** The last assistant message of that turn, markers stripped. */
+  text: string;
+}
+
+/** Total characters of summaries shown to the auditor, and the most any one turn may take. */
+export const TURN_SUMMARIES_BUDGET = 12_000;
+const PER_TURN_CAP = 4_000;
+
+/**
+ * The last assistant message of EVERY implementer turn, oldest first. The audited
+ * code is the whole branch, so the claims it is compared with must be too: on a
+ * fix turn the latest message only describes the fix. Pure.
+ */
+export function collectTurnSummaries(
+  turns: Array<{ id: string; role: string }>,
+  messages: Array<{ role: string; turn_id?: string | null; content: string }>,
+  clean: (text: string) => string,
+): TurnSummary[] {
+  const out: TurnSummary[] = [];
+  turns.filter(t => t.role === 'implementer').forEach((t, i) => {
+    const mine = messages.filter(m => m.role === 'assistant' && m.turn_id === t.id);
+    const text = mine.length ? clean(mine[mine.length - 1].content) : '';
+    if (text) out.push({ turn: i + 1, text });
+  });
+  return out;
+}
+
+/** Labelled, chronological summaries within the budget. Over budget, the oldest go first and the omission is named. */
+export function formatTurnSummaries(summaries: TurnSummary[], budget = TURN_SUMMARIES_BUDGET): string {
+  const blocks = summaries.map(s => ({ turn: s.turn, text: `--- Implementer turn ${s.turn} ---\n${s.text.slice(0, PER_TURN_CAP)}` }));
+  const kept: typeof blocks = [];
+  let used = 0;
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (kept.length > 0 && used + blocks[i].text.length > budget) break;
+    kept.unshift(blocks[i]);
+    used += blocks[i].text.length;
+  }
+  const dropped = blocks.length - kept.length;
+  const head = dropped > 0 ? `(The ${dropped} earliest turn summar${dropped === 1 ? 'y was' : 'ies were'} left out for length: turn${dropped === 1 ? ' 1' : 's 1-' + dropped}.)\n\n` : '';
+  return head + kept.map(k => k.text).join('\n\n').slice(0, budget + PER_TURN_CAP);
+}
+
 export interface Phase2Input {
-  /** The implementer's last message, markers stripped. */
-  implementerSummary: string;
+  /** One entry per implementer turn on the branch, oldest first. */
+  turnSummaries: TurnSummary[];
 }
 
 /** The resumed turn: phase 1 is already stored; only discrepancies are accepted from this one. */
 export function buildPhase2Prompt(i: Phase2Input): string {
-  return `Your account above has been recorded and cannot be changed. Now compare it with the implementer's own summary of the same work, which you have not seen until now:
+  return `Your account above has been recorded and cannot be changed. Now compare it with the implementer's own summaries of the same work, which you have not seen until now.
 
-<implementer_summary>
-${i.implementerSummary.slice(0, 12_000)}
-</implementer_summary>
+Your account covers the WHOLE branch. These are the implementer's SUCCESSIVE turn summaries, oldest first, one per turn: the work was done over several turns, so a later turn that does not repeat what an earlier turn already described (a fix turn describes only the fix) is NOT a discrepancy. Treat the summaries together as the implementer's account of the branch.
 
-List the DISCREPANCIES between the two accounts:
-- "unsupported_claim": something the summary claims that the code does not support (it says X was done; you saw no X, or saw it done differently).
-- "unmentioned": something significant in the code that the summary never mentions (a new dependency, a changed behaviour, a deleted feature, a schema change).
+<implementer_summaries>
+${formatTurnSummaries(i.turnSummaries)}
+</implementer_summaries>
+
+List the DISCREPANCIES between your account and those summaries taken together:
+- "unsupported_claim": something a summary claims that the code does not support (it says X was done; you saw no X, or saw it done differently).
+- "unmentioned": something significant in the code that NONE of the turn summaries mentions (a new dependency, a changed behaviour, a deleted feature, a schema change).
 
 Check the code again where needed, and cite \`path:line\` for each. Do not restate agreement, do not revise your earlier account, and do not add new reuse or convention findings — only discrepancies. If there are none, say so with an empty list.
 

@@ -1455,6 +1455,24 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     }
   };
 
+  // "Send selected to implementer": audit and/or reviewer findings, with the note, as one turn —
+  // the same endpoint (and so the same prompt, message and effects) as the inbox's Fix / Fix all.
+  const handleSendAuditSelection = async (sel: { auditIds: string[]; reviewIds: string[]; note: string }) => {
+    if (pendingFinding || sending || applyingFixes) return;
+    editSeqRef.current++;
+    try {
+      const { findings: updated } = await fixFindings(taskId, sel.reviewIds, { auditFindingIds: sel.auditIds, note: sel.note });
+      setFindings(updated);
+      onTaskChanged?.();
+      await loadData();
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : 'Failed to send findings to the implementer');
+      throw err;
+    } finally {
+      editSeqRef.current++;
+    }
+  };
+
   const handleChangeAudit = async (enabled: boolean) => {
     if (!task) return;
     setSwitchingAudit(true);
@@ -3001,6 +3019,9 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                   audit={audit}
                   onRun={handleRunAudit}
                   onMakeTask={handleMakeAuditTask}
+                  onSend={handleSendAuditSelection}
+                  openReviewFindings={unresolvedFindings()}
+                  canSend={task.status === 'awaiting_feedback'}
                   canRun={!!task.worktree_path && (task.status === 'awaiting_feedback' || task.status === 'completed')}
                 />
               )}

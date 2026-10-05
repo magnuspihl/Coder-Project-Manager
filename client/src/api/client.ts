@@ -266,7 +266,7 @@ export interface Message {
   /** What a CPM-authored message is (e.g. review_handoff); null for ordinary messages. */
   kind?: string | null;
   /** `summary` is the one-line row for agent-facing kinds, computed by the server. */
-  meta?: { count?: number; confirmed?: number; summary?: string } | null;
+  meta?: { count?: number; confirmed?: number; bySource?: { review: number; audit: number }; hasNote?: boolean; summary?: string } | null;
   created_at: string;
 }
 
@@ -623,6 +623,14 @@ export interface AuditReport {
   discrepancies: AuditDiscrepancy[] | null;
   discrepanciesNote?: string;
   unassessedExports: string[];
+  /** Finding id → whose code it is. Absent on audits made before the classification existed. */
+  ownership?: Record<string, AuditOwnership>;
+  resolvedSinceLastAudit?: { auditId: string; items: Array<{ label: string; text: string }> };
+}
+export interface AuditOwnership {
+  owner: 'task' | 'pre_existing';
+  basis: 'lines' | 'added_file' | 'harness' | 'unverified' | 'untouched';
+  reason: string;
 }
 export interface AuditView {
   id: string;
@@ -675,11 +683,15 @@ export const setFindingState = (taskId: string, findingId: string, state: 'open'
     body: JSON.stringify({ state, note: note ?? null }),
   });
 
-/** Send the selected findings back to the implementer to fix. */
-export const fixFindings = (taskId: string, findingIds: string[]) =>
+/**
+ * Send the selected findings back to the implementer: reviewer findings and/or
+ * audit findings, with an optional note, as ONE turn. Both the inbox's Fix / Fix
+ * all and the audit card's "Send selected to implementer" go through here.
+ */
+export const fixFindings = (taskId: string, findingIds: string[], opts: { auditFindingIds?: string[]; note?: string } = {}) =>
   request<{ task: Task; findings: ReviewFinding[] }>(`/api/tasks/${taskId}/findings/fix`, {
     method: 'POST',
-    body: JSON.stringify({ findingIds }),
+    body: JSON.stringify({ findingIds, ...(opts.auditFindingIds?.length ? { auditFindingIds: opts.auditFindingIds } : {}), ...(opts.note?.trim() ? { note: opts.note.trim() } : {}) }),
   });
 
 export const approveTaskRequestForTask = (taskId: string, requestId: string, targetWorkspaceId?: string | null) =>

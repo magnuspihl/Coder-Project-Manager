@@ -27,10 +27,11 @@ import {
 } from './review-proof.js';
 import { formatHandoffMarkdown, formatHandoffIssueTexts, formatEscalationMarkdown } from './message-kinds.js';
 import { getReviewDiff, getReviewDiffInfo, hasBranchChanges, makeProofIO, makeVerificationIO, type Exec } from './review-io.js';
-import { auditEnabled, auditDue, countImplementerTurns, createAudit, finishAudit, getLatestAudit, getRunningAudit, setAuditPhase, setAuditSnapshot, skipAudit } from './audits.js';
+import { auditEnabled, auditDue, countImplementerTurns, createAudit, finishAudit, getLatestAudit, getPreviousReport, getRunningAudit, setAuditPhase, setAuditSnapshot, skipAudit } from './audits.js';
+import { resolvedSince } from './audit-ownership.js';
 import { allCitations, assembleReport, auditGate, cleanImplementerSummary, parseDiscrepancies, parseModelAudit, type AuditReport } from './audit-report.js';
 import { computeHardToReverse } from './audit-facts.js';
-import { AUDITOR_SYSTEM_PROMPT, bundleGuidance, buildPhase1Prompt, buildPhase2Prompt, buildReportRecoveryPrompt } from './audit-prompt.js';
+import { AUDITOR_SYSTEM_PROMPT, bundleGuidance, buildPhase1Prompt, buildPhase2Prompt, buildReportRecoveryPrompt, collectTurnSummaries, type TurnSummary } from './audit-prompt.js';
 import { buildLineIndex, readAddedExports, readGuidanceDocs, readPackageJsons, readSnapshot } from './audit-io.js';
 import { describeRunCommand, describeRunner, parseTestProfile, type TestProfile } from './test-runners.js';
 import { resolveTestProfile, resolveTestObligation, getStoredTestProfile, setStoredTestProfile } from './test-profile.js';
@@ -4999,15 +5000,9 @@ function startAudit(task: Task, trigger: 'auto' | 'manual', implementerTurns: nu
   });
 }
 
-/** The implementer's last message of its last turn that said anything, markers stripped. */
-function lastImplementerSummary(taskId: string): string {
-  const turns = getTaskTurns(taskId).filter(t => t.role === 'implementer');
-  const msgs = getMessages(taskId).filter(m => m.role === 'assistant' && m.turn_id);
-  for (let i = turns.length - 1; i >= 0; i--) {
-    const mine = msgs.filter(m => m.turn_id === turns[i].id);
-    if (mine.length) return cleanImplementerSummary(mine[mine.length - 1].content);
-  }
-  return '';
+/** The implementer's summary of every turn on the branch (the audit covers the whole branch, not just the last turn). */
+function implementerTurnSummaries(taskId: string): TurnSummary[] {
+  return collectTurnSummaries(getTaskTurns(taskId), getMessages(taskId), cleanImplementerSummary);
 }
 
 async function runAudit(task: Task, auditId: string, run: AuditRun, trigger: 'auto' | 'manual'): Promise<void> {
@@ -5058,22 +5053,29 @@ async function runAudit(task: Task, auditId: string, run: AuditRun, trigger: 'au
   }
   if (!model) throw new Error('the auditor did not produce a parsable AUDIT_REPORT');
 
-  const base = { worktree, facts, addedExports: exportsAdded };
+  const base = { worktree, facts, addedExports: exportsAdded, diff: snap.diff };
   const index1 = await buildLineIndex(exec, worktree, snap.baseSha, allCitations(model));
   if (run.cancelled) return;
   const report1 = assembleReport({ ...base, model, index: index1 });
   // Phase 1 is written down BEFORE the auditor sees the self-report.
   setAuditPhase(auditId, 'comparing', report1);
 
-  const summary = lastImplementerSummary(task.id);
-  if (!summary) {
-    finishAudit(auditId, 'done', { report: { ...report1, discrepanciesNote: 'no implementer summary to compare against' } });
+  // What the previous audit reported that this one no longer does.
+  const previous = getPreviousReport(task.id, auditId);
+  const withResolved = (r: AuditReport): AuditReport => {
+    if (!previous) return r;
+    return { ...r, resolvedSinceLastAudit: { auditId: previous.id, items: resolvedSince(previous.report, r) } };
+  };
+
+  const summaries = implementerTurnSummaries(task.id);
+  if (summaries.length === 0) {
+    finishAudit(auditId, 'done', { report: withResolved({ ...report1, discrepanciesNote: 'no implementer summary to compare against' }) });
     return;
   }
 
   let report: AuditReport = report1;
   try {
-    const phase2 = await runAuditProcess(task, run, { prompt: buildPhase2Prompt({ implementerSummary: summary }), resume: true, maxTurns: AUDITOR_COMPARE_MAX_TURNS });
+    const phase2 = await runAuditProcess(task, run, { prompt: buildPhase2Prompt({ turnSummaries: summaries }), resume: true, maxTurns: AUDITOR_COMPARE_MAX_TURNS });
     if (run.cancelled) return;
     const found = parseDiscrepancies(phase2.text);
     if (found) {
@@ -5088,7 +5090,7 @@ async function runAudit(task: Task, auditId: string, run: AuditRun, trigger: 'au
     if (run.cancelled) return;
     report = { ...report1, discrepanciesNote: `the comparison with the implementer's summary failed: ${(err as Error).message.slice(0, 200)}` };
   }
-  if (finishAudit(auditId, 'done', { report })) {
+  if (finishAudit(auditId, 'done', { report: withResolved(report) })) {
     appendStreamLog(task.id, 'auditor_done', `[Auditor] ${report.summary.slice(0, 200)}`);
   }
 }

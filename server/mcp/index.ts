@@ -20,6 +20,7 @@ import {
   getMaxConcurrent,
   getTaskParticipants,
   getTaskTurns,
+  getReviewFindings,
   type Message,
   type TaskTurn,
   type TaskParticipant,
@@ -37,6 +38,7 @@ import {
   getTaskBranchDiff,
   MAX_REVIEW_LOOPS,
 } from '../services/claude.js';
+import { sendFindingsToImplementer } from '../services/fix-send.js';
 import { auditSummary, auditView, countImplementerTurns, getLatestAudit } from '../services/audits.js';
 import { handleTaskCompletionGit, removeTaskWorktree } from '../services/git.js';
 import { listWorkspaces, getWorkspace, stopWorkspace, startWorkspace, CoderAuthError } from '../services/coder.js';
@@ -60,6 +62,25 @@ function getOwnedTask(taskId: string, ctx: AuthCtx): Task | null {
   const task = getTask(taskId);
   if (!task || task.user_id !== ctx.userId) return null;
   return task;
+}
+
+/** The send_findings_to_implementer tool: same semantics as the UI's "Send selected to implementer". Exported for tests. */
+export function runSendFindings(
+  ctx: AuthCtx,
+  input: { task_id: string; review_finding_ids?: string[]; audit_finding_ids?: string[]; note?: string },
+  launch?: (workspaceId: string) => void,
+) {
+  const task = getOwnedTask(input.task_id, ctx);
+  if (!task) return errorResult('Task not found');
+  const result = sendFindingsToImplementer({
+    task,
+    reviewIds: input.review_finding_ids,
+    auditIds: input.audit_finding_ids,
+    note: input.note,
+    actor: { username: ctx.username, source: ctx.authSource, clientLabel: ctx.clientLabel },
+  }, launch);
+  if (!result.ok) return errorResult(result.error);
+  return jsonResult({ ok: true, sent: result.sent, task: result.task });
 }
 
 function jsonResult(data: unknown) {
@@ -233,6 +254,10 @@ function buildServer(ctx: AuthCtx): McpServer {
         participants,
         // Counts only — the full report is get_audit, to keep this output small.
         audit: auditSummary(getLatestAudit(task_id), countImplementerTurns(task_id)),
+        // The reviewer's findings still in play, with the ids send_findings_to_implementer takes.
+        findings: getReviewFindings(task_id)
+          .filter(f => f.state === 'open' || f.state === 'fixing')
+          .map(f => ({ id: f.id, state: f.state, severity: f.severity, proof_status: f.proof_status, body: f.body.slice(0, 400) })),
       });
     },
   );
@@ -240,7 +265,7 @@ function buildServer(ctx: AuthCtx): McpServer {
   server.registerTool(
     'get_audit',
     {
-      description: 'Get the auditor\'s report for a task: an independent account of what was built, written from the code and the task prompt WITHOUT the implementer\'s summary, then compared with that summary. Fields: status (running, done, failed, cancelled, skipped — with reason), stale (true when the code changed after the audit; stale_label says so), and report: summary; structure (new and modified files); reuseFindings (kind reused, possible_duplicate or new, each with file:line citations); deviations from the repo\'s conventions; hardToReverse (schema, route, MCP tool, dependency and env-var changes, computed from the diff by the harness, not the model); discrepancies between the implementer\'s summary and the code (null if that comparison did not happen — see discrepanciesNote); unassessedExports (new exports the auditor gave no reuse entry for). Every citation carries a check: ok=false means it could not be verified — do not trust it. A possible_duplicate with verified=false has a citation that does not resolve at the merge-base. Never blocks the task; it reports to the human.',
+      description: 'Get the auditor\'s report for a task: an independent account of what was built, written from the code and the task prompt WITHOUT the implementer\'s summary, then compared with that summary. Fields: status (running, done, failed, cancelled, skipped — with reason), stale (true when the code changed after the audit; stale_label says so), and report: summary; structure (new and modified files); reuseFindings (kind reused, possible_duplicate or new, each with file:line citations); deviations from the repo\'s conventions; hardToReverse (schema, route, MCP tool, dependency and env-var changes, computed from the diff by the harness, not the model); discrepancies between the implementer\'s summary and the code (null if that comparison did not happen — see discrepanciesNote); unassessedExports (new exports the auditor gave no reuse entry for). Every citation carries a check: ok=false means it could not be verified — do not trust it. A possible_duplicate with verified=false has a citation that does not resolve at the merge-base. Report.ownership maps each finding id to who owns the code: owner "task" (introduced or changed by this task — send it to the implementer with send_findings_to_implementer) or "pre_existing" (unchanged code — a separate task); an unverified citation counts as the task\'s own, and basis says why. report.resolvedSinceLastAudit lists earlier findings that no longer appear. Never blocks the task; it reports to the human.',
       inputSchema: { task_id: z.string().describe('Task ID') },
       annotations: { readOnlyHint: true },
     },
@@ -484,6 +509,21 @@ function buildServer(ctx: AuthCtx): McpServer {
       if (!result.started) return errorResult(result.reason ?? 'Could not start the audit');
       return jsonResult({ ok: true, audit: auditView(getLatestAudit(task.id)!, countImplementerTurns(task.id)) });
     },
+  );
+
+  server.registerTool(
+    'send_findings_to_implementer',
+    {
+      description: 'Send selected findings back to THIS task\'s implementer as ONE combined message and ONE implementer turn — the same as the UI\'s "Send selected to implementer". Use it for findings about code this task introduced (get_audit ownership.owner = "task"); pre-existing code belongs in a separate task. Select reviewer findings by id (get_task findings) and/or audit findings by id (get_audit, e.g. "r1", "d2"). Reviewer findings with a proof test are defects to make pass; audit findings are judgement calls the implementer may decline with a reason, steered by `note` (e.g. "use the existing constant; ignore the list one"). The task must be awaiting feedback. After the turn the normal loop applies: verification, review, then re-audit (the old audit becomes stale, and the new one lists what is resolved).',
+      inputSchema: {
+        task_id: z.string().describe('Task ID'),
+        review_finding_ids: z.array(z.string()).optional().describe('Reviewer finding ids'),
+        audit_finding_ids: z.array(z.string()).optional().describe('Audit finding ids from the latest audit report'),
+        note: z.string().max(4000).optional().describe('Free-text steer for the implementer'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    async (input) => runSendFindings(ctx, input),
   );
 
   server.registerTool(
