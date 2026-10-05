@@ -32,6 +32,10 @@ export interface MessageMeta {
   count?: number;
   /** How many of them the harness confirmed with a failing test. */
   confirmed?: number;
+  /** For a fix request: how many of `count` came from each source. */
+  bySource?: { review: number; audit: number };
+  /** The user sent a free-text note with it. */
+  hasNote?: boolean;
   /** The one-line row shown while collapsed. Computed from the counts above. */
   summary?: string;
 }
@@ -51,16 +55,19 @@ export function handoffSummary(count: number, confirmed: number): string {
 }
 
 /** "Fix request: 3 findings → sent to implementer". */
-export function fixRequestSummary(count: number | undefined): string {
-  return count && count > 0
-    ? `Fix request: ${plural(count, 'finding', 'findings')} → sent to implementer`
-    : 'Fix request → sent to implementer';
+export function fixRequestSummary(count: number | undefined, bySource?: { review: number; audit: number }): string {
+  if (!count || count <= 0) return 'Fix request → sent to implementer';
+  // Only worth spelling out when the request mixes sources or is audit-only.
+  const split = bySource && bySource.audit > 0
+    ? ` (${[bySource.review > 0 ? `${bySource.review} review` : '', `${bySource.audit} audit`].filter(Boolean).join(', ')})`
+    : '';
+  return `Fix request: ${plural(count, 'finding', 'findings')}${split} → sent to implementer`;
 }
 
 export function summaryFor(kind: string, meta: MessageMeta | null | undefined): string | null {
   if (meta?.summary) return meta.summary;
   if (kind === 'review_handoff') return handoffSummary(meta?.count ?? 0, meta?.confirmed ?? 0);
-  if (kind === 'fix_request') return fixRequestSummary(meta?.count);
+  if (kind === 'fix_request') return fixRequestSummary(meta?.count, meta?.bySource);
   return null;
 }
 

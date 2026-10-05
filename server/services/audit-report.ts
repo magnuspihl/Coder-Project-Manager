@@ -10,6 +10,7 @@
 import { exemptReason, splitDiff } from './review-coverage.js';
 import type { HardFact } from './audit-facts.js';
 import { checkCite, type CheckedCite, type LineIndex } from './audit-citations.js';
+import { classifyReport, parseChangeMap } from './audit-ownership.js';
 
 export const AUDIT_MARKER = 'AUDIT_REPORT';
 
@@ -64,6 +65,27 @@ export interface ModelAudit {
   annotations: Record<string, string>;
 }
 
+/** Whose code a finding is about, decided by the harness from its verified citations (audit-ownership.ts). */
+export interface Ownership {
+  /** task = introduced or changed by this task, so it is fixed IN this task. pre_existing = code this task did not touch. */
+  owner: 'task' | 'pre_existing';
+  /**
+   * How it was decided. lines: a cited line range overlaps lines the task changed;
+   * added_file: a cited file is one the task added; harness: a fact computed from the
+   * diff; unverified: no citation resolved, so it is treated as the task's own — never
+   * silently as "new task"; untouched: every verified citation is unchanged code.
+   */
+  basis: 'lines' | 'added_file' | 'harness' | 'unverified' | 'untouched';
+  /** One sentence for the human. */
+  reason: string;
+}
+
+/** An earlier audit's finding that this audit no longer reports. */
+export interface ResolvedFinding {
+  label: string;
+  text: string;
+}
+
 export interface AuditReport {
   summary: string;
   structure: AuditStructure;
@@ -77,6 +99,10 @@ export interface AuditReport {
   discrepanciesNote?: string;
   /** Exports the change added that the auditor gave no reuse entry for — the checklist is mandatory. */
   unassessedExports: string[];
+  /** Finding id → whose code it is. Absent on reports written before the classification existed. */
+  ownership?: Record<string, Ownership>;
+  /** Findings of the previous finished audit that this one no longer reports. */
+  resolvedSinceLastAudit?: { auditId: string; items: ResolvedFinding[] };
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +274,8 @@ export function assembleReport(args: {
   addedExports: Array<{ path: string; name: string }>;
   index: LineIndex;
   worktree?: string;
+  /** The merge-base diff the audit read; with it every finding is classified as task-owned or pre-existing. */
+  diff?: string;
   discrepancies?: Discrepancy[] | null;
   discrepanciesNote?: string;
 }): AuditReport {
@@ -257,7 +285,7 @@ export function assembleReport(args: {
     .filter(e => !assessed.has(e.name))
     .map(e => `${e.name} (${e.path})`);
   const discrepancies = args.discrepancies ? args.discrepancies.map(d => verifyCited(d, index, worktree)) : null;
-  return {
+  const report: AuditReport = {
     summary: model.summary,
     structure: model.structure,
     reuseFindings: model.reuseFindings.map(r => verifyReuse(r, index, worktree)),
@@ -267,6 +295,7 @@ export function assembleReport(args: {
     ...(discrepancies === null && args.discrepanciesNote ? { discrepanciesNote: args.discrepanciesNote } : {}),
     unassessedExports,
   };
+  return args.diff === undefined ? report : { ...report, ownership: classifyReport(report, parseChangeMap(args.diff), worktree) };
 }
 
 // ---------------------------------------------------------------------------

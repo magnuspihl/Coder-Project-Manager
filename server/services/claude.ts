@@ -27,7 +27,8 @@ import {
 } from './review-proof.js';
 import { formatHandoffMarkdown, formatHandoffIssueTexts, formatEscalationMarkdown } from './message-kinds.js';
 import { getReviewDiff, getReviewDiffInfo, hasBranchChanges, makeProofIO, makeVerificationIO, type Exec } from './review-io.js';
-import { auditEnabled, auditDue, countImplementerTurns, createAudit, finishAudit, getLatestAudit, getRunningAudit, setAuditPhase, setAuditSnapshot, skipAudit } from './audits.js';
+import { auditEnabled, auditDue, countImplementerTurns, createAudit, finishAudit, getLatestAudit, getPreviousReport, getRunningAudit, setAuditPhase, setAuditSnapshot, skipAudit } from './audits.js';
+import { resolvedSince } from './audit-ownership.js';
 import { allCitations, assembleReport, auditGate, cleanImplementerSummary, parseDiscrepancies, parseModelAudit, type AuditReport } from './audit-report.js';
 import { computeHardToReverse } from './audit-facts.js';
 import { AUDITOR_SYSTEM_PROMPT, bundleGuidance, buildPhase1Prompt, buildPhase2Prompt, buildReportRecoveryPrompt } from './audit-prompt.js';
@@ -5058,16 +5059,23 @@ async function runAudit(task: Task, auditId: string, run: AuditRun, trigger: 'au
   }
   if (!model) throw new Error('the auditor did not produce a parsable AUDIT_REPORT');
 
-  const base = { worktree, facts, addedExports: exportsAdded };
+  const base = { worktree, facts, addedExports: exportsAdded, diff: snap.diff };
   const index1 = await buildLineIndex(exec, worktree, snap.baseSha, allCitations(model));
   if (run.cancelled) return;
   const report1 = assembleReport({ ...base, model, index: index1 });
   // Phase 1 is written down BEFORE the auditor sees the self-report.
   setAuditPhase(auditId, 'comparing', report1);
 
+  // What the previous audit reported that this one no longer does.
+  const previous = getPreviousReport(task.id, auditId);
+  const withResolved = (r: AuditReport): AuditReport => {
+    if (!previous) return r;
+    return { ...r, resolvedSinceLastAudit: { auditId: previous.id, items: resolvedSince(previous.report, r) } };
+  };
+
   const summary = lastImplementerSummary(task.id);
   if (!summary) {
-    finishAudit(auditId, 'done', { report: { ...report1, discrepanciesNote: 'no implementer summary to compare against' } });
+    finishAudit(auditId, 'done', { report: withResolved({ ...report1, discrepanciesNote: 'no implementer summary to compare against' }) });
     return;
   }
 
@@ -5088,7 +5096,7 @@ async function runAudit(task: Task, auditId: string, run: AuditRun, trigger: 'au
     if (run.cancelled) return;
     report = { ...report1, discrepanciesNote: `the comparison with the implementer's summary failed: ${(err as Error).message.slice(0, 200)}` };
   }
-  if (finishAudit(auditId, 'done', { report })) {
+  if (finishAudit(auditId, 'done', { report: withResolved(report) })) {
     appendStreamLog(task.id, 'auditor_done', `[Auditor] ${report.summary.slice(0, 200)}`);
   }
 }

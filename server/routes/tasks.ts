@@ -53,6 +53,7 @@ import { findUserWorkspaceById } from '../services/workspace-cache.js';
 import { auditEnabled, auditView, countImplementerTurns, getLatestAudit, setTaskAudit } from '../services/audits.js';
 import { findingById, findingTaskPrompt } from '../services/audit-report.js';
 import { formatFindingForImplementer, PROOF_INSTRUCTIONS } from '../services/review-proof.js';
+import { sendFindingsToImplementer } from '../services/fix-send.js';
 import { buildFixRequestText, REVIEW_FIX_REPLY_PREFIX } from '../services/message-kinds.js';
 import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview, triggerManualAudit, wakeTaskNow, startFullVerification, FINDING_REPORT_FORMAT } from '../services/claude.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
@@ -528,52 +529,33 @@ router.post('/tasks/:taskId/findings/fix', requireAuth, (req: Request, res: Resp
     res.status(404).json({ error: 'Task not found' });
     return;
   }
-  if (task.status !== 'awaiting_feedback') {
-    res.status(400).json({ error: 'Task is not awaiting feedback' });
+  // One inbox: reviewer findings and audit findings go in the same send, as one
+  // implementer turn. The wording and the effects live in sendFindingsToImplementer.
+  const { findingIds, auditFindingIds, note } = req.body;
+  if (findingIds !== undefined && !Array.isArray(findingIds)) {
+    res.status(400).json({ error: 'findingIds must be an array' });
     return;
   }
-
-  const { findingIds } = req.body;
-  if (!Array.isArray(findingIds) || findingIds.length === 0) {
-    res.status(400).json({ error: 'findingIds must be a non-empty array' });
+  if (auditFindingIds !== undefined && !Array.isArray(auditFindingIds)) {
+    res.status(400).json({ error: 'auditFindingIds must be an array' });
     return;
   }
-
-  const all = getReviewFindings(task.id);
-  const selected = findingIds
-    .filter((id: unknown) => typeof id === 'string')
-    .map((id: string) => all.find(f => f.id === id))
-    .filter((f): f is NonNullable<typeof f> => f !== undefined);
-  if (selected.length === 0) {
-    res.status(404).json({ error: 'No matching findings' });
+  if (note !== undefined && typeof note !== 'string') {
+    res.status(400).json({ error: 'note must be a string' });
     return;
   }
-
-  // Tag each finding with its ref and ask for a FINDING_REPORT, exactly as the
-  // auto-review retry prompt does. This is not cosmetic: the findings below move
-  // to 'fixing', and applyFindingReport reopens everything the implementer did
-  // not report on. Without the refs and the format there is no report to parse,
-  // so every finding sent from the inbox came back 'open' with no note — and on
-  // an auto-review-off task no later reviewer pass exists to close them, leaving
-  // them un-clearable however many times the user clicked Fix.
-  const issueList = selected.map(f => formatFindingForImplementer(f)).join('\n\n');
-  const proofNote = selected.some(f => f.proof_status === 'confirmed' && f.proof_path) ? `\n\n${PROOF_INSTRUCTIONS}` : '';
-  const dismissed = getDismissedFindings(task.id);
-  // Tell the implementer what NOT to touch as well, so it doesn't "helpfully"
-  // fix a waived finding it can still see in the earlier conversation.
-  const waiverNote = dismissed.length > 0
-    ? `\n\nThe user has explicitly DISMISSED the following reviewer findings. Do not act on them, and do not undo or "improve" the code they refer to:\n${dismissed.map((f, i) => `${i + 1}. ${f.body}${f.note ? ` (user's reason: ${f.note})` : ''}`).join('\n')}`
-    : '';
-  const body = `${REVIEW_FIX_REPLY_PREFIX}. Each is tagged with a ref you must report against.\n\n${issueList}${proofNote}${waiverNote}\n\n${FINDING_REPORT_FORMAT}`;
-
-  addMessage(task.id, 'user', body, { username: req.user!.username, source: req.authSource, clientLabel: req.clientLabel, kind: 'fix_request', meta: { count: selected.length, confirmed: selected.filter(f => f.proof_status === 'confirmed' && f.proof_path).length } });
-  selected.forEach(f => setReviewFindingState(f.id, 'fixing'));
-  resetReviewLoopCount(task.id);
-  if (task.pending_complete) setPendingComplete(task.id, false);
-
-  updateTaskStatus(task.id, 'queued');
-  res.json({ task: getTask(task.id), findings: getReviewFindings(task.id) });
-  runInBackground(`findings-fix ${task.id}`, () => processQueue(task.workspace_id));
+  const result = sendFindingsToImplementer({
+    task,
+    reviewIds: findingIds,
+    auditIds: auditFindingIds,
+    note,
+    actor: { username: req.user!.username, source: req.authSource, clientLabel: req.clientLabel },
+  });
+  if (!result.ok) {
+    res.status(result.status).json({ error: result.error });
+    return;
+  }
+  res.json({ task: result.task, findings: getReviewFindings(task.id), sent: result.sent });
 });
 
 // Touch a task: atomically record open time, return previous value

@@ -166,3 +166,13 @@ test('a finding of any kind can be found by id and turned into a task prompt tha
   assert.match(prompt, /server\/services\/claude\.ts:100/);
   assert.match(prompt, /default branch/);
 });
+
+test('assembleReport given the diff classifies each finding; without it the report carries no ownership', () => {
+  const m = parseModelAudit(`AUDIT_REPORT: ${JSON.stringify({ ...REPORT, reuseFindings: [{ name: 'x', verdict: 'possible_duplicate', new: 'a.ts:2', existing: 'b.ts:1', note: 'n' }] })}`)!;
+  const idx = index({ 'a.ts': 3, 'b.ts': 5 }, { 'a.ts': 4, 'b.ts': 5 });
+  const diff = 'diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1,3 +1,4 @@\n l1\n+new2\n l3\n l4\n';
+  const withDiff = assembleReport({ model: m, facts, addedExports: [], index: idx, diff });
+  assert.equal(withDiff.ownership!.r1.owner, 'task');
+  assert.equal(withDiff.ownership!.h1.basis, 'harness');
+  assert.equal(assembleReport({ model: m, facts, addedExports: [], index: idx }).ownership, undefined);
+});

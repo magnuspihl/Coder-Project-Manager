@@ -315,3 +315,9 @@ dbTest('addMessage takes its optional parts as an options object and stores them
   const row = getDb().prepare('SELECT username, source, client_label FROM messages WHERE id = ?').get(m.id);
   assert.deepEqual({ ...row as object }, { username: 'tester', source: 'api', client_label: 'cli' });
 });
+
+test('a fix request that mixes sources says how many came from each', () => {
+  assert.equal(fixRequestSummary(3, { review: 2, audit: 1 }), 'Fix request: 3 findings (2 review, 1 audit) → sent to implementer');
+  assert.equal(fixRequestSummary(2, { review: 0, audit: 2 }), 'Fix request: 2 findings (2 audit) → sent to implementer');
+  assert.equal(fixRequestSummary(2, { review: 2, audit: 0 }), 'Fix request: 2 findings → sent to implementer');
+});

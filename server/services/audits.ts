@@ -49,6 +49,16 @@ export function getLatestAudit(taskId: string): TaskAuditRow | undefined {
     .get(taskId) as TaskAuditRow | undefined;
 }
 
+/** The most recent finished audit of a task other than `excludeId`, with a parsable report — what "resolved since" compares against. */
+export function getPreviousReport(taskId: string, excludeId: string): { id: string; report: AuditReport } | null {
+  const rows = getDb().prepare("SELECT * FROM task_audits WHERE task_id = ? AND id != ? AND status = 'done' AND report_json IS NOT NULL ORDER BY started_at DESC, rowid DESC LIMIT 3")
+    .all(taskId, excludeId) as TaskAuditRow[];
+  for (const r of rows) {
+    try { return { id: r.id, report: JSON.parse(r.report_json!) as AuditReport }; } catch { /* try the next */ }
+  }
+  return null;
+}
+
 export function getAudit(id: string): TaskAuditRow | undefined {
   return getDb().prepare('SELECT * FROM task_audits WHERE id = ?').get(id) as TaskAuditRow | undefined;
 }
