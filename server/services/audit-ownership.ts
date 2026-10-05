@@ -102,7 +102,7 @@ const norm = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
 const pathsOf = (cites: Array<string | null | undefined>) =>
   cites.map(c => (c ? parseCite(c)?.path ?? norm(c) : '')).filter(Boolean).sort().join(',');
 
-interface Identified extends ResolvedFinding { key: string }
+interface Identified extends ResolvedFinding { key: string; discrepancy?: true }
 
 /** The actionable findings of a report, each with a stable identity: name/kind + cited path. */
 function identified(r: AuditReport): Identified[] {
@@ -115,14 +115,16 @@ function identified(r: AuditReport): Identified[] {
   // reads as "resolved" plus a new one; the cost of a simple identity.
   for (const d of r.deviations) out.push({ key: `dev|${norm(d.text).slice(0, 60)}|${pathsOf(d.cites)}`, label: 'deviation', text: d.text });
   for (const h of r.hardToReverse) out.push({ key: `hard|${h.kind}|${norm(h.detail)}`, label: `hard to reverse · ${h.kind}`, text: h.detail });
-  for (const x of r.discrepancies ?? []) out.push({ key: `${x.kind}|${norm(x.text).slice(0, 60)}|${pathsOf(x.cites)}`, label: x.kind === 'unmentioned' ? 'not in the summary' : 'unsupported claim', text: x.text });
+  for (const x of r.discrepancies ?? []) out.push({ key: `${x.kind}|${norm(x.text).slice(0, 60)}|${pathsOf(x.cites)}`, label: x.kind === 'unmentioned' ? 'not in the summary' : 'unsupported claim', text: x.text, discrepancy: true });
   return out;
 }
 
 /** Findings the previous audit reported that this one does not. */
 export function resolvedSince(previous: AuditReport, current: AuditReport): ResolvedFinding[] {
   const now = new Set(identified(current).map(f => f.key));
-  return identified(previous).filter(f => !now.has(f.key)).map(({ label, text }) => ({ label, text }));
+  // A null list means the comparison did not run this time (no summary, or it failed): absent is not resolved.
+  const compared = current.discrepancies !== null;
+  return identified(previous).filter(f => !now.has(f.key) && (compared || !f.discrepancy)).map(({ label, text }) => ({ label, text }));
 }
 
 // ---------------------------------------------------------------------------

@@ -127,3 +127,8 @@ test('task-owned and unclassified findings start ticked; pre-existing ones start
   assert.equal(defaultSelected(undefined), true, 'an older audit with no classification');
   assert.equal(defaultSelected(classifyCites([ok('c.ts:10')], changes)), false);
 });
+
+test('a comparison that did not run hides nothing else: other earlier findings are still reported resolved', () => {
+  const prev = report({ deviations: [{ id: 'd1', text: 'gone', cites: ['a.ts:1'] }], discrepancies: [{ id: 'x1', kind: 'unmentioned', text: 'col', cites: [] }] });
+  assert.deepEqual(resolvedSince(prev, report({ discrepancies: null })).map(g => g.label), ['deviation']);
+});
