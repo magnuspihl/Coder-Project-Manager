@@ -40,13 +40,14 @@ function Finding({ id, label, labelCls, text, cites, checks, unverified, ownersh
   const secondary = 'border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800';
   return (
     <li className="text-sm text-gray-800 dark:text-gray-200" data-testid={`audit-finding-${id}`}>
-      <div className="flex items-start gap-2">
+      {/* Narrow screens: checkbox, label and actions share the first row and the text gets the full width below. */}
+      <div className="flex flex-wrap sm:flex-nowrap items-start gap-2">
         {canSend && (
           <input type="checkbox" className="mt-1 shrink-0" checked={checked} onChange={() => onToggle(id)}
             aria-label={`Select ${label} finding`} data-testid={`audit-select-${id}`} />
         )}
         <span className={`shrink-0 mt-0.5 text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded ${labelCls}`}>{label}</span>
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 order-last basis-full sm:order-none sm:basis-auto sm:flex-1">
           <p className="whitespace-pre-wrap break-words">{text}</p>
           <div className="mt-0.5">
             {cites.map((c, i) => <Cite key={`${c}-${i}`} cite={c} check={checks?.[i]} />)}
@@ -66,7 +67,7 @@ function Finding({ id, label, labelCls, text, cites, checks, unverified, ownersh
             )}
           </div>
         </div>
-        <div className="shrink-0 flex flex-col gap-1">
+        <div className="shrink-0 ml-auto flex flex-wrap justify-end sm:flex-col sm:flex-nowrap gap-1">
           {canSend && (
             <button onClick={() => onSend(id)} disabled={busy}
               className={`text-[11px] px-2 py-0.5 rounded disabled:opacity-50 ${taskOwned ? primary : secondary}`}>
@@ -161,13 +162,13 @@ export default function AuditCard({ audit, onRun, onMakeTask, onSend, openReview
   const header = (
     <div className="flex items-baseline justify-between gap-3 flex-wrap">
       <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Audit</h3>
-      <div className="flex items-center gap-2 text-[11px]">
+      <div className="flex flex-wrap sm:flex-nowrap items-center gap-2 text-[11px]">
         {audit.stale && (
           <span className="px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-300 font-medium" data-testid="audit-stale">
             {audit.stale_label}
           </span>
         )}
-        <span className="text-gray-500 dark:text-gray-400">
+        <span className="text-gray-500 dark:text-gray-400 order-last basis-full sm:order-none sm:basis-auto">
           Independent of the implementer&apos;s summary. Hard-to-reverse facts come from the diff; citations are checked.
         </span>
         {canRun && audit.status !== 'running' && (
