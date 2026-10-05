@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  assembleReport, auditGate, AUDIT_MIN_CHANGED_LINES, cleanImplementerSummary, findingById, findingTaskPrompt,
+  assembleReport, groupedNames, auditGate, AUDIT_MIN_CHANGED_LINES, cleanImplementerSummary, findingById, findingTaskPrompt,
   isAuditStale, parseDiscrepancies, parseModelAudit, STALE_LABEL,
 } from './audit-report.js';
 import type { LineIndex } from './audit-citations.js';
@@ -175,4 +175,40 @@ test('assembleReport given the diff classifies each finding; without it the repo
   assert.equal(withDiff.ownership!.r1.owner, 'task');
   assert.equal(withDiff.ownership!.h1.basis, 'harness');
   assert.equal(assembleReport({ model: m, facts, addedExports: [], index: idx }).ownership, undefined);
+});
+
+test('names listing several identifiers are read as a group; a single name or prose is not', () => {
+  assert.deepEqual(groupedNames('isFixRequestText / inferLegacyKind / resolveMessageTag'), ['isFixRequestText', 'inferLegacyKind', 'resolveMessageTag']);
+  assert.deepEqual(groupedNames('a(), b and c'), ['a', 'b', 'c']);
+  assert.deepEqual(groupedNames('`a`, `b`'), ['a', 'b']);
+  assert.equal(groupedNames('makeThing'), null);
+  assert.equal(groupedNames('the new helper and its tests'), null);
+});
+
+test('a grouped reuse entry credits every listed export on the checklist, each with the entry\'s verdict and citation; a missing one stays unassessed', () => {
+  const m = parseModelAudit(`AUDIT_REPORT: ${JSON.stringify({ ...REPORT, reuseFindings: [
+    { name: 'alpha / beta and gamma / notExported', verdict: 'possible_duplicate', new: 'a.ts:1', existing: 'b.ts:2', note: 'all overlap util' },
+  ] })}`)!;
+  const rep = assembleReport({
+    model: m, facts: [], index: index({ 'b.ts': 5 }, { 'a.ts': 5, 'b.ts': 5 }),
+    addedExports: [
+      { path: 'a.ts', name: 'alpha' }, { path: 'a.ts', name: 'beta' }, { path: 'a.ts', name: 'gamma' }, { path: 'a.ts', name: 'delta' },
+    ],
+  });
+  const byName = Object.fromEntries(rep.reuseFindings.map(f => [f.name, f]));
+  for (const n of ['alpha', 'beta', 'gamma']) {
+    assert.equal(byName[n].kind, 'possible_duplicate');
+    assert.equal(byName[n].newCite, 'a.ts:1');
+    assert.equal(byName[n].existingCite, 'b.ts:2');
+    assert.equal(byName[n].verified, true);
+  }
+  assert.ok(byName.notExported, 'a listed name that is not on the checklist stays as its own entry');
+  assert.deepEqual(rep.unassessedExports, ['delta (a.ts)']);
+  assert.deepEqual(rep.reuseFindings.map(f => f.id), ['r1', 'r2', 'r3', 'r4']);
+});
+
+test('an export nobody mentions is still unassessed when other entries are grouped', () => {
+  const m = parseModelAudit(`AUDIT_REPORT: ${JSON.stringify({ ...REPORT, reuseFindings: [{ name: 'one, two', verdict: 'new', new: 'a.ts:1', note: 'n' }] })}`)!;
+  const rep = assembleReport({ model: m, facts: [], index: index({}, { 'a.ts': 5 }), addedExports: [{ path: 'a.ts', name: 'one' }, { path: 'a.ts', name: 'two' }, { path: 'a.ts', name: 'three' }] });
+  assert.deepEqual(rep.unassessedExports, ['three (a.ts)']);
 });

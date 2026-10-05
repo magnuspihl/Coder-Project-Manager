@@ -266,6 +266,36 @@ function verifyCited<T extends { cites: string[] }>(item: T, index: LineIndex, w
   return { ...item, checks, verified: checks.length > 0 && checks.every(c => c.ok) };
 }
 
+const IDENT = /^[A-Za-z_$][\w$]*$/;
+
+/**
+ * The export names in a reuse entry's name when it lists several ("a / b, c and d"),
+ * or null when it is one name (or does not read as a list of identifiers). Pure.
+ */
+export function groupedNames(name: string): string[] | null {
+  const parts = name.split(/\s*(?:\/|,|;|&|\band\b)\s*/i).map(p => p.replace(/[`'"]/g, '').replace(/\(\)$/, '').trim()).filter(Boolean);
+  return parts.length > 1 && parts.every(p => IDENT.test(p)) ? parts : null;
+}
+
+/**
+ * The checklist is one entry per export, but a model sometimes writes one entry for
+ * several. Split such an entry into one per listed export on the checklist, each
+ * carrying the entry's verdict, citations and note, so each is verified and credited
+ * as assessed. Names not on the checklist stay together in a residual entry.
+ */
+export function splitGroupedReuse(findings: ReuseFinding[], checklist: Set<string>): ReuseFinding[] {
+  const out: ReuseFinding[] = [];
+  for (const f of findings) {
+    const names = groupedNames(f.name);
+    const listed = names?.filter(n => checklist.has(n)) ?? [];
+    if (!names || listed.length === 0) { out.push(f); continue; }
+    for (const n of listed) out.push({ ...f, name: n });
+    const rest = names.filter(n => !checklist.has(n));
+    if (rest.length > 0) out.push({ ...f, name: rest.join(' / ') });
+  }
+  return out.map((f, i) => ({ ...f, id: `r${i + 1}` }));
+}
+
 /** Merge the model's account with the harness's facts and checks. */
 export function assembleReport(args: {
   model: ModelAudit;
@@ -280,7 +310,9 @@ export function assembleReport(args: {
   discrepanciesNote?: string;
 }): AuditReport {
   const { model, facts, index, worktree } = args;
-  const assessed = new Set(model.reuseFindings.map(r => r.name.replace(/\(\)$/, '')));
+  const checklist = new Set(args.addedExports.map(e => e.name));
+  const reuse = splitGroupedReuse(model.reuseFindings, checklist);
+  const assessed = new Set(reuse.map(r => r.name.replace(/\(\)$/, '')));
   const unassessedExports = args.addedExports
     .filter(e => !assessed.has(e.name))
     .map(e => `${e.name} (${e.path})`);
@@ -288,7 +320,7 @@ export function assembleReport(args: {
   const report: AuditReport = {
     summary: model.summary,
     structure: model.structure,
-    reuseFindings: model.reuseFindings.map(r => verifyReuse(r, index, worktree)),
+    reuseFindings: reuse.map(r => verifyReuse(r, index, worktree)),
     deviations: model.deviations.map(d => verifyCited(d, index, worktree)),
     hardToReverse: facts.map(f => (model.annotations[f.id] ? { ...f, note: model.annotations[f.id] } : f)),
     discrepancies,
