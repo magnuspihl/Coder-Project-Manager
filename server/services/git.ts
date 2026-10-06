@@ -1,5 +1,6 @@
-import { sshExec as coderSshExec, detectProjectDir, type RemoteExecError } from './claude.js';
+import { sshExec as coderSshExec, detectProjectDir, isLocalWorkspace, type RemoteExecError } from './claude.js';
 import { getValidCoderTokenForUser } from './sessions.js';
+import { getWorkspaceStatusByName } from './coder.js';
 import {
   addMessage, getTask, getMessages, createTaskCheckpoint,
   markMessagesStaleAfter, setPendingRollbackNote, type Task, type TaskCheckpoint,
@@ -10,6 +11,11 @@ import { execFile } from 'child_process';
 import { AsyncLocalStorage } from 'async_hooks';
 
 const CPM_WORKTREE_BASE = process.env.CPM_WORKTREE_BASE || '/home/coder/.cpm/worktrees';
+
+/** Where a task's worktree lives on its workspace. */
+function taskWorktreePath(taskId: string): string {
+  return `${CPM_WORKTREE_BASE}/task-${taskId}`;
+}
 
 /**
  * Base dir (on the remote workspace, alongside CPM_WORKTREE_BASE) for a task's
@@ -556,7 +562,7 @@ export async function handleTaskLaunchGit(task: Task): Promise<void> {
     const remoteAllowed = isRemoteAllowed(task.workspace_id);
     const forkPrMode = remoteAllowed && isForkPrMode(task.workspace_id);
     const branchName = generateBranchName(task);
-    const worktreePath = `${CPM_WORKTREE_BASE}/task-${task.id}`;
+    const worktreePath = taskWorktreePath(task.id);
 
     if (remoteAllowed) {
       // Branch from the canonical tip of the real target repo so the worktree
@@ -826,7 +832,17 @@ export async function removeTaskWorktree(task: Task): Promise<boolean> {
       // the directory forever once the workspace comes back.
       const check = (await sshExec(ws, `test -d ${shellEscape(wt)} && echo yes || echo no`, GIT_T_READ).catch(() => 'unknown')).trim();
       if (check === 'yes') {
-        await sshExec(ws, `${gitRoot}git worktree remove ${shellEscape(wt)} --force`, GIT_T_INDEX);
+        // A directory git no longer lists as a worktree (no `.git` file — e.g.
+        // untracked build output that outlived an earlier removal) can never be
+        // removed by `git worktree remove`; delete it outright, but only at the
+        // exact path CPM created for this task, so nothing else is ever rm'd.
+        const listed = await sshExec(ws, `${gitRoot}git worktree list --porcelain`, GIT_T_READ);
+        const registered = listed.split(/\r?\n/).some(l => l.trim() === `worktree ${wt}`);
+        if (!registered && wt === taskWorktreePath(task.id)) {
+          await sshExec(ws, `rm -rf ${shellEscape(wt)}`, GIT_T_INDEX);
+        } else {
+          await sshExec(ws, `${gitRoot}git worktree remove ${shellEscape(wt)} --force`, GIT_T_INDEX);
+        }
         removed = true;
       } else if (check === 'no') {
         removed = true;
@@ -876,8 +892,8 @@ export async function removeTaskWorktree(task: Task): Promise<boolean> {
  * Runs at startup and then periodically (see startWorktreeReconciler). Retries per
  * task are capped per process lifetime: removeTaskWorktree posts a warning message
  * to the task on every failure, so unbounded retries against a permanently stuck
- * worktree (or a long-stopped workspace) would spam messages and SSH timeouts.
- * Capped-out tasks are retried again after the next server restart.
+ * worktree would spam messages. Capped-out tasks are retried again after the next
+ * server restart. Workspaces that aren't running are skipped without SSHing in.
  *
  * Worktree-dir only — does NOT kill ports, since a deleted task's old port range may
  * already have been reallocated to a now-active task.
@@ -885,13 +901,40 @@ export async function removeTaskWorktree(task: Task): Promise<boolean> {
 const MAX_RECONCILE_ATTEMPTS = 3;
 const reconcileAttempts = new Map<string, number>();
 
+/**
+ * Is the workspace running, checked over Coder's REST API (which, unlike
+ * `coder ssh`, never starts it)? The workspace CPM itself runs in always is.
+ * Any doubt — no token, failed lookup, deleted workspace — answers false.
+ */
+async function isWorkspaceRunning(workspaceName: string, userId: string | null): Promise<boolean> {
+  if (isLocalWorkspace(workspaceName)) return true;
+  let token: string | null = null;
+  if (userId) token = await getValidCoderTokenForUser(userId).catch(() => null);
+  token = token || process.env.CODER_SESSION_TOKEN || null;
+  if (!token) return false;
+  try {
+    return await getWorkspaceStatusByName(token, workspaceName) === 'running';
+  } catch (err) {
+    console.warn(`[git] Worktree reconcile: status check failed for ${workspaceName}: ${(err as Error).message?.slice(0, 150)}`);
+    return false;
+  }
+}
+
 export async function reconcileLeakedWorktrees(): Promise<void> {
   const rows = (getDb().prepare(
     `SELECT * FROM tasks WHERE worktree_path IS NOT NULL AND deleted_at IS NOT NULL`
   ).all() as Task[]).filter(t => (reconcileAttempts.get(t.id) ?? 0) < MAX_RECONCILE_ATTEMPTS);
   if (rows.length === 0) return;
   console.log(`[git] Reconciling ${rows.length} worktree(s) left behind by deleted tasks`);
+  const running = new Map<string, boolean>();
   for (const task of rows) {
+    // `coder ssh` auto-starts a stopped workspace, so cleanup must never be the
+    // reason a workspace comes up. Skipping a stopped one isn't a failed attempt:
+    // its leftovers are cleaned on a later sweep once something else starts it.
+    // Keyed per user too: the lookup is by name within the token owner's workspaces.
+    const key = `${task.user_id}\0${task.workspace_name}`;
+    if (!running.has(key)) running.set(key, await isWorkspaceRunning(task.workspace_name, task.user_id));
+    if (!running.get(key)) continue;
     let ok = false;
     try {
       ok = await removeTaskWorktree(task);
