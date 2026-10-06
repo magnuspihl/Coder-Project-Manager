@@ -1640,7 +1640,7 @@ function shellEscape(s: string): string {
 // Name of the workspace this server is running in (set by Coder)
 const LOCAL_WORKSPACE_NAME = process.env.CODER_WORKSPACE_NAME || '';
 
-function isLocalWorkspace(workspaceName: string): boolean {
+export function isLocalWorkspace(workspaceName: string): boolean {
   return !!LOCAL_WORKSPACE_NAME && workspaceName === LOCAL_WORKSPACE_NAME;
 }
 
