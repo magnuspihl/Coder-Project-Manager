@@ -29,12 +29,13 @@ import type { Task } from './tasks.js';
 export type PreviewExec = (command: string, timeoutMs: number) => Promise<string>;
 
 /**
- * `starting` while CPM is (re)starting it, `running` once started (and still
+ * `starting` while CPM is (re)starting it, `installing` while the detached
+ * process installs missing dependencies first, `running` once started (and still
  * alive at the health check), `failed` when it could not start or died right
  * away, `stopped` once the task reached a terminal state, `none` when CPM looked
  * and found no command to run. NULL = CPM never managed a preview for the task.
  */
-export type PreviewStatus = 'starting' | 'running' | 'failed' | 'stopped' | 'none';
+export type PreviewStatus = 'starting' | 'installing' | 'running' | 'failed' | 'stopped' | 'none';
 
 /** Statuses after which a task must never get a (new) preview. */
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
@@ -42,6 +43,8 @@ const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const MAX_COMMAND_LENGTH = 1000;
 export const MAX_LOG_LINES = 500;
 const DEFAULT_HEALTHCHECK_MS = parseInt(process.env.CPM_PREVIEW_HEALTHCHECK_MS || '10000', 10);
+/** How long the health check keeps waiting on a dependency install before giving up watching. */
+const DEFAULT_INSTALL_WATCH_MS = parseInt(process.env.CPM_PREVIEW_INSTALL_WATCH_MS || String(20 * 60_000), 10);
 
 export function previewLogPath(taskId: string): string {
   return `/tmp/cpm-preview-${safeId(taskId)}.log`;
@@ -49,6 +52,11 @@ export function previewLogPath(taskId: string): string {
 
 export function previewPidPath(taskId: string): string {
   return `/tmp/cpm-preview-${safeId(taskId)}.pid`;
+}
+
+/** `installing` or `running` — which phase the detached preview process is in. */
+export function previewStatePath(taskId: string): string {
+  return `/tmp/cpm-preview-${safeId(taskId)}.state`;
 }
 
 /** Task ids are UUIDs; strip anything else so a path can never escape /tmp. */
@@ -181,6 +189,7 @@ export function previewUrlForPort(workspaceName: string, port: number): string |
 export function buildPreviewStopCommand(taskId: string): string {
   return wrapScript(`set +e
 PIDF=${shq(previewPidPath(taskId))}
+rm -f ${shq(previewStatePath(taskId))}
 [ -f "$PIDF" ] || exit 0
 pid=$(cat "$PIDF" 2>/dev/null)
 rm -f "$PIDF"
@@ -200,12 +209,34 @@ export interface PreviewStartSpec {
   command: string;
   portStart: number;
   portEnd: number;
+  /**
+   * Install dependencies first when node_modules is missing — only for the
+   * auto-detected `npm run dev`. A fresh worktree has no node_modules, so
+   * without this nearly every new task's preview would fail. An explicit
+   * workspace command is the user's call and never gets an install.
+   */
+  autoInstall: boolean;
 }
 
 /**
- * Start the preview fully detached and return immediately. The started shell
- * writes its own pid (== its process group, thanks to setsid) for the stop
- * script. Prints `cpm-preview-started <pid>` on success.
+ * Runs inside the detached process: record the pid (== process group, thanks
+ * to setsid), install missing dependencies if asked, then become the preview
+ * command. The phase goes to the state file so the health check can tell a
+ * slow install from a dead server.
+ */
+const PREVIEW_RUNNER = `echo $$ > "$CPM_PREVIEW_PIDFILE"
+if [ -n "$CPM_PREVIEW_INSTALL" ]; then
+  echo installing > "$CPM_PREVIEW_STATEFILE"
+  echo "[cpm] node_modules is missing; installing dependencies: $CPM_PREVIEW_INSTALL"
+  sh -c "$CPM_PREVIEW_INSTALL" || { echo "[cpm] dependency install failed"; exit 1; }
+fi
+echo running > "$CPM_PREVIEW_STATEFILE"
+exec sh -c "$CPM_PREVIEW_CMD"`;
+
+/**
+ * Start the preview fully detached and return immediately. Prints
+ * `cpm-preview-started <pid>` on success, plus ` installing` when the detached
+ * process installs dependencies before starting the command.
  */
 export function buildPreviewStartCommand(spec: PreviewStartSpec): string {
   const log = shq(previewLogPath(spec.taskId));
@@ -214,21 +245,33 @@ cd ${shq(spec.workDir)} || { echo "cpm-preview-error: cannot cd to ${spec.workDi
 export PATH="$HOME/.local/bin:$PATH" PORT=${spec.portStart} CPM_PORT_RANGE="${spec.portStart}-${spec.portEnd}"
 export CPM_PREVIEW_CMD=${shq(spec.command)}
 export CPM_PREVIEW_PIDFILE=${shq(previewPidPath(spec.taskId))}
-rm -f "$CPM_PREVIEW_PIDFILE"
+export CPM_PREVIEW_STATEFILE=${shq(previewStatePath(spec.taskId))}
+export CPM_PREVIEW_RUNNER=${shq(PREVIEW_RUNNER)}
+AUTO_INSTALL=${spec.autoInstall ? 1 : 0}
+CPM_PREVIEW_INSTALL=
+if [ "$AUTO_INSTALL" = 1 ] && [ -f package.json ] && [ ! -d node_modules ]; then
+  if [ -f pnpm-lock.yaml ] && command -v pnpm >/dev/null 2>&1; then CPM_PREVIEW_INSTALL="pnpm install --frozen-lockfile"
+  elif [ -f yarn.lock ] && command -v yarn >/dev/null 2>&1; then CPM_PREVIEW_INSTALL="yarn install --frozen-lockfile"
+  elif [ -f package-lock.json ]; then CPM_PREVIEW_INSTALL="npm ci"
+  else CPM_PREVIEW_INSTALL="npm install"; fi
+fi
+export CPM_PREVIEW_INSTALL
+rm -f "$CPM_PREVIEW_PIDFILE" "$CPM_PREVIEW_STATEFILE"
 SETSID=; command -v setsid >/dev/null 2>&1 && SETSID=setsid
-$SETSID nohup sh -c 'echo $$ > "$CPM_PREVIEW_PIDFILE"; exec sh -c "$CPM_PREVIEW_CMD"' > ${log} 2>&1 < /dev/null &
+$SETSID nohup sh -c "$CPM_PREVIEW_RUNNER" > ${log} 2>&1 < /dev/null &
 i=0
 while [ $i -lt 10 ] && [ ! -s "$CPM_PREVIEW_PIDFILE" ]; do sleep 0.1; i=$((i+1)); done
-if [ -s "$CPM_PREVIEW_PIDFILE" ]; then echo "cpm-preview-started $(cat "$CPM_PREVIEW_PIDFILE")"; else echo "cpm-preview-error: the preview process did not start"; fi
+if [ -s "$CPM_PREVIEW_PIDFILE" ]; then echo "cpm-preview-started $(cat "$CPM_PREVIEW_PIDFILE")\${CPM_PREVIEW_INSTALL:+ installing}"; else echo "cpm-preview-error: the preview process did not start"; fi
 exit 0`);
 }
 
-/** `alive`, or `dead` followed by the log tail. */
+/** `alive <phase>`, or `dead <phase>` followed by the log tail. */
 function buildHealthCheckCommand(taskId: string): string {
   return wrapScript(`set +e
 pid=$(cat ${shq(previewPidPath(taskId))} 2>/dev/null)
-if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo alive; exit 0; fi
-echo dead
+phase=$(cat ${shq(previewStatePath(taskId))} 2>/dev/null)
+if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "alive \${phase:-running}"; exit 0; fi
+echo "dead \${phase:-running}"
 tail -n 20 ${shq(previewLogPath(taskId))} 2>/dev/null
 exit 0`);
 }
@@ -245,6 +288,8 @@ export interface RestartOptions {
   portKillCommand?: (portStart: number) => string;
   /** Delay before checking the preview is still alive; 0 disables the check. */
   healthCheckMs?: number;
+  /** How long to keep re-checking while dependencies install. */
+  installWatchMs?: number;
 }
 
 export interface RestartOutcome {
@@ -328,8 +373,10 @@ async function doRestart(taskId: string, opts: RestartOptions): Promise<RestartO
       return { status: 'skipped' };
     }
 
-    const out = await opts.exec(buildPreviewStartCommand({ taskId, workDir, command: resolved.command, portStart, portEnd }), 15000);
-    const started = /cpm-preview-started (\d+)/.exec(out);
+    const out = await opts.exec(buildPreviewStartCommand({
+      taskId, workDir, command: resolved.command, portStart, portEnd, autoInstall: resolved.source === 'detected',
+    }), 15000);
+    const started = /cpm-preview-started (\d+)( installing)?/.exec(out);
     if (!started) {
       const error = firstLine(out.replace(/^.*cpm-preview-error:\s*/s, '')) || 'the preview process did not start';
       setPreviewState(taskId, { status: 'failed', error });
@@ -339,8 +386,9 @@ async function doRestart(taskId: string, opts: RestartOptions): Promise<RestartO
 
     const url = previewUrlForPort(task.workspace_name, portStart);
     const startedAt = new Date().toISOString();
-    setPreviewState(taskId, { status: 'running', startedAt, url });
-    console.log(`[preview] task ${taskId}: started "${resolved.command}" in ${workDir} on :${portStart} (pid ${started[1]})`);
+    const installing = !!started[2];
+    setPreviewState(taskId, { status: installing ? 'installing' : 'running', startedAt, url });
+    console.log(`[preview] task ${taskId}: started "${resolved.command}" in ${workDir} on :${portStart} (pid ${started[1]})${installing ? ', installing dependencies first' : ''}`);
 
     // Raced with a terminal transition after the start? Then cleanupPortRange
     // may already have run and missed this server — stop it ourselves.
@@ -351,8 +399,8 @@ async function doRestart(taskId: string, opts: RestartOptions): Promise<RestartO
       return { status: 'stopped' };
     }
 
-    scheduleHealthCheck(taskId, startedAt, opts);
-    return { status: 'running', url };
+    scheduleHealthCheck(taskId, startedAt, opts, Date.now(), installing);
+    return { status: installing ? 'installing' : 'running', url };
   } catch (err) {
     const error = (err as Error)?.message?.slice(0, 500) || String(err);
     console.warn(`[preview] task ${taskId}: restart failed: ${error.slice(0, 200)}`);
@@ -361,29 +409,48 @@ async function doRestart(taskId: string, opts: RestartOptions): Promise<RestartO
   }
 }
 
-/** A dev server that crashes on boot (missing deps, syntax error) shows as failed, with its log. */
-function scheduleHealthCheck(taskId: string, startedAt: string, opts: RestartOptions): void {
+/**
+ * A dev server that crashes on boot (missing deps, syntax error) shows as
+ * failed, with its log. While dependencies are still installing the check
+ * keeps coming back instead of judging; once the install is done the server
+ * gets its own check, so a slow install is never mistaken for a dead preview.
+ */
+function scheduleHealthCheck(taskId: string, startedAt: string, opts: RestartOptions, since: number, wasInstalling: boolean): void {
   const delay = opts.healthCheckMs ?? DEFAULT_HEALTHCHECK_MS;
   if (!(delay > 0)) return;
   const timer = setTimeout(() => {
     void (async () => {
-      const t = getTaskRow(taskId) as (Task & { preview_started_at?: string | null; preview_status?: string | null }) | undefined;
-      // A newer restart (or a stop) has superseded this one.
-      if (!t || t.preview_started_at !== startedAt || t.preview_status !== 'running') return;
+      const current = () => {
+        const t = getTaskRow(taskId) as (Task & { preview_started_at?: string | null; preview_status?: string | null }) | undefined;
+        // A newer restart (or a stop) supersedes this one.
+        return !!t && t.preview_started_at === startedAt && (t.preview_status === 'running' || t.preview_status === 'installing');
+      };
+      if (!current()) return;
       let out: string;
       try {
         out = await opts.exec(buildHealthCheckCommand(taskId), 15000);
       } catch {
-        return; // can't tell — leave it as running rather than guess
+        return; // can't tell — leave it as it is rather than guess
       }
-      if (!/\bdead\b/.test(firstLine(out))) return;
-      const tail = out.replace(/^[^\n]*dead\r?\n?/, '').trim();
-      const fresh = getTaskRow(taskId) as (Task & { preview_started_at?: string | null }) | undefined;
-      if (!fresh || fresh.preview_started_at !== startedAt) return;
-      setPreviewState(taskId, {
-        status: 'failed',
-        error: `The preview exited shortly after starting.${tail ? `\n${tail.slice(-1500)}` : ''}`,
-      });
+      if (!current()) return;
+      const [state, phase] = firstLine(out).split(/\s+/);
+      if (state === 'alive') {
+        if (phase === 'installing') {
+          setPreviewState(taskId, { status: 'installing' });
+          if (Date.now() - since < (opts.installWatchMs ?? DEFAULT_INSTALL_WATCH_MS)) {
+            scheduleHealthCheck(taskId, startedAt, opts, since, true);
+          }
+        } else if (wasInstalling) {
+          // Install finished and the command is up: give the server its own check.
+          setPreviewState(taskId, { status: 'running' });
+          scheduleHealthCheck(taskId, startedAt, opts, since, false);
+        }
+        return;
+      }
+      if (state !== 'dead') return;
+      const tail = out.replace(/^[^\n]*\r?\n?/, '').trim();
+      const what = phase === 'installing' ? 'Installing the dependencies failed.' : 'The preview exited shortly after starting.';
+      setPreviewState(taskId, { status: 'failed', error: `${what}${tail ? `\n${tail.slice(-1500)}` : ''}` });
     })().catch(() => {});
   }, delay);
   timer.unref?.();

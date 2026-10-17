@@ -185,7 +185,7 @@ export interface ReviewFinding {
   proof_output: string | null;
 }
 
-export type PreviewStatus = 'starting' | 'running' | 'failed' | 'stopped' | 'none';
+export type PreviewStatus = 'starting' | 'installing' | 'running' | 'failed' | 'stopped' | 'none';
 
 export interface Task {
   id: string;

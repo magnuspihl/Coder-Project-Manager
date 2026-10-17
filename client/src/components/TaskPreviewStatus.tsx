@@ -3,6 +3,7 @@ import { getTaskPreviewLog, restartTaskPreview, type Task } from '../api/client'
 
 const LABELS: Record<string, { text: string; dot: string }> = {
   starting: { text: 'Preview starting', dot: 'bg-amber-400 animate-pulse' },
+  installing: { text: 'Preview installing deps', dot: 'bg-amber-400 animate-pulse' },
   running: { text: 'Preview running', dot: 'bg-green-500' },
   failed: { text: 'Preview failed', dot: 'bg-red-500' },
   stopped: { text: 'Preview stopped', dot: 'bg-gray-400' },
@@ -28,9 +29,9 @@ export default function TaskPreviewStatus({ task, onChanged }: { task: Task; onC
   const finished = FINISHED.includes(task.status);
   const canRestart = !finished && task.port_range_start != null;
 
-  // Starting is short-lived and settles on the server; poll until it does.
+  // Starting/installing settle on the server; poll until they do.
   useEffect(() => {
-    if (status !== 'starting') return;
+    if (status !== 'starting' && status !== 'installing') return;
     const timer = setInterval(onChanged, 2000);
     return () => clearInterval(timer);
   }, [status, onChanged]);
@@ -96,6 +97,11 @@ export default function TaskPreviewStatus({ task, onChanged }: { task: Task; onC
               <code className="font-mono text-gray-700 dark:text-gray-200">{task.preview_command}</code>
               {task.port_range_start != null && <span className="text-gray-400"> on port {task.port_range_start}</span>}
             </div>
+          )}
+          {status === 'installing' && (
+            <p className="text-gray-600 dark:text-gray-300">
+              node_modules was missing, so dependencies are being installed before the dev server starts. Show log to follow along.
+            </p>
           )}
           {status === 'none' && (
             <p className="text-gray-600 dark:text-gray-300">

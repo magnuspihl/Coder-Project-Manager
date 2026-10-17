@@ -137,6 +137,7 @@ dbTest('reads package.json from, and starts the preview in, the task worktree', 
     assert.match(start, /cd '\/wt\/one'/);
     assert.match(start, /PORT=47010 CPM_PORT_RANGE="47010-47019"/);
     assert.match(start, /setsid/);
+    assert.match(start, /AUTO_INSTALL=1/, 'an auto-detected npm run dev installs missing dependencies');
     assert.match(start, /nohup sh -c .* > '\/tmp\/cpm-preview-[0-9a-f-]+\.log' 2>&1 < \/dev\/null &/);
     assert.equal(calls.every(c => c.workspace === 'remote-ws'), true, 'everything runs on the task workspace');
   } finally { restore(); }
@@ -162,7 +163,9 @@ dbTest('the workspace preview command wins over auto-detection, and empty means 
     const t = await settled(task.id);
     assert.equal(t.preview_command, 'npx vite --port $PORT --host');
     assert.equal(calls.some(c => c.command.startsWith('cat ')), false, 'no detection when a command is set');
-    assert.match(calls.find(c => c.command.includes('CPM_PREVIEW_CMD'))!.command, /CPM_PREVIEW_CMD='npx vite --port \$PORT --host'/);
+    const start = calls.find(c => c.command.includes('CPM_PREVIEW_CMD'))!.command;
+    assert.match(start, /CPM_PREVIEW_CMD='npx vite --port \$PORT --host'/);
+    assert.match(start, /AUTO_INSTALL=0/, 'an explicit command never gets an automatic install');
   } finally { restore(); }
   assert.deepEqual(P.parsePreviewCommand('   '), { ok: true, value: null });
   assert.deepEqual(P.parsePreviewCommand('npm run dev\nrm -rf ~'), { ok: false, error: 'command must be a single line' });
@@ -242,7 +245,7 @@ dbTest('a preview that crashes right after starting shows as failed, with the en
   const exec = async (command: string) => {
     const script = decode(command);
     if (script.includes('CPM_PREVIEW_CMD')) return 'cpm-preview-started 4242';
-    if (script.includes('echo alive')) return "dead\nError: Cannot find module 'vite'";
+    if (script.includes('kill -0 "$pid"')) return "dead running\nError: Cannot find module 'vite'";
     return '';
   };
   const outcome = await P.restartTaskPreview(task.id, { exec, rangeSize: 10, healthCheckMs: 5 });
@@ -369,7 +372,7 @@ test('the start script returns immediately with the process detached, and the st
   // A command with a child of its own, to prove the whole group goes.
   const command = `sh -c 'echo $$ > ${marker}; sleep 30' & echo "port=$PORT range=$CPM_PORT_RANGE"; sleep 30`;
   const startedAt = Date.now();
-  const out = execFileSync('sh', ['-c', P.buildPreviewStartCommand({ taskId, workDir: work, command, portStart: 47090, portEnd: 47099 })]).toString();
+  const out = execFileSync('sh', ['-c', P.buildPreviewStartCommand({ taskId, workDir: work, command, portStart: 47090, portEnd: 47099, autoInstall: false })]).toString();
   assert.ok(Date.now() - startedAt < 5000, 'did not wait for the command');
   const m = /cpm-preview-started (\d+)/.exec(out);
   assert.ok(m, out);
@@ -394,6 +397,108 @@ test('the start script returns immediately with the process detached, and the st
     rmSync(P.previewLogPath(taskId), { force: true });
     rmSync(P.previewPidPath(taskId), { force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Installing missing dependencies (real scripts, fake package managers)
+// ---------------------------------------------------------------------------
+
+/**
+ * Run the real start script in a fresh project dir whose package managers are
+ * fakes that log their arguments: `ci`/`install` create node_modules, `run`
+ * stays up like a dev server. Returns the start output and the logged calls
+ * once the preview command itself has been reached.
+ */
+function startWithFakeManagers(opts: { files: string[]; nodeModules: boolean; autoInstall: boolean }) {
+  const taskId = randomUUID();
+  const work = mkdtempSync(join(dir, 'proj-'));
+  const fakeBin = mkdtempSync(join(dir, 'fakebin-'));
+  const calls = join(work, 'calls.log');
+  for (const tool of ['npm', 'pnpm']) {
+    writeFileSync(join(fakeBin, tool), `#!/bin/sh\necho "${tool} $*" >> '${calls}'\ncase "$1" in run) exec sleep 30;; *) mkdir -p node_modules;; esac\n`);
+    chmodSync(join(fakeBin, tool), 0o755);
+  }
+  writeFileSync(join(work, 'package.json'), '{"scripts":{"dev":"vite"}}');
+  for (const f of opts.files) writeFileSync(join(work, f), '');
+  if (opts.nodeModules) mkdirSync(join(work, 'node_modules'));
+  const env = { ...process.env, PATH: `${fakeBin}:${process.env.PATH}`, HOME: work };
+  const out = execFileSync('sh', ['-c', P.buildPreviewStartCommand({
+    taskId, workDir: work, command: 'npm run dev', portStart: 47090, portEnd: 47099, autoInstall: opts.autoInstall,
+  })], { env }).toString();
+  const read = () => (existsSync(calls) ? readFileSync(calls, 'utf8').trim().split('\n') : []);
+  for (let i = 0; i < 50 && !read().some(l => l.endsWith('run dev')); i++) execFileSync('sleep', ['0.1']);
+  const lines = read();
+  execFileSync('sh', ['-c', P.buildPreviewStopCommand(taskId)]);
+  rmSync(P.previewLogPath(taskId), { force: true });
+  return { out, calls: lines, nodeModules: existsSync(join(work, 'node_modules')) };
+}
+
+test('installs with npm ci before npm run dev when node_modules is missing and package-lock.json exists', { timeout: 20000 }, () => {
+  const r = startWithFakeManagers({ files: ['package-lock.json'], nodeModules: false, autoInstall: true });
+  assert.match(r.out, /cpm-preview-started \d+ installing/);
+  assert.deepEqual(r.calls, ['npm ci', 'npm run dev']);
+  assert.equal(r.nodeModules, true);
+});
+
+test('installs with npm install when there is no lockfile', { timeout: 20000 }, () => {
+  const r = startWithFakeManagers({ files: [], nodeModules: false, autoInstall: true });
+  assert.deepEqual(r.calls, ['npm install', 'npm run dev']);
+});
+
+test('installs with pnpm when the project has a pnpm lockfile', { timeout: 20000 }, () => {
+  const r = startWithFakeManagers({ files: ['pnpm-lock.yaml'], nodeModules: false, autoInstall: true });
+  assert.deepEqual(r.calls, ['pnpm install --frozen-lockfile', 'npm run dev']);
+});
+
+test('skips the install when node_modules already exists', { timeout: 20000 }, () => {
+  const r = startWithFakeManagers({ files: ['package-lock.json'], nodeModules: true, autoInstall: true });
+  assert.doesNotMatch(r.out, /installing/);
+  assert.deepEqual(r.calls, ['npm run dev']);
+});
+
+test('never installs for an explicit workspace preview command, even without node_modules', { timeout: 20000 }, () => {
+  const r = startWithFakeManagers({ files: ['package-lock.json'], nodeModules: false, autoInstall: false });
+  assert.doesNotMatch(r.out, /installing/);
+  assert.deepEqual(r.calls, ['npm run dev']);
+  assert.equal(r.nodeModules, false);
+});
+
+/** Restart with a mocked workspace whose health checks answer from `phases` in turn. */
+async function restartWithHealth(phases: string[]) {
+  const task = makeTask();
+  const answers = [...phases];
+  const exec = async (command: string) => {
+    const script = decode(command);
+    if (script.startsWith('cat ')) return '{"scripts":{"dev":"vite"}}';
+    if (script.includes('CPM_PREVIEW_CMD')) return 'cpm-preview-started 4242 installing';
+    if (script.includes('kill -0 "$pid"')) return answers.length > 1 ? answers.shift()! : answers[0];
+    return '';
+  };
+  const outcome = await P.restartTaskPreview(task.id, { exec, rangeSize: 10, healthCheckMs: 5 });
+  return { task, outcome };
+}
+
+dbTest('a long install is shown as installing and not failed, then running once the server is up', async () => {
+  const { task, outcome } = await restartWithHealth(['alive installing', 'alive installing', 'alive installing', 'alive running']);
+  assert.equal(outcome.status, 'installing');
+  assert.equal(T.getTask(task.id)!.preview_status, 'installing');
+  for (let i = 0; i < 200 && T.getTask(task.id)!.preview_status === 'installing'; i++) await new Promise(r => setTimeout(r, 5));
+  await new Promise(r => setTimeout(r, 50)); // the post-install check runs too
+  assert.equal(T.getTask(task.id)!.preview_status, 'running');
+});
+
+dbTest('a failed install shows as failed with the install log', async () => {
+  const { task } = await restartWithHealth(['alive installing', 'dead installing\nnpm ERR! 404 Not Found']);
+  for (let i = 0; i < 200 && T.getTask(task.id)!.preview_status !== 'failed'; i++) await new Promise(r => setTimeout(r, 5));
+  const t = T.getTask(task.id)!;
+  assert.equal(t.preview_status, 'failed');
+  assert.match(t.preview_error ?? '', /Installing the dependencies failed\.[\s\S]*npm ERR! 404/);
+});
+
+dbTest('a server that crashes right after its install finished is still caught', async () => {
+  const { task } = await restartWithHealth(['alive installing', 'alive running', 'dead running\nError: Cannot find module']);
+  for (let i = 0; i < 200 && T.getTask(task.id)!.preview_status !== 'failed'; i++) await new Promise(r => setTimeout(r, 5));
+  assert.match(T.getTask(task.id)!.preview_error ?? '', /exited shortly after starting[\s\S]*Cannot find module/);
 });
 
 // ---------------------------------------------------------------------------
