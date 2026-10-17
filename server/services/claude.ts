@@ -37,6 +37,7 @@ import { describeRunCommand, describeRunner, parseTestProfile, type TestProfile 
 import { resolveTestProfile, resolveTestObligation, getStoredTestProfile, setStoredTestProfile } from './test-profile.js';
 import { buildTestingPrompt, extractNoTests, extractTestProfile } from './implementer-markers.js';
 import { buildVerification, summariseVerification, reviewerTestLines, withBudget, type VerificationIO, type VerificationLevel, type VerificationSummary } from './verification.js';
+import { buildPreviewStopCommand, proxyUriForWorkspace, readPreviewLog, restartTaskPreview, type PreviewExec } from './preview.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
@@ -338,11 +339,74 @@ exit 0`;
   return `printf %s '${b64}' | base64 -d | sh`;
 }
 
+/**
+ * How preview management reaches a workspace. sshExec in production; tests swap
+ * it so they can observe (and stall) the remote calls without a workspace.
+ */
+type PreviewRemoteExec = (workspaceName: string, command: string, timeout: number, userId: string | null) => Promise<string>;
+let previewRemoteExec: PreviewRemoteExec = (ws, cmd, timeout, userId) => sshExec(ws, cmd, timeout, userId);
+
+/** Test hook: replace the remote exec used by previews and cleanupPortRange. Returns a restore function. */
+export function setPreviewExecForTests(fn: PreviewRemoteExec): () => void {
+  const prev = previewRemoteExec;
+  previewRemoteExec = fn;
+  return () => { previewRemoteExec = prev; };
+}
+
+function previewExecFor(task: Pick<Task, 'workspace_name' | 'user_id'>): PreviewExec {
+  return (cmd, timeout) => previewRemoteExec(task.workspace_name, cmd, timeout, task.user_id);
+}
+
+/**
+ * (Re)start the task's CPM-managed preview. Fire-and-forget by design: it runs
+ * on CPM's side after the agent's turn has ended, never inside the agent's
+ * claude process, and its outcome (including failure) is recorded on the task
+ * rather than awaited by anything in the turn-completion path.
+ */
+export function firePreviewRestart(taskId: string): void {
+  const task = getTask(taskId);
+  if (!task || task.port_range_start === null || task.port_range_start === undefined) return;
+  restartTaskPreview(taskId, {
+    exec: previewExecFor(task),
+    rangeSize: PORT_RANGE_SIZE,
+    portKillCommand: (start) => buildPortRangeKillScript(start, PORT_RANGE_SIZE, null),
+  }).catch(err => console.error(`[preview] restart failed for task ${taskId}:`, (err as Error).message?.slice(0, 200)));
+}
+
+/**
+ * The "Restart preview" action: check the task can have a preview, mark it
+ * starting, and kick the restart off without waiting for it.
+ */
+export function requestPreviewRestart(taskId: string): { ok: true } | { ok: false; error: string } {
+  const task = getTask(taskId);
+  if (!task) return { ok: false, error: 'Task not found' };
+  if (['completed', 'failed', 'cancelled'].includes(task.status)) {
+    return { ok: false, error: `A ${task.status} task has no preview — its ports were released.` };
+  }
+  if (task.port_range_start === null || task.port_range_start === undefined) {
+    return { ok: false, error: 'This task has no ports assigned yet — its preview starts after its first turn.' };
+  }
+  if (!task.worktree_path && !task.project_dir) {
+    return { ok: false, error: 'This task has no working directory to run a preview in.' };
+  }
+  getDb().prepare("UPDATE tasks SET preview_status = 'starting', preview_error = NULL WHERE id = ?").run(taskId);
+  firePreviewRestart(taskId);
+  return { ok: true };
+}
+
+/** Last lines of the task's preview log, read from its workspace. */
+export function getPreviewLog(task: Task, lines: number): Promise<string> {
+  return readPreviewLog(task.id, previewExecFor(task), lines);
+}
+
 export async function cleanupPortRange(task: Task): Promise<void> {
   if (task.port_range_start === null || task.port_range_start === undefined) return;
-  const cmd = buildPortRangeKillScript(task.port_range_start, PORT_RANGE_SIZE, task.worktree_path ?? null);
+  // The preview's process group first (CPM started it, so it knows the pgid —
+  // this matters when it runs from project_dir, where the worktree sweep below
+  // can't see it), then everything on the range and in the worktree.
+  const cmd = `${buildPreviewStopCommand(task.id)}; ${buildPortRangeKillScript(task.port_range_start, PORT_RANGE_SIZE, task.worktree_path ?? null)}`;
   try {
-    const out = await sshExec(task.workspace_name, cmd, 10000, task.user_id);
+    const out = await previewExecFor(task)(cmd, 20000);
     const killed = out.split('\n').filter((l) => l.startsWith('killed-')).length;
     if (killed > 0) {
       console.log(`[claude-executor] cleanupPortRange: killed ${killed} process(es) for task ${task.id} (range ${task.port_range_start}-${task.port_range_start + PORT_RANGE_SIZE - 1})`);
@@ -355,7 +419,12 @@ export async function cleanupPortRange(task: Task): Promise<void> {
   // Release the port range back to the pool. The task keeps its worktree but its
   // ports are now free for reallocation; if the task later resumes (retry/reopen)
   // it will be assigned a fresh range. Avoids two tasks claiming the same ports.
-  getDb().prepare('UPDATE tasks SET port_range_start = NULL WHERE id = ?').run(task.id);
+  // A CPM-managed preview is now gone, and its URL points at ports another task
+  // may be given next — drop it rather than leave a link to someone else's server.
+  getDb().prepare(`UPDATE tasks SET port_range_start = NULL,
+      verification_url = CASE WHEN preview_status IS NOT NULL AND preview_status != 'none' THEN NULL ELSE verification_url END,
+      preview_status = CASE WHEN preview_status IS NOT NULL AND preview_status != 'none' THEN 'stopped' ELSE preview_status END
+    WHERE id = ?`).run(task.id);
   task.port_range_start = null;
 }
 
@@ -795,6 +864,8 @@ To run something that outlives your turn, do BOTH of these:
 
    \`setsid\` is the load-bearing part — without it the job shares the SSH session's process group and is killed when your turn ends. \`nohup\` alone is not enough. Write output to a file; nothing is capturing its stdout once you are gone.
 
+   This is for work that FINISHES (a long build, a render, a data job) — never for servers. Do not use it to start a dev/preview server or anything else meant to keep running: CPM starts the task's preview itself when your turn ends.
+
 2. Schedule a wake-up before you stop writing, by emitting this block on its own lines (not inside a code block):
 
 [WAKE]
@@ -839,16 +910,16 @@ The path must resolve inside your current project/working directory — CPM refu
  * worst one.
  *
  * All of it is static for the life of a task, so it belongs in the system
- * prompt, where it is written to cache once and read back at 0.1x. Returns null
- * when there is no way to build a URL, matching the previous behaviour of
- * emitting nothing at all in that case.
+ * prompt, where it is written to cache once and read back at 0.1x. Without a
+ * way to build a URL it carries only the rule that CPM, not the agent, starts
+ * the preview.
  */
-function buildCoderUrlGuidance(
+export function buildCoderUrlGuidance(
   workspaceName: string,
   proxyUriForTask: string,
   portStart: number | null,
   portEnd: number | null,
-): string | null {
+): string {
   const intro =
     'PREVIEW LINKS AND PORTS:\n' +
     'Only if your changes result in something visually testable in a browser (e.g. a webapp UI change), ' +
@@ -856,11 +927,20 @@ function buildCoderUrlGuidance(
     'changes, config changes, refactors, or other non-visual work. This project runs inside a Coder workspace, ' +
     'so use Coder-routed URLs (not localhost).';
 
+  // CPM, not the agent, runs the preview: agents that started servers
+  // themselves kept hanging their own turn waiting on (or polling) them.
+  const serverRule =
+    '\n\nCPM STARTS THE PREVIEW, NOT YOU: when your turn ends, CPM (re)starts this task\'s preview server ' +
+    'automatically' + (portStart !== null ? ` on $PORT (${portStart})` : '') + ', in this working directory, ' +
+    'using the workspace\'s preview command (by default `npm run dev` when package.json has a "dev" script). ' +
+    'NEVER start servers or other long-running processes yourself — not in the foreground, not in the background, ' +
+    'not with nohup/setsid. Verify your work with commands that terminate: typecheck, build, tests. If the preview ' +
+    'needs a different command or environment to work, say so in your report instead of starting it yourself.';
+
   const portRule = portStart !== null
-    ? ` This task runs in a dedicated git worktree with ports ${portStart}–${portEnd} reserved for it. Bind any ` +
-      `dev/preview server you start to a port in that range (the env var $PORT is already set to ${portStart}). ` +
-      'Do NOT use default ports like 3000 or 5173 — those belong to the main checkout and would show the user ' +
-      "main's preview, not yours."
+    ? ` This task has ports ${portStart}–${portEnd} reserved for it ($PORT is ${portStart}, $CPM_PORT_RANGE is ` +
+      `${portStart}-${portEnd}). Make sure the app's dev server honours $PORT — do NOT hard-code default ports like ` +
+      "3000 or 5173; those belong to the main checkout and would show the user main's preview, not yours."
     : '';
 
   if (proxyUriForTask) {
@@ -868,20 +948,21 @@ function buildCoderUrlGuidance(
     if (portStart !== null) {
       const previewUrl = proxyUriForTask.replace('{{port}}', String(portStart));
       return intro + portRule +
-        ` Your primary preview URL is: ${previewUrl} (substitute another port from your range if you bind ` +
-        'multiple services).';
+        ` The preview URL for this task is: ${previewUrl} — link to it (with a deep path where useful) when ` +
+        'the change is visual.' + serverRule;
     }
     const example = proxyUriForTask.replace('{{port}}', 'PORT');
     return intro +
       ` For web apps, use the Coder port-forwarding URL format: ${example} (replace PORT with the actual port ` +
-      'number, e.g. 5173 for Vite).';
+      'number).' + serverRule;
   }
 
   if (CODER_URL) {
-    return intro + portRule + ` The Coder access URL is: ${CODER_URL}. The workspace name is: ${workspaceName}.`;
+    return intro + portRule + ` The Coder access URL is: ${CODER_URL}. The workspace name is: ${workspaceName}.` + serverRule;
   }
 
-  return null;
+  // No way to build a URL, but the rule about servers holds regardless.
+  return serverRule.trim();
 }
 
 // Per-message nudge: appended to a user prompt that sounds like a
@@ -2387,19 +2468,9 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
   }
 
   // Append instruction for the agent to provide Coder deep links
-  // Use VSCODE_PROXY_URI if available (has the exact pattern), otherwise build from parts
-  const proxyUri = process.env.VSCODE_PROXY_URI || '';
-  // VSCODE_PROXY_URI is baked with CPM's own workspace name. If the task targets a
-  // different workspace, swap that segment so the preview URL points at the right host.
-  const proxyUriForTask = (() => {
-    if (!proxyUri || !LOCAL_WORKSPACE_NAME || !task.workspace_name) return proxyUri;
-    if (task.workspace_name.toLowerCase() === LOCAL_WORKSPACE_NAME.toLowerCase()) return proxyUri;
-    // Coder's wildcard host is case-insensitive and canonically lowercased, but
-    // CODER_WORKSPACE_NAME may be cased differently than the baked proxy segment,
-    // so match case-insensitively and emit the target name lowercased.
-    const escaped = LOCAL_WORKSPACE_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return proxyUri.replace(new RegExp(`--${escaped}--`, 'i'), `--${task.workspace_name.toLowerCase()}--`);
-  })();
+  // Use VSCODE_PROXY_URI if available (has the exact pattern), otherwise build from parts.
+  // Shared with the CPM-managed preview, which sets verification_url from it.
+  const proxyUriForTask = proxyUriForWorkspace(task.workspace_name);
   const portStart = task.port_range_start ?? null;
   const portEnd = portStart !== null ? portStart + PORT_RANGE_SIZE - 1 : null;
   // The Coder deep-link / port guidance this used to append to every user
@@ -2978,6 +3049,7 @@ export function interruptTask(taskId: string): void {
   );
   updateTaskStatus(partial.id, 'awaiting_feedback');
   fireCheckpoint(partial.id);
+  firePreviewRestart(partial.id);
 }
 
 /**
@@ -3124,6 +3196,7 @@ export async function reconnectWorkingTasks(): Promise<void> {
               if (hasResponse) {
                 updateTaskStatus(task.id, 'awaiting_feedback');
                 fireCheckpoint(task.id);
+                firePreviewRestart(task.id);
               } else {
                 // No response captured — task was likely interrupted. Re-queue for retry.
                 console.log(`[recovery] Task "${task.title}" exited with no response — re-queuing`);
@@ -3157,6 +3230,7 @@ export async function reconnectWorkingTasks(): Promise<void> {
                 console.log(`[recovery] Task "${task.title}" produced a result before SSH died — finalizing as awaiting_feedback`);
                 updateTaskStatus(task.id, 'awaiting_feedback');
                 fireCheckpoint(task.id);
+                firePreviewRestart(task.id);
               }
             } else {
               console.log(`[recovery] Task "${task.title}" SSH process gone, no exit code, no result — re-queuing for automatic retry`);
@@ -3520,6 +3594,7 @@ function startFilePolling(task: Task, implementerTurnId?: string | null, compact
           if (hasResponse) {
             updateTaskStatus(task.id, 'awaiting_feedback');
             fireCheckpoint(task.id);
+            firePreviewRestart(task.id);
           } else {
             console.log(`[claude-poller] Task ${task.id} finished with no response — re-queuing`);
             addMessage(task.id, 'system', 'Claude exited without producing a response. Re-queued for automatic retry.');
@@ -5245,7 +5320,7 @@ function fireCheckpoint(taskId: string): void {
  * shell holds the stdout pipe open). We kill the lingering SSH process so the
  * remote command isn't stranded, then move the task forward.
  */
-function finalizeTask(task: Task, resultError: string | null): void {
+export function finalizeTask(task: Task, resultError: string | null): void {
   completeImplementerTurn(task.id);
   const db = getDb();
   // Read the latest ssh_pid before we clear it, so killTaskProcess can target it.
@@ -5272,6 +5347,9 @@ function finalizeTask(task: Task, resultError: string | null): void {
   } else {
     const hasResponse = getMessages(task.id).some(m => m.role === 'assistant');
     if (hasResponse) {
+      // The implementer's turn is over: bring its preview up to date. Fire-and-
+      // forget — whatever the preview does must not hold up what follows.
+      firePreviewRestart(task.id);
       onImplementerTurnComplete(task).catch(err => {
         console.error(`[auto-review] Error in post-implementer hook for task ${task.id}:`, (err as Error).message?.slice(0, 200));
         setActiveTaskTurnRole(task.id, null);

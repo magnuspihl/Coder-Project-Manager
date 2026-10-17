@@ -55,7 +55,8 @@ import { findingById, findingTaskPrompt } from '../services/audit-report.js';
 import { formatFindingForImplementer, PROOF_INSTRUCTIONS } from '../services/review-proof.js';
 import { sendFindingsToImplementer } from '../services/fix-send.js';
 import { buildFixRequestText, REVIEW_FIX_REPLY_PREFIX } from '../services/message-kinds.js';
-import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview, triggerManualAudit, wakeTaskNow, startFullVerification, FINDING_REPORT_FORMAT } from '../services/claude.js';
+import { processQueue, cancelTask, interruptTask, getTaskActivity, getRateLimitInfo, getTaskStreamLog, getTaskStreamLogAfter, launchTaskParticipant, isTaskParticipantRunning, getTaskParticipantActivity, stopTaskParticipant, cleanupPortRange, triggerTaskHostCatchUp, triggerTaskParticipantCatchUp, withWorkspaceLock, triggerManualReview, triggerManualAudit, wakeTaskNow, startFullVerification, FINDING_REPORT_FORMAT, requestPreviewRestart, getPreviewLog } from '../services/claude.js';
+import { MAX_LOG_LINES } from '../services/preview.js';
 import { getWorkspace, CoderAuthError } from '../services/coder.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { handleTaskCompletionGit, handleTaskReopenGit, checkoutTaskBranch, removeTaskWorktree, rollbackTaskToCheckpoint } from '../services/git.js';
@@ -1012,6 +1013,37 @@ router.post('/tasks/:taskId/interrupt', requireAuth, (req: Request, res: Respons
   interruptTask(task.id);
 
   res.json({ task: getTask(task.id) });
+});
+
+// Restart the task's CPM-managed preview. Answers at once; the client polls
+// preview_status for the outcome.
+router.post('/tasks/:taskId/preview/restart', requireAuth, (req: Request, res: Response) => {
+  const result = requestPreviewRestart(req.params.taskId);
+  if (!result.ok) {
+    res.status(result.error === 'Task not found' ? 404 : 400).json({ error: result.error });
+    return;
+  }
+  res.status(202).json({ task: getTask(req.params.taskId) });
+});
+
+// The last lines of the task's preview log (default 200, at most MAX_LOG_LINES).
+router.get('/tasks/:taskId/preview/log', requireAuth, async (req: Request, res: Response) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Task not found' });
+    return;
+  }
+  const lines = req.query.lines === undefined ? 200 : parseInt(String(req.query.lines), 10);
+  if (!Number.isFinite(lines) || lines < 1) {
+    res.status(400).json({ error: 'lines must be a positive integer' });
+    return;
+  }
+  try {
+    const log = await getPreviewLog(task, Math.min(lines, MAX_LOG_LINES));
+    res.json({ log, status: task.preview_status, command: task.preview_command, error: task.preview_error });
+  } catch (err) {
+    res.status(502).json({ error: `Could not read the preview log: ${(err as Error).message?.slice(0, 300)}` });
+  }
 });
 
 // Fire an agent-scheduled wake-up now instead of waiting for its timer/sentinel.

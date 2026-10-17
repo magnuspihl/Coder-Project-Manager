@@ -136,10 +136,27 @@ const WORKTREE_RE = new RegExp(
   '^' + escapeRegex(CPM_WORKTREE_BASE) + '/task-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:/|$)',
 );
 
-interface TaskRow {
+export interface TaskRow {
   id: string;
   status: string;
   deleted: boolean;
+}
+
+/**
+ * What to do with one listener in CPM's managed port space:
+ *  - `ignore`: not under a CPM worktree — e.g. the workspace's own main-checkout
+ *    server, or a CPM-managed preview of a task that runs from project_dir.
+ *  - `owned`:  runs from the worktree of a live task. This is where CPM's own
+ *    previews sit for as long as their task is alive, so it is never reaped.
+ *  - `orphan`: runs from the worktree of a terminal, deleted, or unknown task.
+ */
+export function classifyListener(cwd: string, tasksById: Map<string, TaskRow>): { kind: 'ignore' } | { kind: 'owned' | 'orphan'; taskId: string; task?: TaskRow } {
+  const m = WORKTREE_RE.exec(cwd);
+  if (!m) return { kind: 'ignore' };
+  const taskId = m[1];
+  const task = tasksById.get(taskId);
+  const isActive = task && !task.deleted && ACTIVE_STATUSES.includes(task.status);
+  return { kind: isActive ? 'owned' : 'orphan', taskId, task };
 }
 
 /** Same fallback `buildCoderEnv` uses: the user's own token, else the ambient one. */
@@ -188,12 +205,10 @@ async function sweepWorkspace(workspaceName: string, userId: string, tasksById: 
   const orphanDetail: string[] = [];
 
   for (const l of listeners) {
-    const m = WORKTREE_RE.exec(l.cwd);
-    if (!m) continue; // not under a CPM worktree — not ours to attribute or reap
-    const taskId = m[1];
-    const task = tasksById.get(taskId);
-    const isActive = task && !task.deleted && ACTIVE_STATUSES.includes(task.status);
-    if (isActive) {
+    const c = classifyListener(l.cwd, tasksById);
+    if (c.kind === 'ignore') continue; // not under a CPM worktree — not ours to attribute or reap
+    const { taskId, task } = c;
+    if (c.kind === 'owned') {
       owned.set(l.port, taskId);
     } else if (REAP_ENABLED) {
       // Terminal, deleted, or unknown task still holding a managed port → leak.

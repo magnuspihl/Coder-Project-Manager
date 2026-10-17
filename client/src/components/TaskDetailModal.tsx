@@ -67,6 +67,7 @@ import RateLimitBanner from './RateLimitBanner';
 import { useDraft } from '../hooks/useDraft';
 import { useWorkspacePreview } from '../hooks/useWorkspacePreview';
 import WorkspacePreviewPanel, { PreviewToggleButton } from './WorkspacePreviewPanel';
+import TaskPreviewStatus from './TaskPreviewStatus';
 import { linkify } from '../utils/linkify';
 import Markdown from './Markdown';
 import { useLightbox, type LightboxImage } from './ImageLightbox';
@@ -2714,6 +2715,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                       View Live
                     </a>
                   )}
+                  <TaskPreviewStatus task={task} onChanged={() => { onTaskChanged?.(); void loadData(); }} />
                 </div>
               </div>
               <PreviewToggleButton state={preview} />

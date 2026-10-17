@@ -54,6 +54,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- The "CPM is working on this" label actually put on that issue, if any, so
   -- the same label is removed later even if the workspace setting changed since.
   github_issue_progress_label TEXT,
+  -- CPM-managed preview (services/preview.ts): 'starting' | 'running' | 'failed' |
+  -- 'stopped' | 'none'; NULL = CPM never managed a preview for this task.
+  preview_status TEXT,
+  preview_error TEXT,
+  preview_command TEXT,
+  preview_started_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT,
@@ -303,6 +309,11 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
   test_profile TEXT,
   -- NULL = auto, 'on', 'off': whether implementers must write tests here (services/test-profile.ts).
   test_obligation TEXT,
+  -- Command CPM runs to start a task's preview (services/preview.ts). NULL =
+  -- auto-detect (`npm run dev` when package.json has a dev script).
+  preview_command TEXT,
+  -- What auto-detection last found, shown in settings when preview_command is NULL.
+  preview_detected_command TEXT,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
