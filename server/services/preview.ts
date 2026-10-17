@@ -210,7 +210,7 @@ export interface PreviewStartSpec {
   portStart: number;
   portEnd: number;
   /**
-   * Install dependencies first when node_modules is missing — only for the
+   * Install dependencies first when they are missing or stale — only for the
    * auto-detected `npm run dev`. A fresh worktree has no node_modules, so
    * without this nearly every new task's preview would fail. An explicit
    * workspace command is the user's call and never gets an install.
@@ -218,17 +218,23 @@ export interface PreviewStartSpec {
   autoInstall: boolean;
 }
 
+/** Written into node_modules after a successful install: the hash of what was installed. */
+export const INSTALL_MARKER = 'node_modules/.cpm-install-ok';
+
 /**
  * Runs inside the detached process: record the pid (== process group, thanks
- * to setsid), install missing dependencies if asked, then become the preview
- * command. The phase goes to the state file so the health check can tell a
- * slow install from a dead server.
+ * to setsid), install dependencies if asked, then become the preview command.
+ * The phase goes to the state file so the health check can tell a slow
+ * install from a dead server. The install marker is written only after a
+ * successful install, so a failed or killed one is retried next time.
  */
 const PREVIEW_RUNNER = `echo $$ > "$CPM_PREVIEW_PIDFILE"
 if [ -n "$CPM_PREVIEW_INSTALL" ]; then
   echo installing > "$CPM_PREVIEW_STATEFILE"
-  echo "[cpm] node_modules is missing; installing dependencies: $CPM_PREVIEW_INSTALL"
+  echo "[cpm] dependencies are missing or changed; installing: $CPM_PREVIEW_INSTALL"
+  rm -f ${INSTALL_MARKER}
   sh -c "$CPM_PREVIEW_INSTALL" || { echo "[cpm] dependency install failed"; exit 1; }
+  mkdir -p node_modules && printf '%s\\n' "$CPM_PREVIEW_DEPS_HASH" > ${INSTALL_MARKER}
 fi
 echo running > "$CPM_PREVIEW_STATEFILE"
 exec sh -c "$CPM_PREVIEW_CMD"`;
@@ -237,6 +243,11 @@ exec sh -c "$CPM_PREVIEW_CMD"`;
  * Start the preview fully detached and return immediately. Prints
  * `cpm-preview-started <pid>` on success, plus ` installing` when the detached
  * process installs dependencies before starting the command.
+ *
+ * Installs when the marker in node_modules is missing or records a different
+ * hash of the lockfile (package.json when there is none) — so a fresh
+ * worktree, a failed/interrupted install, and dependencies the agent changed
+ * this turn all get one, and an unchanged project never does.
  */
 export function buildPreviewStartCommand(spec: PreviewStartSpec): string {
   const log = shq(previewLogPath(spec.taskId));
@@ -249,13 +260,25 @@ export CPM_PREVIEW_STATEFILE=${shq(previewStatePath(spec.taskId))}
 export CPM_PREVIEW_RUNNER=${shq(PREVIEW_RUNNER)}
 AUTO_INSTALL=${spec.autoInstall ? 1 : 0}
 CPM_PREVIEW_INSTALL=
-if [ "$AUTO_INSTALL" = 1 ] && [ -f package.json ] && [ ! -d node_modules ]; then
-  if [ -f pnpm-lock.yaml ] && command -v pnpm >/dev/null 2>&1; then CPM_PREVIEW_INSTALL="pnpm install --frozen-lockfile"
-  elif [ -f yarn.lock ] && command -v yarn >/dev/null 2>&1; then CPM_PREVIEW_INSTALL="yarn install --frozen-lockfile"
-  elif [ -f package-lock.json ]; then CPM_PREVIEW_INSTALL="npm ci"
-  else CPM_PREVIEW_INSTALL="npm install"; fi
+CPM_PREVIEW_DEPS_HASH=
+if [ "$AUTO_INSTALL" = 1 ] && [ -f package.json ]; then
+  if [ -f pnpm-lock.yaml ] && command -v pnpm >/dev/null 2>&1; then
+    DEPS=pnpm-lock.yaml; INSTALL="pnpm install --frozen-lockfile"
+  elif [ -f yarn.lock ] && command -v yarn >/dev/null 2>&1; then
+    DEPS=yarn.lock
+    # Yarn Berry (2+) dropped --frozen-lockfile for --immutable.
+    YARN_MAJOR=$(yarn --version 2>/dev/null | cut -d. -f1)
+    case "$YARN_MAJOR" in ''|*[!0-9]*) YARN_MAJOR=1;; esac
+    if [ -f .yarnrc.yml ] || [ "$YARN_MAJOR" -ge 2 ]; then INSTALL="yarn install --immutable"; else INSTALL="yarn install --frozen-lockfile"; fi
+  elif [ -f package-lock.json ]; then
+    DEPS=package-lock.json; INSTALL="npm ci"
+  else
+    DEPS=package.json; INSTALL="npm install"
+  fi
+  CPM_PREVIEW_DEPS_HASH="$DEPS:$(cksum < "$DEPS" | awk '{print $1"-"$2}')"
+  if [ "$(cat ${INSTALL_MARKER} 2>/dev/null)" != "$CPM_PREVIEW_DEPS_HASH" ]; then CPM_PREVIEW_INSTALL="$INSTALL"; fi
 fi
-export CPM_PREVIEW_INSTALL
+export CPM_PREVIEW_INSTALL CPM_PREVIEW_DEPS_HASH
 rm -f "$CPM_PREVIEW_PIDFILE" "$CPM_PREVIEW_STATEFILE"
 SETSID=; command -v setsid >/dev/null 2>&1 && SETSID=setsid
 $SETSID nohup sh -c "$CPM_PREVIEW_RUNNER" > ${log} 2>&1 < /dev/null &
@@ -265,15 +288,29 @@ if [ -s "$CPM_PREVIEW_PIDFILE" ]; then echo "cpm-preview-started $(cat "$CPM_PRE
 exit 0`);
 }
 
-/** `alive <phase>`, or `dead <phase>` followed by the log tail. */
+/**
+ * Prints `cpm-health: alive <phase>` or `cpm-health: dead <phase>`, the latter
+ * followed by the log tail. Prefixed so the parse doesn't depend on it being
+ * the first line (`coder ssh` can put other output in front of it).
+ */
 function buildHealthCheckCommand(taskId: string): string {
   return wrapScript(`set +e
 pid=$(cat ${shq(previewPidPath(taskId))} 2>/dev/null)
 phase=$(cat ${shq(previewStatePath(taskId))} 2>/dev/null)
-if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "alive \${phase:-running}"; exit 0; fi
-echo "dead \${phase:-running}"
+if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "cpm-health: alive \${phase:-running}"; exit 0; fi
+echo "cpm-health: dead \${phase:-running}"
 tail -n 20 ${shq(previewLogPath(taskId))} 2>/dev/null
 exit 0`);
+}
+
+/** Find the health line anywhere in the output; the log tail is whatever follows it. */
+export function parseHealthOutput(out: string): { state: 'alive' | 'dead'; phase: string; tail: string } | null {
+  const lines = out.replace(/\r\n?/g, '\n').split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = /cpm-health: (alive|dead)(?: (\S+))?/.exec(lines[i]);
+    if (m) return { state: m[1] as 'alive' | 'dead', phase: m[2] || 'running', tail: lines.slice(i + 1).join('\n').trim() };
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -433,13 +470,26 @@ function scheduleHealthCheck(taskId: string, startedAt: string, opts: RestartOpt
         return; // can't tell — leave it as it is rather than guess
       }
       if (!current()) return;
-      const [state, phase] = firstLine(out).split(/\s+/);
+      const health = parseHealthOutput(out);
+      if (!health) return;
+      const { state, phase, tail } = health;
       if (state === 'alive') {
         if (phase === 'installing') {
-          setPreviewState(taskId, { status: 'installing' });
-          if (Date.now() - since < (opts.installWatchMs ?? DEFAULT_INSTALL_WATCH_MS)) {
+          const watchMs = opts.installWatchMs ?? DEFAULT_INSTALL_WATCH_MS;
+          if (Date.now() - since < watchMs) {
+            setPreviewState(taskId, { status: 'installing' });
             scheduleHealthCheck(taskId, startedAt, opts, since, true);
+            return;
           }
+          // Never leave it "installing" forever: give up, stop it (the marker
+          // is only written on success, so the next start retries), and say why.
+          const log = await opts.exec(`tail -n 20 ${shq(previewLogPath(taskId))} 2>/dev/null; exit 0`, 15000).catch(() => '');
+          await opts.exec(buildPreviewStopCommand(taskId), 20000).catch(() => '');
+          if (!current()) return;
+          setPreviewState(taskId, {
+            status: 'failed',
+            error: `The dependency install did not finish within ${formatDuration(watchMs)}, so it was stopped.${log.trim() ? `\n${log.trim().slice(-1500)}` : ''}`,
+          });
         } else if (wasInstalling) {
           // Install finished and the command is up: give the server its own check.
           setPreviewState(taskId, { status: 'running' });
@@ -447,13 +497,15 @@ function scheduleHealthCheck(taskId: string, startedAt: string, opts: RestartOpt
         }
         return;
       }
-      if (state !== 'dead') return;
-      const tail = out.replace(/^[^\n]*\r?\n?/, '').trim();
       const what = phase === 'installing' ? 'Installing the dependencies failed.' : 'The preview exited shortly after starting.';
       setPreviewState(taskId, { status: 'failed', error: `${what}${tail ? `\n${tail.slice(-1500)}` : ''}` });
     })().catch(() => {});
   }, delay);
   timer.unref?.();
+}
+
+function formatDuration(ms: number): string {
+  return ms >= 60_000 ? `${Math.round(ms / 60_000)} min` : `${Math.max(1, Math.round(ms / 1000))} s`;
 }
 
 /** The last `lines` lines of the task's preview log ('' when there is none yet). */

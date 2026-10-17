@@ -245,7 +245,7 @@ dbTest('a preview that crashes right after starting shows as failed, with the en
   const exec = async (command: string) => {
     const script = decode(command);
     if (script.includes('CPM_PREVIEW_CMD')) return 'cpm-preview-started 4242';
-    if (script.includes('kill -0 "$pid"')) return "dead running\nError: Cannot find module 'vite'";
+    if (script.includes('kill -0 "$pid"')) return "cpm-health: dead running\nError: Cannot find module 'vite'";
     return '';
   };
   const outcome = await P.restartTaskPreview(task.id, { exec, rangeSize: 10, healthCheckMs: 5 });
@@ -404,101 +404,185 @@ test('the start script returns immediately with the process detached, and the st
 // ---------------------------------------------------------------------------
 
 /**
- * Run the real start script in a fresh project dir whose package managers are
- * fakes that log their arguments: `ci`/`install` create node_modules, `run`
- * stays up like a dev server. Returns the start output and the logged calls
- * once the preview command itself has been reached.
+ * A project dir plus fake package managers (npm, pnpm, yarn) that log their
+ * arguments: `run` stays up like a dev server; anything else "installs" by
+ * creating node_modules, and fails when a `fail-install` file is present.
+ * `yarn --version` answers from a `yarn-version` file (default 1.22.19).
  */
-function startWithFakeManagers(opts: { files: string[]; nodeModules: boolean; autoInstall: boolean }) {
-  const taskId = randomUUID();
+function makeProject(files: Record<string, string>) {
   const work = mkdtempSync(join(dir, 'proj-'));
   const fakeBin = mkdtempSync(join(dir, 'fakebin-'));
   const calls = join(work, 'calls.log');
-  for (const tool of ['npm', 'pnpm']) {
-    writeFileSync(join(fakeBin, tool), `#!/bin/sh\necho "${tool} $*" >> '${calls}'\ncase "$1" in run) exec sleep 30;; *) mkdir -p node_modules;; esac\n`);
+  for (const tool of ['npm', 'pnpm', 'yarn']) {
+    writeFileSync(join(fakeBin, tool), `#!/bin/sh
+if [ "$1" = --version ]; then cat yarn-version 2>/dev/null || echo 1.22.19; exit 0; fi
+echo "${tool} $*" >> '${calls}'
+case "$1" in run) exec sleep 30;; esac
+mkdir -p node_modules
+[ -f fail-install ] && exit 1
+exit 0
+`);
     chmodSync(join(fakeBin, tool), 0o755);
   }
   writeFileSync(join(work, 'package.json'), '{"scripts":{"dev":"vite"}}');
-  for (const f of opts.files) writeFileSync(join(work, f), '');
-  if (opts.nodeModules) mkdirSync(join(work, 'node_modules'));
-  const env = { ...process.env, PATH: `${fakeBin}:${process.env.PATH}`, HOME: work };
-  const out = execFileSync('sh', ['-c', P.buildPreviewStartCommand({
-    taskId, workDir: work, command: 'npm run dev', portStart: 47090, portEnd: 47099, autoInstall: opts.autoInstall,
-  })], { env }).toString();
-  const read = () => (existsSync(calls) ? readFileSync(calls, 'utf8').trim().split('\n') : []);
-  for (let i = 0; i < 50 && !read().some(l => l.endsWith('run dev')); i++) execFileSync('sleep', ['0.1']);
-  const lines = read();
-  execFileSync('sh', ['-c', P.buildPreviewStopCommand(taskId)]);
-  rmSync(P.previewLogPath(taskId), { force: true });
-  return { out, calls: lines, nodeModules: existsSync(join(work, 'node_modules')) };
+  for (const [f, content] of Object.entries(files)) writeFileSync(join(work, f), content);
+  return { work, fakeBin, calls };
 }
 
-test('installs with npm ci before npm run dev when node_modules is missing and package-lock.json exists', { timeout: 20000 }, () => {
-  const r = startWithFakeManagers({ files: ['package-lock.json'], nodeModules: false, autoInstall: true });
+/** Run the real start script once in `project`; returns the output and the calls this start made. */
+function startIn(project: ReturnType<typeof makeProject>, autoInstall = true) {
+  const taskId = randomUUID();
+  const read = () => (existsSync(project.calls) ? readFileSync(project.calls, 'utf8').trim().split('\n') : []);
+  const before = read().length;
+  const env = { ...process.env, PATH: `${project.fakeBin}:${process.env.PATH}`, HOME: project.work };
+  const out = execFileSync('sh', ['-c', P.buildPreviewStartCommand({
+    taskId, workDir: project.work, command: 'npm run dev', portStart: 47090, portEnd: 47099, autoInstall,
+  })], { env }).toString();
+  const log = () => (existsSync(P.previewLogPath(taskId)) ? readFileSync(P.previewLogPath(taskId), 'utf8') : '');
+  for (let i = 0; i < 50 && !read().slice(before).some(l => l.endsWith('run dev')) && !log().includes('install failed'); i++) {
+    execFileSync('sleep', ['0.1']);
+  }
+  const calls = read().slice(before);
+  execFileSync('sh', ['-c', P.buildPreviewStopCommand(taskId)]);
+  rmSync(P.previewLogPath(taskId), { force: true });
+  return { out, calls };
+}
+
+const marker = (project: ReturnType<typeof makeProject>) => join(project.work, P.INSTALL_MARKER);
+
+test('installs with npm ci before npm run dev in a fresh worktree with a package-lock.json', { timeout: 20000 }, () => {
+  const project = makeProject({ 'package-lock.json': '{"v":1}' });
+  const r = startIn(project);
   assert.match(r.out, /cpm-preview-started \d+ installing/);
   assert.deepEqual(r.calls, ['npm ci', 'npm run dev']);
-  assert.equal(r.nodeModules, true);
+  assert.ok(existsSync(marker(project)), 'a successful install is recorded');
 });
 
 test('installs with npm install when there is no lockfile', { timeout: 20000 }, () => {
-  const r = startWithFakeManagers({ files: [], nodeModules: false, autoInstall: true });
-  assert.deepEqual(r.calls, ['npm install', 'npm run dev']);
+  assert.deepEqual(startIn(makeProject({})).calls, ['npm install', 'npm run dev']);
 });
 
 test('installs with pnpm when the project has a pnpm lockfile', { timeout: 20000 }, () => {
-  const r = startWithFakeManagers({ files: ['pnpm-lock.yaml'], nodeModules: false, autoInstall: true });
-  assert.deepEqual(r.calls, ['pnpm install --frozen-lockfile', 'npm run dev']);
+  assert.deepEqual(startIn(makeProject({ 'pnpm-lock.yaml': 'x' })).calls, ['pnpm install --frozen-lockfile', 'npm run dev']);
 });
 
-test('skips the install when node_modules already exists', { timeout: 20000 }, () => {
-  const r = startWithFakeManagers({ files: ['package-lock.json'], nodeModules: true, autoInstall: true });
-  assert.doesNotMatch(r.out, /installing/);
-  assert.deepEqual(r.calls, ['npm run dev']);
+test('uses yarn install --frozen-lockfile for Yarn 1', { timeout: 20000 }, () => {
+  assert.deepEqual(startIn(makeProject({ 'yarn.lock': 'x' })).calls, ['yarn install --frozen-lockfile', 'npm run dev']);
+});
+
+test('uses yarn install --immutable for Yarn Berry, detected by version 2 or newer', { timeout: 20000 }, () => {
+  const r = startIn(makeProject({ 'yarn.lock': 'x', 'yarn-version': '4.1.0' }));
+  assert.deepEqual(r.calls, ['yarn install --immutable', 'npm run dev']);
+});
+
+test('uses yarn install --immutable when the project has a .yarnrc.yml', { timeout: 20000 }, () => {
+  const r = startIn(makeProject({ 'yarn.lock': 'x', '.yarnrc.yml': 'nodeLinker: node-modules' }));
+  assert.deepEqual(r.calls, ['yarn install --immutable', 'npm run dev']);
+});
+
+test('does not install again on the next turn when the lockfile is unchanged', { timeout: 30000 }, () => {
+  const project = makeProject({ 'package-lock.json': '{"v":1}' });
+  startIn(project);
+  const second = startIn(project);
+  assert.doesNotMatch(second.out, /installing/);
+  assert.deepEqual(second.calls, ['npm run dev']);
+});
+
+test('installs again when the lockfile changed, e.g. after the agent added a package', { timeout: 30000 }, () => {
+  const project = makeProject({ 'package-lock.json': '{"v":1}' });
+  startIn(project);
+  writeFileSync(join(project.work, 'package-lock.json'), '{"v":2,"added":"left-pad"}');
+  assert.deepEqual(startIn(project).calls, ['npm ci', 'npm run dev']);
+});
+
+test('installs again when package.json changed in a project without a lockfile', { timeout: 30000 }, () => {
+  const project = makeProject({});
+  startIn(project);
+  writeFileSync(join(project.work, 'package.json'), '{"scripts":{"dev":"vite"},"dependencies":{"left-pad":"1"}}');
+  assert.deepEqual(startIn(project).calls, ['npm install', 'npm run dev']);
+});
+
+test('a failed install is retried on the next start even though node_modules now exists', { timeout: 30000 }, () => {
+  const project = makeProject({ 'package-lock.json': '{"v":1}', 'fail-install': '' });
+  const first = startIn(project);
+  assert.deepEqual(first.calls, ['npm ci'], 'the dev server is not started after a failed install');
+  assert.ok(existsSync(join(project.work, 'node_modules')), 'the failed install left a partial node_modules');
+  assert.equal(existsSync(marker(project)), false, 'but no success marker');
+  rmSync(join(project.work, 'fail-install'));
+  assert.deepEqual(startIn(project).calls, ['npm ci', 'npm run dev']);
+});
+
+test('installs when node_modules exists but was not installed by CPM for this lockfile', { timeout: 20000 }, () => {
+  const project = makeProject({ 'package-lock.json': '{"v":1}' });
+  mkdirSync(join(project.work, 'node_modules'));
+  assert.deepEqual(startIn(project).calls, ['npm ci', 'npm run dev']);
 });
 
 test('never installs for an explicit workspace preview command, even without node_modules', { timeout: 20000 }, () => {
-  const r = startWithFakeManagers({ files: ['package-lock.json'], nodeModules: false, autoInstall: false });
+  const project = makeProject({ 'package-lock.json': '{"v":1}' });
+  const r = startIn(project, false);
   assert.doesNotMatch(r.out, /installing/);
   assert.deepEqual(r.calls, ['npm run dev']);
-  assert.equal(r.nodeModules, false);
+  assert.equal(existsSync(join(project.work, 'node_modules')), false);
 });
 
 /** Restart with a mocked workspace whose health checks answer from `phases` in turn. */
-async function restartWithHealth(phases: string[]) {
+async function restartWithHealth(phases: string[], extra: { installWatchMs?: number } = {}) {
   const task = makeTask();
-  const answers = [...phases];
+  const answers = phases.map(p => `cpm-health: ${p}`);
+  const commands: string[] = [];
   const exec = async (command: string) => {
     const script = decode(command);
+    commands.push(script);
     if (script.startsWith('cat ')) return '{"scripts":{"dev":"vite"}}';
     if (script.includes('CPM_PREVIEW_CMD')) return 'cpm-preview-started 4242 installing';
     if (script.includes('kill -0 "$pid"')) return answers.length > 1 ? answers.shift()! : answers[0];
+    if (script.startsWith('tail -n 20')) return 'added 812 packages, still resolving…';
     return '';
   };
-  const outcome = await P.restartTaskPreview(task.id, { exec, rangeSize: 10, healthCheckMs: 5 });
-  return { task, outcome };
+  const outcome = await P.restartTaskPreview(task.id, { exec, rangeSize: 10, healthCheckMs: 5, ...extra });
+  return { task, outcome, commands };
 }
+
+const waitForStatus = async (taskId: string, status: string) => {
+  for (let i = 0; i < 300 && T.getTask(taskId)!.preview_status !== status; i++) await new Promise(r => setTimeout(r, 5));
+  return T.getTask(taskId)!;
+};
 
 dbTest('a long install is shown as installing and not failed, then running once the server is up', async () => {
   const { task, outcome } = await restartWithHealth(['alive installing', 'alive installing', 'alive installing', 'alive running']);
   assert.equal(outcome.status, 'installing');
   assert.equal(T.getTask(task.id)!.preview_status, 'installing');
-  for (let i = 0; i < 200 && T.getTask(task.id)!.preview_status === 'installing'; i++) await new Promise(r => setTimeout(r, 5));
+  await waitForStatus(task.id, 'running');
   await new Promise(r => setTimeout(r, 50)); // the post-install check runs too
   assert.equal(T.getTask(task.id)!.preview_status, 'running');
 });
 
+dbTest('an install that never finishes is stopped and shown as failed, not installing forever', async () => {
+  const { task, commands } = await restartWithHealth(['alive installing'], { installWatchMs: 40 });
+  const t = await waitForStatus(task.id, 'failed');
+  assert.equal(t.preview_status, 'failed');
+  assert.match(t.preview_error ?? '', /did not finish within 1 s, so it was stopped\.\nadded 812 packages/);
+  assert.ok(commands.filter(c => c.includes('killed-preview')).length >= 2, 'the stuck install is killed (after the pre-start kill)');
+});
+
 dbTest('a failed install shows as failed with the install log', async () => {
   const { task } = await restartWithHealth(['alive installing', 'dead installing\nnpm ERR! 404 Not Found']);
-  for (let i = 0; i < 200 && T.getTask(task.id)!.preview_status !== 'failed'; i++) await new Promise(r => setTimeout(r, 5));
-  const t = T.getTask(task.id)!;
-  assert.equal(t.preview_status, 'failed');
+  const t = await waitForStatus(task.id, 'failed');
   assert.match(t.preview_error ?? '', /Installing the dependencies failed\.[\s\S]*npm ERR! 404/);
 });
 
 dbTest('a server that crashes right after its install finished is still caught', async () => {
   const { task } = await restartWithHealth(['alive installing', 'alive running', 'dead running\nError: Cannot find module']);
-  for (let i = 0; i < 200 && T.getTask(task.id)!.preview_status !== 'failed'; i++) await new Promise(r => setTimeout(r, 5));
-  assert.match(T.getTask(task.id)!.preview_error ?? '', /exited shortly after starting[\s\S]*Cannot find module/);
+  const t = await waitForStatus(task.id, 'failed');
+  assert.match(t.preview_error ?? '', /exited shortly after starting[\s\S]*Cannot find module/);
+});
+
+test('reads the health result wherever it is in the output, not just on the first line', () => {
+  if (loadError) return;
+  assert.deepEqual(P.parseHealthOutput('Welcome to the workspace!\r\ncpm-health: alive installing\r\n'), { state: 'alive', phase: 'installing', tail: '' });
+  assert.deepEqual(P.parseHealthOutput('motd\ncpm-health: dead running\nError: boom\nat x'), { state: 'dead', phase: 'running', tail: 'Error: boom\nat x' });
+  assert.equal(P.parseHealthOutput('nothing useful'), null);
 });
 
 // ---------------------------------------------------------------------------
