@@ -690,6 +690,20 @@ export function getDb(): Database.Database {
   if (!tasksCols9.some(c => c.name === 'github_issue_progress_label')) {
     db.exec("ALTER TABLE tasks ADD COLUMN github_issue_progress_label TEXT");
   }
+  // CPM-managed task previews (services/preview.ts): the per-workspace command
+  // (NULL = auto-detect) and what auto-detection last found, plus each task's
+  // preview state. preview_status NULL = CPM never managed a preview for it.
+  if (!wsCols4.some(c => c.name === 'preview_command')) {
+    db.exec("ALTER TABLE workspace_settings ADD COLUMN preview_command TEXT");
+  }
+  if (!wsCols4.some(c => c.name === 'preview_detected_command')) {
+    db.exec("ALTER TABLE workspace_settings ADD COLUMN preview_detected_command TEXT");
+  }
+  for (const col of ['preview_status', 'preview_error', 'preview_command', 'preview_started_at']) {
+    if (!tasksCols9.some(c => c.name === col)) {
+      db.exec(`ALTER TABLE tasks ADD COLUMN ${col} TEXT`);
+    }
+  }
 
   return db;
 }

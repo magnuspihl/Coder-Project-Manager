@@ -10,6 +10,7 @@ import { getSubscriptionUsage, getObservedSubscriptionKeys, subscriptionKeyFor, 
 import { listAccounts } from '../services/claude-accounts.js';
 import { getStoredTestProfile, setStoredTestProfile, getTestObligationSetting, setTestObligationSetting } from '../services/test-profile.js';
 import { parseTestProfile } from '../services/test-runners.js';
+import { getPreviewCommandSetting, setPreviewCommandSetting, parsePreviewCommand } from '../services/preview.js';
 import { findUserWorkspaceById } from '../services/workspace-cache.js';
 import { deleteSession, refreshAccessToken } from '../services/sessions.js';
 import { getModelsForWorkspace } from '../services/models.js';
@@ -841,6 +842,32 @@ router.put('/:workspaceId/test-profile', requireAuth, (req: Request, res: Respon
   if (profileUpdate) setStoredTestProfile(req.params.workspaceId, profileUpdate.value);
   if (body.obligation !== undefined) setTestObligationSetting(req.params.workspaceId, body.obligation as 'auto' | 'on' | 'off');
   res.json({ ok: true, profile: getStoredTestProfile(req.params.workspaceId), obligation: getTestObligationSetting(req.params.workspaceId) });
+});
+
+// Command CPM runs to start each task's preview (services/preview.ts). null =
+// auto-detect; `detected` is what auto-detection last found, for display.
+router.get('/:workspaceId/preview-command', requireAuth, (req: Request, res: Response) => {
+  if (!findUserWorkspaceById(req.user!.id, req.params.workspaceId)) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  res.json(getPreviewCommandSetting(req.params.workspaceId));
+});
+
+router.put('/:workspaceId/preview-command', requireAuth, (req: Request, res: Response) => {
+  // The command runs in this workspace's shell, so only users who can see the
+  // workspace may change it.
+  if (!findUserWorkspaceById(req.user!.id, req.params.workspaceId)) {
+    res.status(404).json({ error: 'Workspace not found' });
+    return;
+  }
+  const parsed = parsePreviewCommand((req.body as { command?: unknown })?.command);
+  if (!parsed.ok) {
+    res.status(400).json({ error: parsed.error });
+    return;
+  }
+  setPreviewCommandSetting(req.params.workspaceId, parsed.value);
+  res.json({ ok: true, ...getPreviewCommandSetting(req.params.workspaceId) });
 });
 
 export default router;

@@ -41,6 +41,15 @@ export interface Task {
   pr_url: string | null;
   worktree_path: string | null;
   port_range_start: number | null;
+  /**
+   * CPM-managed preview (services/preview.ts): 'starting' | 'running' | 'failed' |
+   * 'stopped' | 'none'. NULL = CPM never managed one, and only then is
+   * verification_url scraped from the agent's messages.
+   */
+  preview_status: string | null;
+  preview_error: string | null;
+  preview_command: string | null;
+  preview_started_at: string | null;
   caveman: string | null;
   pending_complete: number;
   session_initialized: number;
@@ -1030,11 +1039,13 @@ export function addMessage(taskId: string, role: string, content: string, opts: 
     'INSERT INTO messages (id, task_id, role, content, cost, username, participant_id, source, client_label, turn_id, kind, meta, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   ).run(id, taskId, role, content, cost ?? null, username ?? null, participantId ?? null, source ?? null, clientLabel ?? null, turnId ?? null, kind ?? null, metaJson, now);
 
-  // Extract verification URL from assistant messages and store on the task
+  // Extract verification URL from assistant messages and store on the task —
+  // only as a fallback for tasks without a CPM-managed preview, whose URL CPM
+  // sets itself from the port it started the preview on.
   if (role === 'assistant') {
     const url = extractVerificationUrl(content);
     if (url) {
-      db.prepare('UPDATE tasks SET verification_url = ? WHERE id = ?').run(url, taskId);
+      db.prepare("UPDATE tasks SET verification_url = ? WHERE id = ? AND (preview_status IS NULL OR preview_status = 'none')").run(url, taskId);
     }
   }
 
