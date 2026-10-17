@@ -185,6 +185,8 @@ export interface ReviewFinding {
   proof_output: string | null;
 }
 
+export type PreviewStatus = 'starting' | 'running' | 'failed' | 'stopped' | 'none';
+
 export interface Task {
   id: string;
   workspace_id: string;
@@ -213,6 +215,11 @@ export interface Task {
   pr_url: string | null;
   worktree_path: string | null;
   port_range_start: number | null;
+  /** CPM-managed preview state; null = CPM never managed a preview for this task. */
+  preview_status?: PreviewStatus | null;
+  preview_error?: string | null;
+  preview_command?: string | null;
+  preview_started_at?: string | null;
   model: string | null;
   claude_account_id: string | null;
   caveman: string | null;
@@ -792,6 +799,25 @@ export const cancelTask = (taskId: string) =>
 /** Fire a scheduled wake-up now instead of waiting for its timer/sentinel file. */
 export const wakeTaskNow = (taskId: string) =>
   request<{ task: Task }>(`/api/tasks/${taskId}/wake`, { method: 'POST' });
+
+/** Restart the task's CPM-managed preview server. The outcome lands in preview_status. */
+export const restartTaskPreview = (taskId: string) =>
+  request<{ task: Task }>(`/api/tasks/${taskId}/preview/restart`, { method: 'POST' });
+
+/** The last `lines` lines of the task's preview log. */
+export const getTaskPreviewLog = (taskId: string, lines = 200) =>
+  request<{ log: string; status: PreviewStatus | null; command: string | null; error: string | null }>(
+    `/api/tasks/${taskId}/preview/log?lines=${lines}`);
+
+/** The workspace's preview command (null = auto-detect) and what auto-detection last found. */
+export const getPreviewCommand = (workspaceId: string) =>
+  request<{ command: string | null; detected: string | null }>(`/api/workspaces/${workspaceId}/preview-command`);
+
+export const updatePreviewCommand = (workspaceId: string, command: string | null) =>
+  request<{ ok: boolean; command: string | null; detected: string | null }>(`/api/workspaces/${workspaceId}/preview-command`, {
+    method: 'PUT',
+    body: JSON.stringify({ command }),
+  });
 
 /** Disarm a scheduled wake-up without replying to the task. */
 export const cancelTaskWake = (taskId: string) =>
