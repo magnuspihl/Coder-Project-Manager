@@ -185,7 +185,18 @@ export interface ReviewFinding {
   proof_output: string | null;
 }
 
-export type PreviewStatus = 'starting' | 'installing' | 'running' | 'failed' | 'stopped' | 'none';
+export type PreviewStatus = 'starting' | 'installing' | 'running' | 'unreachable' | 'failed' | 'stopped' | 'none';
+
+/**
+ * Whether the task's verification_url can be offered as a working link: a URL
+ * the agent reported (CPM manages no preview) always, a CPM-managed preview's
+ * only once something actually answers on its port.
+ */
+export function isPreviewLinkLive(task: Pick<Task, 'verification_url' | 'preview_status'>): boolean {
+  if (!task.verification_url) return false;
+  const status = task.preview_status ?? null;
+  return status === null || status === 'none' || status === 'running';
+}
 
 export interface Task {
   id: string;

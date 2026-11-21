@@ -18,7 +18,7 @@ import { handleMcpRequest, handleMcpMethodNotAllowed } from './mcp/index.js';
 // Initialize database on import
 import './db/index.js';
 import { abandonRunningAudits } from './services/audits.js';
-import { reconnectWorkingTasks, startRateLimitRetryPoller, startWakePoller } from './services/claude.js';
+import { reconnectWorkingTasks, startRateLimitRetryPoller, startWakePoller, startPreviewWatchdog } from './services/claude.js';
 import { startWorktreeReconciler } from './services/git.js';
 import { startPortJanitor } from './services/port-janitor.js';
 import { startIssueWatchPoller } from './services/github-issue-watcher.js';
@@ -84,6 +84,8 @@ app.listen(PORT, '0.0.0.0', () => {
   // Periodically reap orphaned dev servers and attribute drifted ports to their
   // owning task (see services/port-janitor.ts).
   startPortJanitor();
+  // Re-probe running task previews so a dead link stops showing as running.
+  startPreviewWatchdog();
   // Turn GitHub issues labeled for pickup (per-workspace opt-in) into tasks.
   startIssueWatchPoller();
 });

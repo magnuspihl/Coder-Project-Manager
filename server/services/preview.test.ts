@@ -5,12 +5,16 @@
  * Runs against a real temporary database. Every remote call previews make goes
  * through a mocked exec (setPreviewExecForTests), and a fake `coder` that always
  * fails sits first on PATH so nothing else can reach a real workspace either.
+ * Mocked workspaces answer the port probe as if something listens, so a
+ * preview settles as running the way it would for real; the "Does the port
+ * answer?" tests use the real scripts against a real listener instead.
  * One test runs the generated start/stop scripts for real with a `sleep` (no
  * server, no ports) to prove the start detaches and the stop kills the group.
  */
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
+import { createServer, type AddressInfo, type Server } from 'node:net';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,7 +25,9 @@ process.env.DATABASE_PATH = join(dir, 'test.db');
 process.env.CODER_WORKSPACE_NAME = 'local-ws';
 process.env.VSCODE_PROXY_URI = 'https://{{port}}--main--local-ws--magnus.coder.test';
 process.env.CPM_PORT_RANGE_START = '47000';
-process.env.CPM_PREVIEW_HEALTHCHECK_MS = '0';
+// Probe fast; mocked workspaces answer the port probe like a listening server.
+process.env.CPM_PREVIEW_HEALTHCHECK_MS = '5';
+process.env.CPM_PREVIEW_PROBE_INTERVAL_MS = '5';
 process.env.CPM_WORKTREE_BASE = join(dir, 'worktrees');
 process.env.CPM_CHECKPOINTS_BASE = join(dir, 'checkpoints');
 const bin = join(dir, 'bin');
@@ -51,8 +57,13 @@ before(async () => {
 });
 after(() => rmSync(dir, { recursive: true, force: true }));
 
-const dbTest = (name: string, fn: () => void | Promise<void>) =>
-  test(name, async t => { if (loadError) return t.skip(`database unavailable: ${loadError.message.slice(0, 80)}`); await fn(); });
+function dbTest(name: string, fn: () => void | Promise<void>): void;
+function dbTest(name: string, options: { timeout: number }, fn: () => void | Promise<void>): void;
+function dbTest(name: string, a: { timeout: number } | (() => void | Promise<void>), b?: () => void | Promise<void>): void {
+  const fn = typeof a === 'function' ? a : b!;
+  const options = typeof a === 'function' ? {} : a;
+  test(name, options, async t => { if (loadError) return t.skip(`database unavailable: ${loadError.message.slice(0, 80)}`); await fn(); });
+}
 
 /** The script inside a `printf %s '<b64>' | base64 -d | sh` command, decoded; other commands as-is. */
 function decode(cmd: string): string {
@@ -64,7 +75,7 @@ function decode(cmd: string): string {
 
 interface Call { workspace: string; command: string }
 
-/** A mock remote exec that records calls and answers like a workspace would. */
+/** A mock remote exec that records calls and answers like a workspace whose preview answers on its port. */
 function mockExec(opts: { packageJson?: string | null; start?: string; hang?: boolean; fail?: string } = {}) {
   const calls: Call[] = [];
   const restore = C.setPreviewExecForTests(async (workspace, command) => {
@@ -74,6 +85,7 @@ function mockExec(opts: { packageJson?: string | null; start?: string; hang?: bo
     if (opts.fail) throw new Error(opts.fail);
     if (script.startsWith('cat ')) return opts.packageJson ?? '';
     if (script.includes('CPM_PREVIEW_CMD')) return opts.start ?? 'cpm-preview-started 4242';
+    if (script.includes('kill -0 "$pid"')) return 'cpm-health: alive running open';
     return '';
   });
   return { calls, restore };
@@ -248,9 +260,9 @@ dbTest('a preview that crashes right after starting shows as failed, with the en
     if (script.includes('kill -0 "$pid"')) return "cpm-health: dead running\nError: Cannot find module 'vite'";
     return '';
   };
-  const outcome = await P.restartTaskPreview(task.id, { exec, rangeSize: 10, healthCheckMs: 5 });
-  assert.equal(outcome.status, 'running');
-  for (let i = 0; i < 100 && T.getTask(task.id)!.preview_status === 'running'; i++) await new Promise(r => setTimeout(r, 5));
+  const outcome = await P.restartTaskPreview(task.id, { exec, rangeSize: 10, healthCheckMs: 5, probeIntervalMs: 5 });
+  assert.equal(outcome.status, 'starting');
+  for (let i = 0; i < 100 && T.getTask(task.id)!.preview_status === 'starting'; i++) await new Promise(r => setTimeout(r, 5));
   const t = T.getTask(task.id)!;
   assert.equal(t.preview_status, 'failed');
   assert.match(t.preview_error ?? '', /exited shortly after starting[\s\S]*Cannot find module 'vite'/);
@@ -540,7 +552,7 @@ async function restartWithHealth(phases: string[], extra: { installWatchMs?: num
     if (script.startsWith('tail -n 20')) return 'added 812 packages, still resolving…';
     return '';
   };
-  const outcome = await P.restartTaskPreview(task.id, { exec, rangeSize: 10, healthCheckMs: 5, ...extra });
+  const outcome = await P.restartTaskPreview(task.id, { exec, rangeSize: 10, healthCheckMs: 5, probeIntervalMs: 5, ...extra });
   return { task, outcome, commands };
 }
 
@@ -550,7 +562,7 @@ const waitForStatus = async (taskId: string, status: string) => {
 };
 
 dbTest('a long install is shown as installing and not failed, then running once the server is up', async () => {
-  const { task, outcome } = await restartWithHealth(['alive installing', 'alive installing', 'alive installing', 'alive running']);
+  const { task, outcome } = await restartWithHealth(['alive installing', 'alive installing', 'alive installing', 'alive running open']);
   assert.equal(outcome.status, 'installing');
   assert.equal(T.getTask(task.id)!.preview_status, 'installing');
   await waitForStatus(task.id, 'running');
@@ -580,9 +592,202 @@ dbTest('a server that crashes right after its install finished is still caught',
 
 test('reads the health result wherever it is in the output, not just on the first line', () => {
   if (loadError) return;
-  assert.deepEqual(P.parseHealthOutput('Welcome to the workspace!\r\ncpm-health: alive installing\r\n'), { state: 'alive', phase: 'installing', tail: '' });
-  assert.deepEqual(P.parseHealthOutput('motd\ncpm-health: dead running\nError: boom\nat x'), { state: 'dead', phase: 'running', tail: 'Error: boom\nat x' });
+  assert.deepEqual(P.parseHealthOutput('Welcome to the workspace!\r\ncpm-health: alive installing\r\n'), { state: 'alive', phase: 'installing', port: null, tail: '' });
+  assert.deepEqual(P.parseHealthOutput('motd\ncpm-health: dead running\nError: boom\nat x'), { state: 'dead', phase: 'running', port: null, tail: 'Error: boom\nat x' });
+  assert.deepEqual(P.parseHealthOutput('cpm-health: alive running open'), { state: 'alive', phase: 'running', port: 'open', tail: '' });
+  assert.deepEqual(P.parseHealthOutput('cpm-health: alive running closed\n  Local: http://localhost:40072/'), { state: 'alive', phase: 'running', port: 'closed', tail: 'Local: http://localhost:40072/' });
   assert.equal(P.parseHealthOutput('nothing useful'), null);
+});
+
+// ---------------------------------------------------------------------------
+// Does the port answer? (real scripts, a real listener owned by the test)
+// ---------------------------------------------------------------------------
+
+/** Runs the generated scripts on this machine, standing in for the workspace. */
+const localExec = (command: string, timeoutMs: number) => new Promise<string>((resolve, reject) => {
+  execFile('sh', ['-c', command], { timeout: timeoutMs }, (err, stdout) => (err ? reject(err) : resolve(stdout)));
+});
+
+/** A free port: bind an ephemeral one and let it go again. */
+async function freePort(): Promise<number> {
+  const srv = createServer();
+  await new Promise<void>(r => srv.listen(0, '127.0.0.1', r));
+  const port = (srv.address() as AddressInfo).port;
+  await new Promise(r => srv.close(r));
+  return port;
+}
+
+function listen(port: number, host = '127.0.0.1'): Promise<Server> {
+  const srv = createServer(sock => sock.end());
+  return new Promise((resolve, reject) => { srv.once('error', reject); srv.listen(port, host, () => resolve(srv)); });
+}
+const close = (srv: Server) => new Promise(r => srv.close(r));
+
+/** A task whose preview runs `command` for real, here, on a free port. */
+async function realPreviewTask(command: string) {
+  const port = await freePort();
+  const task = makeTask({ worktree: mkdtempSync(join(dir, 'probe-')), port });
+  P.setPreviewCommandSetting(task.workspace_id, command);
+  return { task, port };
+}
+
+const fastProbe = { exec: localExec, rangeSize: 10, healthCheckMs: 50, probeIntervalMs: 50, portWaitMs: 10000 };
+
+async function stopPreview(taskId: string) {
+  await localExec(P.buildPreviewStopCommand(taskId), 10000).catch(() => '');
+  rmSync(P.previewLogPath(taskId), { force: true });
+}
+
+dbTest('a started preview stays "starting" until its port answers, then becomes running', { timeout: 20000 }, async () => {
+  const { task, port } = await realPreviewTask('sleep 30');
+  let srv: Server | null = null;
+  try {
+    const outcome = await P.restartTaskPreview(task.id, fastProbe);
+    assert.equal(outcome.status, 'starting', 'a live process alone is not a running preview');
+    await new Promise(r => setTimeout(r, 400));
+    assert.equal(T.getTask(task.id)!.preview_status, 'starting', 'still waiting: nothing listens yet');
+    srv = await listen(port);
+    const t = await waitForStatus(task.id, 'running');
+    assert.equal(t.preview_status, 'running');
+    assert.equal(t.preview_error, null);
+  } finally {
+    if (srv) await close(srv);
+    await stopPreview(task.id);
+  }
+});
+
+dbTest('a preview listening only on IPv6 loopback (::1) counts as answering', { timeout: 20000 }, async () => {
+  const { task, port } = await realPreviewTask('sleep 30');
+  let srv: Server | null = null;
+  try {
+    srv = await listen(port, '::1');
+  } catch {
+    return; // no IPv6 loopback on this machine
+  }
+  try {
+    await P.restartTaskPreview(task.id, fastProbe);
+    assert.equal((await waitForStatus(task.id, 'running')).preview_status, 'running');
+  } finally {
+    await close(srv);
+    await stopPreview(task.id);
+  }
+});
+
+dbTest('a preview whose process is alive but never answers on its port is reported as not answering, with the port the log shows', { timeout: 20000 }, async () => {
+  const { task, port } = await realPreviewTask('echo "  VITE ready"; echo "  ➜  Local:   http://localhost:40072/"; sleep 30');
+  try {
+    await P.restartTaskPreview(task.id, { ...fastProbe, portWaitMs: 500 });
+    const t = await waitForStatus(task.id, 'unreachable');
+    assert.equal(t.preview_status, 'unreachable');
+    assert.match(t.preview_error ?? '', new RegExp(`Preview process is running but nothing is listening on port ${port} \\(the app may be ignoring \\$PORT\\)\\. Check the log\\.`));
+    assert.match(t.preview_error ?? '', /on port 40072 instead \(http:\/\/localhost:40072\/\)/);
+  } finally { await stopPreview(task.id); }
+});
+
+dbTest('a preview whose process dies before its port answers is failed, with the end of its log', { timeout: 20000 }, async () => {
+  const { task } = await realPreviewTask('echo "Error: listen EACCES: permission denied 0.0.0.0:80"; exit 1');
+  try {
+    await P.restartTaskPreview(task.id, fastProbe);
+    const t = await waitForStatus(task.id, 'failed');
+    assert.equal(t.preview_status, 'failed');
+    assert.match(t.preview_error ?? '', /exited shortly after starting[\s\S]*EACCES/);
+  } finally { await stopPreview(task.id); }
+});
+
+dbTest('a running preview that stops answering is flagged on recheck without being killed, and recovers when it answers again', { timeout: 20000 }, async () => {
+  const { task, port } = await realPreviewTask('sleep 30');
+  let srv: Server | null = await listen(port);
+  try {
+    await P.restartTaskPreview(task.id, fastProbe);
+    await waitForStatus(task.id, 'running');
+
+    await close(srv); srv = null;
+    assert.equal(await P.recheckTaskPreview(task.id, localExec), 'unreachable');
+    const t = T.getTask(task.id)!;
+    assert.equal(t.preview_status, 'unreachable');
+    assert.match(t.preview_error ?? '', new RegExp(`stopped answering on port ${port}; its process is still running`));
+    const pid = parseInt(readFileSync(P.previewPidPath(task.id), 'utf8'), 10);
+    assert.doesNotThrow(() => process.kill(pid, 0), 'the preview process was left running');
+
+    srv = await listen(port);
+    assert.equal(await P.recheckTaskPreview(task.id, localExec), 'running');
+    assert.equal(T.getTask(task.id)!.preview_error, null);
+  } finally {
+    if (srv) await close(srv);
+    await stopPreview(task.id);
+  }
+});
+
+dbTest('a running preview whose process died is failed on recheck', { timeout: 20000 }, async () => {
+  const { task, port } = await realPreviewTask('sleep 30');
+  const srv = await listen(port);
+  try {
+    await P.restartTaskPreview(task.id, fastProbe);
+    await waitForStatus(task.id, 'running');
+    const pid = parseInt(readFileSync(P.previewPidPath(task.id), 'utf8'), 10);
+    process.kill(-pid, 'SIGKILL');
+    for (let i = 0; i < 50; i++) { try { process.kill(pid, 0); await new Promise(r => setTimeout(r, 20)); } catch { break; } }
+    assert.equal(await P.recheckTaskPreview(task.id, localExec), 'failed', 'even though something still answers on the port');
+    assert.match(T.getTask(task.id)!.preview_error ?? '', /The preview process exited/);
+  } finally {
+    await close(srv);
+    await stopPreview(task.id);
+  }
+});
+
+dbTest('the periodic recheck leaves alone previews that are restarting, stopped, or never started', async () => {
+  const restarting = makeTask();
+  getDb().prepare("UPDATE tasks SET preview_status = 'starting' WHERE id = ?").run(restarting.id);
+  const stopped = makeTask();
+  getDb().prepare("UPDATE tasks SET preview_status = 'stopped' WHERE id = ?").run(stopped.id);
+  const none = makeTask();
+  const calls: string[] = [];
+  const exec = async (command: string) => { calls.push(command); return new Promise<string>(() => {}); };
+  // A restart is in flight for the first (it hangs on the remote call).
+  void P.restartTaskPreview(restarting.id, { exec, rangeSize: 10 });
+  await tick();
+  const before = calls.length;
+  for (const t of [restarting, stopped, none]) assert.equal(await P.recheckTaskPreview(t.id, exec), 'skipped');
+  assert.equal(calls.length, before, 'no health checks were sent');
+});
+
+dbTest('an interrupted start is still rechecked, and judged against the port wait its restart was given', { timeout: 20000 }, async () => {
+  const task = makeTask();
+  P.setPreviewCommandSetting(task.workspace_id, 'npm run dev');
+  const closed = async (command: string) => {
+    const script = decode(command);
+    if (script.includes('CPM_PREVIEW_CMD')) return 'cpm-preview-started 4242';
+    if (script.includes('kill -0 "$pid"')) return 'cpm-health: alive running closed';
+    return '';
+  };
+  // A watched start, superseded by a restart that fails before starting a watch of its own.
+  await P.restartTaskPreview(task.id, { exec: closed, rangeSize: 10, probeIntervalMs: 20, portWaitMs: 60_000 });
+  const failing = async (command: string) => {
+    if (decode(command).includes('CPM_PREVIEW_CMD')) throw new Error('ssh: connection reset');
+    return '';
+  };
+  assert.equal((await P.restartTaskPreview(task.id, { exec: failing, rangeSize: 10, portWaitMs: 200 })).status, 'failed');
+  await new Promise(r => setTimeout(r, 100)); // the superseded watch notices and exits
+
+  // Later the preview is left `starting` with nothing watching it (as after an interrupted watch).
+  const startedAt = new Date(Date.now() - 400).toISOString();
+  getDb().prepare("UPDATE tasks SET preview_status = 'starting', preview_started_at = ? WHERE id = ?").run(startedAt, task.id);
+  assert.equal(await P.recheckTaskPreview(task.id, closed), 'unreachable',
+    'rechecked (no stale watch blocks it), and 400 ms is past the 200 ms the restart allowed');
+  assert.match(T.getTask(task.id)!.preview_error ?? '', /nothing is listening on port 47010/);
+
+  getDb().prepare("UPDATE tasks SET preview_status = 'starting', preview_error = NULL WHERE id = ?").run(task.id);
+  assert.equal(await P.recheckTaskPreview(task.id, closed, { portWaitMs: 60_000 }), 'skipped', 'still within a longer wait');
+});
+
+test('explains where the app went when the log shows another port, and stays quiet when it does not', () => {
+  if (loadError) return;
+  assert.match(P.describeLogPortHint('\x1b[32m  ➜  Local:\x1b[0m   http://localhost:\x1b[1m40072\x1b[0m/', 40170) ?? '', /port 40072 instead/);
+  assert.match(P.describeLogPortHint('Port 40170 is in use, trying another one...\n  Local: http://localhost:40171/', 40170) ?? '',
+    /The log says: "Port 40170 is in use, trying another one\.\.\."[\s\S]*port 40171 instead/);
+  assert.match(P.describeLogPortHint('Error: listen EACCES: permission denied 0.0.0.0:80', 40170) ?? '', /EACCES/);
+  assert.equal(P.describeLogPortHint('  Local: http://localhost:40170/', 40170), null, 'the expected port is no hint');
+  assert.equal(P.describeLogPortHint('compiling...', 40170), null);
 });
 
 // ---------------------------------------------------------------------------

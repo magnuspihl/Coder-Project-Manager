@@ -5,6 +5,7 @@ const LABELS: Record<string, { text: string; dot: string }> = {
   starting: { text: 'Preview starting', dot: 'bg-amber-400 animate-pulse' },
   installing: { text: 'Preview installing deps', dot: 'bg-amber-400 animate-pulse' },
   running: { text: 'Preview running', dot: 'bg-green-500' },
+  unreachable: { text: 'Preview not answering', dot: 'bg-orange-500' },
   failed: { text: 'Preview failed', dot: 'bg-red-500' },
   stopped: { text: 'Preview stopped', dot: 'bg-gray-400' },
   none: { text: 'No preview', dot: 'bg-gray-300 dark:bg-gray-600' },
@@ -29,10 +30,13 @@ export default function TaskPreviewStatus({ task, onChanged }: { task: Task; onC
   const finished = FINISHED.includes(task.status);
   const canRestart = !finished && task.port_range_start != null;
 
-  // Starting/installing settle on the server; poll until they do.
+  // Starting/installing settle on the server; poll until they do. A settled
+  // preview is re-probed on the server about once a minute, so look again at
+  // that pace to catch one that stops (or starts again) answering.
   useEffect(() => {
-    if (status !== 'starting' && status !== 'installing') return;
-    const timer = setInterval(onChanged, 2000);
+    const settling = status === 'starting' || status === 'installing';
+    if (!settling && status !== 'running' && status !== 'unreachable') return;
+    const timer = setInterval(onChanged, settling ? 2000 : 60_000);
     return () => clearInterval(timer);
   }, [status, onChanged]);
 
@@ -109,8 +113,20 @@ export default function TaskPreviewStatus({ task, onChanged }: { task: Task; onC
               Set one in the workspace settings.
             </p>
           )}
+          {status === 'starting' && (
+            <p className="text-gray-600 dark:text-gray-300">
+              Waiting for the preview to answer on port {task.port_range_start}. The link is offered once it does.
+            </p>
+          )}
           {task.preview_error && (
-            <pre className="whitespace-pre-wrap break-words font-mono text-[11px] text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 rounded p-2 max-h-40 overflow-auto">{task.preview_error}</pre>
+            <div className="space-y-1">
+              <pre className="whitespace-pre-wrap break-words font-mono text-[11px] text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 rounded p-2 max-h-40 overflow-auto">{task.preview_error}</pre>
+              {log === null && (
+                <button onClick={loadLog} disabled={logLoading} className="text-blue-600 dark:text-blue-400 hover:underline disabled:opacity-50">
+                  {logLoading ? 'Loading the log…' : 'Show the latest log'}
+                </button>
+              )}
+            </div>
           )}
           <div className="flex items-center gap-2">
             <button

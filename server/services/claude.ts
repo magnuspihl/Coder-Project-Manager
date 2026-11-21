@@ -37,7 +37,7 @@ import { describeRunCommand, describeRunner, parseTestProfile, type TestProfile 
 import { resolveTestProfile, resolveTestObligation, getStoredTestProfile, setStoredTestProfile } from './test-profile.js';
 import { buildTestingPrompt, extractNoTests, extractTestProfile } from './implementer-markers.js';
 import { buildVerification, summariseVerification, reviewerTestLines, withBudget, type VerificationIO, type VerificationLevel, type VerificationSummary } from './verification.js';
-import { buildPreviewStopCommand, proxyUriForWorkspace, readPreviewLog, restartTaskPreview, type PreviewExec } from './preview.js';
+import { buildPreviewStopCommand, proxyUriForWorkspace, readPreviewLog, recheckAllPreviews, restartTaskPreview, type PreviewExec } from './preview.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
@@ -392,6 +392,27 @@ export function requestPreviewRestart(taskId: string): { ok: true } | { ok: fals
   getDb().prepare("UPDATE tasks SET preview_status = 'starting', preview_error = NULL WHERE id = ?").run(taskId);
   firePreviewRestart(taskId);
   return { ok: true };
+}
+
+const PREVIEW_RECHECK_MS = parseInt(process.env.CPM_PREVIEW_RECHECK_MS || '60000', 10);
+let previewWatchdogTimer: NodeJS.Timeout | null = null;
+let previewRecheckRunning = false;
+
+/**
+ * Re-probe every settled preview periodically, so one that stops answering on
+ * its port (or whose process dies) stops being shown as running. Also settles a
+ * start whose watch was cut short by a CPM restart. Reports only — never kills.
+ */
+export function startPreviewWatchdog(): void {
+  if (previewWatchdogTimer || !(PREVIEW_RECHECK_MS > 0)) return;
+  previewWatchdogTimer = setInterval(() => {
+    if (previewRecheckRunning) return;
+    previewRecheckRunning = true;
+    recheckAllPreviews(task => previewExecFor(task))
+      .catch(err => console.error(`[preview] recheck failed: ${(err as Error).message?.slice(0, 200)}`))
+      .finally(() => { previewRecheckRunning = false; });
+  }, PREVIEW_RECHECK_MS);
+  previewWatchdogTimer.unref?.();
 }
 
 /** Last lines of the task's preview log, read from its workspace. */
