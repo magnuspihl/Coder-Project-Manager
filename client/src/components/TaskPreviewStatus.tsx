@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { getTaskPreviewLog, restartTaskPreview, type Task } from '../api/client';
+import { getTaskPreviewLog, previewInstallFailed, restartTaskPreview, type Task } from '../api/client';
 
 const LABELS: Record<string, { text: string; dot: string }> = {
   starting: { text: 'Preview starting', dot: 'bg-amber-400 animate-pulse' },
@@ -50,7 +50,11 @@ export default function TaskPreviewStatus({ task, onChanged }: { task: Task; onC
   // Nothing to show for a task CPM never ran a preview for and can't now.
   if (!status && !canRestart) return null;
 
-  const label = status ? LABELS[status] ?? LABELS.none : { text: 'Preview not started', dot: 'bg-gray-300 dark:bg-gray-600' };
+  // A failed dependency install breaks more than the preview: the review's tests can't run either.
+  const installFailed = previewInstallFailed(task);
+  const label = installFailed
+    ? { text: 'Worktree not testable: dependency install failed', dot: 'bg-red-500' }
+    : status ? LABELS[status] ?? LABELS.none : { text: 'Preview not started', dot: 'bg-gray-300 dark:bg-gray-600' };
 
   const loadLog = async () => {
     setLogLoading(true);
@@ -118,6 +122,11 @@ export default function TaskPreviewStatus({ task, onChanged }: { task: Task; onC
               Waiting for the preview to answer on port {task.port_range_start}. The link is offered once it does.
             </p>
           )}
+          {installFailed && (
+            <p className="text-red-600 dark:text-red-400 font-medium">
+              Worktree not testable: dependency install failed. Until the dependencies install, tests cannot run here, so a review can only come back unverified. The install output is in the log below.
+            </p>
+          )}
           {task.preview_error && (
             <div className="space-y-1">
               <pre className="whitespace-pre-wrap break-words font-mono text-[11px] text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 rounded p-2 max-h-40 overflow-auto">{task.preview_error}</pre>
@@ -150,6 +159,40 @@ export default function TaskPreviewStatus({ task, onChanged }: { task: Task; onC
             <pre className="whitespace-pre-wrap break-words font-mono text-[11px] text-gray-700 dark:text-gray-200 bg-gray-50 dark:bg-gray-800 rounded p-2 max-h-72 overflow-auto">{log}</pre>
           )}
         </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * "Show the install log" for a task whose preview dependency install failed:
+ * the same log the preview popover shows, inline where the unverified review
+ * explains why the tests could not run.
+ */
+export function PreviewInstallLog({ taskId }: { taskId: string }) {
+  const [log, setLog] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const load = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const { log: text } = await getTaskPreviewLog(taskId, 200);
+      setLog(text || '(the log is empty)');
+    } catch (err: any) {
+      setError(err?.message || 'Could not load the log');
+    } finally {
+      setLoading(false);
+    }
+  };
+  return (
+    <div className="space-y-1">
+      <button onClick={load} disabled={loading} className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline disabled:opacity-50">
+        {loading ? 'Loading the install log…' : log === null ? 'Show the install log' : 'Refresh the install log'}
+      </button>
+      {error && <p className="text-[11px] text-red-500">{error}</p>}
+      {log !== null && (
+        <pre className="whitespace-pre-wrap break-words font-mono text-[11px] text-gray-700 dark:text-gray-200 bg-gray-50 dark:bg-gray-800 rounded p-2 max-h-72 overflow-auto">{log}</pre>
       )}
     </div>
   );

@@ -9,6 +9,9 @@
  *   test errors / can't run        → unproven  → advisory
  *
  * A review's outcome is then `fail` only if at least one finding is confirmed.
+ * When the tests could not run AT ALL — the runner itself is missing, or the
+ * whole suite errored before running a test — nothing was verified either way,
+ * and the outcome is `unverified`, never `pass` (see test-env.ts).
  * Everything here is pure or takes its IO as an injected `ProofIO`, so the
  * classification and routing can be tested without a workspace.
  */
@@ -16,6 +19,7 @@
 import type { CoverageReport } from './review-coverage.js';
 import type { ProofFile, ReviewDecision, ReviewIssue } from './review-verdict.js';
 import type { ReviewFinding } from './tasks.js';
+import { environmentFailure } from './test-env.js';
 import {
   defaultFilePattern,
   parseRunOutput,
@@ -42,6 +46,12 @@ export interface ProofResult {
    * test is not.
    */
   repairable: boolean;
+  /**
+   * Unproven because the ENVIRONMENT could not run any test (the runner or its
+   * dependencies are not installed) — not because of the test or the code. No
+   * repair round can fix that, and it makes the whole review unverified.
+   */
+  environment?: boolean;
 }
 
 export interface VerifiedIssue {
@@ -85,14 +95,23 @@ function clip(s: string, n = MAX_OUTPUT_CHARS): string {
   return s.length > n ? s.slice(0, n) + '\n…[truncated]' : s;
 }
 
-/** Turn one runner report into a verdict on the proof. */
-export function classifyRun(report: RunReport): ProofResult {
+/**
+ * Turn one runner report into a verdict on the proof. With the profile, a run
+ * the runner itself could not start (its package or binary missing) is told
+ * apart from a broken test: unproven either way, but `environment` — no repair
+ * round, and the review cannot pass on it.
+ */
+export function classifyRun(report: RunReport, profile?: TestProfile): ProofResult {
   const failed = report.cases.filter(c => c.outcome === 'failed');
   const passed = report.cases.filter(c => c.outcome === 'passed');
   const base = { failedTests: [] as string[], passedTests: passed.length, output: '' };
 
   if (report.timedOut) {
     return { ...base, status: 'unproven', reason: 'The test timed out', repairable: false, output: clip(report.suiteError ?? '') };
+  }
+  const env = profile && report.cases.length === 0 ? environmentFailure(profile, report.suiteError) : null;
+  if (env) {
+    return { ...base, status: 'unproven', reason: `The test could not run: ${env}`, repairable: false, environment: true, output: clip(report.suiteError ?? '') };
   }
   if (report.suiteError) {
     return { ...base, status: 'unproven', reason: 'The test could not run', repairable: true, output: clip(report.suiteError) };
@@ -243,7 +262,7 @@ export async function verifyProofs(args: VerifyArgs): Promise<VerifiedIssue[]> {
         written = true; // set first: a write that throws midway may still leave a file
         await io.write(path, content);
         const raw = await io.run([path]);
-        result = classifyRun(parseRunOutput(profile.runner, raw));
+        result = classifyRun(parseRunOutput(profile.runner, raw), profile);
       }
     } catch (err) {
       result = unproven(`The test could not be run: ${(err as Error).message.slice(0, 200)}`);
@@ -266,7 +285,7 @@ export async function rerunProof(
   run: (files: string[]) => Promise<string>,
 ): Promise<{ fixed: boolean; detail: string }> {
   try {
-    const result = classifyRun(parseRunOutput(profile.runner, await run([path])));
+    const result = classifyRun(parseRunOutput(profile.runner, await run([path])), profile);
     if (result.status === 'refuted') return { fixed: true, detail: 'The proof test now passes' };
     return { fixed: false, detail: result.status === 'confirmed' ? result.output || result.reason : result.reason };
   } catch (err) {
@@ -313,7 +332,13 @@ export function assignRepairFiles(issues: ReviewIssue[], files: ProofFile[]): { 
 
 export interface RoutedReview {
   mode: ReviewMode;
-  outcome: 'pass' | 'fail';
+  /**
+   * `unverified`: no finding was confirmed, but the tests could not run at all,
+   * so nothing was verified — not a pass. Proof mode only.
+   */
+  outcome: 'pass' | 'fail' | 'unverified';
+  /** Why the review is unverified ("tests could not run: …"). Set only then. */
+  unverifiedReason?: string;
   /** Findings that send the implementer back to work. */
   blocking: VerifiedIssue[];
   /** Surfaced to the user, never loops. */
@@ -324,18 +349,26 @@ export interface RoutedReview {
 
 /**
  * Decide the review's outcome. In proof mode the reviewer's own `outcome` is
- * only a claim: the review fails if and only if a finding was confirmed. In
- * opinion mode (no runnable test setup) the reviewer's word stands, as it did
- * before evidence-based review existed.
+ * only a claim: the review fails if and only if a finding was confirmed. When
+ * nothing was confirmed but the tests could not run — a proof's runner was
+ * missing, or `envProblem` (the suite or the pre-check) says so — it is
+ * `unverified`: a broken environment is not a verdict. In opinion mode (no
+ * runnable test setup) the reviewer's word stands, as it did before
+ * evidence-based review existed.
  */
-export function routeReview(mode: ReviewMode, decision: ReviewDecision, verified: VerifiedIssue[]): RoutedReview {
+export function routeReview(mode: ReviewMode, decision: ReviewDecision, verified: VerifiedIssue[], envProblem?: string | null): RoutedReview {
   if (mode === 'opinion') {
     return { mode, outcome: decision.outcome, blocking: verified, advisory: [], refuted: [] };
   }
   const blocking = verified.filter(v => v.proof.status === 'confirmed');
+  const brokenProof = verified.find(v => v.proof.environment);
+  const unverifiedReason = blocking.length > 0
+    ? undefined
+    : envProblem || (brokenProof ? `tests could not run: ${brokenProof.proof.reason.replace(/^The test could not run: /, '')}` : undefined);
   return {
     mode,
-    outcome: blocking.length > 0 ? 'fail' : 'pass',
+    outcome: blocking.length > 0 ? 'fail' : unverifiedReason ? 'unverified' : 'pass',
+    ...(unverifiedReason ? { unverifiedReason } : {}),
     blocking,
     advisory: verified.filter(v => v.proof.status === 'unproven'),
     refuted: verified.filter(v => v.proof.status === 'refuted'),
@@ -375,11 +408,15 @@ export interface StoredProof {
   reason: string;
   failedTests: string[];
   output: string;
+  /** The test could not run because the environment could not run any test. */
+  environment?: boolean;
 }
 
 export interface StoredReview {
   mode: ReviewMode;
   proofs: StoredProof[];
+  /** Set when the review is `unverified`: why the tests could not run, and the install log tail when an install failed. */
+  unverified?: { reason: string; log?: string };
   /** What the harness found the reviewer saw. Absent on reviews that predate coverage checking. */
   coverage?: CoverageReport;
 }
@@ -397,7 +434,9 @@ export function toStored(routed: RoutedReview, all: VerifiedIssue[]): StoredRevi
       reason: v.proof.reason,
       failedTests: v.proof.failedTests,
       output: v.proof.output,
+      ...(v.proof.environment ? { environment: true } : {}),
     })),
+    ...(routed.unverifiedReason ? { unverified: { reason: routed.unverifiedReason } } : {}),
   };
 }
 

@@ -25,7 +25,8 @@ import {
   assignRepairFiles, formatFindingForImplementer, opinionIssues, repairable, rerunProof, routeReview, tally, toStored, verifyProofs,
   PROOF_INSTRUCTIONS, type ReviewMode, type StoredReview, type VerifiedIssue,
 } from './review-proof.js';
-import { formatHandoffMarkdown, formatHandoffIssueTexts, formatEscalationMarkdown } from './message-kinds.js';
+import { formatHandoffMarkdown, formatHandoffIssueTexts, formatEscalationMarkdown, formatUnverifiedMarkdown } from './message-kinds.js';
+import { buildTestEnvCommand, environmentProblem, parseTestEnvOutput, preReviewGate, suiteUnrunnable, testInstallLogPath, type TestEnvCheck } from './test-env.js';
 import { getReviewDiff, getReviewDiffInfo, hasBranchChanges, makeProofIO, makeVerificationIO, type Exec } from './review-io.js';
 import { auditEnabled, auditDue, countImplementerTurns, createAudit, finishAudit, getLatestAudit, getPreviousReport, getRunningAudit, setAuditPhase, setAuditSnapshot, skipAudit } from './audits.js';
 import { resolvedSince } from './audit-ownership.js';
@@ -3791,7 +3792,10 @@ async function verifyTurnTests(task: Task, level: VerificationLevel): Promise<vo
     if (level === 'full' && io) {
       const previous = parseVerification(getTask(task.id)?.verification);
       const fp = await io.fingerprint().catch(() => null);
-      if (previous?.level === 'full' && fp && previous.fingerprint === fp && !previous.notes.some(n => /time budget|did not finish/.test(n))) {
+      // An unrunnable suite is not reused: the fingerprint ignores node_modules,
+      // so a result from before the dependencies were installed would otherwise
+      // outlive the install and keep the review unverified.
+      if (previous?.level === 'full' && fp && previous.fingerprint === fp && !previous.notes.some(n => /time budget|did not finish/.test(n)) && !suiteUnrunnable(previous.suite)) {
         appendStreamLog(task.id, 'verification', '[Harness] tree unchanged since the last full verification — keeping its results');
         // Re-stamp rather than leave the row untouched: a user who asked for this
         // on demand is waiting for the stored result to change, and it IS current.
@@ -3875,6 +3879,53 @@ ${[...lines, ...problems].join('\n') || '(the change adds or modifies no test fi
 
 Also audit these tests. Does each assertion really check what its name claims? Is any requirement in the task above untested, or only trivially tested? Report a weak, vacuous or missing test as a finding WITHOUT a "proof" (it is advisory) — unless you can write a failing test that shows a real defect these tests miss.
 `;
+}
+
+/** How long the review's dependency install (and waiting for a preview's install) may take. Seconds. */
+const TEST_INSTALL_TIMEOUT_SEC = parseInt(process.env.CPM_REVIEW_INSTALL_TIMEOUT_SEC || '600', 10);
+
+/**
+ * Is the test runner installed in the task's worktree? With `install`, a
+ * missing one gets the preview's dependency install (same command, marker and
+ * lock). An ssh failure is `unknown` — the review then proceeds as before.
+ */
+async function checkTestEnvironment(task: Task, profile: TestProfile, install: boolean): Promise<TestEnvCheck> {
+  const cmd = buildTestEnvCommand(profile, task.worktree_path!, {
+    install, logPath: testInstallLogPath(task.id), timeoutSec: TEST_INSTALL_TIMEOUT_SEC,
+  });
+  try {
+    return parseTestEnvOutput(await sshExec(task.workspace_name, cmd, install ? (TEST_INSTALL_TIMEOUT_SEC * 2 + 60) * 1000 : 30000, task.user_id));
+  } catch (err) {
+    console.warn(`[auto-review] Task ${task.id}: the test environment check failed: ${(err as Error).message?.slice(0, 200)}`);
+    return { status: 'unknown', missing: [] };
+  }
+}
+
+/** After the proofs ran: could the tests not run because of the environment? (See environmentProblem.) */
+function reviewEnvironmentProblem(task: Task, profile: TestProfile, verified: VerifiedIssue[]): Promise<string | null> {
+  const v = parseVerification(getTask(task.id)?.verification);
+  return environmentProblem({
+    suite: v?.level === 'full' ? v.suite : undefined,
+    proofs: verified.map(x => x.proof),
+    recheck: () => checkTestEnvironment(task, profile, false),
+  });
+}
+
+/**
+ * Close a reviewer turn as `unverified` before any reviewer ran: the pre-check
+ * found the tests cannot run, so a reviewer turn would only produce proofs the
+ * harness cannot execute — and, before this outcome existed, a "pass".
+ */
+function settleUnverifiedBeforeReview(task: Task, turnId: string, mode: ReviewMode, reason: string, log?: string): void {
+  reviewContexts.delete(turnId);
+  const summary = `Unverified — ${reason}`;
+  completeTaskTurn(turnId, 'unverified', summary);
+  const stored: StoredReview = { mode, proofs: [], unverified: { reason, ...(log ? { log: log.slice(-3000) } : {}) } };
+  setTurnReview(turnId, mode, JSON.stringify(stored));
+  appendStreamLog(task.id, 'reviewer_unverified', `[Reviewer] UNVERIFIED: ${reason} — the reviewer was not started`);
+  console.log(`[auto-review] Task ${task.id} unverified before review: ${reason}`);
+  addMessage(task.id, 'system', formatUnverifiedMarkdown({ reason, reviewed: false, log }), { kind: 'unverified_review' });
+  settleWithUnresolvedFindings(task, { holdCompletion: 'unverified' });
 }
 
 /**
@@ -4122,6 +4173,27 @@ async function launchReviewerOnTask(task: Task, opts: ReviewLaunchOpts = {}): Pr
   appendStreamLog(task.id, 'reviewer_mode', profile
     ? `[Reviewer] proof mode — ${describeRunner(profile)} (${profile.source})`
     : '[Reviewer] opinion mode — no test runner found, findings will not be backed by tests');
+
+  // Proof mode is only worth a reviewer turn when the tests can run. Check the
+  // runner is installed (installing the dependencies like the preview does when
+  // it isn't); when it still can't run, the review is `unverified` — never a
+  // pass — and no reviewer turn is spent on proofs nobody can execute.
+  if (profile) {
+    const env = await checkTestEnvironment(task, profile, true);
+    if (interruptedReviews.has(task.id)) {
+      completeTaskTurn(turn.id);
+      reviewContexts.delete(turn.id);
+      return;
+    }
+    const gate = preReviewGate(env);
+    if (env.status === 'installed') {
+      appendStreamLog(task.id, 'verification', `[Harness] the test runner was not installed — installed the dependencies${env.installCommand ? ` (${env.installCommand})` : ''}`);
+    }
+    if (!gate.proceed) {
+      settleUnverifiedBeforeReview(task, turn.id, mode, gate.reason, gate.log);
+      return;
+    }
+  }
 
   // A review is where the full check earns its cost: the comparison with the
   // original code and the whole suite, computed by the harness and handed to the
@@ -4673,7 +4745,11 @@ async function completeReview(
     // the finding away, and the round cannot recurse.
     reviewContexts.set(turnId, { ...ctx, pending: { decision, verified } });
     appendStreamLog(task.id, 'reviewer_output', `[Reviewer] ${broken.length} test(s) could not run — one repair round`);
-    const proceedWithoutRepair = () => routeVerifiedReview(task, turnId, decision, 'proof', verified, profile);
+    const proceedWithoutRepair = () => {
+      reviewEnvironmentProblem(task, profile, verified)
+        .then(envProblem => routeVerifiedReview(task, turnId, decision, 'proof', verified, profile, envProblem))
+        .catch(err => failReview(task, turnId, err));
+    };
     await executeReviewer(task, turnId, reviewerSessionId, {
       prompt: buildRepairPrompt(broken, profile),
       maxTurns: REPAIR_MAX_TURNS,
@@ -4685,7 +4761,9 @@ async function completeReview(
     });
     return;
   }
-  routeVerifiedReview(task, turnId, decision, 'proof', verified, profile);
+  const envProblem = await reviewEnvironmentProblem(task, profile, verified);
+  if (interruptedReviews.has(task.id)) return;
+  routeVerifiedReview(task, turnId, decision, 'proof', verified, profile, envProblem);
 }
 
 function buildRepairPrompt(broken: VerifiedIssue[], profile: TestProfile): string {
@@ -4726,13 +4804,17 @@ async function finishRepair(task: Task, turnId: string, text: string): Promise<v
 
   const merged = pending.verified.slice();
   idxs.forEach((i, n) => { merged[i] = reverified[n]; });
-  routeVerifiedReview(task, turnId, pending.decision, 'proof', merged, profile);
+  const envProblem = await reviewEnvironmentProblem(task, profile, merged);
+  if (interruptedReviews.has(task.id)) return;
+  routeVerifiedReview(task, turnId, pending.decision, 'proof', merged, profile, envProblem);
 }
 
 /**
  * Apply a fully-verified review: record it, create findings, and either settle
  * the task or send the implementer back. In proof mode the outcome is decided by
- * evidence (routeReview), not by the reviewer's own `outcome`.
+ * evidence (routeReview), not by the reviewer's own `outcome`. `envProblem` says
+ * the tests could not run (see reviewEnvironmentProblem): unless a finding was
+ * confirmed anyway, the review is then `unverified`, not a pass.
  */
 export function routeVerifiedReview(
   task: Task,
@@ -4741,10 +4823,11 @@ export function routeVerifiedReview(
   mode: ReviewMode,
   verified: VerifiedIssue[],
   profile: TestProfile | null,
+  envProblem?: string | null,
 ): void {
   const rctx = reviewContexts.get(turnId);
   reviewContexts.delete(turnId);
-  const routed = routeReview(mode, decision, verified);
+  const routed = routeReview(mode, decision, verified, envProblem);
   const blockingTexts = routed.blocking.map(v => v.issue.text);
 
   // Coverage is checked, not trusted: what the reviewer was shown plus the files
@@ -4763,14 +4846,20 @@ export function routeVerifiedReview(
     : null;
   const kind = coverageOutcome(routed.outcome, coverage);
   const partial = kind === 'partial' && coverage !== null;
-  const summary = partial ? `${partialLabel(coverage)} — ${reviewSummary(decision, routed)}` : reviewSummary(decision, routed);
+  const unverified = kind === 'unverified';
+  const summary = unverified
+    ? `Unverified — ${routed.unverifiedReason} — ${reviewSummary(decision, routed)}`
+    : partial ? `${partialLabel(coverage)} — ${reviewSummary(decision, routed)}` : reviewSummary(decision, routed);
 
   // One source of truth for the verdict: task_turns.review_outcome ('partial' is
   // a first-class value). review_proofs carries only the coverage detail.
   completeTaskTurn(turnId, kind, summary, blockingTexts.length ? blockingTexts : undefined);
-  const storedReview: StoredReview = { ...toStored(routed, verified), ...(coverage ? { coverage } : {}) };
+  // An unverified review records no reviewedTree: nothing it "covered" was
+  // verified, so a later review must not measure itself against it.
+  const storedCoverage = coverage && unverified ? (({ reviewedTree: _t, ...rest }) => rest)(coverage) : coverage;
+  const storedReview: StoredReview = { ...toStored(routed, verified), ...(storedCoverage ? { coverage: storedCoverage } : {}) };
   setTurnReview(turnId, mode, JSON.stringify(storedReview));
-  appendStreamLog(task.id, partial ? 'reviewer_partial' : routed.outcome === 'pass' ? 'reviewer_pass' : 'reviewer_fail',
+  appendStreamLog(task.id, unverified ? 'reviewer_unverified' : partial ? 'reviewer_partial' : routed.outcome === 'pass' ? 'reviewer_pass' : 'reviewer_fail',
     `[Reviewer] ${partial ? 'PARTIAL' : routed.outcome.toUpperCase()}: ${summary}${mode === 'proof' ? ` (${tally(routed)})` : ''}`);
   for (const v of routed.refuted) {
     // Kept for reviewer-quality signal: a refuted claim is a reviewer hallucination caught.
@@ -4827,9 +4916,21 @@ export function routeVerifiedReview(
   }
   if (created.length > 0) createReviewFindings(task.id, turnId, created);
 
-  const verifiedCount = verifyClaimedFixes(task.id, reraisedIds);
+  // An unverified review verifies nothing — not even the reviewer's silence on a claimed fix.
+  const verifiedCount = unverified ? 0 : verifyClaimedFixes(task.id, reraisedIds);
   if (verifiedCount > 0) {
     console.log(`[auto-review] Task ${task.id}: ${verifiedCount} claimed fix(es) verified by reviewer`);
+  }
+
+  if (unverified) {
+    // Like partial: not a pass, so outstanding findings stay open and a deferred
+    // completion is cancelled; nothing goes to the implementer, since nothing is
+    // known to be wrong with the code. No audit either — it reports on a review
+    // that settled, and this one could not check anything.
+    console.log(`[auto-review] Task ${task.id} unverified review: ${routed.unverifiedReason}`);
+    addMessage(task.id, 'system', formatUnverifiedMarkdown({ reason: routed.unverifiedReason!, reviewed: true }), { kind: 'unverified_review' });
+    settleWithUnresolvedFindings(task, { holdCompletion: 'unverified' });
+    return;
   }
 
   if (partial) {
@@ -4838,7 +4939,7 @@ export function routeVerifiedReview(
     // back to the implementer, since nothing is known to be wrong with the code.
     console.log(`[auto-review] Task ${task.id} partial review — not seen: ${coverage.unreviewed.map(u => u.path).join(', ')}`);
     addMessage(task.id, 'system', partialMessage(coverage), { kind: 'partial_review', meta: { count: coverage.unreviewed.length } });
-    settleWithUnresolvedFindings(task, { holdCompletion: true });
+    settleWithUnresolvedFindings(task, { holdCompletion: 'partial' });
     maybeLaunchAudit(task);
     return;
   }
@@ -4868,7 +4969,7 @@ export function routeVerifiedReview(
 
 /** One-line summary of a review, honest about the reviewer's claim vs. what was demonstrated. */
 function reviewSummary(decision: ReviewDecision, routed: ReturnType<typeof routeReview>): string {
-  if (routed.mode === 'opinion') return decision.summary;
+  if (routed.mode === 'opinion' || routed.outcome === 'unverified') return decision.summary;
   if (routed.outcome === 'pass' && decision.outcome === 'fail') {
     return `${decision.summary} — but no finding was confirmed by a failing test (${tally(routed)}), so it does not block.`;
   }
@@ -4987,13 +5088,14 @@ ${lines.join('\n').slice(0, REVIEW_CONTEXT_CHAR_BUDGET)}
  * is exactly the case where it isn't. It is conditional on something actually
  * being open, so an ordinary deferred completion still flushes untouched.
  */
-function settleWithUnresolvedFindings(task: Task, opts: { holdCompletion?: boolean } = {}): void {
+function settleWithUnresolvedFindings(task: Task, opts: { holdCompletion?: 'partial' | 'unverified' } = {}): void {
   const current = getTask(task.id) ?? task;
   if (current.pending_complete && opts.holdCompletion) {
-    // A partial review is not the "review passed" a deferred completion waits for.
+    // A partial or unverified review is not the "review passed" a deferred completion waits for.
     setPendingComplete(task.id, false);
-    addMessage(task.id, 'system',
-      'Pending completion cancelled — the review was only partial, so part of the change has not been reviewed. Review the remaining files or complete the task yourself.');
+    addMessage(task.id, 'system', opts.holdCompletion === 'unverified'
+      ? 'Pending completion cancelled — the review is unverified: its tests could not run, so nothing was checked. Fix the environment and review again, or complete the task yourself.'
+      : 'Pending completion cancelled — the review was only partial, so part of the change has not been reviewed. Review the remaining files or complete the task yourself.');
   } else if (current.pending_complete && hasOpenBlockingFindings(task.id)) {
     setPendingComplete(task.id, false);
     addMessage(task.id, 'system',

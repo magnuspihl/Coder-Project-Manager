@@ -61,6 +61,7 @@ import {
   makeAuditFindingTask,
   type AuditView,
   isPreviewLinkLive,
+  previewInstallFailed,
 } from '../api/client';
 import { playChime } from '../utils/chime';
 import { playListenChime } from '../utils/listenChime';
@@ -68,7 +69,7 @@ import RateLimitBanner from './RateLimitBanner';
 import { useDraft } from '../hooks/useDraft';
 import { useWorkspacePreview } from '../hooks/useWorkspacePreview';
 import WorkspacePreviewPanel, { PreviewToggleButton } from './WorkspacePreviewPanel';
-import TaskPreviewStatus from './TaskPreviewStatus';
+import TaskPreviewStatus, { PreviewInstallLog } from './TaskPreviewStatus';
 import { linkify } from '../utils/linkify';
 import Markdown from './Markdown';
 import { useLightbox, type LightboxImage } from './ImageLightbox';
@@ -2187,6 +2188,82 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
     const tally = proofTally(stored);
     const refuted = stored?.proofs.filter(p => p.status === 'refuted') ?? [];
 
+    // The tests could not run at all (no dependencies installed, the runner
+    // missing, the suite erroring before any test): nothing was verified, so
+    // this is NOT a pass — whatever the reviewer itself concluded.
+    if (turn.review_outcome === 'unverified') {
+      const reason = (stored?.unverified?.reason ?? turn.review_summary ?? 'the tests could not run').replace(/^(Unverified — )?tests could not run:\s*/i, '');
+      const advisory = findingsForTurn(turn.id).filter(f => f.severity === 'advisory');
+      const installFailed = task ? previewInstallFailed(task) : false;
+      const reviewerRan = (stored?.proofs.length ?? 0) > 0 || !!fullReview;
+      return (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 py-1">
+            <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
+            <span
+              className="flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full border text-orange-700 dark:text-orange-300 bg-orange-50 dark:bg-orange-900/30 border-orange-300 dark:border-orange-800 max-w-[80%]"
+              title="The tests could not run, so nothing was verified. This is not a pass."
+            >
+              <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" /></svg>
+              <span className="truncate">Unverified — tests could not run</span>
+            </span>
+            {fullReview && (
+              <button
+                onClick={() => toggleReviewDetails(turn.id)}
+                className="text-[11px] text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 underline"
+              >
+                {expanded ? 'Hide details' : 'Details'}
+              </button>
+            )}
+            <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
+          </div>
+          <div className="rounded-lg p-3 bg-orange-50/60 dark:bg-orange-900/10 border border-orange-200 dark:border-orange-800 mr-8 space-y-2">
+            <p className="text-[11px] font-medium text-orange-800 dark:text-orange-200">
+              Tests could not run: {reason}.
+            </p>
+            <p className="text-[11px] text-orange-800 dark:text-orange-200">
+              {reviewerRan
+                ? 'No finding was confirmed, but no test could run either — so this is not a pass. Nothing was verified.'
+                : 'The reviewer was not started: without a working test runner it could not verify anything. This is not a pass.'}
+            </p>
+            {installFailed && (
+              <div className="space-y-1">
+                <p className="text-[11px] font-medium text-red-700 dark:text-red-300">Worktree not testable: dependency install failed.</p>
+                <PreviewInstallLog taskId={turn.task_id} />
+              </div>
+            )}
+            {stored?.unverified?.log && (
+              <details className="text-[11px]">
+                <summary className="cursor-pointer text-orange-800 dark:text-orange-200">Install log (last lines)</summary>
+                <pre className="mt-1 whitespace-pre-wrap break-words font-mono text-[11px] text-gray-700 dark:text-gray-200 bg-gray-50 dark:bg-gray-800 rounded p-2 max-h-60 overflow-auto">{stored.unverified.log}</pre>
+              </details>
+            )}
+            {task?.status === 'awaiting_feedback' && (
+              <button
+                onClick={handleReview}
+                disabled={reviewing}
+                className="text-xs font-medium px-3 py-1.5 rounded-lg bg-orange-600 hover:bg-orange-700 text-white disabled:opacity-50 transition-colors"
+              >
+                {reviewing ? 'Starting…' : 'Review again'}
+              </button>
+            )}
+            {advisory.length > 0 && (
+              <div className="space-y-2 pt-1">
+                <p className="text-[11px] font-medium text-orange-800 dark:text-orange-200">Advisory notes — the reviewer's tests for {advisory.length === 1 ? 'this' : 'these'} could not be run</p>
+                {advisory.map((f, i) => renderFinding(f, i, task?.status === 'awaiting_feedback'))}
+              </div>
+            )}
+            <RefutedClaims proofs={refuted} />
+          </div>
+          {expanded && fullReview && (
+            <div className="rounded-lg p-4 bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 mr-8">
+              <Markdown content={fullReview} />
+            </div>
+          )}
+        </div>
+      );
+    }
+
     // Nothing wrong found in what the reviewer saw, but it never saw all of the
     // change: neither a pass nor a fail. The coverage detail lives in the proofs.
     if (turn.review_outcome === 'partial') {
@@ -2871,6 +2948,8 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                         ? 'bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 mr-8'
                         : msg.kind === 'review_escalation'
                         ? 'bg-amber-50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700 text-gray-800 dark:text-gray-200 text-sm'
+                        : msg.kind === 'unverified_review'
+                        ? 'bg-orange-50/60 dark:bg-orange-900/10 border border-orange-300 dark:border-orange-800 text-gray-700 dark:text-gray-300 text-sm'
                         : msg.kind === 'partial_review'
                         ? 'bg-amber-50/60 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-800 text-gray-700 dark:text-gray-300 text-sm'
                         : msg.content.startsWith('Error:')

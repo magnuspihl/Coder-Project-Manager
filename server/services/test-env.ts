@@ -1,0 +1,336 @@
+/**
+ * Can this worktree run its tests at all?
+ *
+ * Evidence-based review only means something when the harness can execute
+ * tests. A worktree with no dependencies installed (a fresh checkout, or an
+ * `npm ci` that wiped node_modules and then failed) makes every proof fail with
+ * "Cannot find package 'tsx'" and the whole suite run zero tests. Those runs
+ * prove nothing either way — so the review must not be recorded as a pass.
+ * This module tells "the tests ran" apart from "the tests could not run":
+ *
+ *  - before the review: a pre-check that the runner is installed, which
+ *    installs the dependencies the same way the preview does when it isn't;
+ *  - after the review: classifying a proof run or a suite run as broken by the
+ *    environment rather than by the code or the test.
+ *
+ * The decision logic is pure; the shell scripts are built here and run by the
+ * caller (claude.ts wires sshExec).
+ */
+
+import { DETECT_INSTALL_SH, INSTALL_LOCK_FN, INSTALL_MARKER } from './install-script.js';
+import { shellQuote, type TestProfile } from './test-runners.js';
+import type { SuiteResult } from './verification.js';
+
+const q = shellQuote;
+
+/** What a profile needs before any test can run. */
+export interface RunnerRequirements {
+  /** A Node project: package.json's dependencies must be installed (some node_modules up the tree). */
+  nodeDeps: boolean;
+  /** npm packages that must resolve from the test directory (the runner and its loader). */
+  packages: string[];
+  /** A binary that must be on PATH (go, dotnet, a custom command's first word). */
+  command: string | null;
+  /** A Python module that must import, and the interpreter to try it with. */
+  python: { interpreter: string; module: string } | null;
+}
+
+const NODE_LAUNCHERS = new Set(['npx', 'npm', 'pnpm', 'yarn']);
+const DEFAULT_COMMANDS: Record<TestProfile['runner'], string> = {
+  'node-test': 'node --test',
+  vitest: 'npx --no-install vitest run',
+  jest: 'npx --no-install jest',
+  pytest: 'python3 -m pytest',
+  go: 'go test',
+  dotnet: 'dotnet test',
+};
+
+/** Derive what must be installed from the runner and its (possibly custom) command. */
+export function runnerRequirements(profile: TestProfile): RunnerRequirements {
+  const cmd = (profile.command ?? DEFAULT_COMMANDS[profile.runner]).trim();
+  const first = cmd.split(/\s+/)[0] ?? '';
+  const nodeRunner = profile.runner === 'node-test' || profile.runner === 'vitest' || profile.runner === 'jest';
+  const packages: string[] = [];
+  if (/\bvitest\b/.test(cmd)) packages.push('vitest');
+  if (/\bjest\b/.test(cmd)) packages.push('jest');
+  if (/(^|\s)tsx(\s|$)|--(import|loader|require)[ =]tsx\b/.test(cmd)) packages.push('tsx');
+  if (/\bts-node\b/.test(cmd)) packages.push('ts-node');
+  const py = /^(\S+)\s+-m\s+pytest\b/.exec(cmd);
+  return {
+    nodeDeps: nodeRunner || NODE_LAUNCHERS.has(first) || first === 'node',
+    packages,
+    command: first && !NODE_LAUNCHERS.has(first) && !packages.includes(first) ? first : null,
+    python: py ? { interpreter: py[1], module: 'pytest' } : null,
+  };
+}
+
+export interface TestEnvCheck {
+  /**
+   * ok             — everything the runner needs is there
+   * installed      — something was missing; installing the dependencies fixed it
+   * missing        — something is missing and could not be installed (not a Node project, or still missing after a clean install)
+   * install-failed — the dependency install itself failed
+   * unknown        — the check gave no answer (ssh trouble): the caller proceeds as before
+   */
+  status: 'ok' | 'installed' | 'missing' | 'install-failed' | 'unknown';
+  /** `node_modules`, `package:<name>`, `command:<name>`, `python:<module>`. */
+  missing: string[];
+  installCommand?: string;
+  installExit?: number;
+  /** The tail of the install's output, when it failed. */
+  logTail?: string;
+}
+
+export const ENV_MARK = '@@CPM_ENV@@';
+export const ENV_LOG_MARK = '@@CPM_ENV_LOG@@';
+const LOG_TAIL_BYTES = 3000;
+
+/** Where the review's dependency install writes its log on the workspace. */
+export function testInstallLogPath(taskId: string): string {
+  return `/tmp/cpm-test-install-${taskId.replace(/[^a-zA-Z0-9-]/g, '')}.log`;
+}
+
+/**
+ * Shell that checks the runner is installed in the test directory and — when
+ * `install` is set and it is a Node project — installs the dependencies with
+ * exactly the preview's command and marker (DETECT_INSTALL_SH / INSTALL_MARKER),
+ * under the same per-directory lock, so a preview install already in progress
+ * is waited for rather than raced. Prints `@@CPM_ENV@@ key=value` lines; see
+ * parseTestEnvOutput.
+ *
+ * It installs only when something is actually missing — never just because the
+ * lockfile changed: a working node_modules is left alone.
+ */
+export function buildTestEnvCommand(
+  profile: TestProfile,
+  worktree: string,
+  opts: { install: boolean; logPath: string; timeoutSec: number },
+): string {
+  const req = runnerRequirements(profile);
+  const dir = profile.cwd ? `${worktree.replace(/\/$/, '')}/${profile.cwd}` : worktree;
+  const checks: string[] = [];
+  if (req.nodeDeps) {
+    checks.push(`if [ -f package.json ] && grep -Eq '"(devD|d)ependencies"' package.json && ! cpm_up_dir node_modules; then M="$M node_modules"; fi`);
+  }
+  for (const p of req.packages) checks.push(`cpm_up_file node_modules/${p}/package.json || M="$M package:${p}"`);
+  if (req.command) checks.push(`command -v ${q(req.command)} >/dev/null 2>&1 || M="$M command:${req.command}"`);
+  if (req.python) checks.push(`${q(req.python.interpreter)} -c 'import ${req.python.module}' >/dev/null 2>&1 || M="$M python:${req.python.module}"`);
+
+  const install = opts.install ? `
+if [ -f package.json ] && printf '%s' "$M" | grep -Eq 'node_modules|package:'; then
+  ${INSTALL_LOCK_FN.replace(/\n/g, '\n  ')}
+  cpm_install_lock ${opts.timeoutSec}
+  M=$(cpm_missing)
+  if [ -z "$M" ]; then cpm_install_unlock; echo "${ENV_MARK} result=installed"; exit 0; fi
+  ${DETECT_INSTALL_SH.replace(/\n/g, '\n  ')}
+  echo "${ENV_MARK} install=$CPM_INSTALL"
+  if command -v timeout >/dev/null 2>&1; then T="timeout -k 10 ${opts.timeoutSec}"; else T=""; fi
+  rm -f ${INSTALL_MARKER}
+  $T sh -c "$CPM_INSTALL" > ${q(opts.logPath)} 2>&1 < /dev/null
+  RC=$?
+  [ $RC -eq 0 ] && mkdir -p node_modules && printf '%s\\n' "$CPM_DEPS_HASH" > ${INSTALL_MARKER}
+  cpm_install_unlock
+  M=$(cpm_missing)
+  if [ $RC -ne 0 ]; then
+    echo "${ENV_MARK} result=install-failed exit=$RC"
+    echo "${ENV_MARK} missing=$M"
+    echo "${ENV_LOG_MARK}"
+    tail -c ${LOG_TAIL_BYTES} ${q(opts.logPath)} 2>/dev/null
+    exit 0
+  fi
+  if [ -z "$M" ]; then echo "${ENV_MARK} result=installed"; exit 0; fi
+fi` : '';
+
+  const script = `set +e
+cd ${q(dir)} || { echo "${ENV_MARK} result=missing"; echo "${ENV_MARK} missing=directory"; exit 0; }
+export PATH="$HOME/.local/bin:$PATH"
+cpm_up_dir() { d=$(pwd -P); while :; do [ -d "$d/$1" ] && return 0; [ "$d" = / ] && return 1; d=$(dirname "$d"); done; }
+cpm_up_file() { d=$(pwd -P); while :; do [ -f "$d/$1" ] && return 0; [ "$d" = / ] && return 1; d=$(dirname "$d"); done; }
+cpm_missing() {
+  M=
+  ${checks.join('\n  ') || ':'}
+  printf '%s' "$M" | sed 's/^ *//'
+}
+M=$(cpm_missing)
+if [ -z "$M" ]; then echo "${ENV_MARK} result=ok"; exit 0; fi
+echo "${ENV_MARK} missing=$M"${install}
+echo "${ENV_MARK} result=missing"
+echo "${ENV_MARK} missing=$M"
+exit 0`;
+  // base64, so it survives `coder ssh` (and the user's login shell) unquoted.
+  return `sh -c "$(printf %s '${Buffer.from(script, 'utf8').toString('base64')}' | base64 -d)"`;
+}
+
+/** Read the pre-check's output. Anything unrecognisable is `unknown`, never a verdict. */
+export function parseTestEnvOutput(out: string): TestEnvCheck {
+  const [head, ...logParts] = out.split(ENV_LOG_MARK);
+  let result: string | null = null;
+  let missing: string[] = [];
+  let installCommand: string | undefined;
+  let installExit: number | undefined;
+  for (const line of head.split('\n')) {
+    const i = line.indexOf(ENV_MARK);
+    if (i < 0) continue;
+    const kv = line.slice(i + ENV_MARK.length).trim();
+    const r = /^result=(\S+)(?:\s+exit=(\d+))?/.exec(kv);
+    if (r) { result = r[1]; if (r[2]) installExit = Number(r[2]); continue; }
+    if (kv.startsWith('missing=')) { missing = kv.slice(8).trim().split(/\s+/).filter(Boolean); continue; }
+    if (kv.startsWith('install=')) installCommand = kv.slice(8).trim() || undefined;
+  }
+  const logTail = logParts.join(ENV_LOG_MARK).trim() || undefined;
+  switch (result) {
+    case 'ok': return { status: 'ok', missing: [] };
+    case 'installed': return { status: 'installed', missing: [], installCommand };
+    case 'missing': return { status: 'missing', missing, installCommand };
+    case 'install-failed': return { status: 'install-failed', missing, installCommand, installExit, logTail };
+    default: return { status: 'unknown', missing: [] };
+  }
+}
+
+/** Plain-English account of what is missing, e.g. "no dependencies installed in the worktree". */
+export function describeMissing(missing: string[]): string {
+  if (missing.includes('node_modules')) return 'no dependencies installed in the worktree (node_modules is missing)';
+  const parts = missing.map(m => {
+    const [kind, name] = m.includes(':') ? [m.slice(0, m.indexOf(':')), m.slice(m.indexOf(':') + 1)] : [m, ''];
+    switch (kind) {
+      case 'package': return `the test runner's package "${name}" is not installed in the worktree`;
+      case 'command': return `"${name}" is not installed in the workspace`;
+      case 'python': return `the Python module "${name}" is not installed`;
+      case 'directory': return 'the test directory does not exist';
+      default: return m;
+    }
+  });
+  return parts.join('; ') || 'the test runner is not installed';
+}
+
+/** The one-line reason an unrunnable environment gives, for the review summary. */
+export function envCheckReason(check: TestEnvCheck): string {
+  if (check.status === 'install-failed') {
+    const what = check.missing.length ? describeMissing(check.missing) : 'the test runner is not installed';
+    return `tests could not run: ${what}, and installing the dependencies${check.installCommand ? ` (${check.installCommand})` : ''} failed${check.installExit !== undefined ? ` with exit code ${check.installExit}` : ''}`;
+  }
+  const after = check.installCommand ? ` (still missing after ${check.installCommand})` : '';
+  return `tests could not run: ${describeMissing(check.missing)}${after}`;
+}
+
+// ---------------------------------------------------------------------------
+// Classifying runs
+// ---------------------------------------------------------------------------
+
+/**
+ * Runner output that means the runner itself could not start — its package or
+ * binary is missing — as opposed to a broken test (a wrong relative import, a
+ * syntax error) or a real failure. Only the runner's OWN pieces count: a
+ * reviewer importing a package the project doesn't have is a broken test.
+ * Returns a one-line reason, or null.
+ */
+export function environmentFailure(profile: TestProfile, text: string | undefined): string | null {
+  if (!text) return null;
+  const req = runnerRequirements(profile);
+  const names = [...req.packages, ...(req.command ? [req.command] : []), ...(req.python ? [req.python.module] : [])];
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const name of names) {
+    const n = esc(name);
+    if (new RegExp(`Cannot find (?:package|module) '${n}(?:/[^']*)?'`).test(text)) return `the test runner's package "${name}" is not installed`;
+    if (new RegExp(`(?:^|[\\s:])${n}: (?:command )?not found`, 'm').test(text)) return `"${name}" is not installed`;
+    if (new RegExp(`No module named '?${n}'?`).test(text)) return `the Python module "${name}" is not installed`;
+  }
+  if (/npx canceled due to missing packages|could not determine executable to run/.test(text)) {
+    return 'the test runner is not installed (npx could not find it)';
+  }
+  return null;
+}
+
+/**
+ * The whole suite errored before running a single test: it did not load at
+ * all. "No tests ran" (a clean run that found nothing) and a timeout (it ran,
+ * too slowly) are not this. Returns the reason, or null.
+ */
+export function suiteUnrunnable(suite: SuiteResult | undefined): string | null {
+  if (!suite?.error) return null;
+  if (suite.passed + suite.failed + suite.skipped > 0) return null;
+  if (suite.error === 'No tests ran' || suite.error === 'The suite timed out') return null;
+  const first = suite.error.split('\n').map(l => l.trim()).find(l => /error|cannot|not found|failed/i.test(l))
+    ?? suite.error.split('\n')[0].trim();
+  return `tests could not run: the whole suite errored before running any test (${first.slice(0, 160)})`;
+}
+
+// ---------------------------------------------------------------------------
+// Preview install state (for the UI and MCP)
+// ---------------------------------------------------------------------------
+
+/** Prefixes of preview_error set by preview.ts when the dependency install failed. */
+export const PREVIEW_INSTALL_FAILED_PREFIXES = ['Installing the dependencies failed', 'The dependency install did not finish'];
+
+/** The task's last preview start failed while installing dependencies — its worktree is not testable either. */
+export function previewInstallFailed(task: { preview_status?: string | null; preview_error?: string | null }): boolean {
+  return task.preview_status === 'failed' && !!task.preview_error
+    && PREVIEW_INSTALL_FAILED_PREFIXES.some(p => task.preview_error!.startsWith(p));
+}
+
+/**
+ * After the review: did the tests fail to run because of the environment? The
+ * whole suite erroring before any test is enough on its own. Otherwise, when a
+ * proof failed to LOAD (a missing module, say), the environment is re-checked —
+ * without installing — since a dependency the code needs may have gone missing
+ * mid-review. Proofs whose runner was missing are handled by routeReview
+ * itself. Returns the reason ("tests could not run: …"), or null.
+ */
+export async function environmentProblem(input: {
+  suite?: SuiteResult;
+  proofs: Array<{ status: string; output: string; reason: string; environment?: boolean }>;
+  recheck?: () => Promise<TestEnvCheck>;
+}): Promise<string | null> {
+  const suite = suiteUnrunnable(input.suite);
+  if (suite) return suite;
+  const loadFailure = input.proofs.some(p => p.status === 'unproven' && !p.environment
+    && /Cannot find (package|module)|MODULE_NOT_FOUND|ModuleNotFoundError|No module named|ImportError|command not found|: not found/.test(`${p.reason}\n${p.output}`));
+  if (!loadFailure || !input.recheck) return null;
+  const check = await input.recheck().catch(() => ({ status: 'unknown', missing: [] }) as TestEnvCheck);
+  return check.status === 'missing' || check.status === 'install-failed' ? envCheckReason(check) : null;
+}
+
+/**
+ * Whether a proof-mode review may start, given the pre-check. `ok` and
+ * `installed` proceed; so does `unknown` (the check itself could not be run —
+ * the post-run checks still catch a broken environment). `missing` and
+ * `install-failed` stop it: the review is unverified, with the install log tail.
+ */
+export function preReviewGate(check: TestEnvCheck): { proceed: true } | { proceed: false; reason: string; log?: string } {
+  if (check.status === 'missing' || check.status === 'install-failed') {
+    return { proceed: false, reason: envCheckReason(check), ...(check.logTail ? { log: check.logTail } : {}) };
+  }
+  return { proceed: true };
+}
+
+/** The short "is this reviewed?" answer for get_task: never lets unverified or partial read as a pass. */
+export interface ReviewStatusView {
+  /** The latest completed review's outcome; null when no review has completed. */
+  outcome: 'pass' | 'fail' | 'partial' | 'unverified' | null;
+  /** True only for a pass. A partial or unverified review is NOT a pass. */
+  passed: boolean;
+  summary: string | null;
+  /** For an unverified review: why the tests could not run. */
+  unverified_reason?: string;
+  /** Set when the task's preview dependency install failed — the worktree cannot run tests either. */
+  worktree_not_testable?: string;
+}
+
+export function reviewStatusView(
+  turns: Array<{ role: string; completed_at: string | null; review_outcome: string | null; review_summary: string | null; review_proofs: string | null }>,
+  task: { preview_status?: string | null; preview_error?: string | null },
+): ReviewStatusView {
+  const last = turns.filter(t => t.role === 'reviewer' && t.completed_at && t.review_outcome).pop();
+  const outcome = (last?.review_outcome ?? null) as ReviewStatusView['outcome'];
+  const view: ReviewStatusView = { outcome, passed: outcome === 'pass', summary: last?.review_summary ?? null };
+  if (outcome === 'unverified' && last?.review_proofs) {
+    try {
+      const reason = (JSON.parse(last.review_proofs) as { unverified?: { reason?: string } }).unverified?.reason;
+      if (reason) view.unverified_reason = reason;
+    } catch { /* the summary still says it */ }
+  }
+  if (previewInstallFailed(task)) {
+    view.worktree_not_testable = 'dependency install failed — see the task\'s preview log';
+  }
+  return view;
+}

@@ -1,5 +1,5 @@
 /**
- * task_turns.review_outcome gained 'partial'. Pins the table rebuild on a legacy
+ * task_turns.review_outcome gained 'partial', then 'unverified'. Pins the table rebuild on a legacy
  * database (rows, indexes and dependent findings survive), a fresh bootstrap, and
  * that the two end up with the same shape.
  */
@@ -129,4 +129,54 @@ dbTest('a migrated database ends up with the same task_turns shape as a fresh on
   mod.widenTaskTurnOutcome(migrated);
   assert.deepEqual(shape(migrated), shape(mod.getDb()));
   migrated.close();
+});
+
+/** A database from when 'partial' existed but 'unverified' did not — what every running CPM has today. */
+function partialEraDb() {
+  const db = legacyDb();
+  mod.widenTaskTurnOutcome(db);
+  db.exec(`
+    PRAGMA foreign_keys = OFF;
+    CREATE TABLE tt (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      role TEXT NOT NULL CHECK (role IN ('implementer', 'reviewer')),
+      turn_number INTEGER NOT NULL,
+      claude_session_id TEXT,
+      review_outcome TEXT CHECK (review_outcome IS NULL OR review_outcome IN ('pass', 'fail', 'partial')),
+      review_summary TEXT, review_issues TEXT, review_mode TEXT, review_proofs TEXT, files_changed INTEGER,
+      started_at TEXT NOT NULL DEFAULT (datetime('now')), completed_at TEXT
+    );
+    INSERT INTO tt SELECT id, task_id, role, turn_number, claude_session_id, review_outcome, review_summary, review_issues, review_mode, review_proofs, files_changed, started_at, completed_at FROM task_turns;
+    DROP TABLE task_turns;
+    ALTER TABLE tt RENAME TO task_turns;
+    CREATE INDEX idx_task_turns_task ON task_turns(task_id, turn_number);
+    PRAGMA foreign_keys = ON;
+  `);
+  db.prepare("UPDATE task_turns SET review_outcome = 'partial' WHERE id = 'open'").run();
+  return db;
+}
+
+dbTest('a database that already allows partial is rebuilt to allow unverified, keeping every row and finding', () => {
+  const db = partialEraDb();
+  assert.throws(() => db.prepare("UPDATE task_turns SET review_outcome = 'unverified' WHERE id = 'pass'").run(), /CHECK/, 'before: unverified is rejected');
+  const before = db.prepare('SELECT * FROM task_turns ORDER BY turn_number').all();
+
+  assert.equal(mod.widenTaskTurnOutcome(db), true);
+
+  assert.deepEqual(db.prepare('SELECT * FROM task_turns ORDER BY turn_number').all(), before, 'every row copied verbatim, partial included');
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM review_findings').get() as { n: number }).n, 1, 'findings were not cascade-deleted');
+  db.prepare("UPDATE task_turns SET review_outcome = 'unverified' WHERE id = 'pass'").run();
+  assert.equal((db.prepare("SELECT review_outcome AS o FROM task_turns WHERE id = 'pass'").get() as { o: string }).o, 'unverified');
+  assert.throws(() => db.prepare("UPDATE task_turns SET review_outcome = 'bogus' WHERE id = 'pass'").run(), /CHECK/);
+  assert.equal(mod.widenTaskTurnOutcome(db), false, 'and a second run changes nothing');
+  db.close();
+});
+
+dbTest('a fresh install allows an unverified review outcome', () => {
+  const db = mod.getDb();
+  db.prepare("INSERT OR IGNORE INTO users (id, username) VALUES ('u', 'x')").run();
+  db.prepare("INSERT OR IGNORE INTO tasks (id, workspace_id, workspace_name, user_id, prompt, position) VALUES ('t', 'w', 'w', 'u', 'p', 1)").run();
+  db.prepare("INSERT INTO task_turns (id, task_id, role, turn_number, review_outcome) VALUES ('unv', 't', 'reviewer', 3, 'unverified')").run();
+  assert.equal((db.prepare("SELECT review_outcome AS o FROM task_turns WHERE id = 'unv'").get() as { o: string }).o, 'unverified');
 });

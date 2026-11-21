@@ -92,8 +92,11 @@ export interface Task {
  * How a reviewer turn ended. 'partial' is a review that found nothing wrong in
  * what it saw but did not see all of the change: it is neither a pass (the
  * unseen code is unchecked) nor a fail (nothing is known to be wrong).
+ * 'unverified' is a review whose tests could not run at all (no dependencies
+ * installed, the runner missing, the suite erroring before any test ran): no
+ * finding was confirmed, but nothing was verified either — also not a pass.
  */
-export type ReviewTurnOutcome = 'pass' | 'fail' | 'partial';
+export type ReviewTurnOutcome = 'pass' | 'fail' | 'partial' | 'unverified';
 
 export interface TaskTurn {
   id: string;

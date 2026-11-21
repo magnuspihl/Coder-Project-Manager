@@ -411,7 +411,7 @@ export function getDb(): Database.Database {
     role TEXT NOT NULL CHECK (role IN ('implementer', 'reviewer')),
     turn_number INTEGER NOT NULL,
     claude_session_id TEXT,
-    review_outcome TEXT CHECK (review_outcome IS NULL OR review_outcome IN ('pass', 'fail', 'partial')),
+    review_outcome TEXT CHECK (review_outcome IS NULL OR review_outcome IN ('pass', 'fail', 'partial', 'unverified')),
     review_summary TEXT,
     review_issues TEXT,
     files_changed INTEGER,
@@ -514,9 +514,9 @@ export function getDb(): Database.Database {
   if (!turnCols.some(c => c.name === 'review_mode')) db.exec("ALTER TABLE task_turns ADD COLUMN review_mode TEXT");
   if (!turnCols.some(c => c.name === 'review_proofs')) db.exec("ALTER TABLE task_turns ADD COLUMN review_proofs TEXT");
 
-  // review_outcome gained 'partial'. SQLite can't ALTER a CHECK, so the table is
-  // rebuilt — AFTER the review_mode/review_proofs ALTERs above, since the rebuild
-  // copies every column by name.
+  // review_outcome gained 'partial', then 'unverified'. SQLite can't ALTER a
+  // CHECK, so the table is rebuilt — AFTER the review_mode/review_proofs ALTERs
+  // above, since the rebuild copies every column by name.
   widenTaskTurnOutcome(db);
 
   // Per-delta token usage events, so consumers can attribute tokens to a
@@ -709,15 +709,18 @@ export function getDb(): Database.Database {
 }
 
 /**
- * Rebuild task_turns so review_outcome accepts 'partial' (a review that did not
- * see all of the change — neither a pass nor a fail). A no-op when the table
- * already allows it (fresh installs get it from schema.sql). Exported for tests.
+ * Rebuild task_turns so review_outcome accepts every current outcome: 'partial'
+ * (a review that did not see all of the change — neither a pass nor a fail) and
+ * 'unverified' (a review whose tests could not run at all — also not a pass).
+ * A no-op when the table already allows them (fresh installs get it from
+ * schema.sql). One rebuild covers a database from before either value, and one
+ * that already had 'partial'. Exported for tests.
  *
  * Note the old constraint, `IN ('pass', 'fail', NULL)`, never rejected anything:
  * `x IN (…, NULL)` is NULL — not false — for a non-member, and a CHECK passes on
  * NULL. So 'partial' would have been accepted without a rebuild, and so would
  * 'bogus'. The rebuilt constraint is spelled `IS NULL OR … IN (…)` so it actually
- * enforces the three values.
+ * enforces the allowed values.
  *
  * foreign_keys must be OFF around the rebuild: review_findings.turn_id is
  * ON DELETE CASCADE, so dropping the old table with enforcement on would delete
@@ -726,7 +729,7 @@ export function getDb(): Database.Database {
  */
 export function widenTaskTurnOutcome(db: Database.Database): boolean {
   const sql = (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='task_turns'").get() as { sql: string } | undefined)?.sql ?? '';
-  if (!sql || sql.includes("'partial'")) return false;
+  if (!sql || sql.includes("'unverified'")) return false;
 
   const cols = (db.prepare("PRAGMA table_info(task_turns)").all() as Array<{ name: string }>).map(c => c.name);
   const wanted = ['id', 'task_id', 'role', 'turn_number', 'claude_session_id', 'review_outcome', 'review_summary', 'review_issues', 'review_mode', 'review_proofs', 'files_changed', 'started_at', 'completed_at'];
@@ -746,7 +749,7 @@ export function widenTaskTurnOutcome(db: Database.Database): boolean {
           role TEXT NOT NULL CHECK (role IN ('implementer', 'reviewer')),
           turn_number INTEGER NOT NULL,
           claude_session_id TEXT,
-          review_outcome TEXT CHECK (review_outcome IS NULL OR review_outcome IN ('pass', 'fail', 'partial')),
+          review_outcome TEXT CHECK (review_outcome IS NULL OR review_outcome IN ('pass', 'fail', 'partial', 'unverified')),
           review_summary TEXT,
           review_issues TEXT,
           review_mode TEXT,
@@ -766,7 +769,7 @@ export function widenTaskTurnOutcome(db: Database.Database): boolean {
   } finally {
     db.pragma('foreign_keys = ON');
   }
-  console.log("[migration] task_turns.review_outcome now allows 'partial'");
+  console.log("[migration] task_turns.review_outcome now allows 'partial' and 'unverified'");
   return true;
 }
 

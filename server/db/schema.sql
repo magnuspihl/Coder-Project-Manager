@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS task_turns (
   role TEXT NOT NULL CHECK (role IN ('implementer', 'reviewer')),
   turn_number INTEGER NOT NULL,
   claude_session_id TEXT,
-  review_outcome TEXT CHECK (review_outcome IS NULL OR review_outcome IN ('pass', 'fail', 'partial')),
+  review_outcome TEXT CHECK (review_outcome IS NULL OR review_outcome IN ('pass', 'fail', 'partial', 'unverified')),
   review_summary TEXT,
   review_issues TEXT,
   -- 'proof' (findings must be backed by failing tests) or 'opinion' (no runnable

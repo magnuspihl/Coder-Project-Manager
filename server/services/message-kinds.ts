@@ -15,6 +15,7 @@ export type MessageKind =
   | 'review_handoff'      // agent: findings sent back to the implementer
   | 'fix_request'         // agent: the Fix / Fix-all prompt (stored as a user message)
   | 'partial_review'      // human: the reviewer did not see some files
+  | 'unverified_review'   // human: the tests could not run, so nothing was verified
   | 'review_escalation'   // human: fix budget spent, input needed
   | 'review_started'      // neither: one short line
   | 'audit_skipped'       // neither: one short line
@@ -168,6 +169,24 @@ export function formatPartialMarkdown(opts: {
     `The reviewer found no confirmed defect in what it saw, but it did not see these files, so this is **NOT a pass**:\n\n${bullets}`,
     'Nothing is wrong with the code as far as is known — use **Review remaining files** to have the reviewer read only these.',
   ].join('\n\n');
+}
+
+/**
+ * The markdown the harness adds to the conversation for an unverified review:
+ * the tests could not run, so the review is NOT a pass. `reviewed` is false
+ * when the pre-check stopped it before any reviewer ran.
+ */
+export function formatUnverifiedMarkdown(opts: { reason: string; reviewed: boolean; log?: string }): string {
+  const reason = opts.reason.replace(/^tests could not run:\s*/i, '');
+  const parts = [
+    `**Unverified review — tests could not run: ${reason}.**`,
+    opts.reviewed
+      ? 'No finding was confirmed, but no test could run either, so this is **NOT a pass** — nothing was verified. Any finding the reviewer raised is listed as advisory.'
+      : 'The reviewer was not started: without a working test runner it could not verify anything, so this is **NOT a pass**.',
+  ];
+  if (opts.log?.trim()) parts.push('Last lines of the install log:\n\n```\n' + opts.log.trim().slice(-1500) + '\n```');
+  parts.push('Fix the environment (install the dependencies in the worktree), then use **Review** to run it again — or complete the task yourself.');
+  return parts.join('\n\n');
 }
 
 // ---------------------------------------------------------------------------
