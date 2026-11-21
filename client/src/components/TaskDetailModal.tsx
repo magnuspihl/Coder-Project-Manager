@@ -60,6 +60,7 @@ import {
   setTaskAudit,
   makeAuditFindingTask,
   type AuditView,
+  isPreviewLinkLive,
 } from '../api/client';
 import { playChime } from '../utils/chime';
 import { playListenChime } from '../utils/listenChime';
@@ -2701,9 +2702,19 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
                       </span>
                     )
                   )}
-                  {task.verification_url && (
+                  {task.verification_url && !isPreviewLinkLive(task) && (
+                    <span
+                      className="inline-flex items-center gap-1 text-xs px-2.5 py-1 bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400 rounded-md cursor-not-allowed"
+                      title={task.preview_status === 'starting' || task.preview_status === 'installing'
+                        ? 'The preview is starting; the link works once it answers on its port'
+                        : 'The preview is not answering on its port — see the preview status'}
+                    >
+                      View Live
+                    </span>
+                  )}
+                  {isPreviewLinkLive(task) && (
                     <a
-                      href={task.verification_url}
+                      href={task.verification_url!}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="inline-flex items-center gap-1 text-xs px-2.5 py-1 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors"

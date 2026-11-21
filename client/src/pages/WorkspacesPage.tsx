@@ -43,6 +43,7 @@ import {
   type TaskCounts,
   type TokenTotals,
   type RateLimitUsage,
+  isPreviewLinkLive,
 } from '../api/client';
 import { KOKORO_VOICES } from '../utils/kokoroTTS';
 import { playChime } from '../utils/chime';
@@ -1191,9 +1192,9 @@ export default function WorkspacesPage() {
       )}
       <div className="flex items-center justify-between mt-2">
         <div className="flex items-center gap-1">
-          {task.verification_url && (
+          {isPreviewLinkLive(task) && (
             <a
-              href={task.verification_url}
+              href={task.verification_url!}
               target="_blank"
               rel="noopener noreferrer"
               onClick={(e) => e.stopPropagation()}
