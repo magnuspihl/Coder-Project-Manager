@@ -185,7 +185,11 @@ export function pickBaselineReview(reviews: StoredReviewRef[]): { reviewNumber: 
     const raw = reviews[i].stored;
     if (!raw) continue;
     try {
-      const c = (JSON.parse(raw) as { coverage?: CoverageReport }).coverage;
+      const parsed = JSON.parse(raw) as { coverage?: CoverageReport; unverified?: unknown };
+      // An unverified review (its tests could not run) verified nothing: it is
+      // never the baseline whose files the next review may carry over.
+      if (parsed.unverified) continue;
+      const c = parsed.coverage;
       if (!c?.reviewedTree || c.unreviewed.length > 0) continue;
       return { reviewNumber: i + 1, tree: c.reviewedTree, reviewed: [...c.reviewed, ...(c.carried ?? []).map(f => f.path)] };
     } catch { /* unreadable: not a baseline */ }
@@ -456,14 +460,16 @@ export function assessCoverage(input: AssessInput): CoverageReport {
   };
 }
 
-export type ReviewVerdictKind = 'pass' | 'fail' | 'partial';
+export type ReviewVerdictKind = 'pass' | 'fail' | 'partial' | 'unverified';
 
 /**
- * A fail with confirmed proof stays a fail whatever the coverage. A pass only
- * stays a pass when nothing non-exempt went unseen; otherwise it is "partial".
+ * A fail with confirmed proof stays a fail whatever the coverage, and an
+ * unverified review (the tests could not run) stays unverified — it is weaker
+ * than partial: nothing at all was checked. A pass only stays a pass when
+ * nothing non-exempt went unseen; otherwise it is "partial".
  */
-export function coverageOutcome(outcome: 'pass' | 'fail', report: CoverageReport | null): ReviewVerdictKind {
-  if (outcome === 'fail') return 'fail';
+export function coverageOutcome(outcome: 'pass' | 'fail' | 'unverified', report: CoverageReport | null): ReviewVerdictKind {
+  if (outcome === 'fail' || outcome === 'unverified') return outcome;
   return report && report.unreviewed.length > 0 ? 'partial' : 'pass';
 }
 

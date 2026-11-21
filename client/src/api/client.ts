@@ -82,8 +82,11 @@ export interface TaskTurn {
   role: 'implementer' | 'reviewer';
   turn_number: number;
   claude_session_id: string | null;
-  /** 'partial': nothing wrong found in what the reviewer saw, but it did not see all of the change — not a pass. */
-  review_outcome: 'pass' | 'fail' | 'partial' | null;
+  /**
+   * 'partial': nothing wrong found in what the reviewer saw, but it did not see all of the change — not a pass.
+   * 'unverified': the tests could not run at all (e.g. no dependencies installed), so nothing was verified — not a pass.
+   */
+  review_outcome: 'pass' | 'fail' | 'partial' | 'unverified' | null;
   review_summary: string | null;
   review_issues: string | null;
   /** 'proof': findings had to be backed by failing tests. 'opinion': no test runner was found. */
@@ -108,6 +111,8 @@ export interface StoredProof {
   reason: string;
   failedTests: string[];
   output: string;
+  /** The test could not run because the environment could not run any test (runner/dependencies missing). */
+  environment?: boolean;
 }
 
 /** What the harness concluded about which changed files the reviewer actually saw (server: review-coverage.ts). */
@@ -127,6 +132,8 @@ export interface StoredReview {
   mode: 'proof' | 'opinion';
   proofs: StoredProof[];
   coverage?: ReviewCoverage;
+  /** Set on an 'unverified' review: why the tests could not run, plus the install log tail when an install failed. */
+  unverified?: { reason: string; log?: string };
 }
 
 export type BaselineResult = 'fails' | 'passes' | 'new_code' | 'not_runnable';
@@ -186,6 +193,17 @@ export interface ReviewFinding {
 }
 
 export type PreviewStatus = 'starting' | 'installing' | 'running' | 'unreachable' | 'failed' | 'stopped' | 'none';
+
+/**
+ * The task's preview failed while installing its dependencies, so its worktree
+ * cannot run tests either. Matches the preview_error prefixes server/services/preview.ts
+ * writes (mirrored in server/services/test-env.ts PREVIEW_INSTALL_FAILED_PREFIXES).
+ */
+export function previewInstallFailed(task: Pick<Task, 'preview_status' | 'preview_error'>): boolean {
+  const err = task.preview_error ?? '';
+  return task.preview_status === 'failed'
+    && (err.startsWith('Installing the dependencies failed') || err.startsWith('The dependency install did not finish'));
+}
 
 /**
  * Whether the task's verification_url can be offered as a working link: a URL

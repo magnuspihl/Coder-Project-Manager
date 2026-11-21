@@ -28,6 +28,9 @@
 
 import { getDb } from '../db/index.js';
 import type { Task } from './tasks.js';
+import { DETECT_INSTALL_SH, INSTALL_LOCK_FN, INSTALL_MARKER } from './install-script.js';
+
+export { DETECT_INSTALL_SH, INSTALL_LOCK_FN, INSTALL_MARKER };
 
 /** Runs a shell command on the task's workspace and returns stdout. */
 export type PreviewExec = (command: string, timeoutMs: number) => Promise<string>;
@@ -229,23 +232,29 @@ export interface PreviewStartSpec {
   autoInstall: boolean;
 }
 
-/** Written into node_modules after a successful install: the hash of what was installed. */
-export const INSTALL_MARKER = 'node_modules/.cpm-install-ok';
-
 /**
  * Runs inside the detached process: record the pid (== process group, thanks
  * to setsid), install dependencies if asked, then become the preview command.
  * The phase goes to the state file so the health check can tell a slow
  * install from a dead server. The install marker is written only after a
- * successful install, so a failed or killed one is retried next time.
+ * successful install, so a failed or killed one is retried next time. The
+ * install holds the per-directory lock; one that finished while this waited
+ * for it (the marker now matches) is not repeated.
  */
 const PREVIEW_RUNNER = `echo $$ > "$CPM_PREVIEW_PIDFILE"
+${INSTALL_LOCK_FN}
 if [ -n "$CPM_PREVIEW_INSTALL" ]; then
   echo installing > "$CPM_PREVIEW_STATEFILE"
-  echo "[cpm] dependencies are missing or changed; installing: $CPM_PREVIEW_INSTALL"
-  rm -f ${INSTALL_MARKER}
-  sh -c "$CPM_PREVIEW_INSTALL" || { echo "[cpm] dependency install failed"; exit 1; }
-  mkdir -p node_modules && printf '%s\\n' "$CPM_PREVIEW_DEPS_HASH" > ${INSTALL_MARKER}
+  cpm_install_lock 1200
+  if [ "$(cat ${INSTALL_MARKER} 2>/dev/null)" = "$CPM_PREVIEW_DEPS_HASH" ]; then
+    echo "[cpm] dependencies were installed meanwhile by another CPM install"
+  else
+    echo "[cpm] dependencies are missing or changed; installing: $CPM_PREVIEW_INSTALL"
+    rm -f ${INSTALL_MARKER}
+    sh -c "$CPM_PREVIEW_INSTALL" || { echo "[cpm] dependency install failed"; exit 1; }
+    mkdir -p node_modules && printf '%s\\n' "$CPM_PREVIEW_DEPS_HASH" > ${INSTALL_MARKER}
+  fi
+  cpm_install_unlock
 fi
 echo running > "$CPM_PREVIEW_STATEFILE"
 exec sh -c "$CPM_PREVIEW_CMD"`;
@@ -273,21 +282,9 @@ AUTO_INSTALL=${spec.autoInstall ? 1 : 0}
 CPM_PREVIEW_INSTALL=
 CPM_PREVIEW_DEPS_HASH=
 if [ "$AUTO_INSTALL" = 1 ] && [ -f package.json ]; then
-  if [ -f pnpm-lock.yaml ] && command -v pnpm >/dev/null 2>&1; then
-    DEPS=pnpm-lock.yaml; INSTALL="pnpm install --frozen-lockfile"
-  elif [ -f yarn.lock ] && command -v yarn >/dev/null 2>&1; then
-    DEPS=yarn.lock
-    # Yarn Berry (2+) dropped --frozen-lockfile for --immutable.
-    YARN_MAJOR=$(yarn --version 2>/dev/null | cut -d. -f1)
-    case "$YARN_MAJOR" in ''|*[!0-9]*) YARN_MAJOR=1;; esac
-    if [ -f .yarnrc.yml ] || [ "$YARN_MAJOR" -ge 2 ]; then INSTALL="yarn install --immutable"; else INSTALL="yarn install --frozen-lockfile"; fi
-  elif [ -f package-lock.json ]; then
-    DEPS=package-lock.json; INSTALL="npm ci"
-  else
-    DEPS=package.json; INSTALL="npm install"
-  fi
-  CPM_PREVIEW_DEPS_HASH="$DEPS:$(cksum < "$DEPS" | awk '{print $1"-"$2}')"
-  if [ "$(cat ${INSTALL_MARKER} 2>/dev/null)" != "$CPM_PREVIEW_DEPS_HASH" ]; then CPM_PREVIEW_INSTALL="$INSTALL"; fi
+${DETECT_INSTALL_SH}
+  CPM_PREVIEW_DEPS_HASH="$CPM_DEPS_HASH"
+  if [ "$(cat ${INSTALL_MARKER} 2>/dev/null)" != "$CPM_PREVIEW_DEPS_HASH" ]; then CPM_PREVIEW_INSTALL="$CPM_INSTALL"; fi
 fi
 export CPM_PREVIEW_INSTALL CPM_PREVIEW_DEPS_HASH
 rm -f "$CPM_PREVIEW_PIDFILE" "$CPM_PREVIEW_STATEFILE"

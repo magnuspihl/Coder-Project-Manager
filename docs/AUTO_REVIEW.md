@@ -482,7 +482,7 @@ CREATE TABLE task_turns (
   turn_number INTEGER NOT NULL,           -- 1-indexed, sequential across both roles
   claude_session_id TEXT,                 -- New UUID for reviewer; task's session_id for implementer
   prompt TEXT,                            -- Prompt used for this turn
-  review_outcome TEXT CHECK (review_outcome IS NULL OR review_outcome IN ('pass', 'fail', 'partial')),
+  review_outcome TEXT CHECK (review_outcome IS NULL OR review_outcome IN ('pass', 'fail', 'partial', 'unverified')),
   review_summary TEXT,                    -- Reviewer's one-sentence summary
   review_issues TEXT,                     -- JSON array of issue strings (reviewer fail only)
   files_changed INTEGER,                  -- 1 if worktree was dirty, 0 if clean, NULL for reviewer turns
@@ -1268,12 +1268,55 @@ with any unreviewed file becomes a **partial review**:
 (create new, copy by column name, drop, rename, recreate the index) in one transaction with `foreign_keys` OFF
 around it — `review_findings.turn_id` cascades, so dropping the old table with enforcement on would delete every
 finding. It runs after the `review_mode`/`review_proofs` ALTERs, because the rebuild copies those columns, and is
-a no-op once the table already allows `partial` (fresh installs get it from `schema.sql`). The old constraint,
+a no-op once the table already allows `unverified` (fresh installs get it from `schema.sql`; a database that
+only had `partial` is rebuilt once more). The old constraint,
 `IN ('pass','fail',NULL)`, never rejected anything (NULL in the list makes the test NULL, which a CHECK accepts);
 the new one is `IS NULL OR … IN (…)` and does.
 
 Not covered: a server restart mid-review loses the in-memory context (`reviewContexts`), so that review has no
 coverage record and is reported as before.
+
+### Unverified reviews: a broken environment is not a verdict
+
+A proof can only confirm or refute a defect if the tests actually run. In a worktree with no dependencies installed
+(a fresh checkout, or a preview `npm ci` that wiped node_modules and then failed) every proof fails with
+"Cannot find package 'tsx'" and the suite runs zero tests. Before this, such proofs were simply `unproven`
+(advisory), so the review was recorded as a **pass** that had verified nothing. Now (`server/services/test-env.ts`):
+
+- **Pre-check, before the reviewer runs** (proof mode only). `buildTestEnvCommand` checks the runner is installed
+  in the test directory: Node projects need some `node_modules` up the tree when package.json declares
+  dependencies, plus the runner's own packages (`tsx` for `--import tsx`, `vitest`, `jest`, `ts-node`); other
+  runners need their binary (`go`, `dotnet`, a custom command's first word) or `python3 -c 'import pytest'`.
+  When something Node-side is missing it installs **the same way the preview does** — the shared
+  `DETECT_INSTALL_SH` (npm ci / pnpm / yarn) and the same `INSTALL_MARKER` — under a per-directory `flock`
+  (`INSTALL_LOCK_FN`) that the preview's install also takes, so a preview install already running is waited for
+  instead of raced. It installs only when something is actually missing, never just because the lockfile
+  changed. Still missing, or the install failed → the turn is closed as `unverified` with the reason and the
+  install log tail, and **no reviewer turn is spent**. An ssh failure of the check itself is `unknown` and the
+  review proceeds (the post-run checks still apply). Timeout: `CPM_REVIEW_INSTALL_TIMEOUT_SEC` (600).
+- **After the proofs ran.** `classifyRun` (given the profile) marks a run whose *runner* could not start
+  (`environmentFailure`: its package/binary missing, "npx canceled due to missing packages") as unproven with
+  `environment: true` — never repairable, so no repair round is wasted. A reviewer importing a package the
+  project lacks, or a wrong relative path, is still a broken test. `environmentProblem` adds: the whole suite
+  (from the review's full verification) errored before running any test (`suiteUnrunnable`; "No tests ran" and
+  timeouts don't count), or a proof failed to load and a re-check (no install) now finds dependencies missing.
+- **Outcome.** `routeReview`: a confirmed finding is still a `fail` (that test did run). Otherwise any of the
+  above makes it `unverified`, with `unverifiedReason` ("tests could not run: no dependencies installed in the
+  worktree…"). It is treated like partial: stored as `review_outcome = 'unverified'` (CHECK widened by the same
+  `widenTaskTurnOutcome` rebuild, which now runs on databases that already allow `partial`), the summary starts
+  "Unverified — tests could not run: …", `review_proofs.unverified` holds the reason (and install log), open
+  findings stay open, claimed fixes are not verified, a deferred completion is cancelled, nothing loops to the
+  implementer, no audit starts, and the task returns to `awaiting_feedback`. The conversation gets an
+  `unverified_review` message; the card is an orange "Unverified — tests could not run" badge with a
+  **Review again** button.
+- **Visibility.** MCP `get_task` returns `review: {outcome, passed, summary, unverified_reason,
+  worktree_not_testable}` — `passed` is true only for a pass. When the task's preview failed while installing
+  dependencies, the preview badge reads "Worktree not testable: dependency install failed" and the unverified
+  card links to that log.
+- An unrunnable suite result is never reused by the "tree unchanged" shortcut of full verification: the
+  fingerprint ignores node_modules, so a result from before an install would otherwise outlive it.
+
+Pass, fail and partial are unchanged whenever the tests do run.
 
 ### Re-reviews are measured against the delta
 
