@@ -130,13 +130,14 @@ export function RefutedClaims({ proofs }: { proofs: StoredProof[] }) {
 }
 
 /** Shown on reviews that ran without a test runner: the findings were not checked by anything. */
-export function OpinionNote() {
+export function OpinionNote({ reason }: { reason?: string }) {
   return (
     <p
       className="text-[11px] px-2 py-1 rounded border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 text-amber-800 dark:text-amber-200"
-      title="No test runner was found for this workspace, so the reviewer's findings could not be backed by failing tests."
+      title="The harness did not run any tests for this review, so the reviewer's verdict could not be backed by failing tests."
     >
-      Opinion-based review — no test runner was found, so these findings are the reviewer's judgement and were not checked by running anything.
+      <span className="font-semibold">Not test-verified: {reason ?? 'no test runner was found'}.</span>{' '}
+      This verdict is the reviewer's judgement — nothing was checked by running tests.
       Set a test command in the workspace settings, or have the implementer add tests.
     </p>
   );

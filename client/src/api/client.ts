@@ -134,6 +134,8 @@ export interface StoredReview {
   coverage?: ReviewCoverage;
   /** Set on an 'unverified' review: why the tests could not run, plus the install log tail when an install failed. */
   unverified?: { reason: string; log?: string };
+  /** Opinion mode: the review was not test-verified, and why. */
+  notTestVerified?: { reason: string };
 }
 
 export type BaselineResult = 'fails' | 'passes' | 'new_code' | 'not_runnable';

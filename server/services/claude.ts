@@ -22,7 +22,7 @@ import {
 } from './review-coverage.js';
 import { parseReviewDecision, extractProofFiles, type ReviewDecision, type ReviewIssue } from './review-verdict.js';
 import {
-  assignRepairFiles, formatFindingForImplementer, opinionIssues, repairable, rerunProof, routeReview, tally, toStored, verifyProofs,
+  assignRepairFiles, formatFindingForImplementer, OPINION_REASON_UNKNOWN, opinionIssues, repairable, rerunProof, routeReview, tally, toStored, verifyProofs,
   PROOF_INSTRUCTIONS, type ReviewMode, type StoredReview, type VerifiedIssue,
 } from './review-proof.js';
 import { formatHandoffMarkdown, formatHandoffIssueTexts, formatEscalationMarkdown, formatUnverifiedMarkdown } from './message-kinds.js';
@@ -35,7 +35,7 @@ import { computeHardToReverse } from './audit-facts.js';
 import { AUDITOR_SYSTEM_PROMPT, bundleGuidance, buildPhase1Prompt, buildPhase2Prompt, buildReportRecoveryPrompt, collectTurnSummaries, type TurnSummary } from './audit-prompt.js';
 import { buildLineIndex, readAddedExports, readGuidanceDocs, readPackageJsons, readSnapshot } from './audit-io.js';
 import { describeRunCommand, describeRunner, parseTestProfile, type TestProfile } from './test-runners.js';
-import { resolveTestProfile, resolveTestObligation, getStoredTestProfile, setStoredTestProfile } from './test-profile.js';
+import { explainTestProfile, resolveTestProfile, resolveTestObligation, getStoredTestProfile, setStoredTestProfile } from './test-profile.js';
 import { buildTestingPrompt, extractNoTests, extractTestProfile } from './implementer-markers.js';
 import { buildVerification, summariseVerification, reviewerTestLines, withBudget, type VerificationIO, type VerificationLevel, type VerificationSummary } from './verification.js';
 import { buildPreviewStopCommand, proxyUriForWorkspace, readPreviewLog, recheckAllPreviews, restartTaskPreview, type PreviewExec } from './preview.js';
@@ -4165,14 +4165,19 @@ async function launchReviewerOnTask(task: Task, opts: ReviewLaunchOpts = {}): Pr
   // Evidence-based review needs a way to run tests. With none, degrade to the
   // opinion-based review — and record that on the turn so the UI can say so
   // instead of implying the findings were checked.
-  const profile = await resolveTestProfile(task.workspace_id, task.worktree_path!,
+  const { profile, reason: noRunnerReason } = await explainTestProfile(task.workspace_id, task.worktree_path!,
     cmd => sshExec(task.workspace_name, cmd, 15000, task.user_id));
   const mode: ReviewMode = profile ? 'proof' : 'opinion';
-  setTurnReview(turn.id, mode, null);
-  reviewContexts.set(turn.id, { mode, profile });
+  const notTestVerified = profile ? undefined : noRunnerReason ?? 'no test runner found';
+  // Recorded up front, so a review that is still running already reads as
+  // "not test-verified: <reason>" rather than as an ordinary review.
+  setTurnReview(turn.id, mode, notTestVerified
+    ? JSON.stringify({ mode, proofs: [], notTestVerified: { reason: notTestVerified } } satisfies StoredReview)
+    : null);
+  reviewContexts.set(turn.id, { mode, profile, ...(notTestVerified ? { notTestVerified } : {}) });
   appendStreamLog(task.id, 'reviewer_mode', profile
     ? `[Reviewer] proof mode — ${describeRunner(profile)} (${profile.source})`
-    : '[Reviewer] opinion mode — no test runner found, findings will not be backed by tests');
+    : `[Reviewer] opinion mode — not test-verified: ${notTestVerified}`);
 
   // Proof mode is only worth a reviewer turn when the tests can run. Check the
   // runner is installed (installing the dependencies like the preview does when
@@ -4265,6 +4270,8 @@ interface ReviewContext {
   cutOff?: boolean;
   /** A "review remaining files" run: it covers only part of the change. */
   scoped?: boolean;
+  /** Opinion mode only: why no tests back this review (no runner detected, …). */
+  notTestVerified?: string;
 }
 const reviewContexts = new Map<string, ReviewContext>();
 /** The in-memory review state, exposed so tests can stand in for a finished reviewer run. */
@@ -4827,7 +4834,8 @@ export function routeVerifiedReview(
 ): void {
   const rctx = reviewContexts.get(turnId);
   reviewContexts.delete(turnId);
-  const routed = routeReview(mode, decision, verified, envProblem);
+  const routed = routeReview(mode, decision, verified, envProblem,
+    mode === 'opinion' ? rctx?.notTestVerified ?? OPINION_REASON_UNKNOWN : undefined);
   const blockingTexts = routed.blocking.map(v => v.issue.text);
 
   // Coverage is checked, not trusted: what the reviewer was shown plus the files
@@ -4969,7 +4977,8 @@ export function routeVerifiedReview(
 
 /** One-line summary of a review, honest about the reviewer's claim vs. what was demonstrated. */
 function reviewSummary(decision: ReviewDecision, routed: ReturnType<typeof routeReview>): string {
-  if (routed.mode === 'opinion' || routed.outcome === 'unverified') return decision.summary;
+  if (routed.mode === 'opinion') return `Not test-verified (${routed.notTestVerified ?? OPINION_REASON_UNKNOWN}) — ${decision.summary}`;
+  if (routed.outcome === 'unverified') return decision.summary;
   if (routed.outcome === 'pass' && decision.outcome === 'fail') {
     return `${decision.summary} — but no finding was confirmed by a failing test (${tally(routed)}), so it does not block.`;
   }

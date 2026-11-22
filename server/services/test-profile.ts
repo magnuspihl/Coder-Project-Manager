@@ -8,7 +8,7 @@
  */
 
 import { getDb } from '../db/index.js';
-import { detectProfile, parseTestProfile, type TestProfile } from './test-runners.js';
+import { explainDetectProfile, parseTestProfile, type TestProfile } from './test-runners.js';
 
 export function getStoredTestProfile(workspaceId: string): TestProfile | null {
   const row = getDb().prepare('SELECT test_profile FROM workspace_settings WHERE workspace_id = ?')
@@ -43,23 +43,40 @@ export async function resolveTestProfile(
   worktreePath: string,
   exec: (command: string) => Promise<string>,
 ): Promise<TestProfile | null> {
+  return (await explainTestProfile(workspaceId, worktreePath, exec)).profile;
+}
+
+/**
+ * `resolveTestProfile`, plus why there is none when there is none — the reason a
+ * review falls back to opinion mode, shown as "not test-verified: <reason>".
+ */
+export async function explainTestProfile(
+  workspaceId: string,
+  worktreePath: string,
+  exec: (command: string) => Promise<string>,
+): Promise<{ profile: TestProfile | null; reason?: string }> {
   const stored = getStoredTestProfile(workspaceId);
-  if (stored?.source === 'user') return stored;
+  if (stored?.source === 'user') return { profile: stored };
 
   let detected: TestProfile | null = null;
+  let reason: string;
   try {
     const wt = `'${worktreePath.replace(/'/g, `'\\''`)}'`;
     const out = await exec(`ls -1A ${wt} 2>/dev/null; echo ${PKG_SEPARATOR}; cat ${wt}/package.json 2>/dev/null`);
     const [listing, pkg] = out.replace(/\r\n?/g, '\n').split(PKG_SEPARATOR);
-    detected = detectProfile({
+    const explained = explainDetectProfile({
       rootFiles: listing.split('\n').map(l => l.trim()).filter(Boolean),
       packageJson: pkg?.trim() || null,
     });
-  } catch {
+    detected = explained.profile;
+    reason = explained.reason ?? 'no test runner found';
+  } catch (err) {
     // An unreachable workspace shouldn't turn into a confident "no tests here".
     // Fall through to whatever we already know.
+    reason = `could not inspect the worktree to find its test runner (${((err as Error)?.message ?? 'unknown error').split('\n')[0].slice(0, 120)})`;
   }
-  return detected ?? stored;
+  const profile = detected ?? stored;
+  return profile ? { profile } : { profile: null, reason };
 }
 
 // ---------------------------------------------------------------------------

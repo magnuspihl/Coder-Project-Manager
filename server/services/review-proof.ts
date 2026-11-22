@@ -339,6 +339,8 @@ export interface RoutedReview {
   outcome: 'pass' | 'fail' | 'unverified';
   /** Why the review is unverified ("tests could not run: …"). Set only then. */
   unverifiedReason?: string;
+  /** Opinion mode: why no tests back this review. Always set in opinion mode. */
+  notTestVerified?: string;
   /** Findings that send the implementer back to work. */
   blocking: VerifiedIssue[];
   /** Surfaced to the user, never loops. */
@@ -356,9 +358,18 @@ export interface RoutedReview {
  * runnable test setup) the reviewer's word stands, as it did before
  * evidence-based review existed.
  */
-export function routeReview(mode: ReviewMode, decision: ReviewDecision, verified: VerifiedIssue[], envProblem?: string | null): RoutedReview {
+export function routeReview(
+  mode: ReviewMode,
+  decision: ReviewDecision,
+  verified: VerifiedIssue[],
+  envProblem?: string | null,
+  notTestVerified?: string,
+): RoutedReview {
   if (mode === 'opinion') {
-    return { mode, outcome: decision.outcome, blocking: verified, advisory: [], refuted: [] };
+    return {
+      mode, outcome: decision.outcome, notTestVerified: notTestVerified ?? OPINION_REASON_UNKNOWN,
+      blocking: verified, advisory: [], refuted: [],
+    };
   }
   const blocking = verified.filter(v => v.proof.status === 'confirmed');
   const brokenProof = verified.find(v => v.proof.environment);
@@ -375,6 +386,12 @@ export function routeReview(mode: ReviewMode, decision: ReviewDecision, verified
   };
 }
 
+/**
+ * The reason recorded for an opinion-mode review when the launch-time one is
+ * gone — the in-memory review context does not survive a CPM restart.
+ */
+export const OPINION_REASON_UNKNOWN = 'no test runner was available to this review';
+
 /** A verdict with no per-finding evidence: what an opinion-mode review yields. */
 export function opinionIssues(decision: ReviewDecision): VerifiedIssue[] {
   return (decision.issues ?? []).map(issue => ({
@@ -385,7 +402,7 @@ export function opinionIssues(decision: ReviewDecision): VerifiedIssue[] {
 
 /** One-line tally, e.g. "1 confirmed, 2 refuted, 1 unproven". */
 export function tally(routed: RoutedReview): string {
-  if (routed.mode === 'opinion') return 'opinion-based review (no test runner configured)';
+  if (routed.mode === 'opinion') return `not test-verified: ${routed.notTestVerified ?? OPINION_REASON_UNKNOWN}`;
   const parts = [
     routed.blocking.length && `${routed.blocking.length} confirmed`,
     routed.refuted.length && `${routed.refuted.length} refuted`,
@@ -417,6 +434,11 @@ export interface StoredReview {
   proofs: StoredProof[];
   /** Set when the review is `unverified`: why the tests could not run, and the install log tail when an install failed. */
   unverified?: { reason: string; log?: string };
+  /**
+   * Opinion mode: the review was not test-verified, and why (no runner detected,
+   * the worktree could not be inspected, …). Shown as "not test-verified: <reason>".
+   */
+  notTestVerified?: { reason: string };
   /** What the harness found the reviewer saw. Absent on reviews that predate coverage checking. */
   coverage?: CoverageReport;
 }
@@ -437,6 +459,7 @@ export function toStored(routed: RoutedReview, all: VerifiedIssue[]): StoredRevi
       ...(v.proof.environment ? { environment: true } : {}),
     })),
     ...(routed.unverifiedReason ? { unverified: { reason: routed.unverifiedReason } } : {}),
+    ...(routed.mode === 'opinion' ? { notTestVerified: { reason: routed.notTestVerified ?? OPINION_REASON_UNKNOWN } } : {}),
   };
 }
 
