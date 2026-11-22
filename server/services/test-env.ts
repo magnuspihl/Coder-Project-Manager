@@ -17,7 +17,7 @@
  * caller (claude.ts wires sshExec).
  */
 
-import { DETECT_INSTALL_SH, INSTALL_LOCK_FN, INSTALL_MARKER } from './install-script.js';
+import { DETECT_INSTALL_SH, INSTALL_LOCK_FN, INSTALL_MARKER, NPM_TREE_CURRENT_FN } from './install-script.js';
 import { shellQuote, type TestProfile } from './test-runners.js';
 import type { SuiteResult } from './verification.js';
 
@@ -99,7 +99,9 @@ export function testInstallLogPath(taskId: string): string {
  * parseTestEnvOutput.
  *
  * It installs only when something is actually missing — never just because the
- * lockfile changed: a working node_modules is left alone.
+ * lockfile changed: a working node_modules is left alone. With `install`, it
+ * takes the lock BEFORE looking, so a preview install that is mid-way (npm ci
+ * deletes node_modules first) is waited out rather than judged half-done.
  */
 export function buildTestEnvCommand(
   profile: TestProfile,
@@ -118,10 +120,6 @@ export function buildTestEnvCommand(
 
   const install = opts.install ? `
 if [ -f package.json ] && printf '%s' "$M" | grep -Eq 'node_modules|package:'; then
-  ${INSTALL_LOCK_FN.replace(/\n/g, '\n  ')}
-  cpm_install_lock ${opts.timeoutSec}
-  M=$(cpm_missing)
-  if [ -z "$M" ]; then cpm_install_unlock; echo "${ENV_MARK} result=installed"; exit 0; fi
   ${DETECT_INSTALL_SH.replace(/\n/g, '\n  ')}
   echo "${ENV_MARK} install=$CPM_INSTALL"
   if command -v timeout >/dev/null 2>&1; then T="timeout -k 10 ${opts.timeoutSec}"; else T=""; fi
@@ -129,7 +127,6 @@ if [ -f package.json ] && printf '%s' "$M" | grep -Eq 'node_modules|package:'; t
   $T sh -c "$CPM_INSTALL" > ${q(opts.logPath)} 2>&1 < /dev/null
   RC=$?
   [ $RC -eq 0 ] && mkdir -p node_modules && printf '%s\\n' "$CPM_DEPS_HASH" > ${INSTALL_MARKER}
-  cpm_install_unlock
   M=$(cpm_missing)
   if [ $RC -ne 0 ]; then
     echo "${ENV_MARK} result=install-failed exit=$RC"
@@ -141,6 +138,15 @@ if [ -f package.json ] && printf '%s' "$M" | grep -Eq 'node_modules|package:'; t
   if [ -z "$M" ]; then echo "${ENV_MARK} result=installed"; exit 0; fi
 fi` : '';
 
+  // Wait for any dependency install already running in this directory (the
+  // preview's) before looking — held until the script exits. M0 is what was
+  // missing before the wait, so "another install fixed it" reads as installed.
+  const lockFirst = opts.install ? `M0=
+if [ -f package.json ]; then
+  ${INSTALL_LOCK_FN.replace(/\n/g, '\n  ')}
+  M0=$(cpm_missing)
+  cpm_install_lock ${opts.timeoutSec}
+fi` : 'M0=';
   const script = `set +e
 cd ${q(dir)} || { echo "${ENV_MARK} result=missing"; echo "${ENV_MARK} missing=directory"; exit 0; }
 export PATH="$HOME/.local/bin:$PATH"
@@ -151,8 +157,13 @@ cpm_missing() {
   ${checks.join('\n  ') || ':'}
   printf '%s' "$M" | sed 's/^ *//'
 }
+${lockFirst}
 M=$(cpm_missing)
-if [ -z "$M" ]; then echo "${ENV_MARK} result=ok"; exit 0; fi
+if [ -z "$M" ]; then
+  # Found missing only once another install held the lock, and complete after it: that install fixed it.
+  if [ -n "$M0" ]; then echo "${ENV_MARK} result=installed"; else echo "${ENV_MARK} result=ok"; fi
+  exit 0
+fi
 echo "${ENV_MARK} missing=$M"${install}
 echo "${ENV_MARK} result=missing"
 echo "${ENV_MARK} missing=$M"
@@ -184,6 +195,117 @@ export function parseTestEnvOutput(out: string): TestEnvCheck {
     case 'missing': return { status: 'missing', missing, installCommand };
     case 'install-failed': return { status: 'install-failed', missing, installCommand, installExit, logTail };
     default: return { status: 'unknown', missing: [] };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Settling the dependencies before a verification run
+// ---------------------------------------------------------------------------
+
+export const DEPS_MARK = '@@CPM_DEPS@@';
+
+export interface DependencySettle {
+  /**
+   * none           — not a Node project (no package.json): nothing to settle
+   * current        — the install marker already matches the lockfile
+   * recorded       — no marker, but node_modules matches package-lock.json (a plain `npm ci`): marker written, nothing reinstalled
+   * installed      — stale or missing; installed with the preview's command, marker written
+   * stale          — stale or missing, but `install` was off (this task's preview never installs): left alone
+   * install-failed — the install ran and failed
+   * unknown        — no answer (ssh trouble)
+   */
+  status: 'none' | 'current' | 'recorded' | 'installed' | 'stale' | 'install-failed' | 'unknown';
+  installCommand?: string;
+  installExit?: number;
+  logTail?: string;
+}
+
+/**
+ * Shell run by the harness before it runs any test in a worktree, so that its
+ * runs and the preview's dependency install can never overlap.
+ *
+ * The preview (re)starts at the same moment as the turn-end verification, and
+ * its install (`npm ci`) deletes and re-extracts node_modules — under a test
+ * run, that makes every fresh `npx tsx` fail. Both now go through the same
+ * per-directory lock and the same marker, so the order no longer matters:
+ *
+ *  - the preview's install already holds the lock → this waits for it to finish;
+ *  - this gets the lock first → it leaves node_modules matching the lockfile and
+ *    the marker saying so, so the preview, which re-checks the marker under the
+ *    lock, finds nothing to install.
+ *
+ * The lock cannot simply be held for the whole verification (that is many
+ * separate ssh calls), so "leave nothing for the preview to do" is what keeps
+ * the preview out afterwards. Hence `install`: when the task's preview WOULD
+ * install (an auto-detected `npm run dev`), this runs exactly that install,
+ * first, instead of it happening under the tests. When the preview never
+ * installs (an explicit preview command, no preview at all) nothing else can
+ * race, and a node_modules that is stale is left alone — this never deletes a
+ * tree nothing else would have deleted. Either way, a correct node_modules from
+ * the agent's own `npm ci` is recognised and the marker recorded.
+ *
+ * Prints `@@CPM_DEPS@@ key=value` lines; see parseDependencySettleOutput.
+ */
+export function buildDependencySettleCommand(
+  dir: string,
+  opts: { install: boolean; logPath: string; timeoutSec: number },
+): string {
+  const script = `set +e
+cd ${q(dir)} || { echo "${DEPS_MARK} result=none"; exit 0; }
+export PATH="$HOME/.local/bin:$PATH"
+[ -f package.json ] || { echo "${DEPS_MARK} result=none"; exit 0; }
+${INSTALL_LOCK_FN}
+${NPM_TREE_CURRENT_FN}
+${DETECT_INSTALL_SH}
+cpm_install_lock ${opts.timeoutSec}
+if [ "$(cat ${INSTALL_MARKER} 2>/dev/null)" = "$CPM_DEPS_HASH" ]; then
+  echo "${DEPS_MARK} result=current"
+elif cpm_npm_tree_current "$CPM_DEPS"; then
+  printf '%s\\n' "$CPM_DEPS_HASH" > ${INSTALL_MARKER}
+  echo "${DEPS_MARK} result=recorded"
+elif [ ${opts.install ? 1 : 0} = 0 ]; then
+  echo "${DEPS_MARK} result=stale"
+else
+  echo "${DEPS_MARK} install=$CPM_INSTALL"
+  if command -v timeout >/dev/null 2>&1; then T="timeout -k 10 ${opts.timeoutSec}"; else T=""; fi
+  rm -f ${INSTALL_MARKER}
+  $T sh -c "$CPM_INSTALL" > ${q(opts.logPath)} 2>&1 < /dev/null
+  RC=$?
+  if [ $RC -eq 0 ]; then
+    mkdir -p node_modules && printf '%s\\n' "$CPM_DEPS_HASH" > ${INSTALL_MARKER}
+    echo "${DEPS_MARK} result=installed"
+  else
+    echo "${DEPS_MARK} result=install-failed exit=$RC"
+    echo "${ENV_LOG_MARK}"
+    tail -c ${LOG_TAIL_BYTES} ${q(opts.logPath)} 2>/dev/null
+  fi
+fi
+cpm_install_unlock
+exit 0`;
+  return `sh -c "$(printf %s '${Buffer.from(script, 'utf8').toString('base64')}' | base64 -d)"`;
+}
+
+/** Read the settle step's output. Anything unrecognisable is `unknown`. */
+export function parseDependencySettleOutput(out: string): DependencySettle {
+  const [head, ...logParts] = out.split(ENV_LOG_MARK);
+  let result: string | null = null;
+  let installCommand: string | undefined;
+  let installExit: number | undefined;
+  for (const line of head.split('\n')) {
+    const i = line.indexOf(DEPS_MARK);
+    if (i < 0) continue;
+    const kv = line.slice(i + DEPS_MARK.length).trim();
+    const r = /^result=(\S+)(?:\s+exit=(\d+))?/.exec(kv);
+    if (r) { result = r[1]; if (r[2]) installExit = Number(r[2]); continue; }
+    if (kv.startsWith('install=')) installCommand = kv.slice(8).trim() || undefined;
+  }
+  const logTail = logParts.join(ENV_LOG_MARK).trim() || undefined;
+  switch (result) {
+    case 'none': case 'current': case 'recorded': case 'stale':
+      return { status: result };
+    case 'installed': return { status: 'installed', installCommand };
+    case 'install-failed': return { status: 'install-failed', installCommand, installExit, logTail };
+    default: return { status: 'unknown' };
   }
 }
 

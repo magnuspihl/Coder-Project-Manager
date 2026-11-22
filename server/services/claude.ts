@@ -26,7 +26,7 @@ import {
   PROOF_INSTRUCTIONS, type ReviewMode, type StoredReview, type VerifiedIssue,
 } from './review-proof.js';
 import { formatHandoffMarkdown, formatHandoffIssueTexts, formatEscalationMarkdown, formatUnverifiedMarkdown } from './message-kinds.js';
-import { buildTestEnvCommand, environmentProblem, parseTestEnvOutput, preReviewGate, suiteUnrunnable, testInstallLogPath, type TestEnvCheck } from './test-env.js';
+import { buildDependencySettleCommand, buildTestEnvCommand, environmentProblem, parseDependencySettleOutput, parseTestEnvOutput, preReviewGate, runnerRequirements, suiteUnrunnable, testInstallLogPath, type DependencySettle, type TestEnvCheck } from './test-env.js';
 import { getReviewDiff, getReviewDiffInfo, hasBranchChanges, makeProofIO, makeVerificationIO, type Exec } from './review-io.js';
 import { auditEnabled, auditDue, countImplementerTurns, createAudit, finishAudit, getLatestAudit, getPreviousReport, getRunningAudit, setAuditPhase, setAuditSnapshot, skipAudit } from './audits.js';
 import { resolvedSince } from './audit-ownership.js';
@@ -38,7 +38,7 @@ import { describeRunCommand, describeRunner, parseTestProfile, type TestProfile 
 import { explainTestProfile, resolveTestProfile, resolveTestObligation, getStoredTestProfile, setStoredTestProfile } from './test-profile.js';
 import { buildTestingPrompt, extractNoTests, extractTestProfile } from './implementer-markers.js';
 import { buildVerification, summariseVerification, reviewerTestLines, withBudget, type VerificationIO, type VerificationLevel, type VerificationSummary } from './verification.js';
-import { buildPreviewStopCommand, proxyUriForWorkspace, readPreviewLog, recheckAllPreviews, restartTaskPreview, type PreviewExec } from './preview.js';
+import { buildPreviewStopCommand, previewAutoInstalls, proxyUriForWorkspace, readPreviewLog, recheckAllPreviews, restartTaskPreview, type PreviewExec } from './preview.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
@@ -3779,7 +3779,7 @@ async function verifyTurnTests(task: Task, level: VerificationLevel): Promise<vo
   if (verifyingTasks.has(task.id)) return;
   verifyingTasks.add(task.id);
   const budgetMs = (level === 'full' ? VERIFY_FULL_BUDGET_SEC : VERIFY_TESTS_BUDGET_SEC) * 1000;
-  const deadline = Date.now() + budgetMs;
+  let deadline = Date.now() + budgetMs;
   let abandoned = false;
   try {
     const { obligation, profile } = await resolveTestObligation(task.workspace_id, task.worktree_path,
@@ -3787,6 +3787,15 @@ async function verifyTurnTests(task: Task, level: VerificationLevel): Promise<vo
     // Workspaces where tests are not expected (Godot, Unity…) get no report at all —
     // not even a "no test runner" card on every turn.
     if (obligation === 'off') return;
+
+    // The preview restarts at the same moment as this, and its dependency install
+    // would wipe node_modules under our test runs. Settle the dependencies first,
+    // under the install lock both share. The budget is for running tests, so it
+    // starts afterwards.
+    if (profile && runnerRequirements(profile).nodeDeps) {
+      await settleDependencies(task);
+      deadline = Date.now() + budgetMs;
+    }
 
     const io = profile ? makeVerificationIO(workspaceExec(task), task.worktree_path!, profile) : null;
     if (level === 'full' && io) {
@@ -3841,6 +3850,34 @@ async function verifyTurnTests(task: Task, level: VerificationLevel): Promise<vo
     console.error(`[verification] Task ${task.id}:`, (err as Error).message?.slice(0, 200));
   } finally {
     verifyingTasks.delete(task.id);
+  }
+}
+
+/**
+ * Make sure no dependency install can run under the harness's test runs: wait
+ * for one already in progress, and do the preview's install now if the preview
+ * would otherwise do it in the middle of them (buildDependencySettleCommand).
+ * In the worktree root, the directory the preview installs in. Never throws.
+ */
+async function settleDependencies(task: Task): Promise<DependencySettle> {
+  if (!task.worktree_path) return { status: 'none' };
+  try {
+    const install = await previewAutoInstalls(task.id, previewExecFor(task));
+    const cmd = buildDependencySettleCommand(task.worktree_path, {
+      install, logPath: testInstallLogPath(task.id), timeoutSec: TEST_INSTALL_TIMEOUT_SEC,
+    });
+    const settle = parseDependencySettleOutput(await sshExec(task.workspace_name, cmd, (TEST_INSTALL_TIMEOUT_SEC * 2 + 60) * 1000, task.user_id));
+    if (settle.status === 'recorded') {
+      appendStreamLog(task.id, 'verification', '[Harness] node_modules already matches package-lock.json — recorded it, so the preview does not reinstall');
+    } else if (settle.status === 'installed') {
+      appendStreamLog(task.id, 'verification', `[Harness] dependencies were stale — installed them${settle.installCommand ? ` (${settle.installCommand})` : ''} before running tests, so the preview does not install under them`);
+    } else if (settle.status === 'install-failed') {
+      appendStreamLog(task.id, 'verification', `[Harness] installing the dependencies${settle.installCommand ? ` (${settle.installCommand})` : ''} failed${settle.installExit !== undefined ? ` with exit code ${settle.installExit}` : ''}; running the tests anyway`);
+    }
+    return settle;
+  } catch (err) {
+    console.warn(`[verification] Task ${task.id}: settling dependencies failed: ${(err as Error).message?.slice(0, 200)}`);
+    return { status: 'unknown' };
   }
 }
 

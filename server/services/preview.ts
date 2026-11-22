@@ -28,7 +28,7 @@
 
 import { getDb } from '../db/index.js';
 import type { Task } from './tasks.js';
-import { DETECT_INSTALL_SH, INSTALL_LOCK_FN, INSTALL_MARKER } from './install-script.js';
+import { DETECT_INSTALL_SH, INSTALL_LOCK_FN, INSTALL_MARKER, NPM_TREE_CURRENT_FN } from './install-script.js';
 
 export { DETECT_INSTALL_SH, INSTALL_LOCK_FN, INSTALL_MARKER };
 
@@ -243,11 +243,15 @@ export interface PreviewStartSpec {
  */
 const PREVIEW_RUNNER = `echo $$ > "$CPM_PREVIEW_PIDFILE"
 ${INSTALL_LOCK_FN}
+${NPM_TREE_CURRENT_FN}
 if [ -n "$CPM_PREVIEW_INSTALL" ]; then
   echo installing > "$CPM_PREVIEW_STATEFILE"
   cpm_install_lock 1200
   if [ "$(cat ${INSTALL_MARKER} 2>/dev/null)" = "$CPM_PREVIEW_DEPS_HASH" ]; then
     echo "[cpm] dependencies were installed meanwhile by another CPM install"
+  elif cpm_npm_tree_current "$CPM_PREVIEW_DEPS"; then
+    echo "[cpm] node_modules already matches $CPM_PREVIEW_DEPS; recorded it instead of reinstalling"
+    printf '%s\\n' "$CPM_PREVIEW_DEPS_HASH" > ${INSTALL_MARKER}
   else
     echo "[cpm] dependencies are missing or changed; installing: $CPM_PREVIEW_INSTALL"
     rm -f ${INSTALL_MARKER}
@@ -281,12 +285,18 @@ export CPM_PREVIEW_RUNNER=${shq(PREVIEW_RUNNER)}
 AUTO_INSTALL=${spec.autoInstall ? 1 : 0}
 CPM_PREVIEW_INSTALL=
 CPM_PREVIEW_DEPS_HASH=
+CPM_PREVIEW_DEPS=
+${NPM_TREE_CURRENT_FN}
 if [ "$AUTO_INSTALL" = 1 ] && [ -f package.json ]; then
 ${DETECT_INSTALL_SH}
   CPM_PREVIEW_DEPS_HASH="$CPM_DEPS_HASH"
-  if [ "$(cat ${INSTALL_MARKER} 2>/dev/null)" != "$CPM_PREVIEW_DEPS_HASH" ]; then CPM_PREVIEW_INSTALL="$CPM_INSTALL"; fi
+  CPM_PREVIEW_DEPS="$CPM_DEPS"
+  if [ "$(cat ${INSTALL_MARKER} 2>/dev/null)" != "$CPM_PREVIEW_DEPS_HASH" ]; then
+    # An agent's own plain \`npm ci\` leaves a correct node_modules with no marker: record it, don't reinstall.
+    if cpm_npm_tree_current "$CPM_DEPS"; then printf '%s\\n' "$CPM_PREVIEW_DEPS_HASH" > ${INSTALL_MARKER}; else CPM_PREVIEW_INSTALL="$CPM_INSTALL"; fi
+  fi
 fi
-export CPM_PREVIEW_INSTALL CPM_PREVIEW_DEPS_HASH
+export CPM_PREVIEW_INSTALL CPM_PREVIEW_DEPS_HASH CPM_PREVIEW_DEPS
 rm -f "$CPM_PREVIEW_PIDFILE" "$CPM_PREVIEW_STATEFILE"
 SETSID=; command -v setsid >/dev/null 2>&1 && SETSID=setsid
 $SETSID nohup sh -c "$CPM_PREVIEW_RUNNER" > ${log} 2>&1 < /dev/null &
@@ -487,6 +497,20 @@ export function restartTaskPreview(taskId: string, opts: RestartOptions): Promis
   inFlight.set(taskId, run);
   run.finally(() => { if (inFlight.get(taskId) === run) inFlight.delete(taskId); }).catch(() => {});
   return run;
+}
+
+/**
+ * Whether this task's preview installs dependencies when it (re)starts: it can
+ * have a preview at all, and its command is the auto-detected `npm run dev`
+ * (an explicit workspace command never gets an install). The harness uses it
+ * to decide whether to run that install itself, before its test runs, rather
+ * than let it happen under them (see buildDependencySettleCommand).
+ */
+export async function previewAutoInstalls(taskId: string, exec: PreviewExec): Promise<boolean> {
+  const task = getTaskRow(taskId);
+  if (!isPreviewable(task) || !previewWorkDir(task)) return false;
+  const resolved = await resolvePreviewCommand(task, exec).catch(() => null);
+  return resolved?.source === 'detected';
 }
 
 async function doRestart(taskId: string, opts: RestartOptions): Promise<RestartOutcome> {
