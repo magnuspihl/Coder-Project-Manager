@@ -247,6 +247,23 @@ test('the pre-check waits for a dependency install already running in the same d
   assert.deepEqual(project.read(), [], 'and did not run a second install');
 });
 
+test('the pre-check waits for a running install even when node_modules still looks complete, before judging it', { timeout: 30000 }, async t => {
+  try { execFileSync('sh', ['-c', 'command -v flock']); } catch { return t.skip('flock is not available'); }
+  const project = makeProject();
+  mkdirSync(join(project.work, 'node_modules/tsx'), { recursive: true });
+  writeFileSync(join(project.work, 'node_modules/tsx/package.json'), '{}');
+  // The preview's install has the lock but has not deleted node_modules yet.
+  const lock = `/tmp/cpm-install-$(cd '${project.work}' && pwd -P | cksum | cut -d' ' -f1).lock`;
+  const holder = spawn('sh', ['-c', `exec 9>"${lock}"; flock 9; echo held; sleep 1.5`], { cwd: project.work });
+  await new Promise<void>(resolve => holder.stdout.once('data', () => resolve()));
+  const started = Date.now();
+  const result = check(project, true);
+  const waited = Date.now() - started;
+  assert.ok(waited >= 1000, `it waited for the lock (${waited} ms) instead of reading a tree mid-install`);
+  assert.equal(result.status, 'ok');
+  assert.deepEqual(project.read(), []);
+});
+
 // ---------------------------------------------------------------------------
 // The status shown to MCP callers
 // ---------------------------------------------------------------------------

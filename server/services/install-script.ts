@@ -51,3 +51,34 @@ export const INSTALL_LOCK_FN = `cpm_install_lock() {
   flock -w "$1" 9 || echo "[cpm] another dependency install in this directory did not finish within $1s; going ahead"
 }
 cpm_install_unlock() { exec 9>&-; }`;
+
+/**
+ * Shell: `cpm_npm_tree_current <deps-file>` succeeds when node_modules already
+ * holds exactly what package-lock.json asks for, judged by npm's own record of
+ * what it installed (node_modules/.package-lock.json, written at the end of
+ * every successful `npm ci` / `npm install`, npm 7+). Every non-optional
+ * package in the lockfile must be recorded there at the same version, and its
+ * directory must exist.
+ *
+ * This is how a plain `npm ci` the agent ran itself — which writes no CPM
+ * marker — is recognised, so the preview records the marker instead of
+ * deleting and re-extracting a correct node_modules. Only npm lockfiles are
+ * judged; anything else (pnpm, yarn, no lockfile, no node) is "not known
+ * current" and keeps the marker-only behaviour.
+ */
+export const NPM_TREE_CURRENT_FN = `cpm_npm_tree_current() {
+  [ "$1" = package-lock.json ] && [ -f node_modules/.package-lock.json ] || return 1
+  command -v node >/dev/null 2>&1 || return 1
+  node -e '
+const fs = require("fs");
+const pk = f => JSON.parse(fs.readFileSync(f, "utf8")).packages;
+let want, have;
+try { want = pk("package-lock.json"); have = pk("node_modules/.package-lock.json"); } catch (e) { process.exit(1); }
+if (!want || !have) process.exit(1);
+for (const k of Object.keys(want)) {
+  if (!k.startsWith("node_modules/")) continue;
+  const w = want[k], h = have[k];
+  if (!h) { if (w.optional) continue; process.exit(1); }
+  if (h.version !== w.version || !fs.existsSync(k)) process.exit(1);
+}' >/dev/null 2>&1
+}`;
