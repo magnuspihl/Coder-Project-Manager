@@ -303,12 +303,23 @@ export function preReviewGate(check: TestEnvCheck): { proceed: true } | { procee
   return { proceed: true };
 }
 
-/** The short "is this reviewed?" answer for get_task: never lets unverified or partial read as a pass. */
+/** The short "is this reviewed?" answer for get_task: never lets unverified, partial or untested read as a pass. */
 export interface ReviewStatusView {
   /** The latest completed review's outcome; null when no review has completed. */
   outcome: 'pass' | 'fail' | 'partial' | 'unverified' | null;
-  /** True only for a pass. A partial or unverified review is NOT a pass. */
+  /**
+   * True only for a TEST-VERIFIED pass. A partial or unverified review is not a
+   * pass, and neither is an opinion-mode one: its outcome may be "pass", but
+   * that is the reviewer's say-so with no test run behind it.
+   */
   passed: boolean;
+  /**
+   * Whether the harness ran the tests for this review (proof mode). False for
+   * an opinion-mode review; absent when no review has completed.
+   */
+  test_verified?: boolean;
+  /** For an opinion-mode review: "not test-verified: <why>". */
+  not_test_verified?: string;
   summary: string | null;
   /** For an unverified review: why the tests could not run. */
   unverified_reason?: string;
@@ -317,18 +328,22 @@ export interface ReviewStatusView {
 }
 
 export function reviewStatusView(
-  turns: Array<{ role: string; completed_at: string | null; review_outcome: string | null; review_summary: string | null; review_proofs: string | null }>,
+  turns: Array<{ role: string; completed_at: string | null; review_outcome: string | null; review_summary: string | null; review_proofs: string | null; review_mode?: string | null }>,
   task: { preview_status?: string | null; preview_error?: string | null },
 ): ReviewStatusView {
   const last = turns.filter(t => t.role === 'reviewer' && t.completed_at && t.review_outcome).pop();
   const outcome = (last?.review_outcome ?? null) as ReviewStatusView['outcome'];
-  const view: ReviewStatusView = { outcome, passed: outcome === 'pass', summary: last?.review_summary ?? null };
-  if (outcome === 'unverified' && last?.review_proofs) {
-    try {
-      const reason = (JSON.parse(last.review_proofs) as { unverified?: { reason?: string } }).unverified?.reason;
-      if (reason) view.unverified_reason = reason;
-    } catch { /* the summary still says it */ }
+  let stored: { mode?: string; unverified?: { reason?: string }; notTestVerified?: { reason?: string } } | null = null;
+  if (last?.review_proofs) {
+    try { stored = JSON.parse(last.review_proofs); } catch { /* the summary still says it */ }
   }
+  const opinion = !!last && (last.review_mode ?? stored?.mode) === 'opinion';
+  const view: ReviewStatusView = { outcome, passed: outcome === 'pass' && !opinion, summary: last?.review_summary ?? null };
+  if (last) view.test_verified = !opinion && outcome !== 'unverified';
+  if (opinion) {
+    view.not_test_verified = `not test-verified: ${stored?.notTestVerified?.reason ?? 'opinion-based review — no test runner was available'}`;
+  }
+  if (outcome === 'unverified' && stored?.unverified?.reason) view.unverified_reason = stored.unverified.reason;
   if (previewInstallFailed(task)) {
     view.worktree_not_testable = 'dependency install failed — see the task\'s preview log';
   }

@@ -145,7 +145,17 @@ export function parseTestProfile(raw: unknown, source: TestProfile['source']): T
  * opinion-based review rather than guessing.
  */
 export function detectProfile(input: { packageJson?: string | null; rootFiles: string[] }): TestProfile | null {
+  return explainDetectProfile(input).profile;
+}
+
+/**
+ * `detectProfile`, plus — when nothing was found — a plain-English reason, so a
+ * review that falls back to opinion mode can say WHY it was not test-verified
+ * instead of reading like a normal pass.
+ */
+export function explainDetectProfile(input: { packageJson?: string | null; rootFiles: string[] }): { profile: TestProfile | null; reason?: string } {
   const files = new Set(input.rootFiles);
+  let scriptNote: string | null = null;
 
   if (input.packageJson) {
     try {
@@ -155,29 +165,66 @@ export function detectProfile(input: { packageJson?: string | null; rootFiles: s
         devDependencies?: Record<string, string>;
       };
       const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-      const testScript = pkg.scripts?.test ?? '';
-      if (deps.vitest || /\bvitest\b/.test(testScript)) return { runner: 'vitest', source: 'detected' };
-      if (deps.jest || /\bjest\b/.test(testScript)) return { runner: 'jest', source: 'detected' };
-      const nodeTest = /\bnode\b([^&|;]*?)--test\b\s*([^&|;]*)$/.exec(testScript);
-      if (nodeTest) {
-        const withTsx = /--(import|loader|require)[ =]tsx\b/.test(nodeTest[1]);
-        return {
-          runner: 'node-test',
-          command: withTsx ? 'node --import tsx --test' : undefined,
-          suite: nodeTest[2].trim() || undefined,
-          source: 'detected',
-        };
-      }
-    } catch { /* malformed package.json — fall through to the marker files */ }
+      const testScript = typeof pkg.scripts?.test === 'string' ? pkg.scripts.test : '';
+      if (deps.vitest || /\bvitest\b/.test(testScript)) return { profile: { runner: 'vitest', source: 'detected' } };
+      if (deps.jest || /\bjest\b/.test(testScript)) return { profile: { runner: 'jest', source: 'detected' } };
+      const nodeTest = nodeTestFromScript(testScript);
+      if (nodeTest) return { profile: nodeTest };
+      scriptNote = testScript
+        ? `package.json's "test" script (\`${testScript.slice(0, 120)}\`) is not a runner CPM can drive (node --test, tsx --test, vitest or jest)`
+        : 'package.json has no "test" script and no vitest or jest dependency';
+    } catch {
+      // malformed package.json — fall through to the marker files
+      scriptNote = 'package.json could not be parsed';
+    }
   }
 
   if (['pytest.ini', 'conftest.py', 'tox.ini', 'setup.cfg', 'pyproject.toml', 'requirements.txt'].some(f => files.has(f))) {
     // pyproject/requirements alone don't prove pytest, but it is the de-facto runner
     // and a missing one surfaces as a suite error (→ unproven), not a false verdict.
-    return { runner: 'pytest', source: 'detected' };
+    return { profile: { runner: 'pytest', source: 'detected' } };
   }
-  if (files.has('go.mod')) return { runner: 'go', source: 'detected' };
-  if ([...files].some(f => /\.(sln|csproj|fsproj)$/.test(f))) return { runner: 'dotnet', source: 'detected' };
+  if (files.has('go.mod')) return { profile: { runner: 'go', source: 'detected' } };
+  if ([...files].some(f => /\.(sln|csproj|fsproj)$/.test(f))) return { profile: { runner: 'dotnet', source: 'detected' } };
+  return {
+    profile: null,
+    reason: scriptNote ?? 'no test runner found — no package.json, and no pytest, Go or .NET project files at the repository root',
+  };
+}
+
+/** node's own reporter flags in a script: the harness sets its own (`--test-reporter=tap`). */
+const REPORTER_FLAG = /(^|\s)--test-reporter(-destination)?(=\S+|\s+\S+)/g;
+
+/**
+ * A node:test profile from a package.json `test` script, or null. Recognises
+ * each `&&`/`;`/`||`-separated command that is
+ *  - `node [flags] --test [globs]` — `--import tsx` (or loader/require) kept;
+ *  - `tsx [flags] --test [globs]`, optionally behind npx/pnpm/yarn — run as
+ *    `npx --no-install tsx --test`, the project's own tsx from node_modules
+ *    (a bare `tsx` is only on PATH inside `npm run`).
+ * The globs become the suite, left unquoted-as-written so the shell expands
+ * them exactly as `npm test` would (`test/*.test.ts test/*.test.mts`).
+ */
+function nodeTestFromScript(script: string): TestProfile | null {
+  for (const raw of script.split(/&&|\|\||;/)) {
+    // Leading env assignments (`NODE_ENV=test node --test`) don't change the runner.
+    const seg = raw.trim().replace(/^(?:[A-Za-z_]\w*=\S*\s+)+/, '');
+    // node first: `node --import tsx --test` also contains "tsx --test". tsx
+    // must BE the command (optionally behind a launcher), not an argument.
+    const node = /(?:^|\s|\/)node\s+((?:\S+\s+)*?)--test(?=\s|$)(.*)$/.exec(seg);
+    const tsx = node ? null : /^(?:(?:npx(?:\s+--no-install|\s+-y|\s+--yes)?|pnpm(?:\s+exec)?|yarn|cross-env(?:\s+[A-Za-z_]\w*=\S*)*)\s+)?tsx\s+((?:\S+\s+)*?)--test(?=\s|$)(.*)$/.exec(seg);
+    const m = node ?? tsx;
+    if (!m) continue;
+    const flags = m[1].trim();
+    const command = tsx
+      ? `npx --no-install tsx ${flags ? flags + ' ' : ''}--test`
+      : /--(import|loader|require)[ =]tsx\b/.test(flags) ? 'node --import tsx --test' : undefined;
+    const suite = m[2].replace(REPORTER_FLAG, ' ').trim() || undefined;
+    // The script is repo content: validate it like any other profile text, and
+    // drop what doesn't pass rather than handing it to a shell.
+    return parseTestProfile({ runner: 'node-test', command, suite }, 'detected')
+      ?? parseTestProfile({ runner: 'node-test', command: tsx ? 'npx --no-install tsx --test' : command }, 'detected');
+  }
   return null;
 }
 
@@ -848,6 +895,14 @@ export function parseRunOutput(runner: RunnerKind, raw: string): RunReport {
     }
   } catch (err) {
     return fallback(`Could not parse the ${runner} report: ${(err as Error).message}`);
+  }
+  // Nothing ran and the command failed: the runner never started (or died
+  // before reporting), e.g. `npx --no-install tsx` with tsx not installed —
+  // npx prints its error and node never runs, so there is no TAP at all. That is
+  // a suite-level error carrying the runner's own words, never a clean "no
+  // failures": it is what lets the review call it unverified instead of a pass.
+  if (report.cases.length === 0 && !report.suiteError && exit !== 0) {
+    report.suiteError = tail(result || log) || `The test command exited with code ${exit} without running any test`;
   }
   if (timedOut) report.timedOut = true;
   return report;

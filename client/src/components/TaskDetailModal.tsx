@@ -2332,13 +2332,16 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
           <div className="flex items-center gap-2 py-1">
             <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
             <span
-              className="flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full border text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800"
+              className={`flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full border ${opinionMode
+                // An opinion-mode pass is the reviewer's say-so, not a tested result: never the green "passed" pill.
+                ? 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/30 border-amber-200 dark:border-amber-800'
+                : 'text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-800'}`}
               title={proofMode
                 ? 'The reviewer could not produce a test that fails on this code. That is weaker than proof the code is correct.'
-                : undefined}
+                : opinionMode ? `Not test-verified: ${stored?.notTestVerified?.reason ?? 'no test runner was found'}` : undefined}
             >
               <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
-              {proofMode ? 'No confirmed defects' : opinionMode ? 'Review passed (opinion-based)' : 'Review passed'}
+              {proofMode ? 'No confirmed defects' : opinionMode ? 'Reviewer found no issues — not test-verified' : 'Review passed'}
               {tally && <span className="font-normal opacity-80">· {tally}</span>}
             </span>
             {fullReview && (
@@ -2351,7 +2354,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
             )}
             <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
           </div>
-          {opinionMode && <div className="mr-8"><OpinionNote /></div>}
+          {opinionMode && <div className="mr-8"><OpinionNote reason={stored?.notTestVerified?.reason} /></div>}
           {(stored?.coverage?.carried?.length || stored?.coverage?.exempt.length) ? <div className="mr-8"><CoverageNotes cov={stored.coverage} /></div> : null}
           {(advisory.length > 0 || refuted.length > 0) && (
             <div className="mr-8 space-y-2">
@@ -2404,7 +2407,7 @@ export default function TaskDetailModal({ taskId, onClose, onTaskChanged }: Task
           </span>
           <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700" />
         </div>
-        {opinionMode && <div className="mr-8"><OpinionNote /></div>}
+        {opinionMode && <div className="mr-8"><OpinionNote reason={stored?.notTestVerified?.reason} /></div>}
         <div className="rounded-lg p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 mr-8">
           {turnFindings.length > 0 ? (
             <div className="space-y-2">
