@@ -2014,6 +2014,66 @@ export default function WorkspacesPage() {
     );
   };
 
+  /**
+   * Compact card for a workspace that isn't running. Tasks are only fetched for
+   * running workspaces, so a full swimlane here would be an empty 20rem column;
+   * a card shows just the name, state, and the start control.
+   */
+  const renderInactiveWorkspaceCard = (ws: Workspace) => {
+    const status = ws.latest_build.status;
+    const isStarting = STARTING_STATUSES.includes(status);
+    const counts = taskCounts[ws.id];
+    const openTasks = counts
+      ? counts.working + counts.queued + counts.awaiting_feedback + counts.failed + counts.cancelled
+      : 0;
+    return (
+      <div
+        key={ws.id}
+        data-inactive-ws-id={ws.id}
+        className={`flex items-center gap-2 px-3 py-2 rounded-lg border bg-gray-50 dark:bg-gray-900/50 border-gray-200 dark:border-gray-800 ${
+          isStarting ? '' : 'opacity-70 hover:opacity-100 transition-opacity'
+        }`}
+      >
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate" title={ws.name}>
+            {ws.name}
+          </div>
+          <div className="flex items-center gap-1.5 text-[11px] text-gray-500 dark:text-gray-400">
+            {isStarting ? (
+              <span className="flex items-center gap-1 text-blue-600 dark:text-blue-400" title={`Workspace is ${status}`}>
+                <span className="animate-spin h-2.5 w-2.5 border-[1.5px] border-blue-600 dark:border-blue-400 border-t-transparent rounded-full" />
+                Starting…
+              </span>
+            ) : (
+              <span className={status === 'failed' ? 'text-red-600 dark:text-red-400' : ''}>{status}</span>
+            )}
+            {openTasks > 0 && (
+              <span
+                className="text-amber-600 dark:text-amber-400"
+                title="Tasks that haven't been completed — start the workspace to see them"
+              >
+                · {openTasks} open {openTasks === 1 ? 'task' : 'tasks'}
+              </span>
+            )}
+          </div>
+        </div>
+        {status === 'stopped' && (
+          <button
+            onClick={(e) => handleStart(e, ws.id)}
+            className="shrink-0 text-gray-400 dark:text-gray-500 hover:text-green-500 dark:hover:text-green-400 p-1"
+            title="Start workspace"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+              <path d="M6 4l10 6-10 6V4z" />
+            </svg>
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  const inactiveCards = [...startingWorkspaces, ...(showStopped ? stoppedWorkspaces : [])];
+
   return (
     <div className="flex flex-col flex-1 min-h-0">
       {error && workspaces.length > 0 && (
@@ -2043,8 +2103,11 @@ export default function WorkspacesPage() {
       ) : (
         <div ref={laneContainerRef} className="flex gap-4 overflow-x-auto pb-4 flex-1 min-h-0">
           {runningWorkspaces.map(renderWorkspaceColumn)}
-          {startingWorkspaces.map(renderWorkspaceColumn)}
-          {showStopped && stoppedWorkspaces.map(renderWorkspaceColumn)}
+          {inactiveCards.length > 0 && (
+            <div className="flex-shrink-0 w-56 flex flex-col gap-2 overflow-y-auto min-h-0">
+              {inactiveCards.map(renderInactiveWorkspaceCard)}
+            </div>
+          )}
         </div>
       )}
 
