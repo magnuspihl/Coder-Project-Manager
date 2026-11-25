@@ -1,5 +1,6 @@
 import { execFile } from 'child_process';
 import { writeRemoteStdin } from './ssh-stdin.js';
+import { coderSshArgs } from './coder-ssh.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 
@@ -195,7 +196,7 @@ export async function readWorkspaceMemory(workspaceName: string, projectDir?: st
     `done\n`;
 
   return new Promise<MemoryFile[]>((resolve) => {
-    execFile('coder', ['ssh', workspaceName, '--', script], {
+    execFile('coder', coderSshArgs(workspaceName, script), {
       env: { ...process.env, CODER_URL },
       timeout: 15000,
       maxBuffer: 1024 * 1024, // 1 MB — memory files should be well under this

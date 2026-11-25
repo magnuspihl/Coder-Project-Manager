@@ -18,6 +18,7 @@ import { getCliInfo, updateCli } from '../services/cli-version.js';
 import { getPortOwnerTaskId } from '../services/port-janitor.js';
 import { setWorkspacesForUser } from '../services/workspace-cache.js';
 import { readWorkspaceMemory, writeWorkspaceMemoryFile } from '../services/workspace-memory.js';
+import { coderSshArgs } from '../services/coder-ssh.js';
 import {
   resolveWorkspaceRepo, listOpenIssues, getIssueDetail, GitHubError,
   DEFAULT_PROGRESS_LABEL, getIssueProgressLabel, setIssueProgressLabel,
@@ -372,7 +373,7 @@ router.get('/:id/projects', requireAuth, async (req: Request, res: Response) => 
 
   // Find directories containing .git in home dir (max depth 3)
   const dirs = await new Promise<string[]>((resolve) => {
-    execFile('coder', ['ssh', wsName, '--', 'find', '/home', '-maxdepth', '4', '-name', '.git', '-type', 'd', '-not', '-path', '*/.*/*'], {
+    execFile('coder', coderSshArgs(wsName, 'find', '/home', '-maxdepth', '4', '-name', '.git', '-type', 'd', '-not', '-path', '*/.*/*'), {
       timeout: 10000,
     }, (err, stdout) => {
       if (err) {

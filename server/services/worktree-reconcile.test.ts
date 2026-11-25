@@ -147,6 +147,6 @@ skipIfNoDb('still cleans up after deleted tasks on a workspace that is already r
 
   await G.reconcileLeakedWorktrees();
 
-  assert.ok(coderCalls().some(c => c.startsWith('ssh Foundry') && c.includes('git worktree remove')), 'removal ran over SSH');
+  assert.ok(coderCalls().some(c => c.startsWith('ssh --wait=no Foundry') && c.includes('git worktree remove')), 'removal ran over SSH');
   assert.equal(T.getTask(task.id)!.worktree_path, null);
 });
