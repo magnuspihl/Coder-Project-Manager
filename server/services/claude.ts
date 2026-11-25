@@ -39,6 +39,7 @@ import { explainTestProfile, resolveTestProfile, resolveTestObligation, getStore
 import { buildTestingPrompt, extractNoTests, extractTestProfile } from './implementer-markers.js';
 import { buildVerification, summariseVerification, reviewerTestLines, withBudget, type VerificationIO, type VerificationLevel, type VerificationSummary } from './verification.js';
 import { buildPreviewStopCommand, previewAutoInstalls, proxyUriForWorkspace, readPreviewLog, recheckAllPreviews, restartTaskPreview, type PreviewExec } from './preview.js';
+import { getWorkspaceRunState } from './workspace-status.js';
 
 const CODER_URL = process.env.CODER_URL || '';
 const OLLAMA_BASE_URL = getOllamaBaseUrl();
@@ -409,11 +410,23 @@ export function startPreviewWatchdog(): void {
   previewWatchdogTimer = setInterval(() => {
     if (previewRecheckRunning) return;
     previewRecheckRunning = true;
-    recheckAllPreviews(task => previewExecFor(task))
+    runPreviewWatchdogSweep()
       .catch(err => console.error(`[preview] recheck failed: ${(err as Error).message?.slice(0, 200)}`))
       .finally(() => { previewRecheckRunning = false; });
   }, PREVIEW_RECHECK_MS);
   previewWatchdogTimer.unref?.();
+}
+
+/**
+ * One watchdog pass. Checks each workspace's state over the REST API before
+ * SSHing in, so a workspace the user stopped stays stopped (`coder ssh` would
+ * start it). Exported so tests can run exactly what the timer runs.
+ */
+export function runPreviewWatchdogSweep(): Promise<void> {
+  return recheckAllPreviews(
+    task => previewExecFor(task),
+    task => getWorkspaceRunState(task.workspace_name, task.user_id),
+  );
 }
 
 /** Last lines of the task's preview log, read from its workspace. */
