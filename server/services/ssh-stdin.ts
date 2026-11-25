@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import type { Readable } from 'stream';
+import { coderSshArgs } from './coder-ssh.js';
 
 /**
  * Printed by the remote side once its stdin is safe to write to. Distinctive
@@ -52,7 +53,7 @@ export async function writeRemoteStdin(opts: {
   const wrapped = `stty raw -echo 2>/dev/null; printf %s ${READY_MARKER}; ${remoteScript}`;
 
   return new Promise<void>((resolve, reject) => {
-    const proc = spawn('coder', ['ssh', workspaceName, '--', wrapped], {
+    const proc = spawn('coder', coderSshArgs(workspaceName, wrapped), {
       env,
       // stdout must be a pipe (not 'ignore') because the ready marker arrives on
       // it; stderr must be drained or a chatty transport fills the pipe buffer

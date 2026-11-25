@@ -15,6 +15,7 @@ import { buildMeshyMcpServerEntry, MESHY_MCP_ALLOWED_TOOL, buildMeshyUsagePrompt
 import { getValidCoderTokenForUser, forceRefreshCoderTokenForUser } from './sessions.js';
 import { resolveAccountToken, markAccountUsed } from './claude-accounts.js';
 import { writeRemoteStdin } from './ssh-stdin.js';
+import { coderSshArgs } from './coder-ssh.js';
 import { combineExecOutput, redactSecrets } from './exec-output.js';
 import {
   assessCoverage, buildReviewDiff, carriedNote, coverageOutcome, exemptNote, pickBaselineReview, omittedFilesBlock, partialLabel, partialMessage, reviewerTurnCap, toolCallsFromContent,
@@ -1886,7 +1887,7 @@ export async function sshExec(
 
   const run = (env: NodeJS.ProcessEnv) =>
     new Promise<{ err: (Error & { stderr?: string }) | null; stdout: string; stderr: string }>((resolve) => {
-      execFile('coder', ['ssh', workspaceName, '--', command], { timeout, env, ...(maxBuffer ? { maxBuffer } : {}) }, (err, stdout, stderr) => {
+      execFile('coder', coderSshArgs(workspaceName, command), { timeout, env, ...(maxBuffer ? { maxBuffer } : {}) }, (err, stdout, stderr) => {
         resolve({ err: err as (Error & { stderr?: string }) | null, stdout: stdout || '', stderr: stderr || '' });
       });
     });
@@ -2905,7 +2906,7 @@ async function launchTask(task: Task, isResume = false, feedback?: string, messa
           stdio: 'ignore',
           detached: true,
         })
-      : spawn('coder', ['ssh', task.workspace_name, '--', remoteCmd], {
+      : spawn('coder', coderSshArgs(task.workspace_name, remoteCmd), {
           env: await buildCoderEnv(task.user_id),
           stdio: 'ignore',
           detached: true,
@@ -4462,7 +4463,7 @@ async function executeReviewer(
           stdio: 'ignore',
           detached: true,
         })
-      : spawn('coder', ['ssh', task.workspace_name, '--', remoteCmd], {
+      : spawn('coder', coderSshArgs(task.workspace_name, remoteCmd), {
           env: await buildCoderEnv(task.user_id),
           stdio: 'ignore',
           detached: true,
@@ -5392,7 +5393,7 @@ async function runAuditProcess(
 
     const proc = isLocalWorkspace(task.workspace_name)
       ? spawn('bash', ['-c', remoteCmd], { env: accountAuth.env ?? { ...process.env }, stdio: 'ignore', detached: true })
-      : spawn('coder', ['ssh', task.workspace_name, '--', remoteCmd], { env: await buildCoderEnv(task.user_id), stdio: 'ignore', detached: true });
+      : spawn('coder', coderSshArgs(task.workspace_name, remoteCmd), { env: await buildCoderEnv(task.user_id), stdio: 'ignore', detached: true });
     let spawnError: Error | null = null;
     proc.on('error', err => { spawnError = err as Error; });
     proc.unref();
@@ -6666,7 +6667,7 @@ export async function launchTaskParticipant(
           stdio: 'ignore',
           detached: true,
         })
-      : spawn('coder', ['ssh', participant.workspace_name, '--', remoteCmd], {
+      : spawn('coder', coderSshArgs(participant.workspace_name, remoteCmd), {
           env: await buildCoderEnv(task.user_id, ghToken ? { GH_TOKEN: ghToken } : undefined),
           stdio: 'ignore',
           detached: true,
