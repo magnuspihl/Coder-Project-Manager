@@ -751,6 +751,78 @@ dbTest('the periodic recheck leaves alone previews that are restarting, stopped,
   assert.equal(calls.length, before, 'no health checks were sent');
 });
 
+/**
+ * Runs one real watchdog sweep with the Coder API answering `statuses` (by
+ * workspace name; a missing name is an API error). Returns the workspaces the
+ * sweep SSHed into — each of which `coder ssh` would have started.
+ */
+async function watchdogSweep(statuses: Record<string, string | null>): Promise<string[]> {
+  const { calls, restore } = mockExec();
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string | URL) => {
+    const name = decodeURIComponent(String(url).split('/').pop() || '');
+    if (!(name in statuses)) return new Response('boom', { status: 500 });
+    if (statuses[name] === null) return new Response('not found', { status: 404 });
+    return new Response(JSON.stringify({ latest_build: { status: statuses[name] } }), { status: 200 });
+  }) as typeof fetch;
+  const token = process.env.CODER_SESSION_TOKEN;
+  process.env.CODER_SESSION_TOKEN = 'test-token';
+  try {
+    await C.runPreviewWatchdogSweep();
+  } finally {
+    globalThis.fetch = realFetch;
+    if (token === undefined) delete process.env.CODER_SESSION_TOKEN; else process.env.CODER_SESSION_TOKEN = token;
+    restore();
+  }
+  return calls.map(c => c.workspace);
+}
+
+/** A task on `workspaceName` whose preview the watchdog would recheck. */
+function previewOn(workspaceName: string, status = 'running') {
+  const task = makeTask();
+  getDb().prepare('UPDATE tasks SET workspace_name = ?, preview_status = ? WHERE id = ?').run(workspaceName, status, task.id);
+  return T.getTask(task.id)!;
+}
+
+dbTest('the preview watchdog does not SSH into (and so does not start) a workspace the user stopped', async () => {
+  const task = previewOn('StoppedWs');
+  const sshed = await watchdogSweep({ StoppedWs: 'stopped' });
+  assert.deepEqual(sshed.filter(w => w === 'StoppedWs'), [], 'no coder ssh to the stopped workspace');
+  const t = T.getTask(task.id)!;
+  assert.equal(t.preview_status, 'stopped', 'the preview went down with its workspace');
+  assert.equal(t.preview_error, P.WORKSPACE_STOPPED_PREVIEW_ERROR);
+  assert.deepEqual(await watchdogSweep({ StoppedWs: 'stopped' }), [], 'and later sweeps leave it alone entirely');
+});
+
+dbTest('the preview watchdog also leaves alone workspaces that are stopping or have been deleted', async () => {
+  const stopping = previewOn('StoppingWs');
+  const gone = previewOn('GoneWs', 'unreachable');
+  const sshed = await watchdogSweep({ StoppingWs: 'stopping', GoneWs: null });
+  assert.deepEqual(sshed, []);
+  assert.equal(T.getTask(stopping.id)!.preview_status, 'stopped');
+  assert.equal(T.getTask(gone.id)!.preview_status, 'stopped');
+});
+
+dbTest('the preview watchdog neither SSHes in nor changes anything when the workspace state is unclear', async () => {
+  const starting = previewOn('StartingWs');
+  const unknowable = previewOn('UnknowableWs'); // the mocked API errors for this one
+  const sshed = await watchdogSweep({ StartingWs: 'starting' });
+  assert.deepEqual(sshed, []);
+  assert.equal(T.getTask(starting.id)!.preview_status, 'running');
+  assert.equal(T.getTask(unknowable.id)!.preview_status, 'running');
+  getDb().prepare("UPDATE tasks SET preview_status = 'stopped' WHERE id IN (?, ?)").run(starting.id, unknowable.id);
+});
+
+dbTest('the preview watchdog still rechecks previews on running workspaces', async () => {
+  const a = previewOn('RunningWs', 'unreachable');
+  const b = previewOn('RunningWs', 'unreachable');
+  const sshed = await watchdogSweep({ RunningWs: 'running' });
+  assert.equal(sshed.filter(w => w === 'RunningWs').length, 2, 'both previews were probed');
+  assert.equal(T.getTask(a.id)!.preview_status, 'running', 'and recovered, since the port answers');
+  assert.equal(T.getTask(b.id)!.preview_status, 'running');
+  getDb().prepare("UPDATE tasks SET preview_status = 'stopped' WHERE id IN (?, ?)").run(a.id, b.id);
+});
+
 dbTest('an interrupted start is still rechecked, and judged against the port wait its restart was given', { timeout: 20000 }, async () => {
   const task = makeTask();
   P.setPreviewCommandSetting(task.workspace_id, 'npm run dev');

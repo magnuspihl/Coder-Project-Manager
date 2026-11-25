@@ -28,6 +28,7 @@
 
 import { getDb } from '../db/index.js';
 import type { Task } from './tasks.js';
+import type { WorkspaceRunState } from './workspace-status.js';
 import { DETECT_INSTALL_SH, INSTALL_LOCK_FN, INSTALL_MARKER, NPM_TREE_CURRENT_FN } from './install-script.js';
 
 export { DETECT_INSTALL_SH, INSTALL_LOCK_FN, INSTALL_MARKER };
@@ -741,14 +742,44 @@ export async function recheckTaskPreview(
   return 'skipped';
 }
 
-/** Recheck every settled preview, one at a time (each is a remote call). */
-export async function recheckAllPreviews(execFor: (task: Task) => PreviewExec): Promise<void> {
+export const WORKSPACE_STOPPED_PREVIEW_ERROR =
+  'The workspace was stopped, which stopped the preview. Restart the preview once the workspace is running again.';
+
+/**
+ * Recheck every settled preview, one at a time (each is a remote call).
+ *
+ * The recheck SSHes in, and `coder ssh` starts a stopped workspace — so without
+ * `workspaceState` this would wake every workspace with a preview once a minute,
+ * forever, however often the user stopped it. Only running workspaces are
+ * probed. A workspace that is down took its preview with it, so that preview is
+ * marked stopped (which also takes it out of later sweeps); one whose state
+ * can't be told is skipped and left as it is.
+ */
+export async function recheckAllPreviews(
+  execFor: (task: Task) => PreviewExec,
+  workspaceState: (task: Task) => Promise<WorkspaceRunState>,
+): Promise<void> {
   const rows = getDb().prepare(
     `SELECT * FROM tasks WHERE preview_status IN ('running', 'unreachable', 'starting', 'installing')
        AND deleted_at IS NULL AND port_range_start IS NOT NULL
        AND status NOT IN ('completed', 'failed', 'cancelled')`
   ).all() as Task[];
+  // One status lookup per workspace per sweep. Keyed per user too: the lookup is
+  // by name within the token owner's workspaces.
+  const states = new Map<string, WorkspaceRunState>();
   for (const task of rows) {
+    const key = `${task.user_id}\0${task.workspace_name}`;
+    if (!states.has(key)) states.set(key, await workspaceState(task).catch((): WorkspaceRunState => 'unknown'));
+    const state = states.get(key)!;
+    if (state === 'unknown') continue;
+    if (state === 'down') {
+      const now = getTaskRow(task.id);
+      if (isPreviewable(now) && isRecheckable(now)) {
+        setPreviewState(task.id, { status: 'stopped', error: WORKSPACE_STOPPED_PREVIEW_ERROR });
+        console.log(`[preview] task ${task.id}: workspace ${task.workspace_name} is down; preview marked stopped`);
+      }
+      continue;
+    }
     await recheckTaskPreview(task.id, execFor(task)).catch(() => 'skipped');
   }
 }
